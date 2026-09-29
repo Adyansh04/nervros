@@ -11,7 +11,6 @@ members = [
 default-members = [
     "crates/rosidl-schema",
     "crates/nervros-core",
-    "apps/nervros-cli",
 ]
 
 [workspace.package]

@@ -77,6 +77,20 @@ pub struct RosConfig {
     /// Path prefixes to rewrite when install symlinks point at another machine's paths.
     #[serde(default)]
     pub remap: std::collections::BTreeMap<PathBuf, PathBuf>,
+    /// The fixed frame places and poses are in.
+    #[serde(default = "default_map_frame")]
+    pub map_frame: String,
+    /// The robot's base frame.
+    #[serde(default = "default_base_frame")]
+    pub base_frame: String,
+}
+
+fn default_map_frame() -> String {
+    "map".to_owned()
+}
+
+fn default_base_frame() -> String {
+    "base_footprint".to_owned()
 }
 
 impl Default for RosConfig {
@@ -88,6 +102,8 @@ impl Default for RosConfig {
             discovery_timeout: default_discovery(),
             interfaces: Vec::new(),
             remap: std::collections::BTreeMap::new(),
+            map_frame: default_map_frame(),
+            base_frame: default_base_frame(),
         }
     }
 }

@@ -11,10 +11,17 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["ros"]
+# Talk to a live ROS graph through r2r; needs a sourced ROS environment (scripts/ros-env.sh).
+ros = ["nervros-ros/rcl"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 nervros-core = { path = "../../crates/nervros-core" }
+nervros-ros = { path = "../../crates/nervros-ros", default-features = false }
+serde_json.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
