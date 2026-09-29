@@ -8,8 +8,10 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
+use futures::future::BoxFuture;
+use rig::agent::tool::ToolOutput;
 use rig::client::CompletionClient as _;
-use rig::completion::{Message, Prompt as _, PromptError};
+use rig::completion::{Chat as _, Message, Prompt as _, PromptError};
 use rig::message::{ImageMediaType, UserContent};
 use secrecy::{ExposeSecret, SecretString};
 
@@ -98,6 +100,14 @@ pub enum LlmError {
     /// A model broke the free-only rule at request time.
     #[error(transparent)]
     NotFree(#[from] free_only::FreeOnlyError),
+    /// The model or provider failed during a turn.
+    #[error("{model}: {message}")]
+    Turn {
+        /// The model id.
+        model: String,
+        /// What went wrong.
+        message: String,
+    },
 }
 
 fn describe(skipped: &[(String, Skip)], failed: &[(String, String)]) -> String {
@@ -298,4 +308,153 @@ fn is_rate_limited(error: &PromptError) -> bool {
         }
         _ => false,
     }
+}
+
+/// Model-facing JSON a tool returns.
+pub type ToolFuture = BoxFuture<'static, serde_json::Value>;
+
+/// A tool as the agent loop sees it: a spec plus an async call that returns the JSON the model
+/// reads. The session wraps each registry tool this way, guard and events included.
+#[derive(Clone)]
+pub struct LoopTool {
+    /// The name the model uses.
+    pub name: String,
+    /// What it does.
+    pub description: String,
+    /// JSON Schema of the arguments.
+    pub parameters: serde_json::Value,
+    /// Runs the tool.
+    pub invoke: std::sync::Arc<dyn Fn(serde_json::Value) -> ToolFuture + Send + Sync>,
+}
+
+impl std::fmt::Debug for LoopTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopTool")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The conversation so far, tool calls and results included, in rig's message form.
+#[derive(Debug, Clone, Default)]
+pub struct History(Vec<Message>);
+
+impl History {
+    /// Number of messages.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether it is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Drops the oldest messages beyond `max`, starting at a user message so no tool result is
+    /// left without its call.
+    pub fn trim(&mut self, max: usize) {
+        if self.0.len() <= max {
+            return;
+        }
+        let mut start = self.0.len() - max;
+        while start < self.0.len() && !is_user_text(&self.0[start]) {
+            start += 1;
+        }
+        self.0.drain(..start);
+    }
+}
+
+fn is_user_text(m: &Message) -> bool {
+    matches!(m, Message::User { content } if content.iter().all(|c| matches!(c, UserContent::Text(_))))
+}
+
+/// What the session asks of its model layer; [`Llm`] implements it, tests use a scripted model.
+pub trait AgentSource: Send + Sync {
+    /// Model ids to try for a role, in order.
+    fn candidates(&self, role: Role, need: Need) -> Vec<String>;
+
+    /// A rig builder for one model.
+    ///
+    /// # Errors
+    ///
+    /// The model cannot be built.
+    fn builder(&self, model_id: &str) -> Result<AgentBuilder, LlmError>;
+
+    /// Counts one request against the model's quota.
+    fn record_use(&self, model_id: &str);
+}
+
+impl AgentSource for Llm {
+    fn candidates(&self, role: Role, need: Need) -> Vec<String> {
+        self.router
+            .candidates(role, need, SystemTime::now())
+            .0
+            .into_iter()
+            .map(|m| m.id.clone())
+            .collect()
+    }
+
+    fn builder(&self, model_id: &str) -> Result<AgentBuilder, LlmError> {
+        let model = self
+            .router
+            .config()
+            .model(model_id)
+            .ok_or_else(|| LlmError::Client {
+                provider: String::new(),
+                message: format!("unknown model `{model_id}`"),
+            })?;
+        self.agent_builder(model)
+    }
+
+    fn record_use(&self, model_id: &str) {
+        if let Err(e) = self.router.record_use(model_id, SystemTime::now()) {
+            tracing::warn!(model = %model_id, error = %e, "could not save the quota ledger");
+        }
+    }
+}
+
+/// Runs one user turn: the model may call the tools up to `max_turns` model calls in total.
+/// Committed messages, tool calls and results included, are appended to `history`.
+///
+/// # Errors
+///
+/// [`LlmError::Turn`] when the provider or the loop fails.
+pub async fn chat(
+    model_id: &str,
+    builder: AgentBuilder,
+    preamble: &str,
+    max_turns: usize,
+    tools: &[LoopTool],
+    history: &mut History,
+    text: &str,
+) -> Result<String, LlmError> {
+    let dynamic: Vec<DynamicTool> = tools
+        .iter()
+        .map(|t| {
+            let invoke = std::sync::Arc::clone(&t.invoke);
+            DynamicTool::new(
+                t.name.clone(),
+                t.description.clone(),
+                t.parameters.clone(),
+                move |_cx, args| {
+                    let fut = invoke(args);
+                    Box::pin(async move { Ok(ToolOutput::json(fut.await)) })
+                },
+            )
+        })
+        .collect();
+    let builder = builder
+        .preamble(preamble)
+        .default_max_turns(max_turns)
+        .dynamic_tools(dynamic);
+    let agent = builder.build();
+    agent
+        .chat(text, &mut history.0)
+        .await
+        .map_err(|e| LlmError::Turn {
+            model: model_id.to_owned(),
+            message: e.to_string(),
+        })
 }

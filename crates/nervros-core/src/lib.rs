@@ -4,6 +4,7 @@
 //! a rig upgrade touches one module.
 
 pub mod builtins;
+pub mod context;
 pub mod guard;
 pub mod llm;
 pub mod look;
@@ -11,4 +12,5 @@ pub mod profile;
 pub mod providers;
 pub mod schemas;
 pub mod secret;
+pub mod session;
 pub mod tools;
