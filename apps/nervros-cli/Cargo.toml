@@ -10,3 +10,11 @@ authors.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+nervros-core = { path = "../../crates/nervros-core" }
+reqwest.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
