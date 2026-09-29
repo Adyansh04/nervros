@@ -4277,7 +4277,9 @@ dependencies = [
  "anyhow",
  "clap",
  "nervros-core",
+ "nervros-ros",
  "reqwest 0.13.5",
+ "serde_json",
  "tokio",
  "tracing-subscriber",
 ]
@@ -4288,7 +4290,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "bytes",
  "futures",
+ "image",
  "nervros-ros",
  "reqwest 0.13.5",
  "rig",
