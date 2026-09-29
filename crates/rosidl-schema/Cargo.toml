@@ -10,3 +10,13 @@ authors.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# Exact float parsing, so that the reference's numbers compare equal bit for bit.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
