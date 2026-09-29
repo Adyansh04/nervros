@@ -1,0 +1,12 @@
+[package]
+name = "nervros-ros"
+description = "ROS 2 access for NervROS: calls by type string, action jobs, snapshots, images and TF behind one trait."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true

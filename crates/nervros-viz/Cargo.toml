@@ -1,0 +1,12 @@
+[package]
+name = "nervros-viz"
+description = "Maps ROS 2 data and agent events to Rerun."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
