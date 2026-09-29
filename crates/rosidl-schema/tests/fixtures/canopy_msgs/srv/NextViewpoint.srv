@@ -1,0 +1,29 @@
+# Where to stand and which way to look next. Called in a loop by the exploration tree.
+
+# "frontier" closes the map under SLAM; "coverage" makes the camera see what the map holds.
+string MODE_FRONTIER="frontier"
+string MODE_COVERAGE="coverage"
+string mode
+---
+uint8 STATUS_VIEWPOINT=0
+uint8 STATUS_DONE=1
+# Not now: no map or pose yet, or the map has not caught up with the last viewpoint. Ask again.
+uint8 STATUS_UNAVAILABLE=2
+# The last viewpoints were all unreached from here: move the robot off, then ask again.
+uint8 STATUS_STUCK=3
+uint8 status
+
+uint32 viewpoint_id
+
+# Where to stand; the yaw is the first heading.
+geometry_msgs/PoseStamped pose
+
+# Map-frame yaws to face in turn once there, rad.
+float32[] headings
+
+string room_id
+
+# Target cells the view is predicted to cover.
+float32 expected_gain
+
+string message

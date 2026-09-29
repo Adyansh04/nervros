@@ -1,0 +1,34 @@
+# Close the last gap to a measured object after navigation has parked the robot nearby. Nav2's
+# xy_goal_tolerance (0.5 m) is far wider than the arm's reach window.
+#
+# One closed loop over the measured pose, in x, y and yaw at once. The gait ignores small linear
+# commands, so the server floors its speeds rather than letting a proportional term fade out.
+
+# A class_id on /objects. Read when the goal starts, so a retry never replays a stale pose.
+string object_id
+# Which arm must reach it. Only picks the side of the pelvis the object should end up on.
+string ARM_LEFT=left
+string ARM_RIGHT=right
+string arm
+# Heading to hold while approaching, rad, in the odometry frame. Pass the staging NavigateToPose
+# goal's yaw: re-aiming at the object from a metre out walks in on a curve.
+float64 working_yaw
+# Hold the heading the robot arrived with and ignore working_yaw.
+bool use_current_heading
+# Seconds before giving up. 0 uses the server's default.
+float64 timeout_s
+---
+bool success
+# On failure, the phase that failed and why. Not meant to be parsed.
+string message
+# Where the object ended up in the base frame, m.
+float64 final_x_m
+float64 final_y_m
+---
+# Current phase, also the prefix of a failure message.
+string PHASE_LOCATING=locating
+string PHASE_CLOSING=closing
+string PHASE_VERIFYING=verifying
+string phase
+float64 forward_error_m
+float64 lateral_error_m

@@ -1,0 +1,5 @@
+{
+"unique_identifier_msgs":{
+"msg/UUID":{"kind":"msg","message":{"comment":["A universally unique identifier (UUID).",""," http://en.wikipedia.org/wiki/Universally_unique_identifier"," http://tools.ietf.org/html/rfc4122.html"],"fields":[{"name":"uuid","type":{"pkg":null,"name":"uint8","bound":null,"array":true,"size":16,"upper":false},"comment":[],"unit":null}],"constants":[]}}
+}
+}

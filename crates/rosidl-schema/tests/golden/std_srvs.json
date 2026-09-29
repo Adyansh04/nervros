@@ -1,0 +1,7 @@
+{
+"std_srvs":{
+"srv/Empty":{"kind":"srv","request":{"comment":[],"fields":[],"constants":[]},"response":{"comment":[],"fields":[],"constants":[]}},
+"srv/SetBool":{"kind":"srv","request":{"comment":[],"fields":[{"name":"data","type":{"pkg":null,"name":"bool","bound":null,"array":false,"size":null,"upper":false},"comment":["e.g. for hardware enabling / disabling"],"unit":null}],"constants":[]},"response":{"comment":[],"fields":[{"name":"success","type":{"pkg":null,"name":"bool","bound":null,"array":false,"size":null,"upper":false},"comment":["indicate successful run of triggered service"],"unit":null},{"name":"message","type":{"pkg":null,"name":"string","bound":null,"array":false,"size":null,"upper":false},"comment":["informational, e.g. for error messages"],"unit":null}],"constants":[]}},
+"srv/Trigger":{"kind":"srv","request":{"comment":[],"fields":[],"constants":[]},"response":{"comment":[],"fields":[{"name":"success","type":{"pkg":null,"name":"bool","bound":null,"array":false,"size":null,"upper":false},"comment":["indicate successful run of triggered service"],"unit":null},{"name":"message","type":{"pkg":null,"name":"string","bound":null,"array":false,"size":null,"upper":false},"comment":["informational, e.g. for error messages"],"unit":null}],"constants":[]}}
+}
+}

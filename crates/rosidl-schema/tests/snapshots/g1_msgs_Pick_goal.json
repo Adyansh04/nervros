@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Pick a known object off a surface with one arm.\n\nThe pose is read from /objects when the goal starts, so a retry re-reads it rather than\nreplaying a stale one. An object not seen within the server's sighting memory fails the goal.\n\nConstants:\nARM_LEFT=left\nARM_RIGHT=right",
+  "properties": {
+    "arm": {
+      "enum": [
+        "left",
+        "right"
+      ],
+      "type": "string"
+    },
+    "object_id": {
+      "description": "A class_id on /objects.",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
