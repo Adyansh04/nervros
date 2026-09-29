@@ -1,0 +1,57 @@
+# Models for the example profile. Every model here is free: local servers, OpenRouter's explicit
+# `:free` variants (checked at load and against the price list at start-up), and nothing else.
+# Roles list model ids in the order they are tried; local models that fit are always appended.
+
+[[provider]]
+id = "local"
+kind = "openai_compat"
+base_url = "http://127.0.0.1:8081/v1"      # scripts/local-llm.sh
+timeout_s = 120
+
+[[provider]]
+id = "openrouter"
+kind = "openai_compat"
+base_url = "https://openrouter.ai/api/v1"
+key = { file = "~/.config/openrouter.key" }
+free_only = true
+headers = { "X-Title" = "NervROS" }
+
+[[model]]
+id = "qwen3.5-9b-local"
+provider = "local"
+model = "qwen3.5-9b"
+vision = true
+tools = true
+tool_choice = true
+structured = "json_schema"
+privacy = { local = true }
+
+[[model]]
+id = "qwen3.8-27b-or"
+provider = "openrouter"
+model = "qwen/qwen3.8-27b:free"
+vision = true
+tools = true
+tool_choice = true
+structured = "json_schema"
+limits = { rpm = 20, pool = "openrouter_free" }
+
+[[model]]
+id = "inkling-or"
+provider = "openrouter"
+model = "thinkingmachines/inkling:free"
+vision = true
+tools = true
+limits = { rpm = 20, pool = "openrouter_free" }
+privacy = { trains = true }
+
+[pools]
+# 50 a day for the whole account; 1,000 once $10 has ever been bought. Refreshed from /key.
+openrouter_free = { rpd = 50 }
+
+# Test roles: local first. Swap in the cloud chains from docs when a full workflow check needs them.
+[roles]
+routine = ["qwen3.5-9b-local"]
+plan = ["qwen3.5-9b-local"]
+vision_check = ["qwen3.5-9b-local"]
+summarise = ["qwen3.5-9b-local"]
