@@ -45,6 +45,23 @@ enum Command {
         #[arg(long)]
         image: Option<PathBuf>,
     },
+    /// Chat with the robot. Lines starting with `/` are commands: `/arm`, `/disarm`, `/stop`,
+    /// `/yes N`, `/no N`, `/quit`; a line that is exactly `stop` also stops the robot.
+    #[cfg(feature = "ros")]
+    Chat {
+        /// Send these messages in order and exit, instead of reading stdin.
+        #[arg(long)]
+        say: Vec<String>,
+        /// Arm at start.
+        #[arg(long)]
+        arm: bool,
+        /// Approve every request; for scripted runs only.
+        #[arg(long)]
+        approve: bool,
+    },
+    /// Check the profile's tools, topics and mission services against the live graph.
+    #[cfg(feature = "ros")]
+    Doctor,
     /// Look through the robot's camera: print the marks and save the marked image.
     #[cfg(feature = "ros")]
     Look {
@@ -103,6 +120,17 @@ async fn main() -> Result<()> {
         } => ask(&cli.models, &prompt, role.into(), image).await,
         #[cfg(feature = "ros")]
         Command::Look { out } => robot::look(&cli.profile, &out).await,
+        #[cfg(feature = "ros")]
+        Command::Chat { say, arm, approve } => {
+            robot::chat(
+                &cli.profile,
+                &state_dir(),
+                robot::ChatOptions { say, arm, approve },
+            )
+            .await
+        }
+        #[cfg(feature = "ros")]
+        Command::Doctor => robot::doctor(&cli.profile).await,
     }
 }
 
