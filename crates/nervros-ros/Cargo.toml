@@ -10,3 +10,21 @@ authors.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+default = ["rcl"]
+# The r2r backend: links rcl, so building needs a sourced ROS environment (scripts/ros-env.sh).
+rcl = ["dep:r2r"]
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+r2r = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+image.workspace = true
+uuid.workspace = true
