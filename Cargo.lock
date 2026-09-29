@@ -4311,6 +4311,7 @@ dependencies = [
  "nervros-ros",
  "reqwest 0.13.5",
  "rig",
+ "rosidl-schema",
  "schemars 1.2.2",
  "secrecy",
  "serde",
@@ -4320,6 +4321,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
