@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rosidl-schema",
+    "crates/nervros-ros",
+    "crates/nervros-core",
+    "crates/nervros-viz",
+    "apps/nervros-cli",
+    "apps/nervros-gui",
+]
+default-members = [
+    "crates/rosidl-schema",
+    "crates/nervros-core",
+    "apps/nervros-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "BSD-3-Clause"
+repository = "https://github.com/Adyansh04/nervros"
+authors = ["Adyansh Gupta"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"
+mod_module_files = "deny"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
