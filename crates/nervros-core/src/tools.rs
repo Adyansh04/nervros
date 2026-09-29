@@ -1,0 +1,584 @@
+//! Tools: what the model can call.
+//!
+//! Most tools are declared in the profile by ROS name and interface type and need no code; a few
+//! builtins (`look`, `list_places`, `robot_state`, `stop`) are written once. Every tool has a spec
+//! (name, description, JSON Schema, risk) and returns an outcome whose message the model can read.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use nervros_ros::{RobotPort, RosError};
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+
+use crate::guard::Guard;
+
+/// How much a tool can change the world.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Risk {
+    /// Reads only.
+    #[default]
+    Observe,
+    /// Changes stored state (the world model, a parameter), not the robot's body.
+    WorldEdit,
+    /// Moves the base.
+    Motion,
+    /// Moves an arm or a hand.
+    Manipulation,
+}
+
+/// Observe tools run freely; act tools need the robot armed and, when supervised, approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    /// Read-only.
+    Observe,
+    /// Changes something.
+    Act,
+}
+
+/// A part of the robot that one action at a time may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Resource {
+    /// The legs or wheels.
+    Base,
+    /// The left arm and hand.
+    LeftArm,
+    /// The right arm and hand.
+    RightArm,
+}
+
+/// What the model sees of a tool.
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    /// Provider-safe name.
+    pub name: String,
+    /// What it does and when to use it.
+    pub description: String,
+    /// JSON Schema of the arguments.
+    pub parameters: Value,
+    /// How much it can change.
+    pub risk: Risk,
+    /// What it occupies while it runs.
+    pub resources: Vec<Resource>,
+    /// How long one call may take.
+    pub timeout: Duration,
+}
+
+impl ToolSpec {
+    /// A spec with no resources and a 10 s timeout.
+    #[must_use]
+    pub fn new(name: &str, description: &str, parameters: Value, risk: Risk) -> Self {
+        Self {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            parameters,
+            risk,
+            resources: Vec::new(),
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    /// Its lane.
+    #[must_use]
+    pub fn lane(&self) -> Lane {
+        if self.risk == Risk::Observe {
+            Lane::Observe
+        } else {
+            Lane::Act
+        }
+    }
+}
+
+/// How a call ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// Done, with data.
+    Succeeded,
+    /// Tried and failed; the message says why.
+    Failed,
+    /// Not run: the guard, the operator or a precondition said no.
+    Refused,
+    /// Started and running in the background; the data carries its id.
+    Accepted,
+}
+
+/// An image a tool produced, for the GUI and optionally the model.
+#[derive(Debug, Clone)]
+pub struct ImageArtifact {
+    /// The snapshot id marks refer to.
+    pub snapshot: String,
+    /// JPEG bytes.
+    pub jpeg: Arc<Vec<u8>>,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+/// What a call returned.
+#[derive(Debug, Clone)]
+pub struct ToolOutcome {
+    /// How it ended.
+    pub status: Status,
+    /// Result data for the model, as JSON.
+    pub data: Value,
+    /// One line for the model and the log.
+    pub message: String,
+    /// Images for the GUI.
+    pub images: Vec<ImageArtifact>,
+}
+
+impl ToolOutcome {
+    /// A success with data.
+    #[must_use]
+    pub fn ok(data: Value) -> Self {
+        Self {
+            status: Status::Succeeded,
+            data,
+            message: String::new(),
+            images: Vec::new(),
+        }
+    }
+
+    /// A failure the model should read.
+    #[must_use]
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            status: Status::Failed,
+            data: Value::Null,
+            message: message.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// A refusal the model should read.
+    #[must_use]
+    pub fn refused(message: impl Into<String>) -> Self {
+        Self {
+            status: Status::Refused,
+            data: Value::Null,
+            message: message.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// The JSON the model gets back: status, message and data, capped in size.
+    #[must_use]
+    pub fn for_model(&self, max_chars: usize) -> Value {
+        let status = match self.status {
+            Status::Succeeded => "succeeded",
+            Status::Failed => "failed",
+            Status::Refused => "refused",
+            Status::Accepted => "accepted",
+        };
+        let data = cap(&self.data, max_chars);
+        let mut out = json!({ "status": status, "data": data });
+        if !self.message.is_empty() {
+            out["message"] = Value::String(self.message.clone());
+        }
+        out
+    }
+}
+
+/// Replaces data that serialises longer than `max_chars` with a truncated string and a note.
+fn cap(data: &Value, max_chars: usize) -> Value {
+    let text = data.to_string();
+    if text.len() <= max_chars {
+        return data.clone();
+    }
+    let cut: String = text.chars().take(max_chars).collect();
+    json!({ "truncated": true, "chars": text.len(), "head": cut })
+}
+
+/// A callable tool.
+#[async_trait]
+pub trait Tool: Send + Sync {
+    /// Its spec.
+    fn spec(&self) -> &ToolSpec;
+
+    /// Runs it. Errors are outcomes, never panics.
+    async fn call(&self, args: Value) -> ToolOutcome;
+}
+
+/// Where tool argument schemas come from.
+pub trait SchemaSource: Send + Sync {
+    /// The JSON Schema of an interface's request (services) or message (topics), with the listed
+    /// fields hidden.
+    ///
+    /// # Errors
+    ///
+    /// A description of why the type has no schema.
+    fn schema(&self, ros_type: &str, part: SchemaPart, hide: &[String]) -> Result<Value, String>;
+}
+
+/// Which half of an interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaPart {
+    /// A service request.
+    Request,
+    /// A topic message.
+    Message,
+}
+
+/// Kinds of config-declared tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    /// Call a service.
+    Service,
+    /// Read a topic's newest message.
+    Topic,
+}
+
+/// One `[[tool]]` entry.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolConfig {
+    /// The name the model uses.
+    pub name: String,
+    /// Service or topic.
+    pub kind: ToolKind,
+    /// The ROS name.
+    pub ros_name: String,
+    /// The interface type, `pkg/srv/Name` or `pkg/msg/Name`.
+    #[serde(rename = "type")]
+    pub ros_type: String,
+    /// Overrides the description taken from the interface file.
+    pub description: Option<String>,
+    /// How much it can change.
+    #[serde(default)]
+    pub risk: Risk,
+    /// What it occupies while running.
+    #[serde(default)]
+    pub resources: Vec<Resource>,
+    /// Per-call timeout.
+    #[serde(default = "d_timeout", deserialize_with = "crate::profile::duration")]
+    pub timeout: Duration,
+    /// Fields the model must not see or fill.
+    #[serde(default)]
+    pub hide_fields: Vec<String>,
+    /// Values merged under the model's arguments.
+    #[serde(default)]
+    pub defaults: Map<String, Value>,
+    /// A full JSON Schema that replaces the generated one.
+    pub schema: Option<Value>,
+}
+
+fn d_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+/// A tool that calls a ROS service.
+pub struct ServiceTool {
+    spec: ToolSpec,
+    ros_name: String,
+    ros_type: String,
+    defaults: Map<String, Value>,
+    robot: Arc<dyn RobotPort>,
+}
+
+/// A tool that returns a topic's newest message.
+pub struct TopicTool {
+    spec: ToolSpec,
+    ros_name: String,
+    ros_type: String,
+    robot: Arc<dyn RobotPort>,
+}
+
+fn merge(defaults: &Map<String, Value>, args: Value) -> Value {
+    let mut out = defaults.clone();
+    if let Value::Object(given) = args {
+        out.extend(given);
+    }
+    Value::Object(out)
+}
+
+fn ros_failure(e: &RosError) -> ToolOutcome {
+    ToolOutcome::failed(e.to_string())
+}
+
+#[async_trait]
+impl Tool for ServiceTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn call(&self, args: Value) -> ToolOutcome {
+        let request = merge(&self.defaults, args);
+        match self
+            .robot
+            .call(&self.ros_name, &self.ros_type, request, self.spec.timeout)
+            .await
+        {
+            Ok(response) => ToolOutcome::ok(response),
+            Err(e) => ros_failure(&e),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for TopicTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn call(&self, _args: Value) -> ToolOutcome {
+        match self
+            .robot
+            .latest(&self.ros_name, &self.ros_type, self.spec.timeout)
+            .await
+        {
+            Ok(msg) => ToolOutcome::ok(msg),
+            Err(e) => ros_failure(&e),
+        }
+    }
+}
+
+/// A tool that cannot be registered.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RegistryError {
+    /// The name is not `[a-zA-Z0-9_-]{1,64}`, which every provider accepts.
+    #[error("tool name `{0}` must be 1 to 64 letters, digits, `_` or `-`")]
+    BadName(String),
+    /// Two tools share a name.
+    #[error("duplicate tool `{0}`")]
+    Duplicate(String),
+    /// The ROS name is on the hard-deny list.
+    #[error("tool `{tool}` reaches `{ros_name}`, which the policy denies")]
+    Denied {
+        /// The tool.
+        tool: String,
+        /// Its ROS name.
+        ros_name: String,
+    },
+    /// No schema for its type.
+    #[error("tool `{tool}`: {message}")]
+    Schema {
+        /// The tool.
+        tool: String,
+        /// Why.
+        message: String,
+    },
+}
+
+/// The tools of a session.
+#[derive(Default)]
+pub struct Registry {
+    tools: BTreeMap<String, Arc<dyn Tool>>,
+}
+
+impl std::fmt::Debug for Registry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.tools.keys()).finish()
+    }
+}
+
+fn valid_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+impl Registry {
+    /// Builds the config-declared tools.
+    ///
+    /// # Errors
+    ///
+    /// The first tool with a bad name, a duplicate, a denied ROS name or no schema.
+    pub fn from_config(
+        configs: &[ToolConfig],
+        robot: &Arc<dyn RobotPort>,
+        schemas: &dyn SchemaSource,
+        guard: &Guard,
+    ) -> Result<Self, RegistryError> {
+        let mut registry = Self::default();
+        for c in configs {
+            if guard.hard_denied(&c.ros_name) {
+                return Err(RegistryError::Denied {
+                    tool: c.name.clone(),
+                    ros_name: c.ros_name.clone(),
+                });
+            }
+            let part = match c.kind {
+                ToolKind::Service => SchemaPart::Request,
+                ToolKind::Topic => SchemaPart::Message,
+            };
+            let parameters = match (&c.schema, c.kind) {
+                (Some(schema), _) => schema.clone(),
+                // A topic read takes no arguments.
+                (None, ToolKind::Topic) => json!({"type": "object", "properties": {}}),
+                (None, ToolKind::Service) => schemas
+                    .schema(&c.ros_type, part, &c.hide_fields)
+                    .map_err(|message| RegistryError::Schema {
+                        tool: c.name.clone(),
+                        message,
+                    })?,
+            };
+            let description = c.description.clone().unwrap_or_else(|| {
+                let from_file = parameters
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let what = match c.kind {
+                    ToolKind::Service => "Calls",
+                    ToolKind::Topic => "Reads the newest message on",
+                };
+                format!("{what} {} ({}). {from_file}", c.ros_name, c.ros_type)
+                    .trim()
+                    .to_owned()
+            });
+            let spec = ToolSpec {
+                name: c.name.clone(),
+                description,
+                parameters,
+                risk: c.risk,
+                resources: c.resources.clone(),
+                timeout: c.timeout,
+            };
+            let tool: Arc<dyn Tool> = match c.kind {
+                ToolKind::Service => Arc::new(ServiceTool {
+                    spec,
+                    ros_name: c.ros_name.clone(),
+                    ros_type: c.ros_type.clone(),
+                    defaults: c.defaults.clone(),
+                    robot: Arc::clone(robot),
+                }),
+                ToolKind::Topic => Arc::new(TopicTool {
+                    spec,
+                    ros_name: c.ros_name.clone(),
+                    ros_type: c.ros_type.clone(),
+                    robot: Arc::clone(robot),
+                }),
+            };
+            registry.add(tool)?;
+        }
+        Ok(registry)
+    }
+
+    /// Adds a tool, such as a builtin.
+    ///
+    /// # Errors
+    ///
+    /// A bad or duplicate name.
+    pub fn add(&mut self, tool: Arc<dyn Tool>) -> Result<(), RegistryError> {
+        let name = tool.spec().name.clone();
+        if !valid_name(&name) {
+            return Err(RegistryError::BadName(name));
+        }
+        if self.tools.contains_key(&name) {
+            return Err(RegistryError::Duplicate(name));
+        }
+        self.tools.insert(name, tool);
+        Ok(())
+    }
+
+    /// A tool by name.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.tools.get(name)
+    }
+
+    /// Every tool, in name order (a stable order helps provider prompt caches).
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn Tool>> {
+        self.tools.values()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::guard::Policy;
+    use nervros_ros::fake::FakeRobot;
+
+    struct Fixed;
+
+    impl SchemaSource for Fixed {
+        fn schema(
+            &self,
+            ros_type: &str,
+            _part: SchemaPart,
+            hide: &[String],
+        ) -> Result<Value, String> {
+            if ros_type == "x/srv/Missing" {
+                return Err("unknown type".into());
+            }
+            Ok(json!({"type": "object", "description": "Finds things.", "hidden": hide}))
+        }
+    }
+
+    fn config(name: &str, ros_name: &str, ros_type: &str) -> ToolConfig {
+        toml::from_str(&format!(
+            "name = \"{name}\"\nkind = \"service\"\nros_name = \"{ros_name}\"\ntype = \"{ros_type}\"\ndefaults = {{ max_results = 5 }}\n"
+        ))
+        .unwrap()
+    }
+
+    fn robot() -> Arc<dyn RobotPort> {
+        Arc::new(FakeRobot::new().with_service("/find", |req| Ok(json!({"got": req}))))
+    }
+
+    #[tokio::test]
+    async fn a_declared_service_becomes_a_tool_with_defaults_merged() {
+        let guard = Guard::new(Policy::default());
+        let reg = Registry::from_config(
+            &[config("find_objects", "/find", "x/srv/Find")],
+            &robot(),
+            &Fixed,
+            &guard,
+        )
+        .unwrap();
+        let tool = reg.get("find_objects").unwrap();
+        assert!(tool.spec().description.contains("Finds things."));
+        let out = tool.call(json!({"query": "cup"})).await;
+        assert_eq!(out.status, Status::Succeeded);
+        assert_eq!(out.data, json!({"got": {"query": "cup", "max_results": 5}}));
+    }
+
+    #[test]
+    fn denied_names_bad_names_and_missing_schemas_are_refused() {
+        let guard = Guard::new(Policy::default());
+        let denied = config("switch", "/controller_manager/switch_controller", "x/srv/S");
+        assert!(matches!(
+            Registry::from_config(&[denied], &robot(), &Fixed, &guard),
+            Err(RegistryError::Denied { .. })
+        ));
+        let bad = config("has space", "/find", "x/srv/Find");
+        assert!(matches!(
+            Registry::from_config(&[bad], &robot(), &Fixed, &guard),
+            Err(RegistryError::BadName(_))
+        ));
+        let missing = config("m", "/find", "x/srv/Missing");
+        assert!(matches!(
+            Registry::from_config(&[missing], &robot(), &Fixed, &guard),
+            Err(RegistryError::Schema { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn failures_are_outcomes_the_model_can_read() {
+        let guard = Guard::new(Policy::default());
+        let reg = Registry::from_config(
+            &[config("gone", "/gone", "x/srv/Find")],
+            &robot(),
+            &Fixed,
+            &guard,
+        )
+        .unwrap();
+        let out = reg.get("gone").unwrap().call(json!({})).await;
+        assert_eq!(out.status, Status::Failed);
+        assert_eq!(out.for_model(100)["message"], "`/gone` is not available");
+    }
+
+    #[test]
+    fn large_results_are_capped() {
+        let big = ToolOutcome::ok(json!({"x": "a".repeat(500)}));
+        let out = big.for_model(50);
+        assert_eq!(out["data"]["truncated"], true);
+    }
+}

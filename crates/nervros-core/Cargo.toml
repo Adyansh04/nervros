@@ -12,6 +12,8 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
+nervros-ros = { path = "../nervros-ros", default-features = false }
 base64.workspace = true
 futures.workspace = true
 reqwest.workspace = true

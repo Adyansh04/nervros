@@ -1,0 +1,30 @@
+# An example robot profile. A real robot's profile lives in the robot's own repository.
+
+[robot]
+name = "Example robot"
+
+[ros]
+domain_id = 0
+
+[policy]
+start_armed = false
+autonomy = "supervised"
+
+[look]
+image = "/camera/color/image_raw"
+detections = { topic = "/detections", type = "vision_msgs/msg/Detection2DArray" }
+
+[[place]]
+name = "dock"
+aliases = ["the charging dock"]
+pose = { x = 0.0, y = 0.0, yaw = 0.0 }
+
+[[tool]]
+name = "battery"
+kind = "topic"
+ros_name = "/battery_state"
+type = "sensor_msgs/msg/BatteryState"
+description = "The robot's battery: voltage, charge and whether it is charging."
+
+[models]
+file = "models.toml"
