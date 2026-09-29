@@ -1,0 +1,12 @@
+# Load and check a behaviour tree exactly as ExecuteMission would, without running it.
+
+# A complete BehaviorTree.CPP v4 document.
+string tree_xml
+---
+bool ok
+# A JSON array of {code, line, node, message}; empty when ok.
+string diagnostics_json
+# SHA-256 (hex) of tree_xml, the value to approve and send with ExecuteMission.
+string tree_sha256
+# Worst-case duration in seconds, from the timeouts and retry counts in the tree.
+float32 worst_case_duration_s

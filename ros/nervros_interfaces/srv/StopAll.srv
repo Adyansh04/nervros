@@ -1,0 +1,10 @@
+# Stop every motion the executor controls: halt the mission, cancel outstanding goals, wait for
+# them to end, then hold posture. A hand that holds an object keeps its grip.
+
+# Why the stop was asked for, such as "button", "chat" or "watchdog".
+string reason
+---
+bool ok
+string message
+# The robot's state after the stop, such as "holding posture; right hand keeps O17".
+string state_after

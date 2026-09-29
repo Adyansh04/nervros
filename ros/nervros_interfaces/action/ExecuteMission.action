@@ -1,0 +1,41 @@
+# Run one behaviour tree that the agent compiled, validated and had approved.
+# The executor runs one mission at a time and rejects a second goal while one is active.
+
+# Client-chosen id, echoed in feedback and in the result.
+string mission_id
+# A complete BehaviorTree.CPP v4 document with main_tree_to_execute set.
+string tree_xml
+# SHA-256 (hex) of tree_xml as approved. The executor recomputes it and rejects a mismatch.
+string tree_sha256
+# Watchdog in seconds. 0 means the executor's default; larger values are clamped to its cap.
+float32 max_duration_s
+
+uint8 MODE_EXECUTE=0
+uint8 MODE_VALIDATE=1
+uint8 MODE_DRY_RUN=2
+# EXECUTE runs the tree; VALIDATE only loads and checks it; DRY_RUN ticks it with mock leaves.
+uint8 mode
+---
+uint8 OUTCOME_SUCCESS=0
+uint8 OUTCOME_FAILURE=1
+uint8 OUTCOME_CANCELED=2
+uint8 OUTCOME_TIMEOUT=3
+uint8 OUTCOME_REJECTED=4
+uint8 OUTCOME_ERROR=5
+uint8 outcome
+# Path of the first node that failed, empty on success.
+string failed_node
+# The step id the failed node belongs to, such as "s2", taken from its "s<N>_" name prefix.
+string failed_step_id
+# The skill server's own words for the failure. For people and models, not for parsing.
+string failure_reason
+# For REJECTED: a JSON array of {code, line, node, message}.
+string diagnostics_json
+# Wall time from goal acceptance to the result.
+float32 elapsed_s
+---
+float32 elapsed_s
+# Paths of the nodes that are RUNNING now.
+string[] running_nodes
+# Status transitions since the previous feedback message.
+NodeEvent[] events
