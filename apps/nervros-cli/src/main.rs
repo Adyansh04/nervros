@@ -9,12 +9,18 @@ use nervros_core::llm::{Ask, ImageFormat, ImageInput, Llm};
 use nervros_core::providers::router::{PrivacyMode, Router};
 use nervros_core::providers::{ModelsConfig, Role, free_only, openrouter};
 
+#[cfg(feature = "ros")]
+mod robot;
+
 #[derive(Parser)]
 #[command(version, about = "Headless NervROS")]
 struct Cli {
     /// The models file.
     #[arg(long, global = true, default_value = "profiles/example/models.toml")]
     models: PathBuf,
+    /// The robot profile.
+    #[arg(long, global = true, default_value = "profiles/example/nervros.toml")]
+    profile: PathBuf,
     #[command(subcommand)]
     command: Command,
 }
@@ -38,6 +44,13 @@ enum Command {
         /// A JPEG or PNG to attach.
         #[arg(long)]
         image: Option<PathBuf>,
+    },
+    /// Look through the robot's camera: print the marks and save the marked image.
+    #[cfg(feature = "ros")]
+    Look {
+        /// Where to write the marked JPEG.
+        #[arg(long, default_value = "look.jpg")]
+        out: PathBuf,
     },
 }
 
@@ -88,6 +101,8 @@ async fn main() -> Result<()> {
             role,
             image,
         } => ask(&cli.models, &prompt, role.into(), image).await,
+        #[cfg(feature = "ros")]
+        Command::Look { out } => robot::look(&cli.profile, &out).await,
     }
 }
 
