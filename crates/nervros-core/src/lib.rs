@@ -7,6 +7,7 @@ pub mod builtins;
 pub mod context;
 pub mod guard;
 pub mod llm;
+pub mod log;
 pub mod look;
 pub mod profile;
 pub mod providers;
