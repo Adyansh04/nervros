@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "found": {
+      "description": "False with a coverage figure means \"not in the part the camera has seen\", not \"absent\".",
+      "type": "boolean"
+    },
+    "message": {
+      "type": "string"
+    },
+    "objects": {
+      "items": {
+        "additionalProperties": false,
+        "description": "One object the world model fused from several views. Poses are in the header frame of the\nenclosing array, normally `map`.\n\nConstants:\nSTATE_ACTIVE=0\nSTATE_STALE=1\nSTATE_REMOVED=2",
+        "properties": {
+          "caption": {
+            "type": "string"
+          },
+          "confidence": {
+            "description": "Share of all label votes held by `label`, 0..1.",
+            "type": "number"
+          },
+          "first_seen": {
+            "additionalProperties": false,
+            "description": "This message communicates ROS Time defined here:\nhttps://design.ros2.org/articles/clock_and_time.html",
+            "properties": {
+              "nanosec": {
+                "description": "The nanoseconds component, valid in the range [0, 1e9), to be added to the seconds component.\ne.g.\nThe time -1.7 seconds is represented as {sec: -2, nanosec: 3e8}\nThe time 1.7 seconds is represented as {sec: 1, nanosec: 7e8}",
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sec": {
+                "description": "The seconds component, valid over all int32 values.",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "id": {
+            "description": "Stable for the life of the world file: \"O12\". Never reused after removal.",
+            "type": "string"
+          },
+          "label": {
+            "description": "The detector label with the most votes.",
+            "type": "string"
+          },
+          "last_seen": {
+            "additionalProperties": false,
+            "description": "This message communicates ROS Time defined here:\nhttps://design.ros2.org/articles/clock_and_time.html",
+            "properties": {
+              "nanosec": {
+                "description": "The nanoseconds component, valid in the range [0, 1e9), to be added to the seconds component.\ne.g.\nThe time -1.7 seconds is represented as {sec: -2, nanosec: 3e8}\nThe time 1.7 seconds is represented as {sec: 1, nanosec: 7e8}",
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sec": {
+                "description": "The seconds component, valid over all int32 values.",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "name": {
+            "description": "Canonical name and one-line caption from the describer. Empty until described.",
+            "type": "string"
+          },
+          "observations": {
+            "maximum": 4294967295,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pose": {
+            "additionalProperties": false,
+            "description": "Centre of the oriented bounding box; only yaw is set in the orientation.",
+            "properties": {
+              "orientation": {
+                "additionalProperties": false,
+                "description": "This represents an orientation in free space in quaternion form.",
+                "properties": {
+                  "w": {
+                    "default": 1.0,
+                    "type": "number"
+                  },
+                  "x": {
+                    "default": 0.0,
+                    "type": "number"
+                  },
+                  "y": {
+                    "default": 0.0,
+                    "type": "number"
+                  },
+                  "z": {
+                    "default": 0.0,
+                    "type": "number"
+                  }
+                },
+                "type": "object"
+              },
+              "position": {
+                "additionalProperties": false,
+                "description": "This contains the position of a point in free space",
+                "properties": {
+                  "x": {
+                    "type": "number"
+                  },
+                  "y": {
+                    "type": "number"
+                  },
+                  "z": {
+                    "type": "number"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          },
+          "room_id": {
+            "description": "Room the footprint centre falls in, and the object it rests on. Empty when unknown or on the\nfloor.",
+            "type": "string"
+          },
+          "size": {
+            "additionalProperties": false,
+            "description": "Full extents along the box axes, m.",
+            "properties": {
+              "x": {
+                "description": "This is semantically different than a point.\nA vector is always anchored at the origin.\nWhen a transform is applied to a vector, only the rotational component is applied.",
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "type": "object"
+          },
+          "state": {
+            "enum": [
+              0,
+              1,
+              2
+            ],
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "support_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "scores": {
+      "items": {
+        "type": "number"
+      },
+      "type": "array"
+    },
+    "searched_coverage": {
+      "type": "number"
+    }
+  },
+  "type": "object"
+}

@@ -1,0 +1,102 @@
+{
+  "$defs": {
+    "builtin_interfaces.Time": {
+      "additionalProperties": false,
+      "description": "This message communicates ROS Time defined here:\nhttps://design.ros2.org/articles/clock_and_time.html",
+      "properties": {
+        "nanosec": {
+          "description": "The nanoseconds component, valid in the range [0, 1e9), to be added to the seconds component.\ne.g.\nThe time -1.7 seconds is represented as {sec: -2, nanosec: 3e8}\nThe time 1.7 seconds is represented as {sec: 1, nanosec: 7e8}",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sec": {
+          "description": "The seconds component, valid over all int32 values.",
+          "maximum": 2147483647,
+          "minimum": -2147483648,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "geometry_msgs.Point": {
+      "additionalProperties": false,
+      "description": "This contains the position of a point in free space",
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "z": {
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "geometry_msgs.Pose": {
+      "additionalProperties": false,
+      "description": "A representation of pose in free space, composed of position and orientation.",
+      "properties": {
+        "orientation": {
+          "$ref": "#/$defs/geometry_msgs.Quaternion"
+        },
+        "position": {
+          "$ref": "#/$defs/geometry_msgs.Point"
+        }
+      },
+      "type": "object"
+    },
+    "geometry_msgs.Quaternion": {
+      "additionalProperties": false,
+      "description": "This represents an orientation in free space in quaternion form.",
+      "properties": {
+        "w": {
+          "default": 1.0,
+          "type": "number"
+        },
+        "x": {
+          "default": 0.0,
+          "type": "number"
+        },
+        "y": {
+          "default": 0.0,
+          "type": "number"
+        },
+        "z": {
+          "default": 0.0,
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "std_msgs.Header": {
+      "additionalProperties": false,
+      "description": "Standard metadata for higher-level stamped data types.\nThis is generally used to communicate timestamped data\nin a particular coordinate frame.",
+      "properties": {
+        "frame_id": {
+          "description": "Transform frame with which this data is associated.",
+          "type": "string"
+        },
+        "stamp": {
+          "$ref": "#/$defs/builtin_interfaces.Time",
+          "description": "Two-integer timestamp that is expressed as seconds and nanoseconds."
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A Pose with reference coordinate frame and timestamp",
+  "properties": {
+    "header": {
+      "$ref": "#/$defs/std_msgs.Header"
+    },
+    "pose": {
+      "$ref": "#/$defs/geometry_msgs.Pose"
+    }
+  },
+  "type": "object"
+}

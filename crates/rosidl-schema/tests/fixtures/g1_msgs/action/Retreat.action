@@ -1,0 +1,18 @@
+# Reverse away from a surface far enough that the next motion does not drag the arm across it.
+#
+# Reverses and stops, without turning: a navigation goal normally follows. Reverse shares the
+# gait's forward deadband, so the server commands it above that floor.
+
+# Distance to end up from the start, m. The gait coasts a little after the command stops, so
+# expect slightly more.
+float64 distance_m
+# Seconds before giving up. 0 uses the server's default.
+float64 timeout_s
+---
+bool success
+string message
+float64 travelled_m
+---
+string PHASE_BACKING_OFF=backing_off
+string phase
+float64 travelled_m

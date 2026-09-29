@@ -1,0 +1,23 @@
+# Pick a known object off a surface with one arm.
+#
+# The pose is read from /objects when the goal starts, so a retry re-reads it rather than
+# replaying a stale one. An object not seen within the server's sighting memory fails the goal.
+
+# A class_id on /objects.
+string object_id
+# Selects the arm group, its hand group and the palm to attach to.
+string ARM_LEFT=left
+string ARM_RIGHT=right
+string arm
+---
+bool success
+# On failure, the phase that failed and why. Not meant to be parsed.
+string message
+---
+# Current phase, also the prefix of a failure message.
+string PHASE_LOCATING=locating
+string PHASE_PREGRASP=pregrasp
+string PHASE_APPROACH=approach
+string PHASE_GRASP=grasp
+string PHASE_LIFT=lift
+string phase
