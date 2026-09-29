@@ -9,5 +9,6 @@ pub mod llm;
 pub mod look;
 pub mod profile;
 pub mod providers;
+pub mod schemas;
 pub mod secret;
 pub mod tools;
