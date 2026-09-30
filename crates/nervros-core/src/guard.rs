@@ -362,7 +362,7 @@ impl Guard {
                 }
                 Lane::Edit => {
                     return Decision::NeedApproval {
-                        reason: format!("`{}` changes the world model", spec.name),
+                        reason: format!("`{}` changes what the robot remembers", spec.name),
                     };
                 }
                 Lane::Observe => {}
@@ -444,7 +444,7 @@ mod tests {
         let edit = spec("edit_world", Risk::Annotate);
         match g.decide(&edit, &json!({})) {
             Decision::NeedApproval { reason } => {
-                assert!(reason.contains("world model"), "{reason}");
+                assert!(reason.contains("remembers"), "{reason}");
             }
             other => panic!("{other:?}"),
         }
