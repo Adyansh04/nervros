@@ -56,6 +56,7 @@ pub fn spawn(
     events: broadcast::Receiver<Event>,
 ) -> JoinSet<()> {
     put_static(rec, "world", &rerun::ViewCoordinates::RIGHT_HAND_Z_UP());
+    layout(rec);
     let mut tasks = JoinSet::new();
     tasks.spawn(pose(
         rec.clone(),
@@ -80,6 +81,37 @@ pub fn spawn(
     }
     tasks.spawn(agent(rec.clone(), events));
     tasks
+}
+
+/// The default layout: the world large on the left; the camera, the agent's last marked image and
+/// its log on the right. Only a default, so a layout the operator arranges is kept.
+fn layout(rec: &RecordingStream) {
+    use rerun::blueprint::{
+        Blueprint, BlueprintActivation, Horizontal, Spatial2DView, Spatial3DView, TextLogView,
+        Vertical,
+    };
+    let side = Vertical::new([
+        Spatial2DView::new("Camera").with_origin("/camera").into(),
+        Spatial2DView::new("Last look")
+            .with_origin("/agent/look")
+            .into(),
+        TextLogView::new("Agent").with_origin("/agent/log").into(),
+    ]);
+    let root = Horizontal::new([
+        Spatial3DView::new("World").with_origin("/world").into(),
+        side.into(),
+    ])
+    .with_column_shares([2.0, 1.0]);
+    let activation = BlueprintActivation {
+        make_active: false,
+        make_default: true,
+    };
+    if let Err(e) = Blueprint::new(root)
+        .with_auto_views(false)
+        .send(rec, activation)
+    {
+        tracing::debug!(error = %e, "the viewer layout was not sent");
+    }
 }
 
 fn put(rec: &RecordingStream, path: &str, what: &impl AsComponents) {
