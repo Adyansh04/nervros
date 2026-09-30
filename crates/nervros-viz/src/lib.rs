@@ -385,8 +385,10 @@ fn draw_detections(rec: &RecordingStream, path: &str, msg: &Value) {
     );
 }
 
-/// The default layout: the world large on the left; the cameras, the agent's last marked image and
-/// its log on the right. Only a default, so a layout the operator arranges is kept.
+/// The default layout: the world large; beside it the first camera over the others and the agent's
+/// last marked image, in tabs as the chat shows that image too; and the agent's log and the
+/// mission's steps in a strip below, as wide as the viewer so their columns read. Only a default,
+/// so a layout the operator arranges is kept.
 fn layout(rec: &RecordingStream, cameras: &[(String, String)]) {
     use rerun::blueprint::{
         Blueprint, BlueprintActivation, Horizontal, Spatial2DView, Spatial3DView,
@@ -397,40 +399,42 @@ fn layout(rec: &RecordingStream, cameras: &[(String, String)]) {
         if let Some(first) = title.get_mut(0..1) {
             first.make_ascii_uppercase();
         }
-        Spatial2DView::new(format!("{title} camera"))
-            .with_origin(path.as_str())
-            .into()
+        Spatial2DView::new(title).with_origin(path.as_str()).into()
     };
-    let camera_slot: rerun::blueprint::ContainerLike = match cameras {
-        [] => Spatial2DView::new("Camera")
-            .with_origin(CAMERA_PATH[0])
-            .into(),
-        [(_, path)] => Spatial2DView::new("Camera")
-            .with_origin(path.as_str())
-            .into(),
-        many => Tabs::new(many.iter().map(view)).into(),
+    let mut views: Vec<rerun::blueprint::ContainerLike> = match cameras {
+        [] => vec![
+            Spatial2DView::new("Camera")
+                .with_origin(CAMERA_PATH[0])
+                .into(),
+        ],
+        [(_, path)] => vec![
+            Spatial2DView::new("Camera")
+                .with_origin(path.as_str())
+                .into(),
+        ],
+        many => many.iter().map(view).collect(),
     };
-    let side = Vertical::new([
-        camera_slot,
+    let first = views.remove(0);
+    views.push(
         Spatial2DView::new("Last look")
             .with_origin("/agent/look")
             .into(),
-        Tabs::new([
-            TextLogView::new("Agent").with_origin("/agent/log").into(),
-            StateTimelineView::new("Mission")
-                .with_origin("/mission")
-                .into(),
-            TimeSeriesView::new("Exploring")
-                .with_origin("/mapping")
-                .into(),
-        ])
-        .into(),
-    ]);
-    let root = Horizontal::new([
+    );
+    let top = Horizontal::new([
         Spatial3DView::new("World").with_origin("/world").into(),
-        side.into(),
+        Vertical::new([first, Tabs::new(views).into()]).into(),
     ])
-    .with_column_shares([2.0, 1.0]);
+    .with_column_shares([3.0, 2.0]);
+    let strip = Tabs::new([
+        TextLogView::new("Agent").with_origin("/agent/log").into(),
+        StateTimelineView::new("Mission")
+            .with_origin("/mission")
+            .into(),
+        TimeSeriesView::new("Exploring")
+            .with_origin("/mapping")
+            .into(),
+    ]);
+    let root = Vertical::new([top.into(), strip.into()]).with_row_shares([3.0, 1.0]);
     let activation = BlueprintActivation {
         make_active: false,
         make_default: true,
