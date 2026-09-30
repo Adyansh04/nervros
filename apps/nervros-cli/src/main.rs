@@ -63,8 +63,30 @@ enum Command {
     /// Look through the robot's camera: print the marks and save the marked image.
     #[cfg(feature = "ros")]
     Look {
+        /// Which camera, by the profile's names; the `[look]` one by default.
+        #[arg(long)]
+        camera: Option<String>,
         /// Where to write the marked JPEG.
         #[arg(long, default_value = "look.jpg")]
+        out: PathBuf,
+    },
+    /// Segment what a prompt names in a camera's newest frame: print the regions and save the
+    /// drawn image. The model backend asks the `segment` role's models, as the app does.
+    #[cfg(feature = "ros")]
+    Segment {
+        /// What to segment, such as "the floor".
+        prompt: String,
+        /// Which camera, by the profile's names; the `[look]` one by default.
+        #[arg(long)]
+        camera: Option<String>,
+        /// `model` or `service`; the profile's `[segment] backend` by default.
+        #[arg(long)]
+        backend: Option<String>,
+        /// `cutout` or `overlay`.
+        #[arg(long, default_value = "cutout")]
+        view: String,
+        /// Where to write the JPEG.
+        #[arg(long, default_value = "segment.jpg")]
         out: PathBuf,
     },
     /// Run one read-only ROS tool against the live graph, without a model: `ros_graph`,
@@ -86,6 +108,7 @@ enum RoleArg {
     Plan,
     VisionCheck,
     Summarise,
+    Segment,
 }
 
 impl From<RoleArg> for Role {
@@ -95,6 +118,7 @@ impl From<RoleArg> for Role {
             RoleArg::Plan => Self::Plan,
             RoleArg::VisionCheck => Self::VisionCheck,
             RoleArg::Summarise => Self::Summarise,
+            RoleArg::Segment => Self::Segment,
         }
     }
 }
@@ -126,7 +150,19 @@ async fn main() -> Result<()> {
             image,
         } => ask(&models_file(&cli.profile)?, &prompt, role.into(), image).await,
         #[cfg(feature = "ros")]
-        Command::Look { out } => robot::look(&cli.profile, &out).await,
+        Command::Look { camera, out } => robot::look(&cli.profile, camera, &out).await,
+        #[cfg(feature = "ros")]
+        Command::Segment {
+            prompt,
+            camera,
+            backend,
+            view,
+            out,
+        } => {
+            let args = serde_json::json!({"prompt": prompt, "camera": camera, "backend": backend,
+                "view": view});
+            robot::segment(&cli.profile, args, &out).await
+        }
         #[cfg(feature = "ros")]
         Command::Chat { say, arm, approve } => {
             robot::chat(
@@ -152,6 +188,7 @@ async fn models(path: &Path, check: bool) -> Result<()> {
         ("plan", Role::Plan),
         ("vision_check", Role::VisionCheck),
         ("summarise", Role::Summarise),
+        ("segment", Role::Segment),
     ] {
         println!("{name}: {}", config.roles.chain(role).join(" > "));
     }
@@ -167,7 +204,7 @@ async fn models(path: &Path, check: bool) -> Result<()> {
     if !check {
         return Ok(());
     }
-    let llm = Llm::new(router).context("loading provider keys")?;
+    let llm = Llm::new(router);
     let http = reqwest::Client::new();
     for provider in &llm.router().config().providers {
         let Some(base) = provider
@@ -230,7 +267,7 @@ async fn ask(path: &Path, prompt: &str, role: Role, image: Option<PathBuf>) -> R
             Some(ImageInput { bytes, format })
         }
     };
-    let llm = Llm::new(router(path)?).context("loading provider keys")?;
+    let llm = Llm::new(router(path)?);
     let answer = llm
         .ask(Ask {
             role,

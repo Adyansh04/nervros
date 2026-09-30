@@ -5,31 +5,90 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use nervros_core::look::{LookTool, SnapshotStore};
+use nervros_core::look::{Cameras, LookTool, SnapshotStore};
 use nervros_core::profile::Profile;
-use nervros_core::tools::{Status, Tool as _};
+use nervros_core::segment::SegmentTool;
+use nervros_core::tools::{Status, Tool};
 
-pub(crate) async fn look(profile_path: &Path, out: &Path) -> Result<()> {
+pub(crate) async fn look(profile_path: &Path, camera: Option<String>, out: &Path) -> Result<()> {
     let profile = Profile::load(profile_path).context("loading the profile")?;
     let config = profile
         .look
         .clone()
         .context("the profile has no [look] section")?;
     let robot = nervros_core::app::connect(&profile)?;
-    let tool = LookTool::start(config, robot, Arc::new(SnapshotStore::default()), None)
-        .context("subscribing to the camera")?;
+    let cameras = Cameras::start(&config, &robot).context("subscribing to the cameras")?;
+    let tool = LookTool::new(
+        config,
+        cameras,
+        robot,
+        Arc::new(SnapshotStore::default()),
+        None,
+    );
+    run_once(&tool, serde_json::json!({ "camera": camera }), out).await
+}
+
+pub(crate) async fn segment(
+    profile_path: &Path,
+    args: serde_json::Value,
+    out: &Path,
+) -> Result<()> {
+    use nervros_core::llm::Llm;
+    use nervros_core::providers::ModelsConfig;
+    use nervros_core::providers::router::{PrivacyMode, Router};
+
+    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let look = profile
+        .look
+        .clone()
+        .context("the profile has no [look] section")?;
+    let config = profile
+        .segment
+        .clone()
+        .context("the profile has no [segment] section")?;
+    let models = ModelsConfig::load(&profile.resolve(&profile.models.file))
+        .context("loading the models file")?;
+    let ledger = nervros_core::app::state_dir().join("quota.json");
+    let privacy = match profile.privacy.mode {
+        nervros_core::profile::PrivacyModeConfig::Sim => PrivacyMode::Sim,
+        nervros_core::profile::PrivacyModeConfig::Home => PrivacyMode::Home,
+    };
+    let router =
+        Router::with_ledger_file(models, &ledger, privacy).context("loading the quota ledger")?;
+    let llm = Arc::new(Llm::new(router));
+    let robot = nervros_core::app::connect(&profile)?;
+    let cameras = Cameras::start(&look, &robot).context("subscribing to the cameras")?;
+    let tool = SegmentTool::new(
+        config,
+        cameras,
+        robot,
+        Arc::new(SnapshotStore::default()),
+        Some(llm as Arc<dyn nervros_core::segment::Outliner>),
+    );
+    let args = match args {
+        serde_json::Value::Object(map) => {
+            serde_json::Value::Object(map.into_iter().filter(|(_, v)| !v.is_null()).collect())
+        }
+        other => other,
+    };
+    run_once(&tool, args, out).await
+}
+
+/// Calls an image tool once, prints its data and saves its image.
+async fn run_once(tool: &dyn Tool, args: serde_json::Value, out: &Path) -> Result<()> {
     // Frames and discovery need a moment after the node starts.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let outcome = tool.call(serde_json::json!({})).await;
+    let name = tool.spec().name.clone();
+    let outcome = tool.call(args).await;
     if outcome.status != Status::Succeeded {
-        bail!("look failed: {}", outcome.message);
+        bail!("{name} failed: {}", outcome.message);
     }
     println!("{}", serde_json::to_string_pretty(&outcome.data)?);
     if let Some(image) = outcome.images.first() {
         std::fs::write(out, image.jpeg.as_slice())
             .with_context(|| format!("writing {}", out.display()))?;
         eprintln!(
-            "marked image: {} ({}x{})",
+            "image: {} ({}x{})",
             out.display(),
             image.width,
             image.height

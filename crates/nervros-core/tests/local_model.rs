@@ -37,7 +37,7 @@ const LOCAL_ONLY: &str = r#"
 )]
 fn llm() -> Llm {
     let config = ModelsConfig::parse(LOCAL_ONLY).unwrap();
-    Llm::new(Router::new(config, Ledger::default(), PrivacyMode::Sim)).unwrap()
+    Llm::new(Router::new(config, Ledger::default(), PrivacyMode::Sim))
 }
 
 #[tokio::test]

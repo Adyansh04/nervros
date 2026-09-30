@@ -1,9 +1,10 @@
 //! The robot profile: one `nervros.toml` per robot, kept in the robot's own repository.
 //!
-//! It names the robot, how to reach its ROS graph, the policy, the places, the camera and detection
-//! topics `look` reads, the mission executor's interfaces, the tools and the models file. Paths are
-//! relative to the profile's directory.
+//! It names the robot, how to reach its ROS graph, the policy, the places, the cameras and
+//! detection topics `look` and `segment` read, the mission executor's interfaces, the tools and the
+//! models file. Paths are relative to the profile's directory.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -29,6 +30,8 @@ pub struct Profile {
     pub policy: Policy,
     /// Inputs of the `look` builtin.
     pub look: Option<LookConfig>,
+    /// The `segment` builtin; it needs `[look]`'s cameras.
+    pub segment: Option<SegmentConfig>,
     /// The robot's mission executor.
     pub mission: Option<MissionConfig>,
     /// Named places beyond the world model's rooms.
@@ -152,10 +155,13 @@ pub enum PrivacyModeConfig {
     Home,
 }
 
-/// Where `look` reads from.
+/// Where `look` reads from: its own camera, the default, and any others in `cameras`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LookConfig {
+    /// The camera's name, as the `camera` argument of `look` and `segment` takes it.
+    #[serde(default = "default_camera_name")]
+    pub name: String,
     /// The colour image topic.
     pub image: String,
     /// The detection topic and its type.
@@ -170,6 +176,71 @@ pub struct LookConfig {
     /// it sees, so it does not take a view of the floor for an empty room.
     #[serde(default)]
     pub about: Option<String>,
+    /// Other cameras by name, such as `[look.cameras.head]`.
+    #[serde(default)]
+    pub cameras: BTreeMap<String, CameraConfig>,
+}
+
+/// A camera beyond `[look]`'s own.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraConfig {
+    /// The colour image topic.
+    pub image: String,
+    /// Its detections; without them `look` shows the frame unmarked.
+    pub detections: Option<TopicRef>,
+    /// What the vision model should know about this camera.
+    #[serde(default)]
+    pub about: Option<String>,
+}
+
+impl LookConfig {
+    /// Every camera by name, `[look]`'s own first.
+    #[must_use]
+    pub fn all_cameras(&self) -> Vec<(String, CameraConfig)> {
+        let own = CameraConfig {
+            image: self.image.clone(),
+            detections: Some(self.detections.clone()),
+            about: self.about.clone(),
+        };
+        std::iter::once((self.name.clone(), own))
+            .chain(self.cameras.iter().map(|(n, c)| (n.clone(), c.clone())))
+            .collect()
+    }
+}
+
+fn default_camera_name() -> String {
+    "main".to_owned()
+}
+
+/// Where `segment`'s masks come from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentBackend {
+    /// A vision model, the models file's `segment` role, asked for outlines.
+    #[default]
+    Model,
+    /// The `service` below.
+    Service,
+}
+
+/// The `segment` builtin.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentConfig {
+    /// The backend a call gets unless it names the other.
+    #[serde(default)]
+    pub backend: SegmentBackend,
+    /// A `canopy_msgs/srv/Segment` service: a camera name, as `[look]` names it, and a prompt in;
+    /// `success`, `message` and an `InstanceMaskArray` out.
+    pub service: Option<String>,
+    /// How long the service may take; its first call may load the models.
+    #[serde(default = "default_segment_timeout", deserialize_with = "duration")]
+    pub timeout: Duration,
+}
+
+fn default_segment_timeout() -> Duration {
+    Duration::from_secs(40)
 }
 
 fn default_marks() -> usize {
@@ -243,7 +314,36 @@ pub struct VizConfig {
     /// The robot's URDF, relative to the profile: the viewer draws the robot with it, posed by TF.
     /// `package://` meshes are found through `ROS_PACKAGE_PATH` or `AMENT_PREFIX_PATH`.
     pub urdf: Option<PathBuf>,
+    /// More topics the viewer draws, as RViz would.
+    #[serde(rename = "layer", default)]
+    pub layers: Vec<LayerConfig>,
 }
+
+/// A topic the viewer draws in the world as RViz would.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LayerConfig {
+    /// What the app's Layers list calls it.
+    pub name: String,
+    /// The topic.
+    pub topic: String,
+    /// One of [`LAYER_TYPES`].
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// For a marker array, the namespaces to draw; all when empty.
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    /// Starts hidden.
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// The message types a `[[viz.layer]]` can draw.
+pub const LAYER_TYPES: [&str; 3] = [
+    "nav_msgs/msg/OccupancyGrid",
+    "visualization_msgs/msg/MarkerArray",
+    "sensor_msgs/msg/LaserScan",
+];
 
 /// A named place.
 #[derive(Debug, Clone, Deserialize)]
@@ -306,14 +406,17 @@ pub enum ProfileError {
         /// The parse error.
         source: toml::de::Error,
     },
-    /// Two tools or two places share a name.
+    /// Two tools, places or cameras share a name.
     #[error("duplicate {kind} `{name}`")]
     Duplicate {
-        /// `tool` or `place`.
+        /// `tool`, `place` or `camera`.
         kind: &'static str,
         /// The repeated name.
         name: String,
     },
+    /// Settings that cannot work together.
+    #[error("{0}")]
+    Invalid(String),
 }
 
 impl Profile {
@@ -353,6 +456,36 @@ impl Profile {
                     kind: "place",
                     name: p.name.clone(),
                 });
+            }
+        }
+        for layer in self.viz.iter().flat_map(|v| &v.layers) {
+            if !LAYER_TYPES.contains(&layer.msg_type.as_str()) {
+                return Err(ProfileError::Invalid(format!(
+                    "[[viz.layer]] `{}`: the viewer draws {}, not {}",
+                    layer.name,
+                    LAYER_TYPES.join(", "),
+                    layer.msg_type
+                )));
+            }
+        }
+        if let Some(look) = &self.look
+            && look.cameras.contains_key(&look.name)
+        {
+            return Err(ProfileError::Duplicate {
+                kind: "camera",
+                name: look.name.clone(),
+            });
+        }
+        if let Some(segment) = &self.segment {
+            if self.look.is_none() {
+                return Err(ProfileError::Invalid(
+                    "[segment] needs [look]'s cameras".to_owned(),
+                ));
+            }
+            if segment.backend == SegmentBackend::Service && segment.service.is_none() {
+                return Err(ProfileError::Invalid(
+                    "[segment] backend = \"service\" needs `service`".to_owned(),
+                ));
             }
         }
         Ok(())
@@ -421,6 +554,58 @@ mod tests {
         assert_eq!(parse_duration("1.5"), Some(1.5));
         assert_eq!(parse_duration("-1s"), None);
         assert_eq!(parse_duration("soon"), None);
+    }
+
+    fn check(text: &str) -> Result<(), ProfileError> {
+        toml::from_str::<Profile>(text).unwrap().check()
+    }
+
+    const BASE: &str = "[robot]\nname = \"r\"\n[models]\nfile = \"m.toml\"\n";
+    const LOOK: &str = "[look]\nname = \"chest\"\nimage = \"/chest\"\n\
+        detections = { topic = \"/d\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n";
+
+    #[test]
+    fn cameras_segment_and_layers_are_checked() {
+        let text = format!("{BASE}{LOOK}[look.cameras.head]\nimage = \"/head\"\n");
+        let profile: Profile = toml::from_str(&text).unwrap();
+        let names: Vec<String> = profile
+            .look
+            .unwrap()
+            .all_cameras()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["chest", "head"]);
+        let twice = format!("{BASE}{LOOK}[look.cameras.chest]\nimage = \"/other\"\n");
+        assert!(matches!(
+            check(&twice),
+            Err(ProfileError::Duplicate { kind: "camera", .. })
+        ));
+        let blind = format!("{BASE}[segment]\n");
+        assert!(
+            check(&blind)
+                .unwrap_err()
+                .to_string()
+                .contains("needs [look]")
+        );
+        let no_service = format!("{BASE}{LOOK}[segment]\nbackend = \"service\"\n");
+        assert!(
+            check(&no_service)
+                .unwrap_err()
+                .to_string()
+                .contains("needs `service`")
+        );
+        let fine = format!("{BASE}{LOOK}[segment]\nservice = \"/segmenter/segment\"\n");
+        assert!(check(&fine).is_ok());
+        let odd = format!(
+            "{BASE}[[viz.layer]]\nname = \"Cloud\"\ntopic = \"/c\"\ntype = \"sensor_msgs/msg/PointCloud2\"\n"
+        );
+        assert!(
+            check(&odd)
+                .unwrap_err()
+                .to_string()
+                .contains("the viewer draws")
+        );
     }
 
     #[test]

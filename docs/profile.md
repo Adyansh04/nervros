@@ -142,11 +142,43 @@ vision model available, `look` returns the marks alone and says why.
 
 | Key | Default | |
 |---|---|---|
+| `name` | `"main"` | The camera's name, as `look` and `segment` take it in `camera`. |
 | `image` | required | A `sensor_msgs/msg/Image` topic. |
 | `detections` | required | `{ topic, type }`, where the type is `canopy_msgs/msg/InstanceMaskArray` or `vision_msgs/msg/Detection2DArray`. |
 | `max_marks` | `12` | |
 | `max_age` | `"5s"` | Older detections are left out. |
 | `about` | none | What the vision model should know about the camera, such as where it points and how far it sees. |
+
+More cameras go under `[look.cameras.<name>]` with `image`, `about` and, optionally, `detections`
+(without them `look` shows that camera's frame unmarked). The tools then take a `camera` argument,
+`[look]`'s own by default, and the chat model sees each camera's `about` to choose one.
+
+```toml
+[look]
+name = "chest"
+image = "/chest_camera/color/image_raw"
+detections = { topic = "/detector_chest/instance_masks", type = "canopy_msgs/msg/InstanceMaskArray" }
+
+[look.cameras.head]
+image = "/camera/color/image_raw"
+about = "It points down at the floor in front of the robot."
+```
+
+### `[segment]`
+
+The `segment` tool: masks for whatever a prompt names in a camera's newest frame ("the floor",
+"every mug on the table"), including things no detector marks. The operator sees the regions drawn,
+as a cutout on a dimmed frame or tinted over it; the chat model gets each region's label, box and
+share of the frame, as marks of the snapshot. It needs `[look]`'s cameras.
+
+| Key | Default | |
+|---|---|---|
+| `backend` | `"model"` | `model` asks the models file's `segment` role for outlines, Gemini's segmentation format (`box_2d` and a polygon, 0 to 1000); `service` calls `service`. A call may name the other when both are set up. |
+| `service` | none | A `canopy_msgs/srv/Segment` service: the camera, by the profile's name, and the prompt in; `success`, `message` and an `InstanceMaskArray` cut from one of that camera's frames out. canopy's `segmenter` is one. |
+| `timeout` | `"40s"` | How long the service may take; its first call may load the models. |
+
+`nervros-cli segment "the floor" --camera head --out floor.jpg` runs it once, without the chat
+model.
 
 ### `[world]`
 
@@ -169,7 +201,28 @@ frustum placed by TF from `[ros] base_frame` to the image's frame; without it, t
 on its own. With `urdf`, the robot is drawn as its model, posed by TF: the model's root from
 `[ros] base_frame`, and each joint that is not fixed from its parent link to its child link.
 `package://` meshes are found through `ROS_PACKAGE_PATH` or `AMENT_PREFIX_PATH`. The robot's
-heading arrow is drawn either way.
+heading arrow is drawn either way. Every camera in `[look]` gets its own view, with the detector's
+boxes on its frames.
+
+`[[viz.layer]]` adds a topic the viewer draws in the world as RViz would:
+
+```toml
+[[viz.layer]]
+name = "Next viewpoint"                   # its switch in the app's Layers tab
+topic = "/canopy/markers"
+type = "visualization_msgs/msg/MarkerArray"
+namespaces = ["viewpoint", "visited"]     # a marker array's namespaces to draw; all when left out
+hidden = false                            # starts hidden
+```
+
+| Type | Drawn as |
+|---|---|
+| `nav_msgs/msg/OccupancyGrid` | Its occupied cells, over the map in the layer's colour. |
+| `visualization_msgs/msg/MarkerArray` | Each marker by its type: arrows, cubes, spheres, cylinders, lines, point lists, triangle lists and text. Mesh markers are left out. |
+| `sensor_msgs/msg/LaserScan` | Points in the map, by TF from the scan's frame. |
+
+The Layers tab also switches the viewer's own drawings: the map, coverage, rooms, objects, trail,
+plan, the robot model and the detector's boxes.
 
 ### `[mission]`
 
@@ -204,5 +257,5 @@ pose = { x = 0.0, y = 0.0, yaw = 0.0 }   # in frame, default "map"
 ## Builtin tools
 
 Every robot gets `list_places`, `robot_state` and `stop`. `stop` is always allowed, armed or not,
-because it only makes the robot do less. `look` comes with `[look]`, and `plan_mission` and
-`run_mission` come with `[mission]`.
+because it only makes the robot do less. `look` comes with `[look]`, `segment` with `[segment]`,
+and `plan_mission` and `run_mission` with `[mission]`.

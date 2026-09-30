@@ -87,6 +87,7 @@ type SharedLive = Arc<Mutex<Live>>;
 enum Tab {
     Mission,
     World,
+    Layers,
     Approvals,
     Events,
     Models,
@@ -94,14 +95,26 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: [(Self, &'static str); 6] = [
+    const ALL: [(Self, &'static str); 7] = [
         (Self::Mission, "Mission"),
         (Self::World, "World"),
+        (Self::Layers, "Layers"),
         (Self::Approvals, "Approvals"),
         (Self::Events, "Events"),
         (Self::Models, "Models"),
         (Self::Doctor, "Doctor"),
     ];
+}
+
+/// What the embedded viewer shows: the recording's data, the bridge drawing it, whose layers the
+/// Layers tab switches, and how much of it the viewer keeps.
+pub struct ViewerFeed {
+    /// The recording's data.
+    pub input: LogReceiver,
+    /// The bridge filling the recording.
+    pub bridge: nervros_viz::Bridge,
+    /// The viewer drops its oldest data past this.
+    pub memory_limit: re_memory::MemoryLimit,
 }
 
 /// Where closing the window stands while a mission runs.
@@ -183,6 +196,7 @@ pub struct Gui {
     /// Set by the viewer on the UI thread when the selection changes.
     picked: Rc<RefCell<Option<Picked>>>,
     closing: Closing,
+    bridge: nervros_viz::Bridge,
 }
 
 impl Gui {
@@ -195,8 +209,7 @@ impl Gui {
         main_thread: re_viewer::MainThreadToken,
         cc: &eframe::CreationContext<'_>,
         agent: Agent,
-        input: LogReceiver,
-        memory_limit: re_memory::MemoryLimit,
+        feed: ViewerFeed,
         runtime: tokio::runtime::Handle,
         log_path: PathBuf,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -243,8 +256,8 @@ impl Gui {
             None,
             re_viewer::AsyncRuntimeHandle::new_native(runtime),
         );
-        viewer.app_options_mut().memory_limit = memory_limit;
-        viewer.add_log_receiver(input);
+        viewer.app_options_mut().memory_limit = feed.memory_limit;
+        viewer.add_log_receiver(feed.input);
         let live = Arc::new(Mutex::new(Live::default()));
         let recheck = watch(&agent, &live, &cc.egui_ctx);
         let events = agent.session.subscribe();
@@ -264,6 +277,7 @@ impl Gui {
             recheck,
             picked,
             closing: Closing::Open,
+            bridge: feed.bridge,
         })
     }
 
@@ -370,6 +384,7 @@ impl Gui {
                 Key::Num4,
                 Key::Num5,
                 Key::Num6,
+                Key::Num7,
             ];
             let tab = keys.iter().position(|k| i.consume_key(Modifiers::CTRL, *k));
             (esc, stop, tab)
@@ -659,7 +674,8 @@ impl Gui {
 
     fn dock(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        // Wrapped, so the tabs never widen the dock past what the operator gave it.
+        ui.horizontal_wrapped(|ui| {
             for (tab, name) in Tab::ALL {
                 let count = if tab == Tab::Approvals {
                     self.chat.pending().count()
@@ -691,6 +707,7 @@ impl Gui {
             .show(ui, |ui| match self.tab {
                 Tab::Mission => self.mission_tab(ui),
                 Tab::World => self.world_tab(ui),
+                Tab::Layers => self.layers_tab(ui),
                 Tab::Approvals => self.approvals_tab(ui),
                 Tab::Events => self.events_tab(ui),
                 Tab::Models => self.models_tab(ui),
@@ -725,6 +742,10 @@ impl Gui {
         };
         let actions = world_view(ui, &rooms, objects);
         self.act(ui.ctx(), actions);
+    }
+
+    fn layers_tab(&self, ui: &mut egui::Ui) {
+        layers_view(ui, &self.bridge.layers);
     }
 
     fn approvals_tab(&mut self, ui: &mut egui::Ui) {
@@ -777,6 +798,7 @@ impl Gui {
             (Role::Plan, "Plan"),
             (Role::VisionCheck, "Vision check"),
             (Role::Summarise, "Summarise"),
+            (Role::Segment, "Segment"),
         ] {
             ui.label(RichText::new(name).strong());
             let (take, skipped) = router.candidates(role, Need::default(), now);
@@ -993,6 +1015,35 @@ fn world_view(ui: &mut egui::Ui, rooms: &Value, objects: Option<usize>) -> Vec<A
     actions
 }
 
+/// A switch per layer the viewer draws, as RViz's displays list has.
+fn layers_view(ui: &mut egui::Ui, layers: &nervros_viz::Layers) {
+    let list = layers.list();
+    if list.is_empty() {
+        empty(ui, "The profile gives the viewer nothing to draw.");
+        return;
+    }
+    ui.label(
+        RichText::new("What the world and camera views draw. A hidden layer is cleared.")
+            .small()
+            .color(ui.tokens().text_subdued),
+    );
+    ui.add_space(6.0);
+    for (name, mut shown) in list {
+        ui.horizontal(|ui| {
+            if ui.toggle_switch(12.0, &mut shown).changed() {
+                layers.set(&name, shown);
+            }
+            let text = RichText::new(&name);
+            ui.label(if shown {
+                text
+            } else {
+                text.color(ui.tokens().text_subdued)
+            });
+        });
+        ui.add_space(2.0);
+    }
+}
+
 fn empty(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).color(ui.tokens().text_subdued));
 }
@@ -1028,7 +1079,8 @@ impl eframe::App for Gui {
             .show(ui, |ui| self.chat_panel(ui));
         if self.dock_open {
             egui::Panel::right("nervros_dock")
-                .default_size(320.0)
+                .default_size(340.0)
+                .size_range(280.0..=640.0)
                 .frame(
                     Frame::new()
                         .fill(t.panel_bg_color)
@@ -1269,6 +1321,34 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_layers_tab() {
+        let layers = nervros_viz::Layers::default();
+        for (name, shown) in [
+            ("Robot model", true),
+            ("Detections", true),
+            ("Map", true),
+            ("Camera coverage", false),
+            ("Rooms", true),
+            ("Scan", true),
+        ] {
+            layers.add(name, shown);
+        }
+        let mut harness = Harness::builder()
+            .wgpu()
+            .with_size(egui::vec2(340.0, 300.0))
+            .build_ui(move |ui| {
+                Frame::new()
+                    .fill(ui.tokens().panel_bg_color)
+                    .inner_margin(Margin::same(12))
+                    .show(ui, |ui| layers_view(ui, &layers));
+            });
+        crate::chat::style_for_tests(&harness.ctx);
+        harness.run();
+        harness.fit_contents();
+        crate::chat::compare(&mut harness, "layers", &SnapshotOptions::new());
+    }
+
+    #[test]
     fn closing_with_a_mission_running_asks_first() {
         assert_eq!(on_close(Closing::Open, false), (false, Closing::Open));
         assert_eq!(on_close(Closing::Open, true), (true, Closing::Asking));
@@ -1290,7 +1370,7 @@ mod tests {
         let agent =
             nervros_core::app::start(&profile, robot, &dir.path().join("quota.json")).unwrap();
         let (rec, input) = nervros_viz::in_process().unwrap();
-        let _bridge = nervros_viz::spawn(
+        let bridge = nervros_viz::spawn(
             &rec,
             &agent.robot,
             &agent.profile,
@@ -1301,10 +1381,14 @@ mod tests {
             .wgpu()
             .with_size(egui::vec2(1280.0, 800.0))
             .build_eframe(|cc| {
-                let limit = re_memory::MemoryLimit::from_bytes(1 << 30);
+                let feed = ViewerFeed {
+                    input,
+                    bridge,
+                    memory_limit: re_memory::MemoryLimit::from_bytes(1 << 30),
+                };
                 let log = PathBuf::from("session.ndjson");
                 let token = re_viewer::MainThreadToken::i_promise_i_am_only_using_this_for_a_test();
-                let mut gui = Gui::start(token, cc, agent, input, limit, handle, log).unwrap();
+                let mut gui = Gui::start(token, cc, agent, feed, handle, log).unwrap();
                 gui.chat = crate::chat::tests::sample();
                 gui
             });

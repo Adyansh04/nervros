@@ -27,7 +27,8 @@ headers = { "X-Title" = "NervROS" }
   vLLM, OpenRouter, Groq. `gemini_interactions` is Google's Gemini, whose key travels only in the
   `x-goog-api-key` header, never in a URL.
 - `key` is `{ file = "..." }` or `{ env = "NAME" }`, and absent for a local server. Keys are never
-  logged.
+  logged. A key that cannot be read leaves its provider's models out, and says why when one is
+  asked, rather than stopping the app.
 - `free_only = true` refuses at start-up any model on the provider that is not free. On OpenRouter
   that means ids ending in `:free`; `nervros-cli models --check` also checks the prices OpenRouter
   lists.
@@ -57,6 +58,7 @@ privacy = { trains = false }
 | `limits.pool` | none | A shared daily quota, from `[pools]`, such as OpenRouter's free requests across all its free models. |
 | `privacy.local` | `false` | Runs on this machine; see the profile's `[privacy]`. |
 | `privacy.trains` | `false` | The provider may train on what it is sent. |
+| `params` | none | Request fields passed to the provider as they are, such as Gemini's `{ generation_config = { thinking_level = "low" } }`. |
 
 ```toml
 [pools]
@@ -71,10 +73,28 @@ routine = ["qwen3.5-9b-local"]        # conversation and tool calls
 plan = ["qwen3.5-9b-local"]           # writing mission plans
 vision_check = ["qwen3.5-9b-local"]   # what `look` sees: questions about the camera frame
 summarise = ["qwen3.5-9b-local"]      # captions and summaries
+segment = ["gemini-3.5-flash-lite"]   # outlines for `segment`
 ```
 
 A turn tries its role's models in order and skips a model that lacks what the turn needs, is over a
-limit, or would break the privacy mode. Local models not in the list are tried after the others.
+limit, or would break the privacy mode. Local models not in the list are tried after the others,
+except for `segment`: outlining is a skill few models have, so only the models listed are asked.
+Gemini's free tier outlines well:
+
+```toml
+[[provider]]
+id = "gemini"
+kind = "gemini_interactions"
+key = { file = "~/.config/gemini.key" }
+
+[[model]]
+id = "gemini-3.5-flash-lite"
+provider = "gemini"
+model = "gemini-3.5-flash-lite"
+vision = true
+limits = { rpm = 10, rpd = 250 }
+privacy = { trains = true }
+```
 A model that fails before the robot has acted is replaced by the next one; once the robot has
 acted, the turn ends instead of repeating the action.
 

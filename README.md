@@ -42,8 +42,8 @@ source scripts/ros-env.sh             # bash; add NERVROS_UDP_ONLY=1 if the grap
 cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 ```
 
-`nervros-cli` does the same headless: `chat`, `doctor`, `look`, `models`, `ask`, and `ros`, which
-runs one of the ROS debugging tools against the live graph without a model:
+`nervros-cli` does the same headless: `chat`, `doctor`, `look`, `segment`, `models`, `ask`, and
+`ros`, which runs one of the ROS debugging tools against the live graph without a model:
 
 ```bash
 nervros-cli --profile my.toml ros topic_sample '{"topic": "/odom", "mode": "hz"}'
@@ -52,14 +52,17 @@ nervros-cli --profile my.toml ros topic_sample '{"topic": "/odom", "mode": "hz"}
 With a [`[ros_tools]`](docs/profile.md#ros_tools) table the agent can look at any part of the
 graph as `ros2` would (topics with their QoS, rates, messages, nodes, services, actions,
 parameters, TF and logs), and, where the profile lists them, call services, send action goals,
-set parameters and publish, each approved by you.
+set parameters and publish, each approved by you. With [`[segment]`](docs/profile.md#segment) it
+segments whatever you name in a camera's view, "the floor" or "every mug", and shows you the
+regions.
 
 In the window, Enter sends, Esc stops the reply and Ctrl+Shift+S stops the mission. Ctrl+1 to
-Ctrl+6 switch the dock between the mission, the world model, approvals, events, models and the
-connection check. Closing the window while a mission runs asks first whether to stop the robot,
+Ctrl+7 switch the dock between the mission, the world model, the viewer's layers, approvals, events,
+models and the connection check. Closing the window while a mission runs asks first whether to stop the robot,
 and a new session tells you when the robot is already running one.
-The embedded viewer is [Rerun](https://rerun.io), which keeps the camera, map, rooms, objects and
-mission steps on a timeline. Clicking an object, a room or a point on the map offers messages about
+The embedded viewer is [Rerun](https://rerun.io), which keeps the cameras, map, rooms, objects and
+mission steps on a timeline. [`[[viz.layer]]`](docs/profile.md#viz) adds what RViz would draw:
+occupancy grids, marker arrays and laser scans, each with a switch in the Layers tab. Clicking an object, a room or a point on the map offers messages about
 it, such as "Walk to O17 (shelf).", filled into the composer for you to read and send.
 
 ## Documentation

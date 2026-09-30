@@ -10,12 +10,13 @@ use crate::builtins::{ListPlaces, RobotState, Stop};
 use crate::context::system_prompt;
 use crate::guard::Guard;
 use crate::llm::Llm;
-use crate::look::{LookTool, SnapshotStore};
+use crate::look::{Cameras, LookTool, SnapshotStore};
 use crate::mission::Missions;
 use crate::profile::{PrivacyModeConfig, Profile};
 use crate::providers::ModelsConfig;
 use crate::providers::router::{PrivacyMode, Router};
 use crate::schemas::RosidlSchemas;
+use crate::segment::SegmentTool;
 use crate::session::{Session, SessionConfig};
 use crate::tools::{Registry, SchemaSource, Tool};
 
@@ -59,9 +60,6 @@ pub enum StartError {
     /// The quota ledger.
     #[error("quota ledger: {0}")]
     Ledger(std::io::Error),
-    /// Provider keys.
-    #[error(transparent)]
-    Llm(#[from] crate::llm::LlmError),
     /// Interface files.
     #[error("interface files: {0}")]
     Schemas(#[from] rosidl_schema::Error),
@@ -158,16 +156,31 @@ pub fn start(
         PrivacyModeConfig::Home => PrivacyMode::Home,
     };
     let router = Router::with_ledger_file(models, ledger, privacy).map_err(StartError::Ledger)?;
-    let llm = Arc::new(Llm::new(router)?);
+    let llm = Arc::new(Llm::new(router));
     let guard = Arc::new(Guard::new(profile.policy.clone()));
     let schemas: Arc<dyn SchemaSource> = Arc::new(RosidlSchemas::load(&profile)?);
     let mut registry = Registry::from_config(&profile.tools, &robot, &schemas, &guard)?;
     let snapshots = Arc::new(SnapshotStore::default());
     if let Some(look) = profile.look.clone() {
+        let cameras = Cameras::start(&look, &robot).map_err(StartError::Look)?;
         let eyes: Arc<dyn crate::look::Eyes> = Arc::clone(&llm) as Arc<dyn crate::look::Eyes>;
-        let tool = LookTool::start(look, Arc::clone(&robot), Arc::clone(&snapshots), Some(eyes))
-            .map_err(StartError::Look)?;
-        registry.add(Arc::new(tool))?;
+        registry.add(Arc::new(LookTool::new(
+            look,
+            Arc::clone(&cameras),
+            Arc::clone(&robot),
+            Arc::clone(&snapshots),
+            Some(eyes),
+        )))?;
+        if let Some(segment) = profile.segment.clone() {
+            let outliner = Arc::clone(&llm) as Arc<dyn crate::segment::Outliner>;
+            registry.add(Arc::new(SegmentTool::new(
+                segment,
+                cameras,
+                Arc::clone(&robot),
+                Arc::clone(&snapshots),
+                Some(outliner),
+            )))?;
+        }
     }
     registry.add(Arc::new(ListPlaces::new(&profile, Arc::clone(&robot))))?;
     registry.add(Arc::new(RobotState::new(
