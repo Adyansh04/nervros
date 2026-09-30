@@ -16,6 +16,7 @@ use crate::profile::{PrivacyModeConfig, Profile};
 use crate::providers::ModelsConfig;
 use crate::providers::router::{PrivacyMode, Router};
 use crate::schemas::RosidlSchemas;
+use crate::segment::SegmentTool;
 use crate::session::{Session, SessionConfig};
 use crate::tools::{Registry, SchemaSource, Tool};
 
@@ -168,11 +169,21 @@ pub fn start(
         let eyes: Arc<dyn crate::look::Eyes> = Arc::clone(&llm) as Arc<dyn crate::look::Eyes>;
         registry.add(Arc::new(LookTool::new(
             look,
-            cameras,
+            Arc::clone(&cameras),
             Arc::clone(&robot),
             Arc::clone(&snapshots),
             Some(eyes),
         )))?;
+        if let Some(segment) = profile.segment.clone() {
+            let outliner = Arc::clone(&llm) as Arc<dyn crate::segment::Outliner>;
+            registry.add(Arc::new(SegmentTool::new(
+                segment,
+                cameras,
+                Arc::clone(&robot),
+                Arc::clone(&snapshots),
+                Some(outliner),
+            )))?;
+        }
     }
     registry.add(Arc::new(ListPlaces::new(&profile, Arc::clone(&robot))))?;
     registry.add(Arc::new(RobotState::new(

@@ -150,6 +150,9 @@ pub struct ModelConfig {
     /// Data terms.
     #[serde(default)]
     pub privacy: Privacy,
+    /// Request fields passed to the provider as they are, such as Gemini's
+    /// `{ generation_config = { thinking_level = "low" } }`.
+    pub params: Option<serde_json::Value>,
 }
 
 /// A shared daily budget.
@@ -171,6 +174,19 @@ pub enum Role {
     VisionCheck,
     /// Captions and summaries.
     Summarise,
+    /// Outlining what a prompt names in a camera frame, for `segment`.
+    Segment,
+}
+
+impl Role {
+    /// Every role.
+    pub const ALL: [Self; 5] = [
+        Self::Routine,
+        Self::Plan,
+        Self::VisionCheck,
+        Self::Summarise,
+        Self::Segment,
+    ];
 }
 
 /// Ordered model ids per role; the first usable one is tried first.
@@ -189,6 +205,9 @@ pub struct RolesConfig {
     /// See [`Role::Summarise`].
     #[serde(default)]
     pub summarise: Vec<String>,
+    /// See [`Role::Segment`].
+    #[serde(default)]
+    pub segment: Vec<String>,
 }
 
 impl RolesConfig {
@@ -200,6 +219,7 @@ impl RolesConfig {
             Role::Plan => &self.plan,
             Role::VisionCheck => &self.vision_check,
             Role::Summarise => &self.summarise,
+            Role::Segment => &self.segment,
         }
     }
 }
@@ -313,12 +333,7 @@ impl ModelsConfig {
                 });
             }
         }
-        for role in [
-            Role::Routine,
-            Role::Plan,
-            Role::VisionCheck,
-            Role::Summarise,
-        ] {
+        for role in Role::ALL {
             for id in self.roles.chain(role) {
                 if !models.contains(id.as_str()) {
                     return Err(ConfigError::Unknown {

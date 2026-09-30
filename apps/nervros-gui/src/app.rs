@@ -777,6 +777,7 @@ impl Gui {
             (Role::Plan, "Plan"),
             (Role::VisionCheck, "Vision check"),
             (Role::Summarise, "Summarise"),
+            (Role::Segment, "Segment"),
         ] {
             ui.label(RichText::new(name).strong());
             let (take, skipped) = router.candidates(role, Need::default(), now);

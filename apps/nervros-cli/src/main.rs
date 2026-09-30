@@ -70,6 +70,25 @@ enum Command {
         #[arg(long, default_value = "look.jpg")]
         out: PathBuf,
     },
+    /// Segment what a prompt names in a camera's newest frame: print the regions and save the
+    /// drawn image. The model backend asks the `segment` role's models, as the app does.
+    #[cfg(feature = "ros")]
+    Segment {
+        /// What to segment, such as "the floor".
+        prompt: String,
+        /// Which camera, by the profile's names; the `[look]` one by default.
+        #[arg(long)]
+        camera: Option<String>,
+        /// `model` or `service`; the profile's `[segment] backend` by default.
+        #[arg(long)]
+        backend: Option<String>,
+        /// `cutout` or `overlay`.
+        #[arg(long, default_value = "cutout")]
+        view: String,
+        /// Where to write the JPEG.
+        #[arg(long, default_value = "segment.jpg")]
+        out: PathBuf,
+    },
     /// Run one read-only ROS tool against the live graph, without a model: `ros_graph`,
     /// `topic_sample`, `interface_show`, `tf`, `params`, `log_tail`, or `service_call` on a
     /// service that only reads.
@@ -89,6 +108,7 @@ enum RoleArg {
     Plan,
     VisionCheck,
     Summarise,
+    Segment,
 }
 
 impl From<RoleArg> for Role {
@@ -98,6 +118,7 @@ impl From<RoleArg> for Role {
             RoleArg::Plan => Self::Plan,
             RoleArg::VisionCheck => Self::VisionCheck,
             RoleArg::Summarise => Self::Summarise,
+            RoleArg::Segment => Self::Segment,
         }
     }
 }
@@ -131,6 +152,18 @@ async fn main() -> Result<()> {
         #[cfg(feature = "ros")]
         Command::Look { camera, out } => robot::look(&cli.profile, camera, &out).await,
         #[cfg(feature = "ros")]
+        Command::Segment {
+            prompt,
+            camera,
+            backend,
+            view,
+            out,
+        } => {
+            let args = serde_json::json!({"prompt": prompt, "camera": camera, "backend": backend,
+                "view": view});
+            robot::segment(&cli.profile, args, &out).await
+        }
+        #[cfg(feature = "ros")]
         Command::Chat { say, arm, approve } => {
             robot::chat(
                 &cli.profile,
@@ -155,6 +188,7 @@ async fn models(path: &Path, check: bool) -> Result<()> {
         ("plan", Role::Plan),
         ("vision_check", Role::VisionCheck),
         ("summarise", Role::Summarise),
+        ("segment", Role::Segment),
     ] {
         println!("{name}: {}", config.roles.chain(role).join(" > "));
     }

@@ -1,8 +1,8 @@
 //! The robot profile: one `nervros.toml` per robot, kept in the robot's own repository.
 //!
 //! It names the robot, how to reach its ROS graph, the policy, the places, the cameras and
-//! detection topics `look` reads, the mission executor's interfaces, the tools and the models file.
-//! Paths are relative to the profile's directory.
+//! detection topics `look` and `segment` read, the mission executor's interfaces, the tools and the
+//! models file. Paths are relative to the profile's directory.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,8 @@ pub struct Profile {
     pub policy: Policy,
     /// Inputs of the `look` builtin.
     pub look: Option<LookConfig>,
+    /// The `segment` builtin; it needs `[look]`'s cameras.
+    pub segment: Option<SegmentConfig>,
     /// The robot's mission executor.
     pub mission: Option<MissionConfig>,
     /// Named places beyond the world model's rooms.
@@ -157,7 +159,7 @@ pub enum PrivacyModeConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LookConfig {
-    /// The camera's name, as `look`'s `camera` argument takes it.
+    /// The camera's name, as the `camera` argument of `look` and `segment` takes it.
     #[serde(default = "default_camera_name")]
     pub name: String,
     /// The colour image topic.
@@ -209,6 +211,36 @@ impl LookConfig {
 
 fn default_camera_name() -> String {
     "main".to_owned()
+}
+
+/// Where `segment`'s masks come from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentBackend {
+    /// A vision model, the models file's `segment` role, asked for outlines.
+    #[default]
+    Model,
+    /// The `service` below.
+    Service,
+}
+
+/// The `segment` builtin.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentConfig {
+    /// The backend a call gets unless it names the other.
+    #[serde(default)]
+    pub backend: SegmentBackend,
+    /// A `canopy_msgs/srv/Segment` service: a camera name, as `[look]` names it, and a prompt in;
+    /// `success`, `message` and an `InstanceMaskArray` out.
+    pub service: Option<String>,
+    /// How long the service may take; its first call may load the models.
+    #[serde(default = "default_segment_timeout", deserialize_with = "duration")]
+    pub timeout: Duration,
+}
+
+fn default_segment_timeout() -> Duration {
+    Duration::from_secs(40)
 }
 
 fn default_marks() -> usize {
@@ -353,6 +385,9 @@ pub enum ProfileError {
         /// The repeated name.
         name: String,
     },
+    /// Settings that cannot work together.
+    #[error("{0}")]
+    Invalid(String),
 }
 
 impl Profile {
@@ -401,6 +436,18 @@ impl Profile {
                 kind: "camera",
                 name: look.name.clone(),
             });
+        }
+        if let Some(segment) = &self.segment {
+            if self.look.is_none() {
+                return Err(ProfileError::Invalid(
+                    "[segment] needs [look]'s cameras".to_owned(),
+                ));
+            }
+            if segment.backend == SegmentBackend::Service && segment.service.is_none() {
+                return Err(ProfileError::Invalid(
+                    "[segment] backend = \"service\" needs `service`".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -479,7 +526,7 @@ mod tests {
         detections = { topic = \"/d\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n";
 
     #[test]
-    fn cameras_are_listed_own_first_and_named_once() {
+    fn cameras_are_listed_own_first_and_segment_needs_them() {
         let text = format!("{BASE}{LOOK}[look.cameras.head]\nimage = \"/head\"\n");
         let profile: Profile = toml::from_str(&text).unwrap();
         let names: Vec<String> = profile
@@ -495,6 +542,22 @@ mod tests {
             check(&twice),
             Err(ProfileError::Duplicate { kind: "camera", .. })
         ));
+        let blind = format!("{BASE}[segment]\n");
+        assert!(
+            check(&blind)
+                .unwrap_err()
+                .to_string()
+                .contains("needs [look]")
+        );
+        let no_service = format!("{BASE}{LOOK}[segment]\nbackend = \"service\"\n");
+        assert!(
+            check(&no_service)
+                .unwrap_err()
+                .to_string()
+                .contains("needs `service`")
+        );
+        let fine = format!("{BASE}{LOOK}[segment]\nservice = \"/segmenter/segment\"\n");
+        assert!(check(&fine).is_ok());
     }
 
     #[test]

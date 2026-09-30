@@ -17,5 +17,6 @@ pub mod providers;
 pub mod ros_tools;
 pub mod schemas;
 pub mod secret;
+pub mod segment;
 pub mod session;
 pub mod tools;

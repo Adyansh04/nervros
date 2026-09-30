@@ -57,6 +57,7 @@ privacy = { trains = false }
 | `limits.pool` | none | A shared daily quota, from `[pools]`, such as OpenRouter's free requests across all its free models. |
 | `privacy.local` | `false` | Runs on this machine; see the profile's `[privacy]`. |
 | `privacy.trains` | `false` | The provider may train on what it is sent. |
+| `params` | none | Request fields passed to the provider as they are, such as Gemini's `{ generation_config = { thinking_level = "low" } }`. |
 
 ```toml
 [pools]
@@ -71,10 +72,28 @@ routine = ["qwen3.5-9b-local"]        # conversation and tool calls
 plan = ["qwen3.5-9b-local"]           # writing mission plans
 vision_check = ["qwen3.5-9b-local"]   # what `look` sees: questions about the camera frame
 summarise = ["qwen3.5-9b-local"]      # captions and summaries
+segment = ["gemini-3.5-flash-lite"]   # outlines for `segment`
 ```
 
 A turn tries its role's models in order and skips a model that lacks what the turn needs, is over a
-limit, or would break the privacy mode. Local models not in the list are tried after the others.
+limit, or would break the privacy mode. Local models not in the list are tried after the others,
+except for `segment`: outlining is a skill few models have, so only the models listed are asked.
+Gemini's free tier outlines well:
+
+```toml
+[[provider]]
+id = "gemini"
+kind = "gemini_interactions"
+key = { file = "~/.config/gemini.key" }
+
+[[model]]
+id = "gemini-3.5-flash-lite"
+provider = "gemini"
+model = "gemini-3.5-flash-lite"
+vision = true
+limits = { rpm = 10, rpd = 250 }
+privacy = { trains = true }
+```
 A model that fails before the robot has acted is replaced by the next one; once the robot has
 acted, the turn ends instead of repeating the action.
 

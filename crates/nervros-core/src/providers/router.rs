@@ -148,11 +148,12 @@ impl Router {
         now: SystemTime,
     ) -> (Vec<&ModelConfig>, Vec<(String, Skip)>) {
         let chain = self.config.roles.chain(role);
+        // Outlining is a skill few models have: `segment` asks only the models listed for it.
         let local_tail = self
             .config
             .models
             .iter()
-            .filter(|m| m.privacy.local && !chain.contains(&m.id))
+            .filter(|m| role != Role::Segment && m.privacy.local && !chain.contains(&m.id))
             .map(|m| m.id.as_str());
         let mut take = Vec::new();
         let mut skipped = Vec::new();
@@ -312,6 +313,17 @@ mod tests {
         let r = router(PrivacyMode::Sim);
         let (take, _) = r.candidates(Role::Routine, Need::default(), SystemTime::now());
         assert_eq!(ids(&take), ["big", "text", "local9b"]);
+    }
+
+    #[test]
+    fn segment_asks_only_the_models_listed_for_it() {
+        let r = router(PrivacyMode::Sim);
+        let need = Need {
+            vision: true,
+            ..Need::default()
+        };
+        let (take, _) = r.candidates(Role::Segment, need, SystemTime::now());
+        assert!(take.is_empty(), "{:?}", ids(&take));
     }
 
     #[test]

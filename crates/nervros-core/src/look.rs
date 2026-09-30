@@ -383,6 +383,10 @@ impl History {
     pub(crate) fn newest(&self) -> Option<Arc<Frame>> {
         guard(&self.0).back().cloned()
     }
+
+    pub(crate) fn recent(&self) -> Vec<Arc<Frame>> {
+        guard(&self.0).iter().cloned().collect()
+    }
 }
 
 /// One camera and its recent frames.
