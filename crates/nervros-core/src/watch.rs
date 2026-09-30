@@ -1,7 +1,7 @@
-//! The `watch` and `watches` tools: a condition on a topic kept in view in the background, as
-//! someone debugging a robot leaves a monitor running. When it holds, the watch reports into the
-//! session, and the agent tells the operator: the camera's rate falling, a value crossing a line,
-//! a log line matching.
+//! The `watch`, `watches` and `plot` tools: a condition on a topic kept in view in the
+//! background, as someone debugging a robot leaves a monitor running. When it holds, the watch
+//! reports into the session, and the agent tells the operator: the camera's rate falling, a value
+//! crossing a line, a log line matching. A plot draws a number over time in the viewer instead.
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +13,7 @@ use nervros_ros::RobotPort;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
-use crate::session::{Command, SessionHandle};
+use crate::session::{Command, Event, SessionHandle};
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
 /// How often a value or a message is looked at.
@@ -23,6 +23,8 @@ const RATE_WINDOW: Duration = Duration::from_secs(2);
 const DEFAULT_FOR_S: u64 = 1800;
 const MAX_FOR_S: u64 = 7200;
 const MAX_WATCHES: usize = 8;
+const DEFAULT_PLOT_S: u64 = 120;
+const MAX_PLOT_S: u64 = 1800;
 
 /// What a watch waits for.
 #[derive(Debug, Clone, PartialEq)]
@@ -86,7 +88,8 @@ impl Condition {
 }
 
 /// A field by dotted path (`pose.pose.position.x`, `status.0.level`).
-fn field<'a>(msg: &'a Value, path: &str) -> Option<&'a Value> {
+#[must_use]
+pub fn field<'a>(msg: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.')
         .try_fold(msg, |v, part| match part.parse::<usize>() {
             Ok(i) if v.is_array() => v.get(i),
@@ -212,17 +215,21 @@ impl Watches {
                 spec: watches_spec(),
                 watches: Arc::clone(self),
             }),
+            Arc::new(PlotTool {
+                spec: plot_spec(),
+                watches: Arc::clone(self),
+            }),
         ]
     }
 
-    async fn start(self: &Arc<Self>, args: &Value) -> Result<ToolOutcome, String> {
+    /// The topic the arguments name, and its type from the graph.
+    async fn topic(&self, args: &Value) -> Result<(String, String), String> {
         let topic = args["topic"]
             .as_str()
             .map(str::trim)
             .filter(|t| t.starts_with('/'))
             .ok_or("`topic` is an absolute topic name, such as /scan")?
             .to_owned();
-        let condition = Condition::parse(args)?;
         let graph = self.robot.graph().await.map_err(|e| e.to_string())?;
         let ty = graph
             .topics
@@ -230,6 +237,12 @@ impl Watches {
             .find(|(name, _)| *name == topic)
             .map(|(_, types)| types.first().cloned().unwrap_or_default())
             .ok_or_else(|| format!("no topic `{topic}` in the graph; ros_graph lists them"))?;
+        Ok((topic, ty))
+    }
+
+    async fn start(self: &Arc<Self>, args: &Value) -> Result<ToolOutcome, String> {
+        let condition = Condition::parse(args)?;
+        let (topic, ty) = self.topic(args).await?;
         let for_s = args["for_s"]
             .as_u64()
             .unwrap_or(DEFAULT_FOR_S)
@@ -283,6 +296,50 @@ impl Watches {
         let mut out =
             ToolOutcome::ok(json!({"watch": id, "what": what, "for_s": for_s, "repeat": repeat}));
         out.message = format!("watching {what}; a report comes when it holds");
+        Ok(out)
+    }
+
+    /// Checks the field is a number in the topic's newest message, then asks the viewer to plot
+    /// it.
+    async fn plot(&self, args: &Value) -> Result<ToolOutcome, String> {
+        let path = args["field"]
+            .as_str()
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .ok_or("`field` is a dotted path to a number, such as twist.twist.linear.x")?
+            .to_owned();
+        let (topic, ty) = self.topic(args).await?;
+        let msg = self
+            .robot
+            .latest(&topic, &ty, Duration::from_secs(2))
+            .await
+            .map_err(|e| format!("nothing arrived on {topic} to plot ({e})"))?;
+        let now = match field(&msg, &path) {
+            Some(v) => v
+                .as_f64()
+                .ok_or_else(|| format!("`{path}` in {topic} is {v}, not a number"))?,
+            None => {
+                return Err(format!(
+                    "{topic} has no `{path}`; topic_sample shows its fields"
+                ));
+            }
+        };
+        let for_s = args["for_s"]
+            .as_u64()
+            .unwrap_or(DEFAULT_PLOT_S)
+            .clamp(1, MAX_PLOT_S);
+        let name = format!("{topic} {path}");
+        if let Some(s) = self.session.get() {
+            s.emit(Event::Plot {
+                name: name.clone(),
+                topic,
+                msg_type: ty,
+                field: path,
+                for_s,
+            });
+        }
+        let mut out = ToolOutcome::ok(json!({"plot": name, "now": now, "for_s": for_s}));
+        out.message = format!("plotting {name} in the viewer's Plots tab for {for_s} s");
         Ok(out)
     }
 
@@ -345,6 +402,21 @@ fn watch_spec() -> ToolSpec {
     )
 }
 
+fn plot_spec() -> ToolSpec {
+    ToolSpec::new(
+        "plot",
+        "Draws a number from a topic's messages over time in the app's Plots tab, as rqt_plot \
+         does: a speed, a joint's position, a battery's charge. Use it to show the operator how \
+         something changes; watch reports a condition instead.",
+        json!({"type": "object", "properties": {
+            "topic": {"type": "string", "description": "The topic, such as /odom."},
+            "field": {"type": "string", "description": "A dotted path to a number, such as twist.twist.linear.x or position.3."},
+            "for_s": {"type": "integer", "minimum": 1, "maximum": MAX_PLOT_S, "description": "How long to draw it (120)."}
+        }, "required": ["topic", "field"], "additionalProperties": false}),
+        Risk::Observe,
+    )
+}
+
 fn watches_spec() -> ToolSpec {
     ToolSpec::new(
         "watches",
@@ -379,6 +451,25 @@ impl Tool for WatchTool {
 struct WatchesTool {
     spec: ToolSpec,
     watches: Arc<Watches>,
+}
+
+struct PlotTool {
+    spec: ToolSpec,
+    watches: Arc<Watches>,
+}
+
+#[async_trait]
+impl Tool for PlotTool {
+    fn spec(&self) -> Cow<'_, ToolSpec> {
+        Cow::Borrowed(&self.spec)
+    }
+
+    async fn call(&self, args: Value) -> ToolOutcome {
+        self.watches
+            .plot(&args)
+            .await
+            .unwrap_or_else(ToolOutcome::failed)
+    }
 }
 
 #[async_trait]
@@ -477,6 +568,34 @@ mod tests {
             .start(&json!({"topic": "/nothing", "condition": "text", "contains": "x"}))
             .await;
         assert!(missing.unwrap_err().contains("no topic"));
+    }
+
+    #[tokio::test]
+    async fn a_plot_needs_a_number_and_asks_the_viewer_for_it() {
+        let robot: Arc<dyn RobotPort> = Arc::new(FakeRobot::new().with_topic(
+            "/odom",
+            json!({"twist": {"twist": {"linear": {"x": 0.4}}}, "child_frame_id": "pelvis"}),
+        ));
+        let watches = Watches::new(robot);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut seen) = tokio::sync::broadcast::channel(8);
+        watches.attach(SessionHandle::for_tests(&tx, events));
+        let out = watches
+            .plot(&json!({"topic": "/odom", "field": "twist.twist.linear.x"}))
+            .await
+            .unwrap();
+        assert_eq!(out.data["now"], 0.4);
+        assert!(
+            matches!(seen.try_recv(), Ok(Event::Plot { field, for_s: 120, .. }) if field == "twist.twist.linear.x")
+        );
+        let text = watches
+            .plot(&json!({"topic": "/odom", "field": "child_frame_id"}))
+            .await;
+        assert!(text.unwrap_err().contains("not a number"));
+        let missing = watches
+            .plot(&json!({"topic": "/odom", "field": "pose.x"}))
+            .await;
+        assert!(missing.unwrap_err().contains("no `pose.x`"));
     }
 
     #[tokio::test]

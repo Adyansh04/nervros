@@ -126,7 +126,9 @@ pub fn spawn(
     bridge.cameras(profile);
     bridge.world(profile);
     bridge.profile_layers(profile);
-    bridge.tasks.spawn(agent(rec.clone(), events));
+    bridge
+        .tasks
+        .spawn(agent(rec.clone(), Arc::clone(robot), events));
     Bridge {
         layers: bridge.layers,
         _tasks: bridge.tasks,
@@ -433,6 +435,7 @@ fn layout(rec: &RecordingStream, cameras: &[(String, String)]) {
         TimeSeriesView::new("Exploring")
             .with_origin("/mapping")
             .into(),
+        TimeSeriesView::new("Plots").with_origin("/plots").into(),
     ]);
     let root = Vertical::new([top.into(), strip.into()]).with_row_shares([3.0, 1.0]);
     let activation = BlueprintActivation {
@@ -1082,8 +1085,14 @@ fn step_states() -> rerun::StateConfiguration {
 }
 
 /// The agent's replies and tool calls as a text log, and its marked images.
-async fn agent(rec: RecordingStream, mut events: broadcast::Receiver<Event>) {
+async fn agent(
+    rec: RecordingStream,
+    robot: Arc<dyn RobotPort>,
+    mut events: broadcast::Receiver<Event>,
+) {
     use rerun::TextLogLevel as L;
+    // Plots end with the bridge, like every other task it draws with.
+    let mut plots = JoinSet::new();
     loop {
         let event = match events.recv().await {
             Ok(e) => e,
@@ -1091,6 +1100,44 @@ async fn agent(rec: RecordingStream, mut events: broadcast::Receiver<Event>) {
             Err(broadcast::error::RecvError::Closed) => return,
         };
         let (level, text) = match &event {
+            Event::Plot {
+                name,
+                topic,
+                msg_type,
+                field,
+                for_s,
+            } => {
+                let (topic, ty, field) = (topic.clone(), msg_type.clone(), field.clone());
+                let path = format!("plots/{}", layers::slug(name));
+                put_static(
+                    &rec,
+                    &path,
+                    &rerun::SeriesLines::new().with_names([name.as_str()]),
+                );
+                let (rec, robot) = (rec.clone(), Arc::clone(&robot));
+                let until = tokio::time::Instant::now() + Duration::from_secs(*for_s);
+                plots.spawn(async move {
+                    let mut tick = interval(POSE_PERIOD);
+                    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                    let mut last = Value::Null;
+                    while tokio::time::Instant::now() < until {
+                        tick.tick().await;
+                        let Ok(msg) = robot.latest(&topic, &ty, TOPIC_WAIT).await else {
+                            continue;
+                        };
+                        // The newest message stays until the next arrives: draw each once.
+                        if msg != last {
+                            let value =
+                                nervros_core::watch::field(&msg, &field).and_then(Value::as_f64);
+                            if let Some(v) = value {
+                                put(&rec, &path, &rerun::Scalars::single(v));
+                            }
+                            last = msg;
+                        }
+                    }
+                });
+                continue;
+            }
             Event::Snapshot { jpeg, .. } => {
                 let image = rerun::EncodedImage::from_file_contents(jpeg.to_vec());
                 put(&rec, "agent/look", &image);

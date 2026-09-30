@@ -116,6 +116,19 @@ pub enum Event {
         /// Height.
         height: u32,
     },
+    /// A number in a topic's messages to draw over time, in the viewer's Plots tab.
+    Plot {
+        /// The series' name.
+        name: String,
+        /// The topic.
+        topic: String,
+        /// Its message type.
+        msg_type: String,
+        /// A dotted path to the number in each message.
+        field: String,
+        /// How long to draw it, in seconds.
+        for_s: u64,
+    },
     /// The operator must approve a call.
     ApprovalRequested {
         /// Answer with `Approve(id)` or `Deny(id)`.

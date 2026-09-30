@@ -229,7 +229,11 @@ fn print_event(e: &Event, logs: &Path) {
             };
             println!("  [mission {outcome} after {elapsed_s:.0} s{why}]");
         }
-        Event::User { .. } | Event::TurnStarted { .. } | Event::TurnFinished { .. } => {}
+        // Plots are drawn by the app's viewer; the tool's reply already says what it plots.
+        Event::User { .. }
+        | Event::TurnStarted { .. }
+        | Event::TurnFinished { .. }
+        | Event::Plot { .. } => {}
     }
 }
 
