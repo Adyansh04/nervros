@@ -306,8 +306,13 @@ impl Shared {
         flags: &TurnFlags,
     ) -> Value {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
-        // A tool whose risk depends on its arguments says what this call would do.
-        let assessment = tool.assess(&args);
+        // A tool whose risk depends on its arguments says what this call would do, and a call
+        // that cannot go out fails here, before anyone is asked to approve it.
+        let (assessment, early) = match tool.assess(&args).await {
+            Some(Ok(a)) => (Some(a), None),
+            Some(Err(out)) => (None, Some(out)),
+            None => (None, None),
+        };
         let spec = match &assessment {
             Some(a) => {
                 let mut spec = tool.spec().into_owned();
@@ -324,17 +329,20 @@ impl Shared {
             args: args.clone(),
         });
         let started = Instant::now();
-        let outcome = match self.guard.decide(&spec, &args) {
-            Decision::Deny(r) => ToolOutcome::refused(r.message),
-            Decision::NeedApproval { reason } => {
-                let reason = assessment.map_or(reason, |a| a.reason);
-                if self.ask_approval(&spec.name, &args, reason).await {
-                    self.run(tool, args, &spec.resources).await
-                } else {
-                    ToolOutcome::refused("the operator did not approve this")
+        let outcome = match early {
+            Some(out) => out,
+            None => match self.guard.decide(&spec, &args) {
+                Decision::Deny(r) => ToolOutcome::refused(r.message),
+                Decision::NeedApproval { reason } => {
+                    let reason = assessment.map_or(reason, |a| a.reason);
+                    if self.ask_approval(&spec.name, &args, reason).await {
+                        self.run(tool, args, &spec.resources).await
+                    } else {
+                        ToolOutcome::refused("the operator did not approve this")
+                    }
                 }
-            }
-            Decision::Allow => self.run(tool, args, &spec.resources).await,
+                Decision::Allow => self.run(tool, args, &spec.resources).await,
+            },
         };
         if spec.lane() == Lane::Act
             && matches!(outcome.status, Status::Succeeded | Status::Accepted)

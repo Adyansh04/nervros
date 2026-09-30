@@ -213,8 +213,9 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> Cow<'_, ToolSpec>;
 
     /// For a tool whose risk depends on its arguments, such as a call to any service: what this
-    /// call would do. `None` means the spec says it all.
-    fn assess(&self, _args: &Value) -> Option<Assessment> {
+    /// call would do, checked before anyone is asked to approve it. `None` means the spec says it
+    /// all; an error is the answer when the call cannot go out at all.
+    async fn assess(&self, _args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
         None
     }
 

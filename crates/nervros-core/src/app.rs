@@ -175,6 +175,11 @@ pub fn start(
         Arc::clone(&robot),
         Arc::clone(&guard),
     )))?;
+    if let Some(config) = &profile.ros_tools {
+        for tool in crate::ros_tools::tools(config, &robot, &schemas, &guard) {
+            registry.add(tool)?;
+        }
+    }
     let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
     registry.add(Arc::clone(&stop))?;
     let missions = Missions::new(&profile, Arc::clone(&robot));
