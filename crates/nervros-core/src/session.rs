@@ -583,6 +583,32 @@ enum Origin {
     Report(String),
 }
 
+/// This turn's tools, each call going through the guard; `acted` records any act that ran.
+fn loop_tools(
+    registry: &Registry,
+    shared: &Arc<Shared>,
+    turn: u64,
+    acted: &Arc<AtomicBool>,
+) -> Vec<LoopTool> {
+    registry
+        .iter()
+        .map(|tool| {
+            let (tool, shared, acted) = (Arc::clone(tool), Arc::clone(shared), Arc::clone(acted));
+            let spec = tool.spec().into_owned();
+            LoopTool {
+                name: spec.name,
+                description: spec.description,
+                parameters: spec.parameters,
+                invoke: Arc::new(move |args| {
+                    let (tool, shared, acted) =
+                        (Arc::clone(&tool), Arc::clone(&shared), Arc::clone(&acted));
+                    Box::pin(async move { shared.invoke(&tool, turn, args, &acted).await })
+                }),
+            }
+        })
+        .collect()
+}
+
 async fn run_turn(
     turn: u64,
     origin: Origin,
@@ -610,23 +636,7 @@ async fn run_turn(
         }
     };
     let acted = Arc::new(AtomicBool::new(false));
-    let tools: Vec<LoopTool> = registry
-        .iter()
-        .map(|tool| {
-            let (tool, shared, acted) = (Arc::clone(tool), Arc::clone(&shared), Arc::clone(&acted));
-            let spec = tool.spec().into_owned();
-            LoopTool {
-                name: spec.name,
-                description: spec.description,
-                parameters: spec.parameters,
-                invoke: Arc::new(move |args| {
-                    let (tool, shared, acted) =
-                        (Arc::clone(&tool), Arc::clone(&shared), Arc::clone(&acted));
-                    Box::pin(async move { shared.invoke(&tool, turn, args, &acted).await })
-                }),
-            }
-        })
-        .collect();
+    let tools = loop_tools(&registry, &shared, turn, &acted);
     let need = Need {
         tools: !tools.is_empty(),
         ..Need::default()
@@ -664,6 +674,15 @@ async fn run_turn(
                 return Some(updated);
             }
             Err(e) if !acted.load(Ordering::SeqCst) => {
+                if matches!(
+                    e,
+                    llm::LlmError::Turn {
+                        rate_limited: true,
+                        ..
+                    }
+                ) {
+                    source.park(&model);
+                }
                 shared.emit(Event::Notice {
                     text: format!("{e}; trying the next model"),
                 });
@@ -707,6 +726,7 @@ mod tests {
             Ok(AgentBuilder::new(self.0.clone()))
         }
         fn record_use(&self, _id: &str) {}
+        fn park(&self, _id: &str) {}
     }
 
     struct Echo(ToolSpec);
