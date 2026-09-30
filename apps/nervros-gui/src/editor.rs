@@ -111,6 +111,36 @@ impl Suggestion {
     }
 }
 
+/// A name to draw once every shape is down.
+struct Label {
+    /// The selected or hovered one first, then rooms, then objects, larger ones before smaller.
+    first: u8,
+    area: f64,
+    rect: Rect,
+    galley: Arc<egui::Galley>,
+}
+
+/// Draws each label that covers none placed before it, so a crowded corner keeps its larger
+/// objects' names and the pointer finds the rest.
+fn place(painter: &egui::Painter, mut labels: Vec<Label>) {
+    labels.sort_by(|a, b| a.first.cmp(&b.first).then(b.area.total_cmp(&a.area)));
+    let mut taken: Vec<Rect> = Vec::new();
+    for label in labels {
+        if taken.iter().any(|r| r.intersects(label.rect)) {
+            continue;
+        }
+        // A dark backing, so the outlines under a name do not cross it.
+        painter.rect_filled(label.rect, 3.0, Color32::from_black_alpha(170));
+        // The galley carries its colour; the fallback is for placeholder text only.
+        painter.galley(
+            label.rect.min + Vec2::new(4.0, 1.0),
+            label.galley,
+            Color32::WHITE,
+        );
+        taken.push(label.rect.expand(1.5));
+    }
+}
+
 /// A box on the floor: centre and yaw in the map frame, size along its own axes, all in metres.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Shape2 {
@@ -701,7 +731,11 @@ impl WorldEditor {
         self.gestures(ui, &response, &world);
         self.keys(ui, &world);
         let painter = painter.with_clip_rect(rect);
-        self.draw(&painter, &world);
+        let hovered = response
+            .hover_pos()
+            .and_then(|p| self.object_at(&world, self.to_world(&world, p)))
+            .map(|o| o.id);
+        self.draw(&painter, &world, hovered);
         self.overlay(ui, &painter, rect);
     }
 
@@ -936,7 +970,7 @@ impl WorldEditor {
         }
     }
 
-    fn draw(&self, painter: &egui::Painter, world: &World) {
+    fn draw(&self, painter: &egui::Painter, world: &World, hovered: Option<u64>) {
         if let (Some(texture), Some(v)) = (&self.map, self.view) {
             #[expect(clippy::cast_precision_loss, reason = "map sizes are far below 2^24")]
             let size = Vec2::new(world.map.width as f32, world.map.height as f32) * v.scale;
@@ -944,16 +978,18 @@ impl WorldEditor {
             let at = Rect::from_min_size(v.offset.to_pos2(), size);
             painter.image(texture.id(), at, uv, Color32::WHITE);
         }
+        let mut labels = Vec::new();
         for (i, room) in world.rooms.iter().enumerate() {
-            self.draw_room(painter, world, i, room);
+            labels.push(self.draw_room(painter, world, i, room));
         }
         for object in world
             .objects
             .iter()
             .filter(|o| o.shown || self.selected == Some(Picked::Object(o.id)))
         {
-            self.draw_object(painter, world, object);
+            labels.push(self.draw_object(painter, world, object, hovered == Some(object.id)));
         }
+        place(painter, labels);
         if let Some(drawn) = &self.drawn {
             let mut points: Vec<Pos2> = drawn
                 .corners()
@@ -966,7 +1002,13 @@ impl WorldEditor {
         }
     }
 
-    fn draw_room(&self, painter: &egui::Painter, world: &World, index: usize, room: &Room) {
+    fn draw_room(
+        &self,
+        painter: &egui::Painter,
+        world: &World,
+        index: usize,
+        room: &Room,
+    ) -> Label {
         #[expect(clippy::cast_precision_loss, reason = "a handful of rooms")]
         let hue = (index as f32 * 67.0 % 360.0) / 360.0;
         let colour: Color32 = egui::ecolor::Hsva::new(hue, 0.55, 0.85, 1.0).into();
@@ -994,16 +1036,22 @@ impl WorldEditor {
         };
         let at = self.to_screen(world, room_centre(room));
         let text = format!("{} {kind}{doubt}", room.id);
-        painter.text(
-            at,
-            Align2::CENTER_CENTER,
-            text,
-            FontId::proportional(14.0),
-            colour,
-        );
+        let galley = painter.layout_no_wrap(text, FontId::proportional(14.0), colour);
+        Label {
+            first: u8::from(!chosen),
+            area: 0.0,
+            rect: Rect::from_center_size(at, galley.size() + Vec2::new(8.0, 2.0)),
+            galley,
+        }
     }
 
-    fn draw_object(&self, painter: &egui::Painter, world: &World, object: &Object) {
+    fn draw_object(
+        &self,
+        painter: &egui::Painter,
+        world: &World,
+        object: &Object,
+        hovered: bool,
+    ) -> Label {
         let picked = Picked::Object(object.id);
         let chosen = self.selected.as_ref() == Some(&picked);
         let colour = if !object.shown {
@@ -1043,13 +1091,14 @@ impl WorldEditor {
             painter.line_segment([edge, knob], line);
             painter.circle_filled(knob, HANDLE_PX / 1.4, colour);
         }
-        if self.view.map_or(1.0, |v| v.scale) >= 0.9 || chosen {
-            let at = self.to_screen(world, shape.centre);
-            let font = FontId::proportional(11.5);
-            let galley = painter.layout_no_wrap(object.label.clone(), font, colour);
-            let pill = Rect::from_center_size(at, galley.size() + Vec2::new(8.0, 2.0));
-            painter.rect_filled(pill, 3.0, Color32::from_black_alpha(170));
-            painter.galley(pill.min + Vec2::new(4.0, 1.0), galley, colour);
+        let at = self.to_screen(world, shape.centre);
+        let galley =
+            painter.layout_no_wrap(object.label.clone(), FontId::proportional(11.5), colour);
+        Label {
+            first: if chosen || hovered { 0 } else { 2 },
+            area: shape.size[0] * shape.size[1],
+            rect: Rect::from_center_size(at, galley.size() + Vec2::new(8.0, 2.0)),
+            galley,
         }
     }
 
