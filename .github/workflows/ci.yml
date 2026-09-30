@@ -1,7 +1,5 @@
-# Two jobs. `core` checks what builds anywhere (the schema generator and the agent core) on every
-# push. `ros` builds everything, the r2r node and the Rerun app included, inside ROS 2 Jazzy, and
-# runs every test, the GUI snapshots with the lavapipe software renderer. It is the slow one, so it
-# runs on pull requests and by hand.
+# What builds anywhere: the schema generator and the agent core, on every push and pull request.
+# full.yml builds the rest, which needs ROS 2 and takes far longer.
 name: ci
 
 on:
@@ -32,36 +30,3 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy -p rosidl-schema -p nervros-core --all-targets -- -D warnings
       - run: cargo test -p rosidl-schema -p nervros-core
-
-  ros:
-    if: github.event_name != 'push'
-    runs-on: ubuntu-24.04
-    container: ros:jazzy-ros-base
-    env:
-      CI: "true"
-    steps:
-      - uses: actions/checkout@v5
-      - name: System packages
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends curl ca-certificates build-essential \
-            clang libclang-dev mold pkg-config libssl-dev python3-colcon-common-extensions \
-            libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libudev-dev libwayland-dev mesa-vulkan-drivers libvulkan1
-      - name: Toolchain
-        run: |
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ros
-      - name: Interfaces overlay
-        shell: bash
-        run: ./scripts/build-overlay.sh
-      - name: Clippy
-        shell: bash
-        run: source scripts/ros-env.sh && cargo clippy --workspace --all-targets -- -D warnings
-      - name: Tests
-        shell: bash
-        run: source scripts/ros-env.sh && cargo test --workspace
