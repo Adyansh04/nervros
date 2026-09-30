@@ -246,6 +246,14 @@ impl Spawner {
                 objects,
                 Box::new(move |rec, path, msg| draw_objects(rec, path, msg, &mut drawn)),
             );
+            // Off by default: forty names bury the map, and hovering a box names it.
+            let names = self.layer("Object names", "world/object_names", false);
+            self.watch(
+                world.objects.clone(),
+                OBJECTS_PERIOD,
+                names,
+                Box::new(draw_object_names),
+            );
         }
         let plan = self.layer("Plan", "world/plan", true);
         let topic = profile.viz.as_ref().and_then(|v| v.plan.clone());
@@ -975,6 +983,38 @@ fn object_colour(label: &str, alpha: u8) -> rerun::Color {
     rerun::Color::from_unmultiplied_rgba(r, g, b, alpha)
 }
 
+/// What an object is called: its name, or its label until it has one.
+fn object_name(o: &Value) -> &str {
+    o["name"]
+        .as_str()
+        .filter(|n| !n.is_empty())
+        .or_else(|| o["label"].as_str())
+        .unwrap_or_default()
+}
+
+/// Every object's name above it, as one batch redrawn whole.
+fn draw_object_names(rec: &RecordingStream, path: &str, msg: &Value) {
+    let list = msg["objects"].as_array().map_or(&[][..], Vec::as_slice);
+    let (mut at, mut names) = (Vec::new(), Vec::new());
+    for o in list.iter().filter(|o| o["state"].as_u64() != Some(REMOVED)) {
+        let [x, y, z] = xyz(&o["pose"]["position"]);
+        at.push([x, y, z + xyz(&o["size"])[2] / 2.0 + 0.05]);
+        names.push(format!(
+            "{} {}",
+            o["id"].as_str().unwrap_or_default(),
+            object_name(o)
+        ));
+    }
+    put_static(
+        rec,
+        path,
+        &rerun::Points3D::new(at)
+            .with_labels(names)
+            .with_show_labels(true)
+            .with_radii([0.01]),
+    );
+}
+
 /// Objects from a `canopy_msgs/msg/WorldObjectArray`, one entity each so a click in the viewer
 /// names the object; stale ones are faded, and ones that went away are cleared.
 fn draw_objects(rec: &RecordingStream, path: &str, msg: &Value, drawn: &mut BTreeSet<String>) {
@@ -987,10 +1027,7 @@ fn draw_objects(rec: &RecordingStream, path: &str, msg: &Value, drawn: &mut BTre
         let q = &o["pose"]["orientation"];
         let w = q["w"].as_f64().unwrap_or(1.0);
         let label = o["label"].as_str().unwrap_or_default();
-        let name = o["name"]
-            .as_str()
-            .filter(|n| !n.is_empty())
-            .unwrap_or(label);
+        let name = object_name(o);
         let alpha = if o["state"].as_u64() == Some(STALE) {
             90
         } else {
@@ -1010,6 +1047,7 @@ fn draw_objects(rec: &RecordingStream, path: &str, msg: &Value, drawn: &mut BTre
                 w,
             ]))])
             .with_labels([format!("{id} {name}")])
+            .with_show_labels(false)
             .with_colors([object_colour(label, alpha)]),
         );
         now.insert(id.to_owned());

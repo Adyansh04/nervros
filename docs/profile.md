@@ -237,7 +237,8 @@ hidden = false                            # starts hidden
 | `sensor_msgs/msg/LaserScan` | Points in the map, by TF from the scan's frame. |
 
 The Layers tab also switches the viewer's own drawings: the map, coverage, rooms, objects, trail,
-plan, the robot model and the detector's boxes.
+plan, the robot model and the detector's boxes. Object names start hidden, since a furnished room
+buries the map in them; hovering a box names it either way.
 
 ### `[mission]`
 
