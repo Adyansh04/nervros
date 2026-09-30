@@ -237,6 +237,9 @@ pub struct VizConfig {
     /// The `[look]` camera's `sensor_msgs/msg/CameraInfo`: with it, the frame is drawn in the world
     /// where the camera is, as a frustum, placed by TF from the base frame to the image's frame.
     pub camera_info: Option<TopicRef>,
+    /// The robot's URDF, relative to the profile: the viewer draws the robot with it, posed by TF.
+    /// `package://` meshes are found through `ROS_PACKAGE_PATH` or `AMENT_PREFIX_PATH`.
+    pub urdf: Option<PathBuf>,
 }
 
 /// A named place.

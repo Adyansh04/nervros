@@ -7511,6 +7511,7 @@ dependencies = [
  "nervros-ros",
  "rerun",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

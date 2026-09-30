@@ -5,6 +5,7 @@
 //! it idle while the robot is.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,10 @@ const CAMERA_QUALITY: u8 = 75;
 /// Where the frame goes: on its own, or in the world with the camera's pose and lens, where 3D
 /// views draw it as a frustum.
 const CAMERA_PATH: [&str; 2] = ["/camera", "/world/robot/camera"];
+/// Where the robot's model goes, under the robot's pose.
+const MODEL_PATH: &str = "world/robot/model";
+/// The viewer's name for the frame of the `world/robot` entity, which the model hangs from.
+const ROBOT_FRAME: &str = "tf#/world/robot";
 const REMOVED: u64 = 2;
 const STALE: u64 = 1;
 /// canopy's coverage grid values: seen, still to see, written off (no pose can see it).
@@ -87,6 +92,14 @@ pub fn spawn(
         profile.ros.map_frame.clone(),
         profile.ros.base_frame.clone(),
     ));
+    if let Some(urdf) = profile.viz.as_ref().and_then(|v| v.urdf.as_ref()) {
+        tasks.spawn(robot_model(
+            rec.clone(),
+            Arc::clone(robot),
+            profile.resolve(urdf),
+            profile.ros.base_frame.clone(),
+        ));
+    }
     let camera_info = profile.viz.as_ref().and_then(|v| v.camera_info.clone());
     if let Some(look) = &profile.look {
         tasks.spawn(camera(
@@ -229,6 +242,97 @@ async fn pose(rec: RecordingStream, robot: Arc<dyn RobotPort>, map: String, base
             ),
         );
         last = Some(t);
+    }
+}
+
+/// A frame of the robot's model that TF moves: the model's root under the robot's pose, or a joint
+/// that is not fixed.
+#[derive(Debug, PartialEq, Eq)]
+struct ModelFrame {
+    /// The entity its transform is logged on.
+    entity: String,
+    /// TF's parent and child frames.
+    tf: (String, String),
+    /// The viewer's parent frame; the child keeps TF's name, which is the URDF link's.
+    parent: String,
+}
+
+/// Sends the robot's model from its URDF, geometry and joints at rest, all static, and returns the
+/// frames TF moves.
+fn load_model(rec: &RecordingStream, urdf: &Path, base: &str) -> Result<Vec<ModelFrame>, String> {
+    use rerun::external::re_importer::UrdfTree;
+    use rerun::external::urdf_rs::JointType;
+    let tree = UrdfTree::from_file_path(urdf, Some(MODEL_PATH.into()))
+        .map_err(|e| e.to_string())?
+        .with_static_transform_entity(format!("{MODEL_PATH}/rest"));
+    tree.emit(
+        &mut |chunk| rec.send_chunk(chunk),
+        &rerun::TimePoint::default(),
+        true,
+    )
+    .map_err(|e| e.to_string())?;
+    let root = ModelFrame {
+        entity: format!("{MODEL_PATH}/joints/root"),
+        tf: (base.to_owned(), tree.root().name.clone()),
+        parent: ROBOT_FRAME.to_owned(),
+    };
+    let joints = tree
+        .joints()
+        .filter(|j| !matches!(j.joint_type, JointType::Fixed))
+        .map(|j| ModelFrame {
+            entity: format!("{MODEL_PATH}/joints/{}", j.name),
+            tf: (j.parent.link.clone(), j.child.link.clone()),
+            parent: j.parent.link.clone(),
+        });
+    Ok(std::iter::once(root).chain(joints).collect())
+}
+
+/// The robot's model, posed from TF as often as the robot's pose is drawn.
+async fn robot_model(rec: RecordingStream, robot: Arc<dyn RobotPort>, urdf: PathBuf, base: String) {
+    let sender = rec.clone();
+    let loaded = tokio::task::spawn_blocking(move || load_model(&sender, &urdf, &base)).await;
+    let frames = match loaded {
+        Ok(Ok(frames)) => frames,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "the viewer shows no robot model");
+            return;
+        }
+        Err(_) => return,
+    };
+    let mut last = vec![None; frames.len()];
+    let mut tick = interval(POSE_PERIOD);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        pose_model(&rec, robot.as_ref(), &frames, &mut last);
+    }
+}
+
+/// Logs each model frame TF has and that moved since it was last logged.
+fn pose_model(
+    rec: &RecordingStream,
+    robot: &dyn RobotPort,
+    frames: &[ModelFrame],
+    last: &mut [Option<Transform>],
+) {
+    for (frame, last) in frames.iter().zip(last) {
+        let Ok(t) = robot.transform(&frame.tf.0, &frame.tf.1) else {
+            continue;
+        };
+        if last.as_ref().is_some_and(|l| !moved(l, &t)) {
+            continue;
+        }
+        put(
+            rec,
+            &frame.entity,
+            &rerun::Transform3D::from_translation_rotation(
+                f32s(t.translation),
+                rerun::Quaternion::from_xyzw(f32s(t.rotation)),
+            )
+            .with_parent_frame(frame.parent.as_str())
+            .with_child_frame(frame.tf.1.as_str()),
+        );
+        *last = Some(t);
     }
 }
 
@@ -730,6 +834,40 @@ async fn agent(rec: RecordingStream, mut events: broadcast::Receiver<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_urdf_gives_the_frames_tf_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let urdf = dir.path().join("arm.urdf");
+        std::fs::write(
+            &urdf,
+            r#"<robot name="arm">
+                 <link name="base"><visual><geometry><box size="0.2 0.2 0.2"/></geometry></visual></link>
+                 <link name="upper"><visual><geometry><box size="0.1 0.1 0.4"/></geometry></visual></link>
+                 <link name="tip"/>
+                 <joint name="shoulder" type="revolute">
+                   <parent link="base"/><child link="upper"/><axis xyz="0 1 0"/>
+                   <limit lower="-1" upper="1" effort="1" velocity="1"/>
+                 </joint>
+                 <joint name="tool" type="fixed"><parent link="upper"/><child link="tip"/></joint>
+               </robot>"#,
+        )
+        .unwrap();
+        let (rec, _storage) = RecordingStreamBuilder::new("test").memory().unwrap();
+        let frames = load_model(&rec, &urdf, "base_footprint").unwrap();
+        let root = ModelFrame {
+            entity: "world/robot/model/joints/root".into(),
+            tf: ("base_footprint".into(), "base".into()),
+            parent: ROBOT_FRAME.into(),
+        };
+        let shoulder = ModelFrame {
+            entity: "world/robot/model/joints/shoulder".into(),
+            tf: ("base".into(), "upper".into()),
+            parent: "base".into(),
+        };
+        assert_eq!(frames, [root, shoulder], "the fixed joint stays at rest");
+        assert!(load_model(&rec, &dir.path().join("missing.urdf"), "base_footprint").is_err());
+    }
 
     #[test]
     fn small_motions_are_not_logged() {
