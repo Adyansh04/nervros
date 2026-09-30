@@ -645,16 +645,13 @@ async fn run_turn(
     let mut failures = Vec::new();
     for model in candidates {
         let mut updated = history.clone();
-        let result = llm::chat(
-            &model,
-            Arc::clone(&source),
-            &shared.config.preamble,
-            shared.config.max_model_calls,
-            &tools,
-            &mut updated,
-            &text,
-        )
-        .await;
+        let setup = llm::TurnSetup {
+            preamble: &shared.config.preamble,
+            max_turns: shared.config.max_model_calls,
+            tools: &tools,
+            acted: Arc::clone(&acted),
+        };
+        let result = llm::chat(&model, Arc::clone(&source), setup, &mut updated, &text).await;
         match result {
             Ok(reply) => {
                 shared.emit(Event::Reply {
@@ -680,9 +677,10 @@ async fn run_turn(
                 });
                 failures.push(e.to_string());
             }
+            // What the robot was asked to do goes on, and its report will follow; only the reply
+            // is lost, so this is not the operator's error to deal with.
             Err(e) => {
-                shared.emit(Event::Error {
-                    turn,
+                shared.emit(Event::Notice {
                     text: format!("{e}; the robot already acted, so the turn is not retried"),
                 });
                 return None;
@@ -796,6 +794,63 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(source.taken.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn once_the_robot_has_acted_the_model_is_offered_no_tools() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "find_objects", json!({})),
+            MockTurn::text("Started."),
+        ]);
+        let guard = Arc::new(Guard::new(Policy::default()));
+        guard.set_armed(true);
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            registry(Risk::Motion),
+            guard,
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("go".into()));
+        let approve = |e: &Event| match e {
+            Event::ApprovalRequested { id, .. } => Some(Command::Approve(*id)),
+            _ => None,
+        };
+        let events = collect_until_finished(&mut rx, approve, &session).await;
+        assert!(events.iter().any(|e| matches!(e, Event::Reply { .. })));
+        let offered: Vec<usize> = model.requests().iter().map(|r| r.tools.len()).collect();
+        assert_eq!(
+            offered,
+            [1, 0],
+            "the reply after the act is asked for without tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invented_tool_name_gets_the_real_ones_back() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "default_api", json!({})),
+            MockTurn::text("The cup is in the kitchen."),
+        ]);
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            registry(Risk::Observe),
+            Arc::new(Guard::new(Policy::default())),
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("Where is the cup?".into()));
+        let events = collect_until_finished(&mut rx, |_| None, &session).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Reply { text, .. } if text.contains("kitchen"))),
+            "{events:?}"
+        );
+        let feedback = format!("{:?}", model.requests()[1].chat_history);
+        assert!(feedback.contains("find_objects"), "{feedback}");
     }
 
     struct Echo(ToolSpec);

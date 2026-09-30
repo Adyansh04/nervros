@@ -75,9 +75,9 @@ models, and sends text only to models that are local or do not train on it.
 | `start_armed` | `false` | Whether acts are allowed from the start; the app's switch changes it. |
 | `autonomy` | `supervised` | `observe` refuses every act; `supervised` asks the operator for each; `autonomous` runs them. |
 | `approval_ttl` | `"60s"` | An unanswered approval is a no after this. |
-| `budgets.model_calls` | `10` | Model calls per turn. |
+| `budgets.model_calls` | `10` | Model calls per turn. Once the robot has acted in a turn, the model is offered no more tools and answers. |
 | `budgets.tool_calls` | `12` | Tool calls per turn. |
-| `budgets.wall_time` | `"90s"` | A turn is stopped after this, not counting the operator's time on approvals. Missions run outside turns. |
+| `budgets.wall_time` | `"90s"` | A turn is stopped after this, not counting the operator's time on approvals. Missions run outside turns. Free cloud endpoints can take 20 s a call; give them `"180s"`. |
 | `budgets.repeat_break` | `3` | The same call with the same arguments this many times in a row is refused. |
 | `hard_deny` | see below | ROS names no tool may reach; `*` matches anything. Setting it replaces the defaults. |
 
