@@ -213,6 +213,8 @@ fn default_replans() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorldConfig {
+    /// The occupancy grid (`nav_msgs/msg/OccupancyGrid`), drawn in the viewer.
+    pub map: Option<TopicRef>,
     /// Rooms (`canopy_msgs/msg/RoomArray` or compatible).
     pub rooms: Option<TopicRef>,
     /// Objects (`canopy_msgs/msg/WorldObjectArray` or compatible).

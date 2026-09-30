@@ -57,6 +57,9 @@ r2r = "=0.9.7"
 proptest = "=1.11.0"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
 uuid = { version = "=1.26.1", features = ["v4", "v7", "serde"] }
+mimalloc = "=0.1.52"
+rerun = { version = "=0.38.1", default-features = false, features = ["native_viewer", "sdk"] }
+egui_kittest = { version = "=0.36.2", features = ["wgpu", "snapshot"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
 rig = "=0.42.0"
 schemars = "=1.2.2"

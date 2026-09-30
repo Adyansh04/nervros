@@ -14,6 +14,10 @@ autonomy = "supervised"
 image = "/camera/color/image_raw"
 detections = { topic = "/detections", type = "vision_msgs/msg/Detection2DArray" }
 
+# What the viewer draws besides the robot and camera; each topic is optional.
+[world]
+map = { topic = "/map", type = "nav_msgs/msg/OccupancyGrid" }
+
 [[place]]
 name = "dock"
 aliases = ["the charging dock"]

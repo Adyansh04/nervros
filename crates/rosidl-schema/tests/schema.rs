@@ -237,12 +237,14 @@ fn byte_blobs_are_hidden_unless_an_override_keeps_them() {
     let text = "\nuint8[] blob\nbyte[] raw\nuint8[<=16] short\nuint8[16] uuid\nint8[] signed\nfloat32[] embedding\n";
     let r = registry(&[("pkg/msg/Name", text)]);
     let s = schema_of(&r, "pkg/msg/Name", Part::Message, &Overrides::default());
-    let names: Vec<_> = s["properties"]
+    // Sorted: key order depends on whether serde_json's `preserve_order` is on in the build.
+    let mut names: Vec<_> = s["properties"]
         .as_object()
         .unwrap()
         .keys()
         .cloned()
         .collect();
+    names.sort();
     assert_eq!(names, ["embedding", "signed", "uuid"]);
 
     let keep = FieldOverride {
@@ -371,7 +373,9 @@ fn nested_messages_are_shared_definitions() {
     );
     assert_eq!(prop(&s, "pair")["minItems"], 2);
     let defs = s["$defs"].as_object().unwrap();
-    assert_eq!(defs.keys().collect::<Vec<_>>(), ["pkg.Inner", "pkg.Outer"]);
+    let mut def_names: Vec<_> = defs.keys().collect();
+    def_names.sort();
+    assert_eq!(def_names, ["pkg.Inner", "pkg.Outer"]);
     assert_eq!(defs["pkg.Outer"]["description"], "An outer.");
     assert_eq!(defs["pkg.Outer"]["additionalProperties"], false);
     assert_eq!(
