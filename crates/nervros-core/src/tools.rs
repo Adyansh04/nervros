@@ -4,6 +4,7 @@
 //! builtins (`look`, `list_places`, `robot_state`, `stop`) are written once. Every tool has a spec
 //! (name, description, JSON Schema, risk) and returns an outcome whose message the model can read.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,8 +198,8 @@ fn cap(data: &Value, max_chars: usize) -> Value {
 /// A callable tool.
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Its spec.
-    fn spec(&self) -> &ToolSpec;
+    /// Its spec; borrowed unless it changes while the agent runs.
+    fn spec(&self) -> Cow<'_, ToolSpec>;
 
     /// Runs it. Errors are outcomes, never panics.
     async fn call(&self, args: Value) -> ToolOutcome;
@@ -303,8 +304,8 @@ fn ros_failure(e: &RosError) -> ToolOutcome {
 
 #[async_trait]
 impl Tool for ServiceTool {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
+    fn spec(&self) -> Cow<'_, ToolSpec> {
+        Cow::Borrowed(&self.spec)
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
@@ -322,8 +323,8 @@ impl Tool for ServiceTool {
 
 #[async_trait]
 impl Tool for TopicTool {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
+    fn spec(&self) -> Cow<'_, ToolSpec> {
+        Cow::Borrowed(&self.spec)
     }
 
     async fn call(&self, _args: Value) -> ToolOutcome {

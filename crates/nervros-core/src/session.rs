@@ -244,7 +244,7 @@ impl Shared {
             args: args.clone(),
         });
         let started = Instant::now();
-        let outcome = match self.guard.decide(spec, &args) {
+        let outcome = match self.guard.decide(&spec, &args) {
             Decision::Deny(r) => ToolOutcome::refused(r.message),
             Decision::NeedApproval { reason } => {
                 if self.ask_approval(&spec.name, &args, reason).await {
@@ -423,7 +423,7 @@ async fn run_turn(
         .iter()
         .map(|tool| {
             let (tool, shared, acted) = (Arc::clone(tool), Arc::clone(&shared), Arc::clone(&acted));
-            let spec = tool.spec().clone();
+            let spec = tool.spec().into_owned();
             LoopTool {
                 name: spec.name,
                 description: spec.description,
@@ -499,6 +499,7 @@ async fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
     use crate::guard::Policy;
     use crate::llm::{AgentBuilder, LlmError};
     use crate::tools::{Risk, ToolSpec};
@@ -521,8 +522,8 @@ mod tests {
 
     #[async_trait]
     impl Tool for Echo {
-        fn spec(&self) -> &ToolSpec {
-            &self.0
+        fn spec(&self) -> Cow<'_, ToolSpec> {
+            Cow::Borrowed(&self.0)
         }
         async fn call(&self, args: Value) -> ToolOutcome {
             ToolOutcome::ok(json!({"echo": args}))

@@ -6,6 +6,7 @@
 //! `vision_msgs/msg/Detection2DArray` (boxes), read as JSON. Frames are kept for a few seconds so a
 //! detection that lags its camera is drawn on the frame it came from, not on a newer one.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -450,8 +451,8 @@ impl LookTool {
 
 #[async_trait]
 impl Tool for LookTool {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
+    fn spec(&self) -> Cow<'_, ToolSpec> {
+        Cow::Borrowed(&self.spec)
     }
 
     async fn call(&self, _args: Value) -> ToolOutcome {
