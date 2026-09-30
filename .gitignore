@@ -3,4 +3,8 @@
 /logs
 /.nervros
 *.ndjson
+# egui_kittest leaves these beside a snapshot that failed to match.
+**/tests/snapshots/*.diff.png
+**/tests/snapshots/*.new.png
+**/tests/snapshots/*.old.png
 .env
