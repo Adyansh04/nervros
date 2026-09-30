@@ -63,6 +63,9 @@ enum Command {
     /// Look through the robot's camera: print the marks and save the marked image.
     #[cfg(feature = "ros")]
     Look {
+        /// Which camera, by the profile's names; the `[look]` one by default.
+        #[arg(long)]
+        camera: Option<String>,
         /// Where to write the marked JPEG.
         #[arg(long, default_value = "look.jpg")]
         out: PathBuf,
@@ -126,7 +129,7 @@ async fn main() -> Result<()> {
             image,
         } => ask(&models_file(&cli.profile)?, &prompt, role.into(), image).await,
         #[cfg(feature = "ros")]
-        Command::Look { out } => robot::look(&cli.profile, &out).await,
+        Command::Look { camera, out } => robot::look(&cli.profile, camera, &out).await,
         #[cfg(feature = "ros")]
         Command::Chat { say, arm, approve } => {
             robot::chat(

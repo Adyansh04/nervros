@@ -142,11 +142,27 @@ vision model available, `look` returns the marks alone and says why.
 
 | Key | Default | |
 |---|---|---|
+| `name` | `"main"` | The camera's name, as `look` takes it in `camera`. |
 | `image` | required | A `sensor_msgs/msg/Image` topic. |
 | `detections` | required | `{ topic, type }`, where the type is `canopy_msgs/msg/InstanceMaskArray` or `vision_msgs/msg/Detection2DArray`. |
 | `max_marks` | `12` | |
 | `max_age` | `"5s"` | Older detections are left out. |
 | `about` | none | What the vision model should know about the camera, such as where it points and how far it sees. |
+
+More cameras go under `[look.cameras.<name>]` with `image`, `about` and, optionally, `detections`
+(without them `look` shows that camera's frame unmarked). `look` then takes a `camera` argument,
+`[look]`'s own by default, and the chat model sees each camera's `about` to choose one.
+
+```toml
+[look]
+name = "chest"
+image = "/chest_camera/color/image_raw"
+detections = { topic = "/detector_chest/instance_masks", type = "canopy_msgs/msg/InstanceMaskArray" }
+
+[look.cameras.head]
+image = "/camera/color/image_raw"
+about = "It points down at the floor in front of the robot."
+```
 
 ### `[world]`
 

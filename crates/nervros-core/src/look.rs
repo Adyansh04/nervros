@@ -1,6 +1,7 @@
 //! The `look` builtin: the camera frame the newest detections were cut from, with each detection
 //! drawn as a numbered mark (Set-of-Mark), stored as a snapshot that the model and the user can
-//! refer to by mark number.
+//! refer to by mark number. [`Cameras`] keeps the recent frames of every camera the profile names,
+//! for `look` and `segment` alike.
 //!
 //! Detections arrive as `canopy_msgs/msg/InstanceMaskArray` (masks) or
 //! `vision_msgs/msg/Detection2DArray` (boxes), read as JSON. Frames are kept for a few seconds so a
@@ -18,7 +19,7 @@ use nervros_ros::{Frame, RobotPort};
 use serde_json::{Value, json};
 
 use crate::llm::{ImageFormat, ImageInput};
-use crate::profile::LookConfig;
+use crate::profile::{CameraConfig, LookConfig};
 use crate::tools::{ImageArtifact, Risk, Tool, ToolOutcome, ToolSpec};
 
 /// The longest side of the frame a vision model gets: enough to read a label across a room, and
@@ -41,7 +42,7 @@ pub trait Eyes: Send + Sync {
 }
 
 /// The frame scaled so its longest side is at most `edge` pixels.
-fn capped(img: &RgbImage, edge: u32) -> RgbImage {
+pub(crate) fn capped(img: &RgbImage, edge: u32) -> RgbImage {
     let (w, h) = img.dimensions();
     let longest = w.max(h);
     if longest <= edge {
@@ -175,7 +176,7 @@ pub fn parse_detections(msg: &Value) -> Detections {
 }
 
 /// Distinct colours for marks, readable on camera images.
-const PALETTE: [[u8; 3]; 12] = [
+pub(crate) const PALETTE: [[u8; 3]; 12] = [
     [230, 25, 75],
     [60, 180, 75],
     [255, 225, 25],
@@ -231,7 +232,7 @@ fn fill(img: &mut RgbImage, r: Rect, colour: [u8; 3]) {
 }
 
 /// Draws a number as a filled badge with white digits, scaled so digits are about 21 px tall.
-fn badge(img: &mut RgbImage, at: (i64, i64), number: usize, colour: [u8; 3]) {
+pub(crate) fn badge(img: &mut RgbImage, at: (i64, i64), number: usize, colour: [u8; 3]) {
     const SCALE: i64 = 3;
     let digits: Vec<usize> = number
         .to_string()
@@ -265,7 +266,7 @@ fn badge(img: &mut RgbImage, at: (i64, i64), number: usize, colour: [u8; 3]) {
 }
 
 /// Blends a mask colour into the pixels a mask covers: three parts image, two parts colour.
-fn tint(img: &mut RgbImage, inst: &Instance, colour: [u8; 3]) {
+pub(crate) fn tint(img: &mut RgbImage, inst: &Instance, colour: [u8; 3]) {
     let Some(mask) = &inst.mask else { return };
     let (bx, by, bw, bh) = inst.bbox;
     for row in 0..bh {
@@ -327,7 +328,7 @@ pub struct SnapshotStore {
     kept: Mutex<VecDeque<Arc<Snapshot>>>,
 }
 
-fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -357,7 +358,7 @@ impl SnapshotStore {
 
 /// Recent frames of one camera.
 #[derive(Debug, Default)]
-struct History(Mutex<VecDeque<Arc<Frame>>>);
+pub(crate) struct History(Mutex<VecDeque<Arc<Frame>>>);
 
 impl History {
     fn push(&self, f: Arc<Frame>) {
@@ -368,7 +369,7 @@ impl History {
         }
     }
 
-    fn closest(&self, stamp_s: f64) -> Option<Arc<Frame>> {
+    pub(crate) fn closest(&self, stamp_s: f64) -> Option<Arc<Frame>> {
         guard(&self.0)
             .iter()
             .min_by(|a, b| {
@@ -379,8 +380,121 @@ impl History {
             .cloned()
     }
 
-    fn newest(&self) -> Option<Arc<Frame>> {
+    pub(crate) fn newest(&self) -> Option<Arc<Frame>> {
         guard(&self.0).back().cloned()
+    }
+}
+
+/// One camera and its recent frames.
+#[derive(Debug)]
+pub struct Camera {
+    /// The name calls use.
+    pub name: String,
+    /// Its topics.
+    pub config: CameraConfig,
+    pub(crate) history: Arc<History>,
+}
+
+impl Camera {
+    /// The newest frame, or why there is none.
+    ///
+    /// # Errors
+    ///
+    /// No frame has arrived yet.
+    pub fn newest(&self) -> Result<Arc<Frame>, String> {
+        self.history.newest().ok_or_else(|| {
+            format!(
+                "no frame from the {} camera ({}) yet",
+                self.name, self.config.image
+            )
+        })
+    }
+}
+
+/// Every camera the profile names, `[look]`'s own first, each keeping its recent frames.
+#[derive(Debug)]
+pub struct Cameras(Vec<Camera>);
+
+impl Cameras {
+    /// Starts keeping frames of every camera. Must be called inside a tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// An image subscription could not be created.
+    pub fn start(
+        look: &LookConfig,
+        robot: &Arc<dyn RobotPort>,
+    ) -> Result<Arc<Self>, nervros_ros::RosError> {
+        let mut cameras = Vec::new();
+        for (name, config) in look.all_cameras() {
+            let mut frames = robot.frames(&config.image)?;
+            let history = Arc::new(History::default());
+            let keep = Arc::clone(&history);
+            tokio::spawn(async move {
+                loop {
+                    let latest = frames.borrow_and_update().clone();
+                    if let Some(f) = latest {
+                        keep.push(f);
+                    }
+                    if frames.changed().await.is_err() {
+                        break;
+                    }
+                }
+            });
+            cameras.push(Camera {
+                name,
+                config,
+                history,
+            });
+        }
+        Ok(Arc::new(Self(cameras)))
+    }
+
+    /// A camera by name, or the default one for `None`.
+    ///
+    /// # Errors
+    ///
+    /// No camera has that name.
+    pub fn get(&self, name: Option<&str>) -> Result<&Camera, String> {
+        let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
+            return self.0.first().ok_or_else(|| "no camera".to_owned());
+        };
+        self.0.iter().find(|c| c.name == name).ok_or_else(|| {
+            format!(
+                "no camera `{name}`; the cameras are {}",
+                self.names().join(", ")
+            )
+        })
+    }
+
+    /// The names, the default first.
+    #[must_use]
+    pub fn names(&self) -> Vec<&str> {
+        self.0.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    /// Adds a `camera` argument to a tool's parameters when there is more than one camera.
+    pub(crate) fn add_argument(&self, parameters: &mut Value) {
+        if self.0.len() < 2 {
+            return;
+        }
+        let about: Vec<String> = self
+            .0
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let default = if i == 0 { " (default)" } else { "" };
+                match &c.config.about {
+                    Some(a) => format!("{}{default}: {a}", c.name),
+                    None => format!("{}{default}.", c.name),
+                }
+            })
+            .collect();
+        parameters["properties"]["camera"] = json!({
+            "type": "string",
+            "enum": self.names(),
+            "description": format!("Which camera. {}", about.join(" "))
+        });
     }
 }
 
@@ -389,77 +503,73 @@ pub struct LookTool {
     spec: ToolSpec,
     config: LookConfig,
     robot: Arc<dyn RobotPort>,
-    history: Arc<History>,
+    cameras: Arc<Cameras>,
     snapshots: Arc<SnapshotStore>,
     eyes: Option<Arc<dyn Eyes>>,
 }
 
 impl LookTool {
-    /// Starts keeping frames of the configured camera. Must be called inside a tokio runtime.
-    ///
-    /// # Errors
-    ///
-    /// The image subscription could not be created.
-    pub fn start(
+    /// `look` over the given cameras.
+    #[must_use]
+    pub fn new(
         config: LookConfig,
+        cameras: Arc<Cameras>,
         robot: Arc<dyn RobotPort>,
         snapshots: Arc<SnapshotStore>,
         eyes: Option<Arc<dyn Eyes>>,
-    ) -> Result<Self, nervros_ros::RosError> {
-        let mut frames = robot.frames(&config.image)?;
-        let history = Arc::new(History::default());
-        let keep = Arc::clone(&history);
-        tokio::spawn(async move {
-            loop {
-                let latest = frames.borrow_and_update().clone();
-                if let Some(f) = latest {
-                    keep.push(f);
-                }
-                if frames.changed().await.is_err() {
-                    break;
-                }
-            }
-        });
+    ) -> Self {
+        let mut parameters = json!({"type": "object", "properties": {
+            "question": {"type": "string", "description": "What to find out from the frame, such as \"is there a red mug on the table?\". Leave it out for a short description."}
+        }, "additionalProperties": false});
+        cameras.add_argument(&mut parameters);
         let spec = ToolSpec::new(
             "look",
             "Looks through the robot's camera now. The detector's finds are drawn on the frame as \
              numbered marks (label, score, box), a vision model looks at that frame and answers \
              `question`, and the operator sees it too. Refer to things as `mark N` of the returned \
              snapshot.",
-            json!({"type": "object", "properties": {
-                "question": {"type": "string", "description": "What to find out from the frame, such as \"is there a red mug on the table?\". Leave it out for a short description."}
-            }, "additionalProperties": false}),
+            parameters,
             Risk::Observe,
         );
-        Ok(Self {
+        Self {
             spec,
             config,
             robot,
-            history,
+            cameras,
             snapshots,
             eyes,
-        })
+        }
     }
 
-    async fn run(&self, question: Option<&str>) -> Result<ToolOutcome, String> {
-        let msg = self
-            .robot
-            .latest(
-                &self.config.detections.topic,
-                &self.config.detections.msg_type,
-                Duration::from_secs(3),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut dets = parse_detections(&msg);
-        let newest = self.history.newest().ok_or("no camera frame yet")?;
-        let age = newest.stamp_s - dets.stamp_s;
-        if age > self.config.max_age.as_secs_f64() {
-            return Err(format!(
-                "the newest detections are {age:.1} s older than the camera; the detector may be stopped"
-            ));
-        }
-        let frame = self.history.closest(dets.stamp_s).unwrap_or(newest);
+    async fn run(
+        &self,
+        question: Option<&str>,
+        camera: Option<&str>,
+    ) -> Result<ToolOutcome, String> {
+        let camera = self.cameras.get(camera)?;
+        let newest = camera.newest()?;
+        let (mut dets, frame, age) = if let Some(topic) = &camera.config.detections {
+            let msg = self
+                .robot
+                .latest(&topic.topic, &topic.msg_type, Duration::from_secs(3))
+                .await
+                .map_err(|e| e.to_string())?;
+            let dets = parse_detections(&msg);
+            let age = newest.stamp_s - dets.stamp_s;
+            if age > self.config.max_age.as_secs_f64() {
+                return Err(format!(
+                    "the newest detections are {age:.1} s older than the camera; the detector may be stopped"
+                ));
+            }
+            let frame = camera.history.closest(dets.stamp_s).unwrap_or(newest);
+            (dets, frame, age)
+        } else {
+            let dets = Detections {
+                stamp_s: newest.stamp_s,
+                instances: Vec::new(),
+            };
+            (dets, newest, 0.0)
+        };
         dets.instances.sort_by(|a, b| b.score.total_cmp(&a.score));
         dets.instances.truncate(self.config.max_marks);
         let mut img = frame.to_rgb().map_err(|e| e.to_string())?;
@@ -481,15 +591,22 @@ impl LookTool {
                 json!({"mark": i + 1, "label": inst.label, "score": (f64::from(inst.score) * 100.0).round() / 100.0, "box": [x, y, w, h]})
             })
             .collect();
-        let seen = self.see(question, &img, &dets.instances).await;
+        let seen = self
+            .see(
+                question,
+                &img,
+                &dets.instances,
+                camera.config.about.as_deref(),
+            )
+            .await;
         let snapshot = self.snapshots.put(Snapshot {
             id: id.clone(),
             stamp_s: frame.stamp_s,
             marks: dets.instances,
             image: image.clone(),
         });
-        let mut data =
-            json!({"snapshot": snapshot.id, "age_s": (age * 10.0).round() / 10.0, "marks": marks});
+        let mut data = json!({"snapshot": snapshot.id, "camera": camera.name,
+            "age_s": (age * 10.0).round() / 10.0, "marks": marks});
         match seen {
             Some(Ok((answer, model))) => {
                 data["answer"] = Value::String(answer);
@@ -510,6 +627,7 @@ impl LookTool {
         question: Option<&str>,
         marked: &RgbImage,
         instances: &[Instance],
+        about: Option<&str>,
     ) -> Option<Result<(String, String), String>> {
         let eyes = self.eyes.as_ref()?;
         let small = capped(marked, MODEL_EDGE_PX);
@@ -533,11 +651,7 @@ impl LookTool {
                  when you mention it."
             )
         };
-        let about = self
-            .config
-            .about
-            .as_deref()
-            .map_or(String::new(), |a| format!(" About this camera: {a}"));
+        let about = about.map_or(String::new(), |a| format!(" About this camera: {a}"));
         let prompt = format!(
             "{}\n\n{marks} Say so when something cannot be seen.{about}",
             question.unwrap_or(DEFAULT_QUESTION)
@@ -557,7 +671,7 @@ impl Tool for LookTool {
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
-        self.run(args["question"].as_str())
+        self.run(args["question"].as_str(), args["camera"].as_str())
             .await
             .unwrap_or_else(ToolOutcome::failed)
     }
@@ -591,6 +705,54 @@ mod tests {
                 {"label": "dustbin", "score": 0.9, "roi": {"x_offset": 5, "y_offset": 28, "width": 10, "height": 10}, "data": []}
             ]
         })
+    }
+
+    fn start(
+        config: LookConfig,
+        robot: Arc<dyn RobotPort>,
+        store: Arc<SnapshotStore>,
+        eyes: Option<Arc<dyn Eyes>>,
+    ) -> LookTool {
+        let cameras = Cameras::start(&config, &robot).unwrap();
+        LookTool::new(config, cameras, robot, store, eyes)
+    }
+
+    #[tokio::test]
+    async fn a_named_camera_is_looked_through_and_one_without_detections_is_unmarked() {
+        let robot: Arc<dyn RobotPort> = Arc::new(
+            FakeRobot::new()
+                .with_frame("/chest", frame(12.0))
+                .with_frame("/head", frame(12.0))
+                .with_topic("/masks", masks(12.0)),
+        );
+        let config: LookConfig = toml::from_str(
+            "name = \"chest\"\nimage = \"/chest\"\ndetections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n\
+             [cameras.head]\nimage = \"/head\"\nabout = \"It looks down.\"\n",
+        )
+        .unwrap();
+        let look = start(config, robot, Arc::new(SnapshotStore::default()), None);
+        let camera = &look.spec().parameters["properties"]["camera"];
+        assert_eq!(camera["enum"], json!(["chest", "head"]));
+        assert!(
+            camera["description"]
+                .as_str()
+                .unwrap()
+                .contains("chest (default). head: It looks down."),
+            "{camera}"
+        );
+        tokio::task::yield_now().await;
+        let out = look.call(json!({"camera": "head"})).await;
+        assert_eq!(out.data["camera"], "head", "{}", out.message);
+        assert_eq!(out.data["marks"], json!([]));
+        let out = look.call(json!({})).await;
+        assert_eq!(out.data["camera"], "chest");
+        assert_eq!(out.data["marks"][0]["label"], "dustbin");
+        let out = look.call(json!({"camera": "wrist"})).await;
+        assert!(
+            out.message.contains("the cameras are chest, head"),
+            "{}",
+            out.message
+        );
     }
 
     #[test]
@@ -631,7 +793,7 @@ mod tests {
         )
         .unwrap();
         let store = Arc::new(SnapshotStore::default());
-        let look = LookTool::start(config, robot, Arc::clone(&store), None).unwrap();
+        let look = start(config, robot, Arc::clone(&store), None);
         tokio::task::yield_now().await;
         let out = look.call(json!({})).await;
         assert_eq!(
@@ -679,13 +841,12 @@ mod tests {
             "image = \"/camera\"\ndetections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n",
         )
         .unwrap();
-        let look = LookTool::start(
+        let look = start(
             config,
             robot,
             Arc::new(SnapshotStore::default()),
             Some(eyes as Arc<dyn Eyes>),
-        )
-        .unwrap();
+        );
         tokio::task::yield_now().await;
         look.call(question).await
     }
@@ -735,13 +896,12 @@ mod tests {
             answer: Ok("A wooden floor.".into()),
             asked: Mutex::new(Vec::new()),
         });
-        let look = LookTool::start(
+        let look = start(
             config,
             robot,
             Arc::new(SnapshotStore::default()),
             Some(Arc::clone(&eyes) as Arc<dyn Eyes>),
-        )
-        .unwrap();
+        );
         tokio::task::yield_now().await;
         let _ = look.call(json!({})).await;
         let asked = guard(&eyes.asked);

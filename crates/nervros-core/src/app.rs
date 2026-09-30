@@ -10,7 +10,7 @@ use crate::builtins::{ListPlaces, RobotState, Stop};
 use crate::context::system_prompt;
 use crate::guard::Guard;
 use crate::llm::Llm;
-use crate::look::{LookTool, SnapshotStore};
+use crate::look::{Cameras, LookTool, SnapshotStore};
 use crate::mission::Missions;
 use crate::profile::{PrivacyModeConfig, Profile};
 use crate::providers::ModelsConfig;
@@ -164,10 +164,15 @@ pub fn start(
     let mut registry = Registry::from_config(&profile.tools, &robot, &schemas, &guard)?;
     let snapshots = Arc::new(SnapshotStore::default());
     if let Some(look) = profile.look.clone() {
+        let cameras = Cameras::start(&look, &robot).map_err(StartError::Look)?;
         let eyes: Arc<dyn crate::look::Eyes> = Arc::clone(&llm) as Arc<dyn crate::look::Eyes>;
-        let tool = LookTool::start(look, Arc::clone(&robot), Arc::clone(&snapshots), Some(eyes))
-            .map_err(StartError::Look)?;
-        registry.add(Arc::new(tool))?;
+        registry.add(Arc::new(LookTool::new(
+            look,
+            cameras,
+            Arc::clone(&robot),
+            Arc::clone(&snapshots),
+            Some(eyes),
+        )))?;
     }
     registry.add(Arc::new(ListPlaces::new(&profile, Arc::clone(&robot))))?;
     registry.add(Arc::new(RobotState::new(

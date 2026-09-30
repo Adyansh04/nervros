@@ -1,9 +1,10 @@
 //! The robot profile: one `nervros.toml` per robot, kept in the robot's own repository.
 //!
-//! It names the robot, how to reach its ROS graph, the policy, the places, the camera and detection
-//! topics `look` reads, the mission executor's interfaces, the tools and the models file. Paths are
-//! relative to the profile's directory.
+//! It names the robot, how to reach its ROS graph, the policy, the places, the cameras and
+//! detection topics `look` reads, the mission executor's interfaces, the tools and the models file.
+//! Paths are relative to the profile's directory.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -152,10 +153,13 @@ pub enum PrivacyModeConfig {
     Home,
 }
 
-/// Where `look` reads from.
+/// Where `look` reads from: its own camera, the default, and any others in `cameras`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LookConfig {
+    /// The camera's name, as `look`'s `camera` argument takes it.
+    #[serde(default = "default_camera_name")]
+    pub name: String,
     /// The colour image topic.
     pub image: String,
     /// The detection topic and its type.
@@ -170,6 +174,41 @@ pub struct LookConfig {
     /// it sees, so it does not take a view of the floor for an empty room.
     #[serde(default)]
     pub about: Option<String>,
+    /// Other cameras by name, such as `[look.cameras.head]`.
+    #[serde(default)]
+    pub cameras: BTreeMap<String, CameraConfig>,
+}
+
+/// A camera beyond `[look]`'s own.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraConfig {
+    /// The colour image topic.
+    pub image: String,
+    /// Its detections; without them `look` shows the frame unmarked.
+    pub detections: Option<TopicRef>,
+    /// What the vision model should know about this camera.
+    #[serde(default)]
+    pub about: Option<String>,
+}
+
+impl LookConfig {
+    /// Every camera by name, `[look]`'s own first.
+    #[must_use]
+    pub fn all_cameras(&self) -> Vec<(String, CameraConfig)> {
+        let own = CameraConfig {
+            image: self.image.clone(),
+            detections: Some(self.detections.clone()),
+            about: self.about.clone(),
+        };
+        std::iter::once((self.name.clone(), own))
+            .chain(self.cameras.iter().map(|(n, c)| (n.clone(), c.clone())))
+            .collect()
+    }
+}
+
+fn default_camera_name() -> String {
+    "main".to_owned()
 }
 
 fn default_marks() -> usize {
@@ -306,10 +345,10 @@ pub enum ProfileError {
         /// The parse error.
         source: toml::de::Error,
     },
-    /// Two tools or two places share a name.
+    /// Two tools, places or cameras share a name.
     #[error("duplicate {kind} `{name}`")]
     Duplicate {
-        /// `tool` or `place`.
+        /// `tool`, `place` or `camera`.
         kind: &'static str,
         /// The repeated name.
         name: String,
@@ -354,6 +393,14 @@ impl Profile {
                     name: p.name.clone(),
                 });
             }
+        }
+        if let Some(look) = &self.look
+            && look.cameras.contains_key(&look.name)
+        {
+            return Err(ProfileError::Duplicate {
+                kind: "camera",
+                name: look.name.clone(),
+            });
         }
         Ok(())
     }
@@ -421,6 +468,33 @@ mod tests {
         assert_eq!(parse_duration("1.5"), Some(1.5));
         assert_eq!(parse_duration("-1s"), None);
         assert_eq!(parse_duration("soon"), None);
+    }
+
+    fn check(text: &str) -> Result<(), ProfileError> {
+        toml::from_str::<Profile>(text).unwrap().check()
+    }
+
+    const BASE: &str = "[robot]\nname = \"r\"\n[models]\nfile = \"m.toml\"\n";
+    const LOOK: &str = "[look]\nname = \"chest\"\nimage = \"/chest\"\n\
+        detections = { topic = \"/d\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n";
+
+    #[test]
+    fn cameras_are_listed_own_first_and_named_once() {
+        let text = format!("{BASE}{LOOK}[look.cameras.head]\nimage = \"/head\"\n");
+        let profile: Profile = toml::from_str(&text).unwrap();
+        let names: Vec<String> = profile
+            .look
+            .unwrap()
+            .all_cameras()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["chest", "head"]);
+        let twice = format!("{BASE}{LOOK}[look.cameras.chest]\nimage = \"/other\"\n");
+        assert!(matches!(
+            check(&twice),
+            Err(ProfileError::Duplicate { kind: "camera", .. })
+        ));
     }
 
     #[test]
