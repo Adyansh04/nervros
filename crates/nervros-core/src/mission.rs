@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 
 use self::catalog::Catalog;
 use self::check::Observed;
-use self::plan::{Compiled, Plan, World};
+use self::plan::{Compiled, Plan, Thing, World};
 use crate::profile::{MissionConfig, Profile};
 use crate::session::{Command, Event, SessionHandle};
 use crate::tools::{Risk, Status, Tool, ToolOutcome, ToolSpec};
@@ -33,8 +33,9 @@ const SERVICE_TIMEOUT: Duration = Duration::from_secs(10);
 const WORLD_WAIT: Duration = Duration::from_secs(2);
 /// Plans kept for `run_mission`, newest last.
 const KEPT_PLANS: usize = 8;
-/// Failed `plan_mission` calls before the model must ask the operator instead.
-const MAX_PLAN_ATTEMPTS: u32 = 3;
+/// Failed `plan_mission` calls before the model must ask the operator instead. Small local models
+/// need about three to fix a plan from its problem list.
+const MAX_PLAN_ATTEMPTS: u32 = 4;
 /// A hash may be shortened to this many characters when it stays unique.
 const MIN_HASH_PREFIX: usize = 8;
 const EXECUTE: &str = "nervros_interfaces/action/ExecuteMission";
@@ -183,11 +184,10 @@ impl Missions {
         }
     }
 
-    async fn world(&self) -> (World, Value, Value) {
-        let world = self.profile.world.as_ref();
-        let rooms = self.latest(world.and_then(|w| w.rooms.as_ref())).await;
-        let objects = self.latest(world.and_then(|w| w.objects.as_ref())).await;
-        let pairs = |msg: &Value, list: &str, name: &str| -> Vec<(String, String)> {
+    /// What the plan compiler knows: places, rooms and objects with their positions, where the
+    /// robot is and what it holds.
+    fn world_of(&self, seen: &Observed) -> World {
+        let things = |msg: &Value, list: &str, name: &str, at: &str| -> Vec<Thing> {
             msg[list]
                 .as_array()
                 .map(|items| {
@@ -196,18 +196,34 @@ impl Missions {
                         .filter(|o| o["state"].as_u64() != Some(2))
                         .map(|o| {
                             let text = |k: &str| o[k].as_str().unwrap_or_default().to_owned();
-                            (text("id"), text(name))
+                            let p = o.pointer(at);
+                            let xy = p.and_then(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)));
+                            Thing {
+                                id: text("id"),
+                                name: text(name),
+                                xy,
+                            }
                         })
                         .collect()
                 })
                 .unwrap_or_default()
         };
-        let w = World {
+        let holding = ["left", "right"]
+            .into_iter()
+            .map(|arm| {
+                let held = seen.state[format!("holding_{arm}")]
+                    .as_str()
+                    .unwrap_or_default();
+                (arm.to_owned(), held.to_owned())
+            })
+            .collect();
+        World {
             places: self.profile.places.clone(),
-            rooms: pairs(&rooms, "rooms", "name"),
-            objects: pairs(&objects, "objects", "label"),
-        };
-        (w, rooms, objects)
+            rooms: things(&seen.rooms, "rooms", "name", "/centroid"),
+            objects: things(&seen.objects, "objects", "label", "/pose/position"),
+            robot: seen.pose,
+            holding,
+        }
     }
 
     fn plan_spec(&self) -> ToolSpec {
@@ -224,7 +240,9 @@ impl Missions {
         };
         let description = format!(
             "Checks a plan for the robot without moving it and returns the plan's hash; then call \
-             run_mission with the hash. Use ids from list_places and find_objects. Skills:\n{listing}"
+             run_mission with the hash. Each step names a skill and gives every one of its arguments \
+             as {{name, value}}, such as {{\"skill\": \"GoToPlace\", \"args\": [{{\"name\": \"place\", \
+             \"value\": \"kitchen\"}}]}}. Use ids from list_places and find_objects. Skills:\n{listing}"
         );
         let parameters = json!({
             "type": "object",
@@ -281,7 +299,7 @@ impl Missions {
             Ok(c) => c,
             Err(e) => return ToolOutcome::failed(e),
         };
-        let (world, _, _) = self.world().await;
+        let world = self.world_of(&self.observe().await);
         let compiled = match plan::compile(&plan, &catalog, &world) {
             Ok(c) => c,
             Err(problems) => return self.rejected(&json!(problems)),
@@ -523,7 +541,9 @@ impl Missions {
     }
 
     async fn observe(&self) -> Observed {
-        let (_, rooms, objects) = self.world().await;
+        let world = self.profile.world.as_ref();
+        let rooms = self.latest(world.and_then(|w| w.rooms.as_ref())).await;
+        let objects = self.latest(world.and_then(|w| w.objects.as_ref())).await;
         let (map, base) = (&self.profile.ros.map_frame, &self.profile.ros.base_frame);
         let pose = self
             .robot

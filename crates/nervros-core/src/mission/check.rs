@@ -4,13 +4,12 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use super::plan::{NEAR_M, predicate as predicate_of};
 use crate::builtins::inside;
 use crate::profile::PlaceConfig;
 
 /// How far from a place's pose still counts as there.
 const AT_PLACE_M: f64 = 0.5;
-/// How far from an object still counts as at it: arm's reach.
-const AT_OBJECT_M: f64 = 1.2;
 /// Slack around a container's footprint for `inside` and `on`.
 const FOOTPRINT_SLACK_M: f64 = 0.05;
 
@@ -40,13 +39,6 @@ pub struct Observed {
     pub state: Value,
 }
 
-/// `name(a, b)` as `("name", ["a", "b"])`.
-fn parse(predicate: &str) -> Option<(&str, Vec<&str>)> {
-    let (name, rest) = predicate.trim().split_once('(')?;
-    let args = rest.strip_suffix(')')?;
-    Some((name.trim(), args.split(',').map(str::trim).collect()))
-}
-
 fn object<'v>(objects: &'v Value, id: &str) -> Option<&'v Value> {
     objects["objects"]
         .as_array()?
@@ -73,7 +65,7 @@ fn verdict(predicate: &str, seen: &Observed) -> Verdict {
         ok,
         detail,
     };
-    match parse(predicate) {
+    match predicate_of(predicate) {
         Some(("at", args)) if args.len() == 1 => at(args[0], seen, out),
         Some(("holding", args)) if args.len() == 2 => {
             let held = seen.state[format!("holding_{}", args[0])].as_str();
@@ -153,7 +145,7 @@ fn at(target: &str, seen: &Observed, out: impl Fn(Option<bool>, String) -> Verdi
     if let Some(o) = object(&seen.objects, target) {
         let (ox, oy) = xy(&o["pose"]["position"]);
         let d = (ox - x).hypot(oy - y);
-        return out(Some(d <= AT_OBJECT_M), format!("{d:.2} m from {target}"));
+        return out(Some(d <= NEAR_M), format!("{d:.2} m from {target}"));
     }
     out(
         None,
