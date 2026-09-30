@@ -220,6 +220,12 @@ impl Sim {
                 _ => {}
             }
         }
+        // A skill that takes the base may move it, as a pick backs off the surface afterwards, so
+        // the robot's position is unknown until the next walk.
+        if skill.resources.iter().any(|r| r == "base") {
+            self.at = None;
+            self.xy = None;
+        }
         problems
     }
 
@@ -829,13 +835,13 @@ mod tests {
         assert!(
             wrong
                 .iter()
-                .any(|p| p.step == "s3" && p.message.contains("left hand to hold something")),
+                .any(|p| p.step == "s4" && p.message.contains("left hand to hold something")),
             "{wrong:?}"
         );
         // After the first place the right hand is empty, so placing again fails too.
         let twice = compile(&steps("right"), &catalog(), &world()).unwrap_err();
         assert_eq!(twice.len(), 1, "{twice:?}");
-        assert_eq!(twice[0].step, "s4");
+        assert_eq!(twice[0].step, "s6", "a walk is added before each place");
         let mut held = world();
         held.robot = Some((5.0, 1.0));
         held.holding.insert("left".to_owned(), "O17".to_owned());
@@ -846,6 +852,28 @@ mod tests {
             compile(&place, &catalog(), &held).is_ok(),
             "a hand may hold something from before"
         );
+    }
+
+    #[test]
+    fn after_a_skill_that_moves_the_base_the_next_one_walks_again() {
+        let p = plan(&json!([
+            {"skill": "GoToPlace", "args": {"place": "O17"}},
+            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}},
+            {"skill": "PlaceInto", "args": {"container_id": "O31", "phrase": "basket", "arm": "right"}}
+        ]));
+        let c = compile(&p, &catalog(), &world()).unwrap();
+        let summaries: Vec<&str> = c.steps.iter().map(|s| s.summary.as_str()).collect();
+        assert_eq!(
+            summaries[2], "GoToPlace(place=O31) (added)",
+            "{summaries:?}"
+        );
+        // Folding the arms does not take the base, so the robot stays where it was.
+        let tuck = plan(&json!([
+            {"skill": "GoToPlace", "args": {"place": "O17"}},
+            {"skill": "TuckForTravel"},
+            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}}
+        ]));
+        assert_eq!(compile(&tuck, &catalog(), &world()).unwrap().steps.len(), 3);
     }
 
     #[test]
