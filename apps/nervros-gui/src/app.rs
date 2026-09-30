@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use nervros_core::app::Agent;
 use nervros_core::doctor::Check;
+use nervros_core::mission::held_by;
 use nervros_core::providers::router::{Need, Router};
 use nervros_core::providers::{ModelConfig, Role};
 use nervros_core::session::{Command, Event};
@@ -206,10 +207,8 @@ impl Gui {
         let live = self.live();
         let held = live.executor.as_ref().and_then(|s| {
             ["left", "right"].into_iter().find_map(|hand| {
-                let obj = s[format!("holding_{hand}")]
-                    .as_str()
-                    .filter(|o| !o.is_empty())?;
-                Some(format!("Stop · {hand} hand keeps {obj}"))
+                let obj = held_by(s, hand);
+                (!obj.is_empty()).then(|| format!("Stop · {hand} hand keeps {obj}"))
             })
         });
         held.unwrap_or_else(|| "Stop mission".to_owned())

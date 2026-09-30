@@ -45,6 +45,24 @@ const OUTCOMES: [&str; 6] = [
 ];
 const STATUSES: [&str; 5] = ["idle", "running", "success", "failure", "skipped"];
 
+/// What a hand holds when the executor cannot say: after a pick that was cut off, it trusts the
+/// hand again only once a place with it succeeds.
+pub const UNKNOWN_HELD: &str = "something unknown";
+
+/// What a `RobotState` (as JSON) says one hand holds: an object id, [`UNKNOWN_HELD`], or empty
+/// for nothing. The executor leaves `holding_*` empty for an unknown hand and says so in
+/// `message`, as "<arm> hand unknown".
+#[must_use]
+pub fn held_by(state: &Value, arm: &str) -> String {
+    let held = state[format!("holding_{arm}")].as_str().unwrap_or_default();
+    let message = state["message"].as_str().unwrap_or_default();
+    if held.is_empty() && message.contains(&format!("{arm} hand unknown")) {
+        UNKNOWN_HELD.to_owned()
+    } else {
+        held.to_owned()
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -210,12 +228,7 @@ impl Missions {
         };
         let holding = ["left", "right"]
             .into_iter()
-            .map(|arm| {
-                let held = seen.state[format!("holding_{arm}")]
-                    .as_str()
-                    .unwrap_or_default();
-                (arm.to_owned(), held.to_owned())
-            })
+            .map(|arm| (arm.to_owned(), held_by(&seen.state, arm)))
             .collect();
         World {
             places: self.profile.places.clone(),
@@ -495,10 +508,8 @@ impl Missions {
             let hands: Vec<String> = ["left", "right"]
                 .iter()
                 .filter_map(|h| {
-                    let held = seen.state[format!("holding_{h}")]
-                        .as_str()
-                        .filter(|o| !o.is_empty())?;
-                    Some(format!("the {h} hand holds {held}"))
+                    let held = held_by(&seen.state, h);
+                    (!held.is_empty()).then(|| format!("the {h} hand holds {held}"))
                 })
                 .collect();
             if !hands.is_empty() {
@@ -812,6 +823,24 @@ mod tests {
         let second = missions.plan(steps()).await.data["hash"].clone();
         assert_eq!(first, second);
         assert!(missions.find(first.as_str().unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_hand_the_executor_cannot_vouch_for_is_full() {
+        let state = json!({"holding_left": "", "holding_right": "",
+                           "message": "idle; left hand unknown (it may hold something)"});
+        assert_eq!(held_by(&state, "left"), UNKNOWN_HELD);
+        assert_eq!(held_by(&state, "right"), "");
+        let robot: Arc<dyn RobotPort> =
+            Arc::new(robot(ScriptedRun::default()).with_topic("/x/state", state));
+        let missions = Missions::new(&profile(), robot).unwrap();
+        let out = missions.plan(steps()).await;
+        assert_eq!(out.status, Status::Failed);
+        let problems = out.data["problems"].to_string();
+        assert!(
+            problems.contains("left hand empty, but it holds something unknown"),
+            "{problems}"
+        );
     }
 
     #[test]
