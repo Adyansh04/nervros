@@ -533,8 +533,13 @@ impl LookTool {
                  when you mention it."
             )
         };
+        let about = self
+            .config
+            .about
+            .as_deref()
+            .map_or(String::new(), |a| format!(" About this camera: {a}"));
         let prompt = format!(
-            "{}\n\n{marks} Say so when something cannot be seen.",
+            "{}\n\n{marks} Say so when something cannot be seen.{about}",
             question.unwrap_or(DEFAULT_QUESTION)
         );
         let image = ImageInput {
@@ -709,6 +714,7 @@ mod tests {
             "{}",
             asked[0].0
         );
+        assert!(!asked[0].0.contains("About this camera"), "{}", asked[0].0);
     }
 
     #[tokio::test]
@@ -722,7 +728,7 @@ mod tests {
                 ),
         );
         let config: LookConfig = toml::from_str(
-            "image = \"/camera\"\ndetections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n",
+            "image = \"/camera\"\ndetections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\nabout = \"It points down at the floor.\"\n",
         )
         .unwrap();
         let eyes = Arc::new(FakeEyes {
@@ -741,6 +747,13 @@ mod tests {
         let asked = guard(&eyes.asked);
         assert!(asked[0].0.contains("marked nothing"), "{}", asked[0].0);
         assert!(!asked[0].0.contains("numbered"), "{}", asked[0].0);
+        assert!(
+            asked[0]
+                .0
+                .ends_with("About this camera: It points down at the floor."),
+            "{}",
+            asked[0].0
+        );
     }
 
     #[tokio::test]

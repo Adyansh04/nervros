@@ -99,6 +99,7 @@ vision model available, `look` returns the marks alone and says why.
 | `detections` | required | `{ topic, type }`, where the type is `canopy_msgs/msg/InstanceMaskArray` or `vision_msgs/msg/Detection2DArray`. |
 | `max_marks` | `12` | |
 | `max_age` | `"5s"` | Older detections are left out. |
+| `about` | none | What the vision model should know about the camera, such as where it points and how far it sees. |
 
 ### `[world]`
 
