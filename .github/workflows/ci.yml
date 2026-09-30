@@ -47,7 +47,7 @@ jobs:
           apt-get install -y --no-install-recommends curl ca-certificates build-essential \
             clang libclang-dev mold pkg-config libssl-dev python3-colcon-common-extensions \
             libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            mesa-vulkan-drivers libvulkan1
+            libudev-dev libwayland-dev mesa-vulkan-drivers libvulkan1
       - name: Toolchain
         run: |
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
