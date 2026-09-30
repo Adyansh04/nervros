@@ -6,12 +6,16 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use futures::future::BoxFuture;
 use rig::agent::tool::ToolOutput;
-use rig::agent::{AgentHook, CompletionCallAction, CompletionCallEvent, HookContext};
+use rig::agent::{
+    AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, InvalidToolCallAction,
+    InvalidToolCallContext, RequestPatch,
+};
 use rig::client::CompletionClient as _;
 use rig::completion::{Chat as _, Message, Prompt as _, PromptError};
 use rig::message::{ImageMediaType, UserContent};
@@ -258,7 +262,7 @@ impl Llm {
                         tracing::warn!(model = %model.id, error = %io, "could not save the quota ledger");
                     }
                     tracing::info!(model = %model.id, error = %e, "model failed, trying the next one");
-                    failed.push((model.id.clone(), e.to_string()));
+                    failed.push((model.id.clone(), without_provider_body(&e.to_string())));
                 }
             }
         }
@@ -432,29 +436,69 @@ impl AgentSource for Llm {
     }
 }
 
-/// Takes each of a turn's requests from the model's quota before it is sent, and ends the turn
-/// when the quota refuses one: a turn is up to `max_turns` requests, not one.
-struct Quota {
+/// Steers one turn's agent loop.
+struct TurnHook {
     source: Arc<dyn AgentSource>,
     model: String,
+    acted: Arc<AtomicBool>,
 }
 
-impl AgentHook for Quota {
+impl AgentHook for TurnHook {
+    /// Takes each request from the model's quota before it is sent (a turn is up to `max_turns`
+    /// requests, not one), and once the robot has acted offers no more tools, so the model
+    /// answers instead of spending the turn on checks the mission's report will answer anyway.
     async fn on_completion_call(
         &self,
         _ctx: &HookContext,
         _event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
-        match self.source.take_request(&self.model) {
-            Ok(()) => CompletionCallAction::continue_run(),
-            Err(why) => CompletionCallAction::stop(format!("{}: {why}", self.model)),
+        if let Err(why) = self.source.take_request(&self.model) {
+            return CompletionCallAction::stop(format!("{}: {why}", self.model));
         }
+        if self.acted.load(Ordering::SeqCst) {
+            return CompletionCallAction::patch(
+                RequestPatch::new().active_tools(Vec::<String>::new()),
+            );
+        }
+        CompletionCallAction::continue_run()
+    }
+
+    /// Small models invent tool names; the model gets the real ones back as the call's result
+    /// and can try again, where rig would otherwise end the turn.
+    async fn on_invalid_tool_call(
+        &self,
+        _ctx: &HookContext,
+        event: &InvalidToolCallContext,
+    ) -> Option<InvalidToolCallAction> {
+        let tools = if event.allowed_tools.is_empty() {
+            "none: answer the operator instead".to_owned()
+        } else {
+            event.allowed_tools.join(", ")
+        };
+        Some(InvalidToolCallAction::Skip {
+            reason: format!(
+                "There is no tool called `{}`. The tools you can call now: {tools}.",
+                event.tool_name
+            ),
+        })
     }
 }
 
-/// Runs one user turn on a model from `source`: the model may call the tools up to `max_turns`
-/// model calls in total, each taken from its quota. Committed messages, tool calls and results
-/// included, are appended to `history`.
+/// What one turn offers the model.
+pub struct TurnSetup<'a> {
+    /// The system prompt.
+    pub preamble: &'a str,
+    /// Model calls allowed in the turn, tool rounds included.
+    pub max_turns: usize,
+    /// The tools on offer.
+    pub tools: &'a [LoopTool],
+    /// Set once a tool has acted on the robot; the rest of the turn is the answer.
+    pub acted: Arc<AtomicBool>,
+}
+
+/// Runs one user turn on a model from `source`: the model may call the tools up to
+/// `setup.max_turns` model calls in total, each taken from its quota. Committed messages, tool
+/// calls and results included, are appended to `history`.
 ///
 /// # Errors
 ///
@@ -463,13 +507,12 @@ impl AgentHook for Quota {
 pub async fn chat(
     model_id: &str,
     source: Arc<dyn AgentSource>,
-    preamble: &str,
-    max_turns: usize,
-    tools: &[LoopTool],
+    setup: TurnSetup<'_>,
     history: &mut History,
     text: &str,
 ) -> Result<String, LlmError> {
-    let dynamic: Vec<DynamicTool> = tools
+    let dynamic: Vec<DynamicTool> = setup
+        .tools
         .iter()
         .map(|t| {
             let invoke = std::sync::Arc::clone(&t.invoke);
@@ -486,12 +529,13 @@ pub async fn chat(
         .collect();
     let builder = source
         .builder(model_id)?
-        .preamble(preamble)
-        .default_max_turns(max_turns)
+        .preamble(setup.preamble)
+        .default_max_turns(setup.max_turns)
         .dynamic_tools(dynamic)
-        .add_hook(Quota {
+        .add_hook(TurnHook {
             source,
             model: model_id.to_owned(),
+            acted: setup.acted,
         });
     let agent = builder.build();
     agent
@@ -499,7 +543,58 @@ pub async fn chat(
         .await
         .map_err(|e| LlmError::Turn {
             model: model_id.to_owned(),
-            message: e.to_string(),
+            message: without_provider_body(&e.to_string()),
             rate_limited: is_rate_limited(&e),
         })
+}
+
+/// A provider error with its JSON body replaced by the provider's own message: the body can
+/// carry account ids (OpenRouter's `user_id`) that belong in neither the chat nor the log.
+fn without_provider_body(text: &str) -> String {
+    let Some(start) = text.find('{') else {
+        return text.to_owned();
+    };
+    let (head, body) = text.split_at(start);
+    let parsed = serde_json::Deserializer::from_str(body)
+        .into_iter::<serde_json::Value>()
+        .next()
+        .and_then(Result::ok);
+    let error = parsed.as_ref().map(|v| &v["error"]);
+    // OpenRouter's `metadata.raw` is the upstream provider's words, more specific than `message`.
+    let said = error
+        .and_then(|e| {
+            e["metadata"]["raw"]
+                .as_str()
+                .or_else(|| e["message"].as_str())
+        })
+        .unwrap_or("details withheld");
+    format!("{head}{said}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_provider_error_keeps_its_words_and_loses_its_body() {
+        let raw = r#"CompletionError: ProviderResponseError: status 429 Too Many Requests: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"qwen/qwen3.8-27b:free is temporarily rate-limited upstream.","provider_name":"ModelRun"}},"user_id":"user_0000example"}"#;
+        let shown = without_provider_body(raw);
+        assert_eq!(
+            shown,
+            "CompletionError: ProviderResponseError: status 429 Too Many Requests: qwen/qwen3.8-27b:free is temporarily rate-limited upstream."
+        );
+        let plain = r#"status 403 Forbidden: {"error":{"message":"only available on agentic harnesses","code":403}}"#;
+        assert_eq!(
+            without_provider_body(plain),
+            "status 403 Forbidden: only available on agentic harnesses"
+        );
+        assert_eq!(
+            without_provider_body("connection refused"),
+            "connection refused"
+        );
+        assert_eq!(
+            without_provider_body("oops: {not json"),
+            "oops: details withheld"
+        );
+    }
 }
