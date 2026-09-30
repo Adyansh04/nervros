@@ -1,0 +1,62 @@
+# The whole workspace in ROS 2 Jazzy: the r2r node, the Rerun viewer and the app, with clippy and
+# every test; the GUI snapshots render with the lavapipe software renderer. A cold build takes over
+# an hour on a hosted runner, and caches saved on a pull request are not shared with the next one,
+# so it runs by hand (Actions > full > Run workflow) rather than on every change: the same checks
+# run locally before each pull request. It needs more disk than a container job gets, so it runs on
+# the runner itself after freeing its preinstalled toolchains.
+name: full
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: full-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Line tables alone for the Rerun tree still outgrow a hosted runner's disk.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+  CI: "true"
+
+jobs:
+  ros:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/local/.ghcup
+          df -h /
+      - uses: actions/checkout@v5
+      - name: ROS 2 Jazzy and system packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update
+          version=$(gh api repos/ros-infrastructure/ros-apt-source/releases/latest --jq .tag_name)
+          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          curl -sSL -o /tmp/ros2-apt-source.deb \
+            "https://github.com/ros-infrastructure/ros-apt-source/releases/download/${version}/ros2-apt-source_${version}.${codename}_all.deb"
+          sudo dpkg -i /tmp/ros2-apt-source.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ros-jazzy-ros-base ros-dev-tools \
+            clang libclang-dev mold pkg-config libssl-dev \
+            libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libudev-dev libwayland-dev mesa-vulkan-drivers libvulkan1
+      - name: Toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: full
+      - name: Interfaces overlay
+        run: ./scripts/build-overlay.sh
+      - name: Clippy
+        run: source scripts/ros-env.sh && cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: source scripts/ros-env.sh && cargo test --workspace
+      - name: Disk left
+        if: always()
+        run: df -h /

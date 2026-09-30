@@ -1,0 +1,32 @@
+# What builds anywhere: the schema generator and the agent core, on every push and pull request.
+# full.yml builds the rest, which needs ROS 2 and takes far longer.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Linker
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang mold
+      - name: Toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: core
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p rosidl-schema -p nervros-core --all-targets -- -D warnings
+      - run: cargo test -p rosidl-schema -p nervros-core
