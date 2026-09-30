@@ -517,10 +517,11 @@ impl Gui {
                             .iter()
                             .find(|r| r["id"] == id.as_str())
                             .and_then(|r| {
-                                r["name"]
+                                r["type"]
                                     .as_str()
+                                    .filter(|t| !t.is_empty())
+                                    .or_else(|| r["name"].as_str())
                                     .filter(|n| !n.is_empty())
-                                    .or_else(|| r["type"].as_str())
                                     .map(str::to_owned)
                             })
                     });
