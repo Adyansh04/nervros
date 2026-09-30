@@ -153,10 +153,6 @@ pub enum PrivacyModeConfig {
 pub struct LookConfig {
     /// The colour image topic.
     pub image: String,
-    /// The depth image aligned to it, for placing marks in 3D.
-    pub depth: Option<String>,
-    /// The colour camera's `sensor_msgs/CameraInfo`.
-    pub camera_info: Option<String>,
     /// The detection topic and its type.
     pub detections: TopicRef,
     /// At most this many marks.

@@ -107,6 +107,8 @@ pub enum LlmError {
         model: String,
         /// What went wrong.
         message: String,
+        /// The provider answered 429.
+        rate_limited: bool,
     },
 }
 
@@ -384,6 +386,9 @@ pub trait AgentSource: Send + Sync {
 
     /// Counts one request against the model's quota.
     fn record_use(&self, model_id: &str);
+
+    /// Sets a model aside after a 429.
+    fn park(&self, model_id: &str);
 }
 
 impl AgentSource for Llm {
@@ -410,6 +415,12 @@ impl AgentSource for Llm {
 
     fn record_use(&self, model_id: &str) {
         if let Err(e) = self.router.record_use(model_id, SystemTime::now()) {
+            tracing::warn!(model = %model_id, error = %e, "could not save the quota ledger");
+        }
+    }
+
+    fn park(&self, model_id: &str) {
+        if let Err(e) = self.router.park(model_id, SystemTime::now(), DEFAULT_PARK) {
             tracing::warn!(model = %model_id, error = %e, "could not save the quota ledger");
         }
     }
@@ -456,5 +467,6 @@ pub async fn chat(
         .map_err(|e| LlmError::Turn {
             model: model_id.to_owned(),
             message: e.to_string(),
+            rate_limited: is_rate_limited(&e),
         })
 }

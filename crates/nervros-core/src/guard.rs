@@ -23,7 +23,7 @@ pub enum Autonomy {
     /// Act-lane tools need the operator's approval.
     #[default]
     Supervised,
-    /// Act-lane tools run without approval unless marked `always`.
+    /// Act-lane tools run without approval.
     Autonomous,
 }
 
@@ -79,9 +79,6 @@ pub struct Policy {
     /// Autonomy level.
     #[serde(default)]
     pub autonomy: Autonomy,
-    /// Navigation-only missions to places the user named in the same message run without approval.
-    #[serde(default = "d_true")]
-    pub auto_run_named_navigation: bool,
     /// How long an approval request stays open.
     #[serde(default = "d_ttl", deserialize_with = "crate::profile::duration")]
     pub approval_ttl: Duration,
@@ -94,9 +91,6 @@ pub struct Policy {
     pub hard_deny: Vec<String>,
 }
 
-fn d_true() -> bool {
-    true
-}
 fn d_ttl() -> Duration {
     Duration::from_mins(1)
 }
@@ -127,7 +121,6 @@ impl Default for Policy {
         Self {
             start_armed: false,
             autonomy: Autonomy::default(),
-            auto_run_named_navigation: true,
             approval_ttl: d_ttl(),
             budgets: Budgets::default(),
             hard_deny: default_hard_deny(),

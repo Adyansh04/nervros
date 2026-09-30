@@ -219,6 +219,8 @@ pub struct SessionConfig {
     pub result_chars: usize,
     /// How long approval requests wait.
     pub approval_ttl: Duration,
+    /// How long a turn may take, not counting the operator's time on approvals.
+    pub turn_time: Duration,
 }
 
 impl Default for SessionConfig {
@@ -229,6 +231,7 @@ impl Default for SessionConfig {
             history_max: 60,
             result_chars: 6000,
             approval_ttl: Duration::from_mins(1),
+            turn_time: Duration::from_secs(90),
         }
     }
 }
@@ -238,6 +241,8 @@ struct Shared {
     approvals: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
     calls: AtomicU64,
     next_approval: AtomicU64,
+    /// Milliseconds this turn spent waiting for the operator.
+    waited_ms: AtomicU64,
     guard: Arc<Guard>,
     config: SessionConfig,
 }
@@ -262,10 +267,13 @@ impl Shared {
             args: args.clone(),
             reason,
         });
+        let asked = Instant::now();
         let approved = matches!(
             tokio::time::timeout(self.config.approval_ttl, rx).await,
             Ok(Ok(true))
         );
+        let waited = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.waited_ms.fetch_add(waited, Ordering::Relaxed);
         lock(&self.approvals).remove(&id);
         self.emit(Event::ApprovalResolved { id, approved });
         approved
@@ -418,6 +426,7 @@ impl Session {
             approvals: Mutex::default(),
             calls: AtomicU64::new(0),
             next_approval: AtomicU64::new(0),
+            waited_ms: AtomicU64::new(0),
             guard,
             config,
         });
@@ -476,14 +485,14 @@ async fn actor(
                         }
                         turns += 1;
                         let task = run_turn(turns, Origin::User(text), history.clone(), Arc::clone(&shared), Arc::clone(&source), Arc::clone(&registry));
-                        running = Some((turns, tokio::spawn(task)));
+                        running = Some((turns, tokio::spawn(limited(turns, Arc::clone(&shared), task))));
                     }
                     Command::Report(text) => {
                         reports.push(text);
                         if running.is_none() {
                             turns += 1;
                             let task = run_turn(turns, Origin::Report(reports.split_off(0).join("\n\n")), history.clone(), Arc::clone(&shared), Arc::clone(&source), Arc::clone(&registry));
-                            running = Some((turns, tokio::spawn(task)));
+                            running = Some((turns, tokio::spawn(limited(turns, Arc::clone(&shared), task))));
                         }
                     }
                     Command::StopGeneration | Command::StopMission => {
@@ -526,8 +535,43 @@ async fn actor(
                 if !reports.is_empty() {
                     turns += 1;
                     let task = run_turn(turns, Origin::Report(reports.split_off(0).join("\n\n")), history.clone(), Arc::clone(&shared), Arc::clone(&source), Arc::clone(&registry));
-                    running = Some((turns, tokio::spawn(task)));
+                    running = Some((turns, tokio::spawn(limited(turns, Arc::clone(&shared), task))));
                 }
+            }
+        }
+    }
+}
+
+/// Runs a turn under its time limit. A turn over it ends with an error, as a stopped one does;
+/// the operator's time on approvals is added back, and never runs out while one is open.
+async fn limited(
+    turn: u64,
+    shared: Arc<Shared>,
+    task: impl Future<Output = Option<History>>,
+) -> Option<History> {
+    tokio::pin!(task);
+    shared.waited_ms.store(0, Ordering::Relaxed);
+    let started = Instant::now();
+    let limit = shared.config.turn_time;
+    let mut deadline = started + limit;
+    loop {
+        tokio::select! {
+            out = &mut task => return out,
+            () = tokio::time::sleep_until(deadline.into()) => {
+                if !lock(&shared.approvals).is_empty() {
+                    deadline = Instant::now() + Duration::from_secs(1);
+                    continue;
+                }
+                let credited = started + limit + Duration::from_millis(shared.waited_ms.load(Ordering::Relaxed));
+                if credited > Instant::now() {
+                    deadline = credited;
+                    continue;
+                }
+                shared.emit(Event::Error {
+                    turn,
+                    text: format!("the turn took longer than {} s and was stopped", limit.as_secs()),
+                });
+                return None;
             }
         }
     }
@@ -537,6 +581,32 @@ async fn actor(
 enum Origin {
     User(String),
     Report(String),
+}
+
+/// This turn's tools, each call going through the guard; `acted` records any act that ran.
+fn loop_tools(
+    registry: &Registry,
+    shared: &Arc<Shared>,
+    turn: u64,
+    acted: &Arc<AtomicBool>,
+) -> Vec<LoopTool> {
+    registry
+        .iter()
+        .map(|tool| {
+            let (tool, shared, acted) = (Arc::clone(tool), Arc::clone(shared), Arc::clone(acted));
+            let spec = tool.spec().into_owned();
+            LoopTool {
+                name: spec.name,
+                description: spec.description,
+                parameters: spec.parameters,
+                invoke: Arc::new(move |args| {
+                    let (tool, shared, acted) =
+                        (Arc::clone(&tool), Arc::clone(&shared), Arc::clone(&acted));
+                    Box::pin(async move { shared.invoke(&tool, turn, args, &acted).await })
+                }),
+            }
+        })
+        .collect()
 }
 
 async fn run_turn(
@@ -566,23 +636,7 @@ async fn run_turn(
         }
     };
     let acted = Arc::new(AtomicBool::new(false));
-    let tools: Vec<LoopTool> = registry
-        .iter()
-        .map(|tool| {
-            let (tool, shared, acted) = (Arc::clone(tool), Arc::clone(&shared), Arc::clone(&acted));
-            let spec = tool.spec().into_owned();
-            LoopTool {
-                name: spec.name,
-                description: spec.description,
-                parameters: spec.parameters,
-                invoke: Arc::new(move |args| {
-                    let (tool, shared, acted) =
-                        (Arc::clone(&tool), Arc::clone(&shared), Arc::clone(&acted));
-                    Box::pin(async move { shared.invoke(&tool, turn, args, &acted).await })
-                }),
-            }
-        })
-        .collect();
+    let tools = loop_tools(&registry, &shared, turn, &acted);
     let need = Need {
         tools: !tools.is_empty(),
         ..Need::default()
@@ -620,6 +674,15 @@ async fn run_turn(
                 return Some(updated);
             }
             Err(e) if !acted.load(Ordering::SeqCst) => {
+                if matches!(
+                    e,
+                    llm::LlmError::Turn {
+                        rate_limited: true,
+                        ..
+                    }
+                ) {
+                    source.park(&model);
+                }
                 shared.emit(Event::Notice {
                     text: format!("{e}; trying the next model"),
                 });
@@ -663,6 +726,7 @@ mod tests {
             Ok(AgentBuilder::new(self.0.clone()))
         }
         fn record_use(&self, _id: &str) {}
+        fn park(&self, _id: &str) {}
     }
 
     struct Echo(ToolSpec);
@@ -734,6 +798,50 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::Reply { text, .. } if text.contains("kitchen")))
         );
+    }
+
+    struct Slow(ToolSpec);
+
+    #[async_trait]
+    impl Tool for Slow {
+        fn spec(&self) -> Cow<'_, ToolSpec> {
+            Cow::Borrowed(&self.0)
+        }
+        async fn call(&self, _args: Value) -> ToolOutcome {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            ToolOutcome::ok(json!({}))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_over_its_time_limit_is_stopped() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "find_objects", json!({})),
+            MockTurn::text("done"),
+        ]);
+        let mut r = Registry::default();
+        let spec = ToolSpec::new(
+            "find_objects",
+            "Slow.",
+            json!({"type": "object"}),
+            Risk::Observe,
+        );
+        r.add(Arc::new(Slow(spec))).unwrap();
+        let config = SessionConfig {
+            turn_time: Duration::from_millis(200),
+            ..SessionConfig::default()
+        };
+        let guard = Arc::new(Guard::new(Policy::default()));
+        let session = Session::start(Arc::new(Scripted(model)), Arc::new(r), guard, None, config);
+        let mut rx = session.subscribe();
+        session.send(Command::User("go".into()));
+        let events = collect_until_finished(&mut rx, |_| None, &session).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Error { text, .. } if text.contains("longer than")))
+        );
+        assert!(!events.iter().any(|e| matches!(e, Event::Reply { .. })));
     }
 
     #[tokio::test]

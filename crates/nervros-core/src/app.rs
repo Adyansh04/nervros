@@ -171,6 +171,7 @@ pub fn start(
         preamble: system_prompt(&profile),
         max_model_calls: usize::try_from(profile.policy.budgets.model_calls).unwrap_or(6),
         approval_ttl: profile.policy.approval_ttl,
+        turn_time: profile.policy.budgets.wall_time,
         ..SessionConfig::default()
     };
     let session = Session::start(
