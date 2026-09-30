@@ -28,15 +28,16 @@ struct Room {
     seen: Value,
 }
 
-/// How much of a room the camera has seen and how many objects it holds, from canopy's
-/// `Room` fields, rounded; null when the message has none of them.
+/// How much of a room's floor and walls the camera has seen and how many objects it holds, from
+/// canopy's `Room` fields, rounded, as flat keys: nested ones read as "unseen" to small models.
+/// Null when the message has none of them.
 fn seen_of(room: &Value) -> Value {
     let round = |k: &str| room[k].as_f64().map(|v| (v * 100.0).round() / 100.0);
     let (floor, faces) = (round("floor_coverage"), round("face_coverage"));
     if floor.is_none() && faces.is_none() {
         return Value::Null;
     }
-    json!({"floor": floor, "walls": faces, "objects": room["object_count"]})
+    json!({"floor_seen": floor, "walls_seen": faces, "objects": room["object_count"]})
 }
 
 /// The world model's rooms, or none when it does not run.
@@ -141,8 +142,8 @@ impl Tool for ListPlaces {
             .into_iter()
             .map(|r| {
                 let mut room = json!({"id": r.id, "name": r.name, "type": r.kind, "kind": "room"});
-                if !r.seen.is_null() {
-                    room["seen"] = r.seen;
+                if let (Some(room), Some(seen)) = (room.as_object_mut(), r.seen.as_object()) {
+                    room.extend(seen.clone());
                 }
                 room
             })
@@ -347,7 +348,7 @@ mod tests {
         assert_eq!(out.data["places"][0]["id"], "zone_a");
         assert_eq!(out.data["rooms"][0]["name"], "kitchen");
         assert!(
-            out.data["rooms"][0].get("seen").is_none(),
+            out.data["rooms"][0].get("floor_seen").is_none(),
             "no coverage fields, nothing claimed"
         );
     }
@@ -360,10 +361,10 @@ mod tests {
         msg["rooms"][0]["object_count"] = json!(5);
         let robot: Arc<dyn RobotPort> = Arc::new(FakeRobot::new().with_topic("/rooms", msg));
         let out = ListPlaces::new(&profile(), robot).call(json!({})).await;
-        assert_eq!(
-            out.data["rooms"][0]["seen"],
-            json!({"floor": 0.72, "walls": 0.31, "objects": 5})
-        );
+        let room = &out.data["rooms"][0];
+        assert_eq!(room["floor_seen"], 0.72);
+        assert_eq!(room["walls_seen"], 0.31);
+        assert_eq!(room["objects"], 5);
     }
 
     #[tokio::test]
