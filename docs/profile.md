@@ -115,11 +115,15 @@ rooms with their floor and walls seen, and its Explore button asks the agent to 
 
 ### `[viz]`
 
-What the viewer draws beyond the world model, each `{ topic, type }` and each optional: `plan`
-(the `nav_msgs/msg/Path` the navigation stack follows, Nav2's `/plan`) and `camera_info` (the
-`[look]` camera's `sensor_msgs/msg/CameraInfo`). With `camera_info`, the camera frame is drawn in
-the world where the camera is, as a frustum placed by TF from `[ros] base_frame` to the image's
-frame; without it, the frame is drawn on its own.
+What the viewer draws beyond the world model, each optional: `plan` (`{ topic, type }`, the
+`nav_msgs/msg/Path` the navigation stack follows, Nav2's `/plan`), `camera_info` (`{ topic, type }`,
+the `[look]` camera's `sensor_msgs/msg/CameraInfo`) and `urdf` (the robot's URDF file, relative to
+the profile). With `camera_info`, the camera frame is drawn in the world where the camera is, as a
+frustum placed by TF from `[ros] base_frame` to the image's frame; without it, the frame is drawn
+on its own. With `urdf`, the robot is drawn as its model, posed by TF: the model's root from
+`[ros] base_frame`, and each joint that is not fixed from its parent link to its child link.
+`package://` meshes are found through `ROS_PACKAGE_PATH` or `AMENT_PREFIX_PATH`. The robot's
+heading arrow is drawn either way.
 
 ### `[mission]`
 
