@@ -1,9 +1,11 @@
 //! The window: a top bar, the chat on the left, the embedded viewer in the centre, a dock on the
 //! right and a status bar. The viewer draws last, into whatever space the panels leave.
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -46,6 +48,33 @@ struct Live {
     pub rooms: Option<Value>,
     /// How many objects the world model holds.
     pub objects: Option<usize>,
+    /// Each object's name, or its label, by id.
+    pub object_names: HashMap<String, String>,
+}
+
+/// What the operator clicked in the viewer, when it is something the agent can act on.
+#[derive(Debug, Clone, PartialEq)]
+enum Picked {
+    Object(String),
+    Room(String),
+    /// A point on the floor, in the map frame.
+    Point([f32; 2]),
+}
+
+impl Picked {
+    /// From the entity paths the viewer bridge draws: `world/objects/<id>`, `world/rooms/<id>`,
+    /// and the map or coverage grid, where the clicked point counts.
+    fn from_click(path: &str, position: Option<[f32; 3]>) -> Option<Self> {
+        let path = path.trim_start_matches('/');
+        if let Some(id) = path.strip_prefix("world/objects/") {
+            return Some(Self::Object(id.to_owned()));
+        }
+        if let Some(id) = path.strip_prefix("world/rooms/") {
+            return Some(Self::Room(id.to_owned()));
+        }
+        let [x, y, _] = position.filter(|_| matches!(path, "world/map" | "world/coverage"))?;
+        Some(Self::Point([x, y]))
+    }
 }
 
 /// Shared between the window and the tasks that fill it.
@@ -87,6 +116,8 @@ pub struct Gui {
     tab: Tab,
     dock_open: bool,
     recheck: tokio::sync::mpsc::UnboundedSender<()>,
+    /// Set by the viewer on the UI thread when the selection changes.
+    picked: Rc<RefCell<Option<Picked>>>,
 }
 
 impl Gui {
@@ -110,6 +141,21 @@ impl Gui {
             expect_data_soon: Some(true),
             ..re_viewer::StartupOptions::default()
         };
+        // A click on an object or a room offers what the agent can do with it.
+        let picked = Rc::new(RefCell::new(None));
+        let sink = Rc::clone(&picked);
+        startup.on_event = Some(Rc::new(move |event: re_viewer::ViewerEvent| {
+            if let re_viewer::ViewerEventKind::SelectionChange { items } = &event.kind {
+                *sink.borrow_mut() = items.iter().find_map(|item| match item {
+                    re_viewer::SelectionChangeItem::Entity {
+                        entity_path,
+                        position,
+                        ..
+                    } => Picked::from_click(&entity_path.to_string(), position.map(Into::into)),
+                    _ => None,
+                });
+            }
+        }));
         // Our own top bar replaces the viewer's; its side panels start collapsed.
         let panels = &mut startup.panel_state_overrides;
         panels.top = Some(PanelState::Hidden);
@@ -144,6 +190,7 @@ impl Gui {
             tab: Tab::Approvals,
             dock_open: true,
             recheck,
+            picked,
         })
     }
 
@@ -318,7 +365,10 @@ impl Gui {
         let mut actions = Vec::new();
         egui::Panel::bottom("nervros_composer_panel")
             .frame(Frame::new().inner_margin(Margin::symmetric(0, 8)))
-            .show(ui, |ui| self.composer(ui, &mut actions));
+            .show(ui, |ui| {
+                self.picked_bar(ui, &mut actions);
+                self.composer(ui, &mut actions);
+            });
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .auto_shrink([false, false])
@@ -328,6 +378,76 @@ impl Gui {
                     .show(ui, self.agent.profile.policy.approval_ttl, &mut actions);
             });
         self.act(ui.ctx(), actions);
+    }
+
+    /// What was clicked in the viewer, and messages about it to send, filled in for the operator
+    /// to read and send.
+    fn picked_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let Some(picked) = self.picked.borrow().clone() else {
+            return;
+        };
+        let (what, prompts) = {
+            let live = self.live();
+            match &picked {
+                Picked::Object(id) => {
+                    let what = live
+                        .object_names
+                        .get(id)
+                        .map_or_else(|| id.clone(), |n| format!("{id} ({n})"));
+                    let prompts = vec![
+                        ("Go there", format!("Walk to {what}.")),
+                        ("What is it?", format!("Tell me about {what}.")),
+                        ("Pick it up", format!("Pick up {what}.")),
+                    ];
+                    (what, prompts)
+                }
+                Picked::Room(id) => {
+                    let name = live.rooms.as_ref().and_then(|m| {
+                        m["rooms"]
+                            .as_array()?
+                            .iter()
+                            .find(|r| r["id"] == id.as_str())
+                            .and_then(|r| {
+                                r["name"]
+                                    .as_str()
+                                    .filter(|n| !n.is_empty())
+                                    .or_else(|| r["type"].as_str())
+                                    .map(str::to_owned)
+                            })
+                    });
+                    let what = name.map_or_else(|| id.clone(), |n| format!("{id} ({n})"));
+                    let prompts = vec![
+                        ("Go there", format!("Walk to {what}.")),
+                        ("What is in it?", format!("What objects are in {what}?")),
+                    ];
+                    (what, prompts)
+                }
+                Picked::Point([x, y]) => {
+                    let what = format!("x {x:.2}, y {y:.2} on the map");
+                    (what.clone(), vec![("Go there", format!("Walk to {what}."))])
+                }
+            }
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("Selected {what}"))
+                    .small()
+                    .color(ui.tokens().text_subdued),
+            );
+            for (label, text) in prompts {
+                if ui.small_button(label).clicked() {
+                    actions.push(Action::Prefill(text));
+                }
+            }
+            if ui
+                .small_button("✕")
+                .on_hover_text("Clear the selection")
+                .clicked()
+            {
+                self.picked.replace(None);
+            }
+        });
+        ui.add_space(4.0);
     }
 
     fn composer(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -814,9 +934,26 @@ fn watch(
                 }
             };
             let rooms = latest(world.as_ref().and_then(|w| w.rooms.clone())).await;
-            let objects = latest(world.as_ref().and_then(|w| w.objects.clone()))
-                .await
+            let objects_msg = latest(world.as_ref().and_then(|w| w.objects.clone())).await;
+            let objects = objects_msg
+                .as_ref()
                 .and_then(|m| m["objects"].as_array().map(Vec::len));
+            let object_names: HashMap<String, String> = objects_msg
+                .as_ref()
+                .and_then(|m| m["objects"].as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|o| {
+                            let id = o["id"].as_str()?;
+                            let name = o["name"]
+                                .as_str()
+                                .filter(|n| !n.is_empty())
+                                .or_else(|| o["label"].as_str())?;
+                            Some((id.to_owned(), name.to_owned()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let executor = match &state {
                 Some(topic) => robot
                     .latest(
@@ -834,6 +971,7 @@ fn watch(
                 l.executor = executor;
                 l.rooms = rooms;
                 l.objects = objects;
+                l.object_names = object_names;
             }
             wake.request_repaint();
         }
@@ -939,6 +1077,25 @@ mod tests {
         [roles]
         routine = ["qwen3.5-9b-local"]
     "#;
+
+    #[test]
+    fn a_click_names_the_object_room_or_floor_point_it_hit() {
+        let at = Some([1.5, -2.0, 0.0]);
+        assert_eq!(
+            Picked::from_click("/world/objects/O17", at),
+            Some(Picked::Object("O17".into()))
+        );
+        assert_eq!(
+            Picked::from_click("world/rooms/R3", None),
+            Some(Picked::Room("R3".into()))
+        );
+        assert_eq!(
+            Picked::from_click("/world/map", at),
+            Some(Picked::Point([1.5, -2.0]))
+        );
+        assert_eq!(Picked::from_click("/world/map", None), None);
+        assert_eq!(Picked::from_click("/camera", at), None);
+    }
 
     #[test]
     fn snapshot_world_tab() {
