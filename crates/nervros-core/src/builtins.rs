@@ -18,11 +18,29 @@ use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
 const WORLD_WAIT: Duration = Duration::from_secs(2);
 
-/// Rooms from the world model as `(id, name, type, outline)`, or none when it does not run.
-async fn rooms(
-    robot: &dyn RobotPort,
-    topic: Option<&TopicRef>,
-) -> Vec<(String, String, String, Vec<(f64, f64)>)> {
+/// A room of the world model.
+struct Room {
+    id: String,
+    name: String,
+    kind: String,
+    outline: Vec<(f64, f64)>,
+    /// What the camera has seen of it, when the world model says (canopy does).
+    seen: Value,
+}
+
+/// How much of a room the camera has seen and how many objects it holds, from canopy's
+/// `Room` fields, rounded; null when the message has none of them.
+fn seen_of(room: &Value) -> Value {
+    let round = |k: &str| room[k].as_f64().map(|v| (v * 100.0).round() / 100.0);
+    let (floor, faces) = (round("floor_coverage"), round("face_coverage"));
+    if floor.is_none() && faces.is_none() {
+        return Value::Null;
+    }
+    json!({"floor": floor, "walls": faces, "objects": room["object_count"]})
+}
+
+/// The world model's rooms, or none when it does not run.
+async fn rooms(robot: &dyn RobotPort, topic: Option<&TopicRef>) -> Vec<Room> {
     let Some(t) = topic else { return Vec::new() };
     let Ok(msg) = robot.latest(&t.topic, &t.msg_type, WORLD_WAIT).await else {
         return Vec::new();
@@ -46,7 +64,13 @@ async fn rooms(
                         })
                         .unwrap_or_default();
                     let text = |k: &str| r[k].as_str().unwrap_or_default().to_owned();
-                    (text("id"), text("name"), text("type"), outline)
+                    Room {
+                        id: text("id"),
+                        name: text("name"),
+                        kind: text("type"),
+                        outline,
+                        seen: seen_of(r),
+                    }
                 })
                 .collect()
         })
@@ -84,7 +108,9 @@ impl ListPlaces {
         let spec = ToolSpec::new(
             "list_places",
             "Lists the places the robot can go to: named places with their aliases, and the rooms the \
-             world model knows. Use the returned ids in plans.",
+             world model knows, with how much of each room's floor and walls the camera has seen (0 to \
+             1) and how many objects it holds. Use the returned ids in plans. A room seen little may \
+             hold objects nobody has found yet.",
             json!({"type": "object", "properties": {}, "additionalProperties": false}),
             Risk::Observe,
         );
@@ -113,9 +139,13 @@ impl Tool for ListPlaces {
         let rooms: Vec<Value> = rooms(self.robot.as_ref(), self.rooms.as_ref())
             .await
             .into_iter()
-            .map(
-                |(id, name, kind, _)| json!({"id": id, "name": name, "type": kind, "kind": "room"}),
-            )
+            .map(|r| {
+                let mut room = json!({"id": r.id, "name": r.name, "type": r.kind, "kind": "room"});
+                if !r.seen.is_null() {
+                    room["seen"] = r.seen;
+                }
+                room
+            })
             .collect();
         ToolOutcome::ok(json!({"places": places, "rooms": rooms}))
     }
@@ -172,9 +202,9 @@ impl Tool for RobotState {
                 let room = rooms(self.robot.as_ref(), self.rooms.as_ref())
                     .await
                     .into_iter()
-                    .find(|(_, _, _, outline)| inside((x, y), outline));
-                if let Some((id, name, kind, _)) = room {
-                    out["room"] = json!({"id": id, "name": name, "type": kind});
+                    .find(|r| inside((x, y), &r.outline));
+                if let Some(r) = room {
+                    out["room"] = json!({"id": r.id, "name": r.name, "type": r.kind});
                 }
             }
             Err(e) => out["pose_error"] = Value::String(e.to_string()),
@@ -316,6 +346,24 @@ mod tests {
         let out = ListPlaces::new(&profile(), robot).call(json!({})).await;
         assert_eq!(out.data["places"][0]["id"], "zone_a");
         assert_eq!(out.data["rooms"][0]["name"], "kitchen");
+        assert!(
+            out.data["rooms"][0].get("seen").is_none(),
+            "no coverage fields, nothing claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn rooms_say_how_much_the_camera_has_seen_of_them() {
+        let mut msg = rooms_msg();
+        msg["rooms"][0]["floor_coverage"] = json!(0.724);
+        msg["rooms"][0]["face_coverage"] = json!(0.31);
+        msg["rooms"][0]["object_count"] = json!(5);
+        let robot: Arc<dyn RobotPort> = Arc::new(FakeRobot::new().with_topic("/rooms", msg));
+        let out = ListPlaces::new(&profile(), robot).call(json!({})).await;
+        assert_eq!(
+            out.data["rooms"][0]["seen"],
+            json!({"floor": 0.72, "walls": 0.31, "objects": 5})
+        );
     }
 
     #[tokio::test]

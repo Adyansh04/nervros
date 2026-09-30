@@ -215,6 +215,11 @@ pub struct WorldConfig {
     pub rooms: Option<TopicRef>,
     /// Objects (`canopy_msgs/msg/WorldObjectArray` or compatible).
     pub objects: Option<TopicRef>,
+    /// What the camera has seen, as an occupancy grid (canopy's: 0 seen, 90 still to see, 99
+    /// written off), drawn over the map while the building is explored.
+    pub coverage: Option<TopicRef>,
+    /// Where the robot has been (`nav_msgs/msg/Path`), drawn as a line.
+    pub trail: Option<TopicRef>,
 }
 
 /// A named place.

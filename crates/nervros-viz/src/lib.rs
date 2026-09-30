@@ -4,6 +4,7 @@
 //! robot at fixed rates and logs only what changed, which bounds what the viewer stores and keeps
 //! it idle while the robot is.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,10 +26,23 @@ const OBJECTS_PERIOD: Duration = Duration::from_secs(1);
 const SLOW_PERIOD: Duration = Duration::from_secs(5);
 const TOPIC_WAIT: Duration = Duration::from_secs(1);
 const CAMERA_QUALITY: u8 = 75;
-/// Occupancy at or above this is a wall, as in `nav2_map_server`'s default.
-const OCCUPIED: i64 = 65;
 const REMOVED: u64 = 2;
 const STALE: u64 = 1;
+/// canopy's coverage grid values: seen, still to see, written off (no pose can see it).
+const SEEN: i64 = 0;
+const TO_SEE: i64 = 90;
+const WRITTEN_OFF: i64 = 99;
+/// Colours objects keep by label, so a class looks the same everywhere.
+const OBJECT_PALETTE: [(u8, u8, u8); 8] = [
+    (120, 160, 255),
+    (255, 170, 60),
+    (110, 200, 120),
+    (230, 100, 140),
+    (170, 130, 240),
+    (80, 200, 210),
+    (230, 210, 80),
+    (200, 140, 100),
+];
 
 /// A recording whose data goes straight to a viewer in this process, and that viewer's input.
 ///
@@ -68,16 +82,27 @@ pub fn spawn(
         tasks.spawn(camera(rec.clone(), Arc::clone(robot), look.image.clone()));
     }
     if let Some(world) = &profile.world {
-        let topics: [(Option<TopicRef>, Duration, Drawer); 3] = [
-            (world.map.clone(), SLOW_PERIOD, draw_map),
-            (world.rooms.clone(), SLOW_PERIOD, draw_rooms),
-            (world.objects.clone(), OBJECTS_PERIOD, draw_objects),
-        ];
-        for (topic, period, draw) in topics {
+        let mut watch = |topic: &Option<TopicRef>, period, draw: Drawer| {
             if let Some(topic) = topic {
-                tasks.spawn(sample(rec.clone(), Arc::clone(robot), topic, period, draw));
+                tasks.spawn(sample(
+                    rec.clone(),
+                    Arc::clone(robot),
+                    topic.clone(),
+                    period,
+                    draw,
+                ));
             }
-        }
+        };
+        watch(&world.map, SLOW_PERIOD, Box::new(draw_map));
+        watch(&world.coverage, OBJECTS_PERIOD, Box::new(draw_coverage));
+        watch(&world.rooms, SLOW_PERIOD, Box::new(draw_rooms));
+        watch(&world.trail, SLOW_PERIOD, Box::new(draw_trail));
+        let mut drawn = BTreeSet::new();
+        watch(
+            &world.objects,
+            OBJECTS_PERIOD,
+            Box::new(move |rec, msg| draw_objects(rec, msg, &mut drawn)),
+        );
     }
     tasks.spawn(agent(rec.clone(), events));
     tasks
@@ -87,15 +112,21 @@ pub fn spawn(
 /// its log on the right. Only a default, so a layout the operator arranges is kept.
 fn layout(rec: &RecordingStream) {
     use rerun::blueprint::{
-        Blueprint, BlueprintActivation, Horizontal, Spatial2DView, Spatial3DView, TextLogView,
-        Vertical,
+        Blueprint, BlueprintActivation, Horizontal, Spatial2DView, Spatial3DView, Tabs,
+        TextLogView, TimeSeriesView, Vertical,
     };
     let side = Vertical::new([
         Spatial2DView::new("Camera").with_origin("/camera").into(),
         Spatial2DView::new("Last look")
             .with_origin("/agent/look")
             .into(),
-        TextLogView::new("Agent").with_origin("/agent/log").into(),
+        Tabs::new([
+            TextLogView::new("Agent").with_origin("/agent/log").into(),
+            TimeSeriesView::new("Exploring")
+                .with_origin("/mapping")
+                .into(),
+        ])
+        .into(),
     ]);
     let root = Horizontal::new([
         Spatial3DView::new("World").with_origin("/world").into(),
@@ -202,7 +233,8 @@ async fn camera(rec: RecordingStream, robot: Arc<dyn RobotPort>, topic: String) 
     }
 }
 
-type Drawer = fn(&RecordingStream, &Value);
+/// Draws one topic's message; objects keep state between calls.
+type Drawer = Box<dyn FnMut(&RecordingStream, &Value) + Send>;
 
 /// Polls a topic and redraws when its message changed.
 async fn sample(
@@ -210,7 +242,7 @@ async fn sample(
     robot: Arc<dyn RobotPort>,
     topic: TopicRef,
     period: Duration,
-    draw: Drawer,
+    mut draw: Drawer,
 ) {
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -238,52 +270,157 @@ fn xyz(v: &Value) -> [f32; 3] {
     f32s([num(&v["x"]), num(&v["y"]), num(&v["z"])])
 }
 
-/// The centres of a `nav_msgs/msg/OccupancyGrid`'s occupied cells, and the cell size.
-// ponytail: ignores the origin's rotation, which map servers leave at zero; rotate the cells if
-// a robot publishes a rotated grid.
-fn walls(msg: &Value) -> (Vec<[f32; 3]>, f32) {
+/// An occupancy grid as image bytes, top row first as images are, with `N` bytes per cell.
+struct Grid {
+    bytes: Vec<u8>,
+    size: [u32; 2],
+    cell_m: f32,
+    /// The lower-left corner in the map frame.
+    corner: [f32; 3],
+}
+
+/// A `nav_msgs/msg/OccupancyGrid` as a [`Grid`], each cell's value mapped by `cell`.
+// ponytail: ignores the origin's rotation, which map servers leave at zero; rotate the grid if a
+// robot publishes a rotated one.
+fn grid<const N: usize>(msg: &Value, cell: impl Fn(i64) -> [u8; N]) -> Option<Grid> {
     let info = &msg["info"];
     let res = num(&info["resolution"]);
-    let width = info["width"].as_u64().unwrap_or(0);
-    let cells = msg["data"].as_array().map_or(&[][..], Vec::as_slice);
-    if res <= 0.0 || width == 0 {
-        return (Vec::new(), 0.0);
+    let width = usize::try_from(info["width"].as_u64()?).ok()?;
+    let height = usize::try_from(info["height"].as_u64()?).ok()?;
+    let data = msg["data"].as_array()?;
+    if res <= 0.0 || width == 0 || data.len() != width * height {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(data.len() * N);
+    // ROS rows start at the origin, the bottom of the map; image rows start at the top.
+    for row in data.chunks(width).rev() {
+        for v in row {
+            bytes.extend_from_slice(&cell(v.as_i64().unwrap_or(-1)));
+        }
     }
     let origin = &info["origin"]["position"];
-    let (ox, oy) = (num(&origin["x"]), num(&origin["y"]));
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "grid indices are far below 2^52"
-    )]
-    let points = cells
-        .iter()
-        .zip(0u64..)
-        .filter(|(v, _)| v.as_i64().is_some_and(|o| o >= OCCUPIED))
-        .map(|(_, i)| {
-            let (col, row) = ((i % width) as f64, (i / width) as f64);
-            f32s([ox + (col + 0.5) * res, oy + (row + 0.5) * res, 0.0])
-        })
-        .collect();
-    let [size] = f32s([res]);
-    (points, size)
+    let [cell_m, x, y] = f32s([res, num(&origin["x"]), num(&origin["y"])]);
+    Some(Grid {
+        bytes,
+        size: [u32::try_from(width).ok()?, u32::try_from(height).ok()?],
+        cell_m,
+        corner: [x, y, 0.0],
+    })
+}
+
+fn put_grid(
+    rec: &RecordingStream,
+    path: &str,
+    grid: Grid,
+    model: rerun::ColorModel,
+    lift: f32,
+    map: bool,
+) {
+    let format = rerun::components::ImageFormat::from_color_model(
+        grid.size,
+        model,
+        rerun::ChannelDatatype::U8,
+    );
+    let [x, y, _] = grid.corner;
+    let mut layer =
+        rerun::GridMap::new(grid.bytes, format, grid.cell_m).with_translation([x, y, lift]);
+    if map {
+        layer = layer.with_colormap(rerun::components::Colormap::RvizMap);
+    }
+    // Static: only the newest grid is kept, where a new one a second would pile up.
+    put_static(rec, path, &layer);
+}
+
+/// ROS occupancy (-1 unknown, 0 free, 100 occupied) in the byte values `Colormap::RvizMap` reads.
+fn occupancy(v: i64) -> [u8; 1] {
+    if v < 0 {
+        [255]
+    } else {
+        [u8::try_from(v.min(100)).unwrap_or(100)]
+    }
+}
+
+/// canopy's coverage values as colours over the map: seen green, still to see amber, written off
+/// grey, the rest clear.
+fn coverage_colour(v: i64) -> [u8; 4] {
+    match v {
+        SEEN => [70, 180, 90, 110],
+        TO_SEE => [240, 160, 40, 150],
+        WRITTEN_OFF => [130, 130, 130, 90],
+        _ => [0, 0, 0, 0],
+    }
 }
 
 fn draw_map(rec: &RecordingStream, msg: &Value) {
-    let (points, size) = walls(msg);
-    put(
-        rec,
-        "world/map",
-        &rerun::Points3D::new(points)
-            .with_radii([size / 2.0])
-            .with_colors([rerun::Color::from_rgb(140, 140, 150)]),
-    );
+    if let Some(g) = grid(msg, occupancy) {
+        put_grid(rec, "world/map", g, rerun::ColorModel::L, 0.0, true);
+    }
 }
 
-/// Room outlines from a `canopy_msgs/msg/RoomArray`, labelled with their names.
+fn draw_coverage(rec: &RecordingStream, msg: &Value) {
+    if let Some(g) = grid(msg, coverage_colour) {
+        put_grid(
+            rec,
+            "world/coverage",
+            g,
+            rerun::ColorModel::RGBA,
+            0.01,
+            false,
+        );
+    }
+}
+
+/// How much of a room the camera has seen, the mean of its floor and walls (canopy's fields).
+fn seen(room: &Value) -> Option<f64> {
+    let floor = room["floor_coverage"].as_f64()?;
+    let faces = room["face_coverage"].as_f64().unwrap_or(floor);
+    Some(f64::midpoint(floor, faces).clamp(0.0, 1.0))
+}
+
+/// Red for unseen through amber to green for seen.
+fn seen_colour(seen: f64) -> rerun::Color {
+    let lerp = |a: u8, b: u8, t: f64| {
+        let v = f64::from(a) + (f64::from(b) - f64::from(a)) * t;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "v is within 0..=255"
+        )]
+        let byte = v.round().clamp(0.0, 255.0) as u8;
+        byte
+    };
+    let (from, to, t) = if seen < 0.5 {
+        ((220, 80, 60), (235, 170, 40), seen * 2.0)
+    } else {
+        ((235, 170, 40), (70, 180, 90), (seen - 0.5) * 2.0)
+    };
+    rerun::Color::from_rgb(
+        lerp(from.0, to.0, t),
+        lerp(from.1, to.1, t),
+        lerp(from.2, to.2, t),
+    )
+}
+
+/// The area of a polygon, by the shoelace formula.
+fn area(points: &[[f32; 3]]) -> f64 {
+    let n = points.len();
+    let twice: f64 = (0..n)
+        .map(|i| {
+            let (a, b) = (points[i], points[(i + 1) % n]);
+            f64::from(a[0]) * f64::from(b[1]) - f64::from(b[0]) * f64::from(a[1])
+        })
+        .sum();
+    twice.abs() / 2.0
+}
+
+/// Room outlines from a `canopy_msgs/msg/RoomArray`, labelled, and coloured by how much the
+/// camera has seen of each; the share seen overall, by area, goes on the "Exploring" plot.
 fn draw_rooms(rec: &RecordingStream, msg: &Value) {
     let list = msg["rooms"].as_array().map_or(&[][..], Vec::as_slice);
     let mut strips = Vec::new();
     let mut labels = Vec::new();
+    let mut colours = Vec::new();
+    let (mut seen_area, mut total_area) = (0.0, 0.0);
     for room in list {
         let Some(points) = room["outline"]["points"].as_array() else {
             continue;
@@ -292,60 +429,124 @@ fn draw_rooms(rec: &RecordingStream, msg: &Value) {
             .iter()
             .map(|p| [xyz(p)[0], xyz(p)[1], 0.02])
             .collect();
+        let room_seen = seen(room);
+        if let Some(fraction) = room_seen {
+            let a = area(&strip);
+            seen_area += fraction * a;
+            total_area += a;
+        }
         if let Some(first) = strip.first().copied() {
             strip.push(first);
         }
         strips.push(strip);
         let text = |k: &str| room[k].as_str().unwrap_or_default().to_owned();
-        labels.push(format!("{} {}", text("id"), text("name")));
+        labels.push(match room_seen {
+            Some(f) => format!("{} {} {:.0}%", text("id"), text("name"), f * 100.0),
+            None => format!("{} {}", text("id"), text("name")),
+        });
+        colours.push(room_seen.map_or(rerun::Color::from_rgb(200, 200, 210), seen_colour));
     }
-    put(
+    put_static(
         rec,
         "world/rooms",
         &rerun::LineStrips3D::new(strips)
             .with_labels(labels)
-            .with_radii([0.02]),
+            .with_colors(colours)
+            .with_radii([0.03]),
+    );
+    #[expect(clippy::cast_precision_loss, reason = "a handful of rooms")]
+    put(
+        rec,
+        "mapping/rooms",
+        &rerun::Scalars::single(list.len() as f64),
+    );
+    if total_area > 0.0 {
+        put(
+            rec,
+            "mapping/seen %",
+            &rerun::Scalars::single(100.0 * seen_area / total_area),
+        );
+    }
+}
+
+/// Where the robot has been, from a `nav_msgs/msg/Path`.
+fn draw_trail(rec: &RecordingStream, msg: &Value) {
+    let points: Vec<[f32; 3]> = msg["poses"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .map(|p| {
+            let [x, y, _] = xyz(&p["pose"]["position"]);
+            [x, y, 0.03]
+        })
+        .collect();
+    put_static(
+        rec,
+        "world/trail",
+        &rerun::LineStrips3D::new([points])
+            .with_radii([0.015])
+            .with_colors([rerun::Color::from_rgb(90, 170, 255)]),
     );
 }
 
-/// Objects from a `canopy_msgs/msg/WorldObjectArray` as labelled boxes; stale ones are faded.
-fn draw_objects(rec: &RecordingStream, msg: &Value) {
+/// A colour by label: FNV-1a over its bytes into the palette.
+fn object_colour(label: &str, alpha: u8) -> rerun::Color {
+    let hash = label.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    });
+    let (r, g, b) = OBJECT_PALETTE[usize::try_from(hash % 8).unwrap_or(0)];
+    rerun::Color::from_unmultiplied_rgba(r, g, b, alpha)
+}
+
+/// Objects from a `canopy_msgs/msg/WorldObjectArray`, one entity each so a click in the viewer
+/// names the object; stale ones are faded, and ones that went away are cleared.
+fn draw_objects(rec: &RecordingStream, msg: &Value, drawn: &mut BTreeSet<String>) {
     let list = msg["objects"].as_array().map_or(&[][..], Vec::as_slice);
-    let live: Vec<&Value> = list
-        .iter()
-        .filter(|o| o["state"].as_u64() != Some(REMOVED))
-        .collect();
-    let centers = live.iter().map(|o| xyz(&o["pose"]["position"]));
-    let halves = live.iter().map(|o| xyz(&o["size"]).map(|s| s / 2.0));
-    let rotations = live.iter().map(|o| {
+    let mut now = BTreeSet::new();
+    for o in list.iter().filter(|o| o["state"].as_u64() != Some(REMOVED)) {
+        let Some(id) = o["id"].as_str().filter(|i| !i.is_empty()) else {
+            continue;
+        };
         let q = &o["pose"]["orientation"];
         let w = q["w"].as_f64().unwrap_or(1.0);
-        rerun::Quaternion::from_xyzw(f32s([num(&q["x"]), num(&q["y"]), num(&q["z"]), w]))
-    });
-    let labels = live.iter().map(|o| {
+        let label = o["label"].as_str().unwrap_or_default();
         let name = o["name"]
             .as_str()
             .filter(|n| !n.is_empty())
-            .or_else(|| o["label"].as_str())
-            .unwrap_or_default();
-        format!("{} {name}", o["id"].as_str().unwrap_or_default())
-    });
-    let colors = live.iter().map(|o| {
+            .unwrap_or(label);
         let alpha = if o["state"].as_u64() == Some(STALE) {
             90
         } else {
             255
         };
-        rerun::Color::from_unmultiplied_rgba(120, 160, 255, alpha)
-    });
+        put_static(
+            rec,
+            &format!("world/objects/{id}"),
+            &rerun::Boxes3D::from_centers_and_half_sizes(
+                [xyz(&o["pose"]["position"])],
+                [xyz(&o["size"]).map(|v| v / 2.0)],
+            )
+            .with_quaternions([rerun::Quaternion::from_xyzw(f32s([
+                num(&q["x"]),
+                num(&q["y"]),
+                num(&q["z"]),
+                w,
+            ]))])
+            .with_labels([format!("{id} {name}")])
+            .with_colors([object_colour(label, alpha)]),
+        );
+        now.insert(id.to_owned());
+    }
+    for gone in drawn.difference(&now) {
+        put_static(rec, &format!("world/objects/{gone}"), &rerun::Clear::flat());
+    }
+    #[expect(clippy::cast_precision_loss, reason = "far fewer objects than 2^52")]
     put(
         rec,
-        "world/objects",
-        &rerun::Boxes3D::from_centers_and_half_sizes(centers, halves)
-            .with_quaternions(rotations)
-            .with_labels(labels)
-            .with_colors(colors),
+        "mapping/objects",
+        &rerun::Scalars::single(now.len() as f64),
     );
+    *drawn = now;
 }
 
 /// The agent's replies and tool calls as a text log, and its marked images.
@@ -410,14 +611,58 @@ mod tests {
     }
 
     #[test]
-    fn walls_are_occupied_cell_centres() {
+    fn grids_come_out_top_row_first() {
         let msg = serde_json::json!({
             "info": {"resolution": 0.5, "width": 2, "height": 2,
                      "origin": {"position": {"x": 1.0, "y": -1.0, "z": 0.0}}},
             "data": [0, 100, -1, 65]
         });
-        let (points, size) = walls(&msg);
-        assert_eq!(points, vec![[1.75, -0.75, 0.0], [1.75, -0.25, 0.0]]);
-        assert!((size - 0.5).abs() < f32::EPSILON);
+        let g = grid(&msg, occupancy).unwrap();
+        assert_eq!(
+            g.bytes,
+            vec![255, 65, 0, 100],
+            "the second ROS row is the image's first"
+        );
+        assert_eq!(g.size, [2, 2]);
+        assert!(
+            g.corner
+                .iter()
+                .zip([1.0, -1.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < f32::EPSILON)
+        );
+        let short =
+            serde_json::json!({"info": {"resolution": 0.5, "width": 2, "height": 2}, "data": [0]});
+        assert!(
+            grid(&short, occupancy).is_none(),
+            "a grid with missing cells is not drawn"
+        );
+    }
+
+    #[test]
+    fn coverage_is_coloured_by_what_the_camera_saw() {
+        assert_eq!(coverage_colour(SEEN)[1], 180);
+        assert_eq!(coverage_colour(TO_SEE)[0], 240);
+        assert_eq!(coverage_colour(-1)[3], 0, "outside the rooms stays clear");
+    }
+
+    #[test]
+    fn a_room_is_as_seen_as_the_mean_of_floor_and_walls() {
+        let room = serde_json::json!({"floor_coverage": 0.9, "face_coverage": 0.5});
+        assert!((seen(&room).unwrap() - 0.7).abs() < 1e-9);
+        assert!(seen(&serde_json::json!({})).is_none());
+        assert_eq!(seen_colour(0.0), rerun::Color::from_rgb(220, 80, 60));
+        assert_eq!(seen_colour(1.0), rerun::Color::from_rgb(70, 180, 90));
+        let square = [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 3.0, 0.0],
+            [0.0, 3.0, 0.0],
+        ];
+        assert!((area(&square) - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn objects_keep_their_colour_by_label() {
+        assert_eq!(object_colour("mug", 255), object_colour("mug", 255));
     }
 }
