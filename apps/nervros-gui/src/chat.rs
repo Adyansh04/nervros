@@ -707,7 +707,8 @@ fn report(ui: &mut egui::Ui, text: &str) {
 fn notice(ui: &mut egui::Ui, text: &str) {
     ui.horizontal(|ui| {
         ui.small_icon(&icons::INFO, Some(ui.tokens().text_subdued));
-        ui.label(RichText::new(text).color(ui.tokens().text_subdued));
+        // The viewer's style extends labels, so a long notice would widen the panel instead.
+        ui.add(egui::Label::new(RichText::new(text).color(ui.tokens().text_subdued)).wrap());
     });
 }
 
@@ -716,7 +717,7 @@ fn error_card(ui: &mut egui::Ui, text: &str, last_user: Option<&str>, actions: &
     card(ui, t.error_fg_color).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.small_icon(&icons::ERROR, Some(t.error_fg_color));
-            ui.label(RichText::new(text).color(t.error_fg_color));
+            ui.add(egui::Label::new(RichText::new(text).color(t.error_fg_color)).wrap());
         });
         if let Some(last) = last_user
             && ui.add(ReButton::new("Retry").small().secondary()).clicked()
@@ -940,9 +941,16 @@ pub(crate) mod tests {
             width: 96,
             height: 54,
         });
+        chat.apply(&Event::Notice {
+            text: "The robot is running mission m7, at s2_GoToPlace, started before this session. \
+                   It carries on unwatched until it ends; Stop ends it now."
+                .to_owned(),
+        });
         chat.apply(&Event::Error {
             turn: 2,
-            text: "every model failed: qwen3.5-9b-local: connection refused".to_owned(),
+            text: "every model failed: qwen3.5-9b-local: connection refused, and \
+                   qwen3.8-27b-or: the free tier's daily quota is spent"
+                .to_owned(),
         });
         render(chat, "chat_error_image");
     }
