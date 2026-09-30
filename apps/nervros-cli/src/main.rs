@@ -90,17 +90,9 @@ impl From<RoleArg> for Role {
     }
 }
 
-/// Where the quota ledger lives: `$XDG_STATE_HOME/nervros`, else `~/.local/state/nervros`.
-fn state_dir() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME").map_or_else(
-        || nervros_core::secret::expand_home(Path::new("~/.local/state/nervros")),
-        |d| PathBuf::from(d).join("nervros"),
-    )
-}
-
 fn router(models: &Path) -> Result<Router> {
     let config = ModelsConfig::load(models).context("loading the models file")?;
-    let ledger = state_dir().join("quota.json");
+    let ledger = nervros_core::app::state_dir().join("quota.json");
     Router::with_ledger_file(config, &ledger, PrivacyMode::Sim).context("loading the quota ledger")
 }
 
@@ -124,7 +116,7 @@ async fn main() -> Result<()> {
         Command::Chat { say, arm, approve } => {
             robot::chat(
                 &cli.profile,
-                &state_dir(),
+                &nervros_core::app::state_dir(),
                 robot::ChatOptions { say, arm, approve },
             )
             .await

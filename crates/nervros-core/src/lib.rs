@@ -6,6 +6,7 @@
 pub mod app;
 pub mod builtins;
 pub mod context;
+pub mod doctor;
 pub mod guard;
 pub mod llm;
 pub mod log;

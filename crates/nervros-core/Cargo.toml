@@ -11,6 +11,10 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The ROS node itself (r2r and a sourced ROS install); off, the core builds anywhere.
+rcl = ["nervros-ros/rcl"]
+
 [dependencies]
 async-trait.workspace = true
 nervros-ros = { path = "../nervros-ros", default-features = false }

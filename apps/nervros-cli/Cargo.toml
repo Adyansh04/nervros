@@ -14,7 +14,7 @@ workspace = true
 [features]
 default = ["ros"]
 # Talk to a live ROS graph through r2r; needs a sourced ROS environment (scripts/ros-env.sh).
-ros = ["nervros-ros/rcl"]
+ros = ["nervros-core/rcl"]
 
 [dependencies]
 anyhow.workspace = true
