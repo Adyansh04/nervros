@@ -517,20 +517,24 @@ impl LookTool {
             Ok(b) => b,
             Err(e) => return Some(Err(e.to_string())),
         };
+        let question = question.map(str::trim).filter(|q| !q.is_empty());
         let marks = if instances.is_empty() {
-            "none".to_owned()
+            // Said plainly: told of "marks: none", a small model reports marks it never saw.
+            "The detector marked nothing on this frame.".to_owned()
         } else {
-            instances
+            let list = instances
                 .iter()
                 .enumerate()
                 .map(|(i, m)| format!("{} {} ({:.2})", i + 1, m.label, m.score))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", ");
+            format!(
+                "The detector's numbered marks on this frame: {list}. Refer to a mark by its number \
+                 when you mention it."
+            )
         };
-        let question = question.map(str::trim).filter(|q| !q.is_empty());
         let prompt = format!(
-            "{}\n\nThe detector's numbered marks on this frame: {marks}. Refer to a mark by its \
-             number when you mention it. Say so when something cannot be seen.",
+            "{}\n\n{marks} Say so when something cannot be seen.",
             question.unwrap_or(DEFAULT_QUESTION)
         );
         let image = ImageInput {
@@ -705,6 +709,38 @@ mod tests {
             "{}",
             asked[0].0
         );
+    }
+
+    #[tokio::test]
+    async fn with_no_marks_the_vision_model_is_told_so_plainly() {
+        let robot: Arc<dyn RobotPort> = Arc::new(
+            FakeRobot::new()
+                .with_frame("/camera", frame(12.0))
+                .with_topic(
+                    "/masks",
+                    json!({"header": {"stamp": {"sec": 12, "nanosec": 0}}, "instances": []}),
+                ),
+        );
+        let config: LookConfig = toml::from_str(
+            "image = \"/camera\"\ndetections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n",
+        )
+        .unwrap();
+        let eyes = Arc::new(FakeEyes {
+            answer: Ok("A wooden floor.".into()),
+            asked: Mutex::new(Vec::new()),
+        });
+        let look = LookTool::start(
+            config,
+            robot,
+            Arc::new(SnapshotStore::default()),
+            Some(Arc::clone(&eyes) as Arc<dyn Eyes>),
+        )
+        .unwrap();
+        tokio::task::yield_now().await;
+        let _ = look.call(json!({})).await;
+        let asked = guard(&eyes.asked);
+        assert!(asked[0].0.contains("marked nothing"), "{}", asked[0].0);
+        assert!(!asked[0].0.contains("numbered"), "{}", asked[0].0);
     }
 
     #[tokio::test]
