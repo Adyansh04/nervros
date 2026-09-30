@@ -395,7 +395,7 @@ fn watch_spec() -> ToolSpec {
             "value": {"description": "For value: what to compare with."},
             "contains": {"type": "string", "description": "For text."},
             "say": {"type": "string", "description": "What the report should add, such as what to do then."},
-            "repeat": {"type": "boolean", "description": "Report each time it comes back, not just once."},
+            "repeat": {"type": "boolean", "description": "true for \"each time\", \"every time\" or \"whenever\": report each time it comes back. Otherwise it reports once and ends."},
             "for_s": {"type": "integer", "minimum": 1, "maximum": MAX_FOR_S, "description": "How long to watch (1800)."}
         }, "required": ["topic", "condition"], "additionalProperties": false}),
         Risk::Observe,
