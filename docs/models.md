@@ -80,8 +80,9 @@ acted, the turn ends instead of repeating the action.
 
 ## Quotas
 
-Requests are counted per model and per pool in `~/.local/state/nervros/quota.json`
-(`$XDG_STATE_HOME/nervros` when set). Days roll over at midnight UTC, and for Gemini at midnight
+Every request is counted, per model and per pool, in `~/.local/state/nervros/quota.json`
+(`$XDG_STATE_HOME/nervros` when set): a turn that calls tools makes several, and one the quota
+refuses ends the turn there. Days roll over at midnight UTC, and for Gemini at midnight
 Pacific time, as the providers count them. A model answering 429 is set aside for a minute. The
 app's top bar shows the answering model with today's count, and the dock's Models tab shows every
 role's chain and why a model is skipped.

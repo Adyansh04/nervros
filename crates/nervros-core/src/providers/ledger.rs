@@ -66,6 +66,17 @@ pub enum Refused {
     Minute,
 }
 
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parked(_) => f.write_str("set aside after a 429"),
+            Self::Daily => f.write_str("its daily limit is used up"),
+            Self::Pool(pool) => write!(f, "the {pool} pool's daily limit is used up"),
+            Self::Minute => f.write_str("its per-minute limit is used up"),
+        }
+    }
+}
+
 impl Ledger {
     /// Loads the ledger from a JSON file, or starts empty when the file does not exist.
     ///

@@ -644,18 +644,10 @@ async fn run_turn(
     let candidates = source.candidates(Role::Routine, need);
     let mut failures = Vec::new();
     for model in candidates {
-        let builder = match source.builder(&model) {
-            Ok(b) => b,
-            Err(e) => {
-                failures.push(format!("{model}: {e}"));
-                continue;
-            }
-        };
         let mut updated = history.clone();
-        source.record_use(&model);
         let result = llm::chat(
             &model,
-            builder,
+            Arc::clone(&source),
             &shared.config.preamble,
             shared.config.max_model_calls,
             &tools,
@@ -725,8 +717,85 @@ mod tests {
         fn builder(&self, _id: &str) -> Result<AgentBuilder, LlmError> {
             Ok(AgentBuilder::new(self.0.clone()))
         }
-        fn record_use(&self, _id: &str) {}
+        fn take_request(&self, _id: &str) -> Result<(), String> {
+            Ok(())
+        }
         fn park(&self, _id: &str) {}
+    }
+
+    /// A scripted model whose quota grants `allowed` requests, counting those it grants.
+    struct Metered {
+        inner: Scripted,
+        allowed: usize,
+        taken: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AgentSource for Metered {
+        fn candidates(&self, role: Role, need: Need) -> Vec<String> {
+            self.inner.candidates(role, need)
+        }
+        fn builder(&self, id: &str) -> Result<AgentBuilder, LlmError> {
+            self.inner.builder(id)
+        }
+        fn take_request(&self, _id: &str) -> Result<(), String> {
+            self.taken
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    (n < self.allowed).then_some(n + 1)
+                })
+                .map(|_| ())
+                .map_err(|_| "its daily limit is used up".to_owned())
+        }
+        fn park(&self, _id: &str) {}
+    }
+
+    fn metered(allowed: usize) -> Arc<Metered> {
+        Arc::new(Metered {
+            inner: Scripted(MockCompletionModel::new([
+                MockTurn::tool_call("c1", "find_objects", json!({"query": "cup"})),
+                MockTurn::text("The cup is in the kitchen."),
+            ])),
+            allowed,
+            taken: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    async fn ask_where_the_cup_is(source: &Arc<Metered>) -> Vec<Event> {
+        let session = Session::start(
+            Arc::clone(source) as Arc<dyn AgentSource>,
+            registry(Risk::Observe),
+            Arc::new(Guard::new(Policy::default())),
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("Where is the cup?".into()));
+        collect_until_finished(&mut rx, |_| None, &session).await
+    }
+
+    #[tokio::test]
+    async fn every_request_of_a_turn_counts_against_the_quota() {
+        let source = metered(10);
+        let events = ask_where_the_cup_is(&source).await;
+        assert!(events.iter().any(|e| matches!(e, Event::Reply { .. })));
+        assert_eq!(
+            source.taken.load(Ordering::SeqCst),
+            2,
+            "the tool call and the reply are two requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spent_quota_ends_the_turn() {
+        let source = metered(1);
+        let events = ask_where_the_cup_is(&source).await;
+        assert!(!events.iter().any(|e| matches!(e, Event::Reply { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Error { text, .. } if text.contains("daily limit"))),
+            "{events:?}"
+        );
+        assert_eq!(source.taken.load(Ordering::SeqCst), 1);
     }
 
     struct Echo(ToolSpec);
