@@ -624,7 +624,12 @@ fn draw_rooms(rec: &RecordingStream, msg: &Value, drawn: &mut BTreeSet<String>) 
         if let Some(first) = strip.first().copied() {
             strip.push(first);
         }
-        let name = room["name"].as_str().unwrap_or_default();
+        // canopy's names are "room C" until someone names the room; its type says more.
+        let name = room["type"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .or_else(|| room["name"].as_str())
+            .unwrap_or_default();
         let label = match room_seen {
             Some(f) => format!("{id} {name} {:.0}%", f * 100.0),
             None => format!("{id} {name}"),
