@@ -54,7 +54,9 @@ graph as `ros2` would (topics with their QoS, rates, messages, nodes, services, 
 parameters, TF and logs), and, where the profile lists them, call services, send action goals,
 set parameters and publish, each approved by you. With [`[segment]`](docs/profile.md#segment) it
 segments whatever you name in a camera's view, "the floor" or "every mug", and shows you the
-regions.
+regions. With [`[editor]`](docs/profile.md#editor) it reviews and fixes the saved world model when
+you ask ("the chair by the window is a stool", "merge the two halves of the sofa"), and Edit world
+opens the same world on its floor plan to fix by hand.
 
 In the window, Enter sends, Esc stops the reply and Ctrl+Shift+S stops the mission. Ctrl+1 to
 Ctrl+7 switch the dock between the mission, the world model, the viewer's layers, approvals, events,

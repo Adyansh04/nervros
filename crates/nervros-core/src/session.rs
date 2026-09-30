@@ -344,7 +344,8 @@ impl Shared {
                 Decision::Allow => self.run(tool, args, &spec.resources).await,
             },
         };
-        if spec.lane() == Lane::Act
+        // An edit is not repeated by the next model either.
+        if spec.lane() != Lane::Observe
             && matches!(outcome.status, Status::Succeeded | Status::Accepted)
         {
             flags.acted.store(true, Ordering::SeqCst);

@@ -34,7 +34,7 @@ does not declare, is for the generic tools of [`[ros_tools]`](#ros_tools), behin
 | `ros_name` | required | The service or topic. |
 | `type` | required | `pkg/srv/Name` or `pkg/msg/Name`. |
 | `description` | from the interface | Replaces the interface file's comment. |
-| `risk` | required for a service; `observe` for a topic | `observe`, `world_edit`, `motion` or `manipulation`. Anything but `observe` is an act: it needs the robot armed and, when supervised, the operator's approval. A service can act on the robot, so a service tool without it fails the start instead of running as a read. |
+| `risk` | required for a service; `observe` for a topic | `observe`, `annotate`, `world_edit`, `motion` or `manipulation`. `annotate` changes only what the robot knows, such as the world model: no arming, the operator's approval when supervised. The rest are acts: they need the robot armed and, when supervised, approval. A service can act on the robot, so a service tool without it fails the start instead of running as a read. |
 | `resources` | none | `base`, `left_arm`, `right_arm`: two calls holding the same one cannot run at once. |
 | `timeout` | `"5s"` | Per call. |
 | `hide_fields` | none | Request fields the model neither sees nor fills, such as an embedding. |
@@ -179,6 +179,21 @@ share of the frame, as marks of the snapshot. It needs `[look]`'s cameras.
 
 `nervros-cli segment "the floor" --camera head --out floor.jpg` runs it once, without the chat
 model.
+
+### `[editor]`
+
+canopy's world editor (`editor/canopy_editor.py <world_dir>`), which serves one saved world over
+HTTP. With it the agent gets `review_world` and `inspect_object` (reads), and `edit_world` and
+`world_edits` (edits, approved when supervised, no arming); and the app gets Edit world, the saved
+world on its floor plan, where objects are picked, moved, resized, turned, split, merged and added
+and rooms typed, as on canopy's own editor page. Both go through the editor, so each sees the
+other's edits.
+
+| Key | Default | |
+|---|---|---|
+| `url` | `"http://127.0.0.1:8765"` | The editor. |
+| `token` | none | `{ file = "..." }` or `{ env = "..." }`, when it serves off loopback. |
+| `reload` | none | A `std_srvs/srv/Trigger` that makes the running world model read the saved world again, called after `world_edits` saves: canopy's `/canopy/reload`. |
 
 ### `[world]`
 
