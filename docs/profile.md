@@ -102,8 +102,12 @@ the model and the operator both see.
 
 The world model's topics, each `{ topic, type }` and each optional: `map` (a
 `nav_msgs/msg/OccupancyGrid`), `rooms` and `objects` (canopy's `RoomArray` and
-`WorldObjectArray`, or messages with the same fields). The viewer draws them; `list_places`,
-`robot_state` and missions read rooms and objects.
+`WorldObjectArray`, or messages with the same fields), `coverage` (an `OccupancyGrid` of what the
+camera has seen, canopy's `/canopy/coverage`: 0 seen, 90 still to see, 99 written off) and `trail`
+(a `nav_msgs/msg/Path` of where the robot has been). The viewer draws them all, rooms coloured by
+how much of each the camera has seen, and plots that share with the room and object counts;
+`list_places`, `robot_state` and missions read rooms and objects. The app's World tab lists the
+rooms with their floor and walls seen, and its Explore button asks the agent to explore.
 
 ### `[mission]`
 

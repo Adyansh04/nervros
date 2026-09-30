@@ -2,6 +2,7 @@
 //! right and a status bar. The viewer draws last, into whatever space the panels leave.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
@@ -29,6 +30,9 @@ const COMPOSER: &str = "nervros_composer";
 const STOP_HINT: &str = "Halts the mission and cancels every goal; the hands keep their grip. \
                          The e-stop on the robot's remote is the real emergency stop.";
 
+/// What the World tab's Explore button says to the agent.
+const EXPLORE_REQUEST: &str = "Explore the building to fill in the map.";
+
 /// What background tasks learn about the robot.
 #[derive(Debug, Default)]
 struct Live {
@@ -38,6 +42,10 @@ struct Live {
     pub executor: Option<Value>,
     /// The last connection check.
     pub checks: Option<Vec<Check>>,
+    /// The world model's last rooms message.
+    pub rooms: Option<Value>,
+    /// How many objects the world model holds.
+    pub objects: Option<usize>,
 }
 
 /// Shared between the window and the tasks that fill it.
@@ -46,6 +54,7 @@ type SharedLive = Arc<Mutex<Live>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Mission,
+    World,
     Approvals,
     Events,
     Models,
@@ -53,8 +62,9 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: [(Self, &'static str); 5] = [
+    const ALL: [(Self, &'static str); 6] = [
         (Self::Mission, "Mission"),
+        (Self::World, "World"),
         (Self::Approvals, "Approvals"),
         (Self::Events, "Events"),
         (Self::Models, "Models"),
@@ -187,7 +197,14 @@ impl Gui {
         let (esc, stop, tab) = ctx.input_mut(|i| {
             let esc = working && i.consume_key(Modifiers::NONE, Key::Escape);
             let stop = i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::S);
-            let keys = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5];
+            let keys = [
+                Key::Num1,
+                Key::Num2,
+                Key::Num3,
+                Key::Num4,
+                Key::Num5,
+                Key::Num6,
+            ];
             let tab = keys.iter().position(|k| i.consume_key(Modifiers::CTRL, *k));
             (esc, stop, tab)
         });
@@ -407,6 +424,7 @@ impl Gui {
             .auto_shrink([false, false])
             .show(ui, |ui| match self.tab {
                 Tab::Mission => self.mission_tab(ui),
+                Tab::World => self.world_tab(ui),
                 Tab::Approvals => self.approvals_tab(ui),
                 Tab::Events => self.events_tab(ui),
                 Tab::Models => self.models_tab(ui),
@@ -423,6 +441,23 @@ impl Gui {
                 "No plan yet. Ask the robot to do something; its plan appears here.",
             ),
         }
+        self.act(ui.ctx(), actions);
+    }
+
+    fn world_tab(&mut self, ui: &mut egui::Ui) {
+        let (rooms, objects) = {
+            let l = self.live();
+            (l.rooms.clone(), l.objects)
+        };
+        let Some(rooms) = rooms else {
+            empty(
+                ui,
+                "No world model yet. With one running, its rooms and how much of each the camera \
+                 has seen appear here.",
+            );
+            return;
+        };
+        let actions = world_view(ui, &rooms, objects);
         self.act(ui.ctx(), actions);
     }
 
@@ -604,6 +639,94 @@ fn chip(ui: &mut egui::Ui, color: Color32, text: impl Into<String>) {
         });
 }
 
+/// The World tab: the world model's rooms, how much of each the camera has seen, and a button that
+/// asks the agent to explore.
+fn world_view(ui: &mut egui::Ui, rooms: &Value, objects: Option<usize>) -> Vec<Action> {
+    let list = rooms["rooms"].as_array().cloned().unwrap_or_default();
+    let fraction = |r: &Value, k: &str| r[k].as_f64().map(|v| v.clamp(0.0, 1.0));
+    let seen: Vec<f64> = list
+        .iter()
+        .filter_map(|r| {
+            let floor = fraction(r, "floor_coverage")?;
+            Some(f64::midpoint(
+                floor,
+                fraction(r, "face_coverage").unwrap_or(floor),
+            ))
+        })
+        .collect();
+    let mut actions = Vec::new();
+    ui.horizontal(|ui| {
+        let mut head = format!("{} rooms · {} objects", list.len(), objects.unwrap_or(0));
+        if !seen.is_empty() {
+            #[expect(clippy::cast_precision_loss, reason = "a handful of rooms")]
+            let mean = seen.iter().sum::<f64>() / seen.len() as f64;
+            let _ = write!(head, " · {:.0}% seen", mean * 100.0);
+        }
+        ui.label(RichText::new(head).strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .button("Explore")
+                .on_hover_text(
+                    "Ask the robot to explore the building. You approve the mission it plans.",
+                )
+                .clicked()
+            {
+                actions.push(Action::Say(EXPLORE_REQUEST.to_owned()));
+            }
+        });
+    });
+    ui.add_space(4.0);
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::Grid::new("world_rooms")
+            .num_columns(4)
+            .striped(true)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                for head in ["Room", "Floor seen", "Walls seen", "Objects"] {
+                    ui.label(RichText::new(head).small().color(ui.tokens().text_subdued));
+                }
+                ui.end_row();
+                for r in &list {
+                    let text = |k: &str| r[k].as_str().unwrap_or_default().to_owned();
+                    let (id, name, kind) = (text("id"), text("name"), text("type"));
+                    // canopy's names are often its types; say it once.
+                    let name = [
+                        id,
+                        name.clone(),
+                        if kind == name { String::new() } else { kind },
+                    ]
+                    .into_iter()
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                    ui.label(name);
+                    for k in ["floor_coverage", "face_coverage"] {
+                        match fraction(r, k) {
+                            #[expect(clippy::cast_possible_truncation, reason = "a fraction")]
+                            Some(f) => {
+                                ui.add(
+                                    egui::ProgressBar::new(f as f32)
+                                        .desired_width(90.0)
+                                        .text(format!("{:.0}%", f * 100.0)),
+                                );
+                            }
+                            None => {
+                                ui.label("·");
+                            }
+                        }
+                    }
+                    ui.label(
+                        r["object_count"]
+                            .as_u64()
+                            .map_or("·".to_owned(), |n| n.to_string()),
+                    );
+                    ui.end_row();
+                }
+            });
+    });
+    actions
+}
+
 fn empty(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).color(ui.tokens().text_subdued));
 }
@@ -676,9 +799,24 @@ fn watch(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         let state = profile.mission.as_ref().map(|m| m.state.clone());
+        let world = profile.world.clone();
         loop {
             tick.tick().await;
             let topics = robot.graph().await.ok().map(|g| g.topics.len());
+            let latest = |t: Option<nervros_core::profile::TopicRef>| {
+                let robot = Arc::clone(&robot);
+                async move {
+                    let t = t?;
+                    robot
+                        .latest(&t.topic, &t.msg_type, Duration::from_secs(1))
+                        .await
+                        .ok()
+                }
+            };
+            let rooms = latest(world.as_ref().and_then(|w| w.rooms.clone())).await;
+            let objects = latest(world.as_ref().and_then(|w| w.objects.clone()))
+                .await
+                .and_then(|m| m["objects"].as_array().map(Vec::len));
             let executor = match &state {
                 Some(topic) => robot
                     .latest(
@@ -694,6 +832,8 @@ fn watch(
                 let mut l = live_graph.lock().unwrap_or_else(PoisonError::into_inner);
                 l.topics = topics;
                 l.executor = executor;
+                l.rooms = rooms;
+                l.objects = objects;
             }
             wake.request_repaint();
         }
@@ -799,6 +939,30 @@ mod tests {
         [roles]
         routine = ["qwen3.5-9b-local"]
     "#;
+
+    #[test]
+    fn snapshot_world_tab() {
+        let rooms = serde_json::json!({"rooms": [
+            {"id": "R1", "name": "kitchen", "type": "kitchen", "floor_coverage": 0.96, "face_coverage": 0.88, "object_count": 9},
+            {"id": "R2", "name": "", "type": "living room", "floor_coverage": 0.61, "face_coverage": 0.34, "object_count": 4},
+            {"id": "R3", "name": "bedroom", "type": "bedroom", "floor_coverage": 0.05, "face_coverage": 0.0, "object_count": 0}
+        ]});
+        let mut harness = Harness::builder()
+            .wgpu()
+            .with_size(egui::vec2(420.0, 300.0))
+            .build_ui(move |ui| {
+                Frame::new()
+                    .fill(ui.tokens().panel_bg_color)
+                    .inner_margin(Margin::same(12))
+                    .show(ui, |ui| {
+                        let _ = world_view(ui, &rooms, Some(13));
+                    });
+            });
+        crate::chat::style_for_tests(&harness.ctx);
+        harness.run();
+        harness.fit_contents();
+        crate::chat::compare(&mut harness, "world", &SnapshotOptions::new());
+    }
 
     #[test]
     fn snapshot_window() {
