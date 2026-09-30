@@ -212,7 +212,8 @@ fn actions(graph: &GraphDetail) -> Vec<(String, String)> {
         .collect()
 }
 
-#[expect(
+// The lint fires only when ROS is compiled in, so `expect` would fail the core-only build.
+#[allow(
     clippy::result_large_err,
     reason = "the error is the tool's answer, returned once per call"
 )]
