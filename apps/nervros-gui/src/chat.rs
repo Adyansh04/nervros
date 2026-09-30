@@ -237,6 +237,8 @@ impl Chat {
             | Event::MissionStarted { .. }
             | Event::MissionProgress { .. }
             | Event::MissionFinished { .. } => self.apply_mission(event),
+            // The viewer draws it; the tool's card already says what.
+            Event::Plot { .. } => {}
         }
     }
 

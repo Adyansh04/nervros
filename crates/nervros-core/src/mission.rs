@@ -75,6 +75,8 @@ struct Running {
 /// Plans, the running mission and the counters that stop endless retries.
 pub struct Missions {
     robot: Arc<dyn RobotPort>,
+    /// The profile's places and the remembered ones.
+    places: Arc<crate::places::Places>,
     profile: Profile,
     config: MissionConfig,
     catalog: Mutex<Option<Catalog>>,
@@ -96,10 +98,15 @@ impl std::fmt::Debug for Missions {
 impl Missions {
     /// For a profile with a `[mission]` section.
     #[must_use]
-    pub fn new(profile: &Profile, robot: Arc<dyn RobotPort>) -> Option<Arc<Self>> {
+    pub fn new(
+        profile: &Profile,
+        places: Arc<crate::places::Places>,
+        robot: Arc<dyn RobotPort>,
+    ) -> Option<Arc<Self>> {
         let config = profile.mission.clone()?;
         Some(Arc::new(Self {
             robot,
+            places,
             profile: profile.clone(),
             config,
             catalog: Mutex::default(),
@@ -231,7 +238,7 @@ impl Missions {
             .map(|arm| (arm.to_owned(), held_by(&seen.state, arm)))
             .collect();
         World {
-            places: self.profile.places.clone(),
+            places: self.places.all(),
             rooms: things(&seen.rooms, "rooms", "name", "/centroid"),
             objects: things(&seen.objects, "objects", "label", "/pose/position"),
             robot: seen.pose,
@@ -571,7 +578,7 @@ impl Missions {
             .unwrap_or(Value::Null);
         Observed {
             pose,
-            places: self.profile.places.clone(),
+            places: self.places.all(),
             rooms,
             objects,
             state,
@@ -649,6 +656,7 @@ impl Tool for RunMission {
 mod tests {
     use super::*;
     use crate::mission::catalog::tests::CATALOG;
+    use crate::places::Places;
     use nervros_ros::GoalStatus;
     use nervros_ros::fake::{FakeRobot, ScriptedRun};
     use std::path::Path;
@@ -728,7 +736,7 @@ mod tests {
             ..ScriptedRun::default()
         };
         let robot: Arc<dyn RobotPort> = Arc::new(robot(run));
-        let missions = Missions::new(&profile(), robot).unwrap();
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
         let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
         let (events, mut rx) = tokio::sync::broadcast::channel(64);
         missions.attach(SessionHandle::for_tests(&tx, events));
@@ -771,7 +779,7 @@ mod tests {
     #[tokio::test]
     async fn problems_go_back_to_the_model_and_attempts_are_capped() {
         let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
-        let missions = Missions::new(&profile(), robot).unwrap();
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
         let bad = json!({"intent": "x", "steps": [{"skill": "PickObject", "args": {"object_id": "O99"}}]});
         for n in 1..=MAX_PLAN_ATTEMPTS {
             let out = missions.plan(bad.clone()).await;
@@ -791,7 +799,7 @@ mod tests {
             ..ScriptedRun::default()
         };
         let robot: Arc<dyn RobotPort> = Arc::new(robot(failing()));
-        let missions = Missions::new(&profile(), robot).unwrap();
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
         let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
         let (events, _rx) = tokio::sync::broadcast::channel(64);
         missions.attach(SessionHandle::for_tests(&tx, events));
@@ -818,7 +826,7 @@ mod tests {
     #[tokio::test]
     async fn the_same_plan_twice_runs_by_its_hash() {
         let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
-        let missions = Missions::new(&profile(), robot).unwrap();
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
         let first = missions.plan(steps()).await.data["hash"].clone();
         let second = missions.plan(steps()).await.data["hash"].clone();
         assert_eq!(first, second);
@@ -833,7 +841,7 @@ mod tests {
         assert_eq!(held_by(&state, "right"), "");
         let robot: Arc<dyn RobotPort> =
             Arc::new(robot(ScriptedRun::default()).with_topic("/x/state", state));
-        let missions = Missions::new(&profile(), robot).unwrap();
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
         let out = missions.plan(steps()).await;
         assert_eq!(out.status, Status::Failed);
         let problems = out.data["problems"].to_string();

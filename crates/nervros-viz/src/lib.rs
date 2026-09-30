@@ -126,7 +126,9 @@ pub fn spawn(
     bridge.cameras(profile);
     bridge.world(profile);
     bridge.profile_layers(profile);
-    bridge.tasks.spawn(agent(rec.clone(), events));
+    bridge
+        .tasks
+        .spawn(agent(rec.clone(), Arc::clone(robot), events));
     Bridge {
         layers: bridge.layers,
         _tasks: bridge.tasks,
@@ -245,6 +247,14 @@ impl Spawner {
                 OBJECTS_PERIOD,
                 objects,
                 Box::new(move |rec, path, msg| draw_objects(rec, path, msg, &mut drawn)),
+            );
+            // Off by default: forty names bury the map, and hovering a box names it.
+            let names = self.layer("Object names", "world/object_names", false);
+            self.watch(
+                world.objects.clone(),
+                OBJECTS_PERIOD,
+                names,
+                Box::new(draw_object_names),
             );
         }
         let plan = self.layer("Plan", "world/plan", true);
@@ -377,8 +387,10 @@ fn draw_detections(rec: &RecordingStream, path: &str, msg: &Value) {
     );
 }
 
-/// The default layout: the world large on the left; the cameras, the agent's last marked image and
-/// its log on the right. Only a default, so a layout the operator arranges is kept.
+/// The default layout: the world large; beside it the first camera over the others and the agent's
+/// last marked image, in tabs as the chat shows that image too; and the agent's log and the
+/// mission's steps in a strip below, as wide as the viewer so their columns read. Only a default,
+/// so a layout the operator arranges is kept.
 fn layout(rec: &RecordingStream, cameras: &[(String, String)]) {
     use rerun::blueprint::{
         Blueprint, BlueprintActivation, Horizontal, Spatial2DView, Spatial3DView,
@@ -389,40 +401,43 @@ fn layout(rec: &RecordingStream, cameras: &[(String, String)]) {
         if let Some(first) = title.get_mut(0..1) {
             first.make_ascii_uppercase();
         }
-        Spatial2DView::new(format!("{title} camera"))
-            .with_origin(path.as_str())
-            .into()
+        Spatial2DView::new(title).with_origin(path.as_str()).into()
     };
-    let camera_slot: rerun::blueprint::ContainerLike = match cameras {
-        [] => Spatial2DView::new("Camera")
-            .with_origin(CAMERA_PATH[0])
-            .into(),
-        [(_, path)] => Spatial2DView::new("Camera")
-            .with_origin(path.as_str())
-            .into(),
-        many => Tabs::new(many.iter().map(view)).into(),
+    let mut views: Vec<rerun::blueprint::ContainerLike> = match cameras {
+        [] => vec![
+            Spatial2DView::new("Camera")
+                .with_origin(CAMERA_PATH[0])
+                .into(),
+        ],
+        [(_, path)] => vec![
+            Spatial2DView::new("Camera")
+                .with_origin(path.as_str())
+                .into(),
+        ],
+        many => many.iter().map(view).collect(),
     };
-    let side = Vertical::new([
-        camera_slot,
+    let first = views.remove(0);
+    views.push(
         Spatial2DView::new("Last look")
             .with_origin("/agent/look")
             .into(),
-        Tabs::new([
-            TextLogView::new("Agent").with_origin("/agent/log").into(),
-            StateTimelineView::new("Mission")
-                .with_origin("/mission")
-                .into(),
-            TimeSeriesView::new("Exploring")
-                .with_origin("/mapping")
-                .into(),
-        ])
-        .into(),
-    ]);
-    let root = Horizontal::new([
+    );
+    let top = Horizontal::new([
         Spatial3DView::new("World").with_origin("/world").into(),
-        side.into(),
+        Vertical::new([first, Tabs::new(views).into()]).into(),
     ])
-    .with_column_shares([2.0, 1.0]);
+    .with_column_shares([3.0, 2.0]);
+    let strip = Tabs::new([
+        TextLogView::new("Agent").with_origin("/agent/log").into(),
+        StateTimelineView::new("Mission")
+            .with_origin("/mission")
+            .into(),
+        TimeSeriesView::new("Exploring")
+            .with_origin("/mapping")
+            .into(),
+        TimeSeriesView::new("Plots").with_origin("/plots").into(),
+    ]);
+    let root = Vertical::new([top.into(), strip.into()]).with_row_shares([3.0, 1.0]);
     let activation = BlueprintActivation {
         make_active: false,
         make_default: true,
@@ -975,6 +990,38 @@ fn object_colour(label: &str, alpha: u8) -> rerun::Color {
     rerun::Color::from_unmultiplied_rgba(r, g, b, alpha)
 }
 
+/// What an object is called: its name, or its label until it has one.
+fn object_name(o: &Value) -> &str {
+    o["name"]
+        .as_str()
+        .filter(|n| !n.is_empty())
+        .or_else(|| o["label"].as_str())
+        .unwrap_or_default()
+}
+
+/// Every object's name above it, as one batch redrawn whole.
+fn draw_object_names(rec: &RecordingStream, path: &str, msg: &Value) {
+    let list = msg["objects"].as_array().map_or(&[][..], Vec::as_slice);
+    let (mut at, mut names) = (Vec::new(), Vec::new());
+    for o in list.iter().filter(|o| o["state"].as_u64() != Some(REMOVED)) {
+        let [x, y, z] = xyz(&o["pose"]["position"]);
+        at.push([x, y, z + xyz(&o["size"])[2] / 2.0 + 0.05]);
+        names.push(format!(
+            "{} {}",
+            o["id"].as_str().unwrap_or_default(),
+            object_name(o)
+        ));
+    }
+    put_static(
+        rec,
+        path,
+        &rerun::Points3D::new(at)
+            .with_labels(names)
+            .with_show_labels(true)
+            .with_radii([0.01]),
+    );
+}
+
 /// Objects from a `canopy_msgs/msg/WorldObjectArray`, one entity each so a click in the viewer
 /// names the object; stale ones are faded, and ones that went away are cleared.
 fn draw_objects(rec: &RecordingStream, path: &str, msg: &Value, drawn: &mut BTreeSet<String>) {
@@ -987,10 +1034,7 @@ fn draw_objects(rec: &RecordingStream, path: &str, msg: &Value, drawn: &mut BTre
         let q = &o["pose"]["orientation"];
         let w = q["w"].as_f64().unwrap_or(1.0);
         let label = o["label"].as_str().unwrap_or_default();
-        let name = o["name"]
-            .as_str()
-            .filter(|n| !n.is_empty())
-            .unwrap_or(label);
+        let name = object_name(o);
         let alpha = if o["state"].as_u64() == Some(STALE) {
             90
         } else {
@@ -1010,6 +1054,7 @@ fn draw_objects(rec: &RecordingStream, path: &str, msg: &Value, drawn: &mut BTre
                 w,
             ]))])
             .with_labels([format!("{id} {name}")])
+            .with_show_labels(false)
             .with_colors([object_colour(label, alpha)]),
         );
         now.insert(id.to_owned());
@@ -1040,8 +1085,14 @@ fn step_states() -> rerun::StateConfiguration {
 }
 
 /// The agent's replies and tool calls as a text log, and its marked images.
-async fn agent(rec: RecordingStream, mut events: broadcast::Receiver<Event>) {
+async fn agent(
+    rec: RecordingStream,
+    robot: Arc<dyn RobotPort>,
+    mut events: broadcast::Receiver<Event>,
+) {
     use rerun::TextLogLevel as L;
+    // Plots end with the bridge, like every other task it draws with.
+    let mut plots = JoinSet::new();
     loop {
         let event = match events.recv().await {
             Ok(e) => e,
@@ -1049,6 +1100,44 @@ async fn agent(rec: RecordingStream, mut events: broadcast::Receiver<Event>) {
             Err(broadcast::error::RecvError::Closed) => return,
         };
         let (level, text) = match &event {
+            Event::Plot {
+                name,
+                topic,
+                msg_type,
+                field,
+                for_s,
+            } => {
+                let (topic, ty, field) = (topic.clone(), msg_type.clone(), field.clone());
+                let path = format!("plots/{}", layers::slug(name));
+                put_static(
+                    &rec,
+                    &path,
+                    &rerun::SeriesLines::new().with_names([name.as_str()]),
+                );
+                let (rec, robot) = (rec.clone(), Arc::clone(&robot));
+                let until = tokio::time::Instant::now() + Duration::from_secs(*for_s);
+                plots.spawn(async move {
+                    let mut tick = interval(POSE_PERIOD);
+                    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                    let mut last = Value::Null;
+                    while tokio::time::Instant::now() < until {
+                        tick.tick().await;
+                        let Ok(msg) = robot.latest(&topic, &ty, TOPIC_WAIT).await else {
+                            continue;
+                        };
+                        // The newest message stays until the next arrives: draw each once.
+                        if msg != last {
+                            let value =
+                                nervros_core::watch::field(&msg, &field).and_then(Value::as_f64);
+                            if let Some(v) = value {
+                                put(&rec, &path, &rerun::Scalars::single(v));
+                            }
+                            last = msg;
+                        }
+                    }
+                });
+                continue;
+            }
             Event::Snapshot { jpeg, .. } => {
                 let image = rerun::EncodedImage::from_file_contents(jpeg.to_vec());
                 put(&rec, "agent/look", &image);

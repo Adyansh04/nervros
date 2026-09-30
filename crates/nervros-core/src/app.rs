@@ -189,6 +189,37 @@ fn seeing_tools(
     Ok(editor)
 }
 
+/// `list_places`, `tag_place` and `forget_place`, over the profile's places and the ones remembered
+/// beside the quota ledger, one file per robot.
+fn place_tools(
+    profile: &Profile,
+    robot: &Arc<dyn RobotPort>,
+    ledger: &Path,
+    registry: &mut Registry,
+) -> Result<Arc<crate::places::Places>, StartError> {
+    let file = ledger.parent().map(|dir| {
+        let name = Some(crate::places::slug(&profile.robot.name))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "robot".into());
+        dir.join("places").join(format!("{name}.json"))
+    });
+    let places = crate::places::Places::new(profile, file);
+    registry.add(Arc::new(ListPlaces::new(
+        profile,
+        Arc::clone(&places),
+        Arc::clone(robot),
+    )))?;
+    registry.add(Arc::new(crate::places::TagPlace::new(
+        profile,
+        Arc::clone(&places),
+        Arc::clone(robot),
+    )))?;
+    registry.add(Arc::new(crate::places::ForgetPlace::new(Arc::clone(
+        &places,
+    ))))?;
+    Ok(places)
+}
+
 /// Starts an agent. Must run inside a tokio runtime.
 ///
 /// # Errors
@@ -212,7 +243,7 @@ pub fn start(
     let mut registry = Registry::from_config(&profile.tools, &robot, &schemas, &guard)?;
     let snapshots = Arc::new(SnapshotStore::default());
     let editor = seeing_tools(&profile, &robot, &llm, &snapshots, &mut registry)?;
-    registry.add(Arc::new(ListPlaces::new(&profile, Arc::clone(&robot))))?;
+    let places = place_tools(&profile, &robot, ledger, &mut registry)?;
     registry.add(Arc::new(RobotState::new(
         &profile,
         Arc::clone(&robot),
@@ -223,9 +254,17 @@ pub fn start(
             registry.add(tool)?;
         }
     }
+    let watches = crate::watch::Watches::new(Arc::clone(&robot));
+    for tool in watches.tools() {
+        registry.add(tool)?;
+    }
+    registry.add(Arc::new(crate::doctor::HealthCheck::new(
+        &profile,
+        Arc::clone(&robot),
+    )))?;
     let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
     registry.add(Arc::clone(&stop))?;
-    let missions = Missions::new(&profile, Arc::clone(&robot));
+    let missions = Missions::new(&profile, places, Arc::clone(&robot));
     if let Some(m) = &missions {
         for tool in m.tools() {
             registry.add(tool)?;
@@ -249,6 +288,7 @@ pub fn start(
     if let Some(m) = &missions {
         m.attach(session.handle());
     }
+    watches.attach(session.handle());
     if let Some(state) = profile.mission.as_ref().map(|m| m.state.clone()) {
         // A mission started before this session runs on unwatched: say so, once, at start.
         let (robot, handle) = (Arc::clone(&robot), session.handle());

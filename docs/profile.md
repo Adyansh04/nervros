@@ -237,7 +237,8 @@ hidden = false                            # starts hidden
 | `sensor_msgs/msg/LaserScan` | Points in the map, by TF from the scan's frame. |
 
 The Layers tab also switches the viewer's own drawings: the map, coverage, rooms, objects, trail,
-plan, the robot model and the detector's boxes.
+plan, the robot model and the detector's boxes. Object names start hidden, since a furnished room
+buries the map in them; hovering a box names it either way.
 
 ### `[mission]`
 
@@ -256,7 +257,10 @@ The robot's mission executor, which runs behaviour trees; see
 
 ### `[[place]]`
 
-Named places, beyond the world model's rooms.
+Named places, beyond the world model's rooms. The operator can add more from where the robot
+stands ("remember this spot as the reading corner"): `tag_place` keeps them beside the quota ledger,
+one JSON file per robot, and `forget_place` drops them. Neither changes this file, and a remembered
+place cannot take a name the profile already uses.
 
 ```toml
 [[place]]
@@ -274,3 +278,13 @@ pose = { x = 0.0, y = 0.0, yaw = 0.0 }   # in frame, default "map"
 Every robot gets `list_places`, `robot_state` and `stop`. `stop` is always allowed, armed or not,
 because it only makes the robot do less. `look` comes with `[look]`, `segment` with `[segment]`,
 and `plan_mission` and `run_mission` with `[mission]`.
+
+The rest are the checks you would run yourself before blaming the model:
+
+| Tool | What it does |
+|---|---|
+| `health_check` | The connection check, plus each camera's frame rate, whether the robot knows where it is on the map, and the executor's state. Returns what is wrong and what is fine. |
+| `watch` | Watches a topic in the background and posts to the chat when a condition holds: its rate drops below a floor, a field crosses a value, or a text field matches. Once, or each time it comes back; at most 8 at a time, all ended with the session. |
+| `watches` | Lists the running watches, or cancels one or all. |
+| `plot` | Draws a number from a topic's messages over time in the app's Plots tab, as `rqt_plot` does, for two minutes unless told longer. |
+| `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each asks for approval when supervised, like a world edit. |

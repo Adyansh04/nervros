@@ -116,6 +116,19 @@ pub enum Event {
         /// Height.
         height: u32,
     },
+    /// A number in a topic's messages to draw over time, in the viewer's Plots tab.
+    Plot {
+        /// The series' name.
+        name: String,
+        /// The topic.
+        topic: String,
+        /// Its message type.
+        msg_type: String,
+        /// A dotted path to the number in each message.
+        field: String,
+        /// How long to draw it, in seconds.
+        for_s: u64,
+    },
     /// The operator must approve a call.
     ApprovalRequested {
         /// Answer with `Approve(id)` or `Deny(id)`.
@@ -490,6 +503,19 @@ async fn actor(
     let mut turns = 0u64;
     let mut running: Option<(u64, JoinHandle<Option<History>>)> = None;
     let mut reports: Vec<String> = Vec::new();
+    // Nobody asked for a report's reply, so a message sent during one waits for it, not refused.
+    let (mut answering_report, mut queued) = (false, None::<String>);
+    let start = |turn: u64, origin: Origin, history: &History| {
+        let task = run_turn(
+            turn,
+            origin,
+            history.clone(),
+            Arc::clone(&shared),
+            Arc::clone(&source),
+            Arc::clone(&registry),
+        );
+        (turn, tokio::spawn(limited(turn, Arc::clone(&shared), task)))
+    };
     loop {
         let finished = async {
             match running.as_mut() {
@@ -504,41 +530,37 @@ async fn actor(
                 match cmd {
                     Command::User(text) => {
                         if running.is_some() {
-                            shared.emit(Event::Notice { text: "still working on the last message; wait or stop it".into() });
+                            let note = if answering_report && queued.is_none() {
+                                queued = Some(text);
+                                "queued until the reply to the report ends"
+                            } else {
+                                "still working on the last message; wait or stop it"
+                            };
+                            shared.emit(Event::Notice { text: note.into() });
                             continue;
                         }
                         turns += 1;
-                        let task = run_turn(turns, Origin::User(text), history.clone(), Arc::clone(&shared), Arc::clone(&source), Arc::clone(&registry));
-                        running = Some((turns, tokio::spawn(limited(turns, Arc::clone(&shared), task))));
+                        running = Some(start(turns, Origin::User(text), &history));
+                        answering_report = false;
                     }
                     Command::Report(text) => {
                         reports.push(text);
                         if running.is_none() {
                             turns += 1;
-                            let task = run_turn(turns, Origin::Report(reports.split_off(0).join("\n\n")), history.clone(), Arc::clone(&shared), Arc::clone(&source), Arc::clone(&registry));
-                            running = Some((turns, tokio::spawn(limited(turns, Arc::clone(&shared), task))));
+                            running = Some(start(turns, Origin::Report(reports.split_off(0).join("\n\n")), &history));
+                            answering_report = true;
                         }
                     }
                     Command::StopGeneration | Command::StopMission => {
                         let mission = cmd == Command::StopMission;
+                        if queued.take().is_some() {
+                            shared.emit(Event::Notice { text: "the queued message was dropped".into() });
+                        }
                         if let Some((turn, handle)) = running.take() {
                             handle.abort();
                             shared.emit(Event::TurnFinished { turn });
                         }
-                        let pending: Vec<u64> = lock(&shared.approvals).keys().copied().collect();
-                        for id in pending {
-                            shared.resolve(id, false);
-                        }
-                        if mission && let Some(stop) = stop.clone() {
-                            let shared = Arc::clone(&shared);
-                            tokio::spawn(async move {
-                                let out = stop.call(json!({"reason": "operator"})).await;
-                                let text = if out.status == Status::Succeeded { format!("robot stopped: {}", out.data) } else { format!("stop failed: {}", out.message) };
-                                shared.emit(Event::Notice { text });
-                            });
-                        }
-                        let reason = if mission { "stopped by the operator: reply and robot" } else { "reply stopped by the operator" };
-                        shared.emit(Event::Halted { reason: reason.into() });
+                        halt(&shared, stop.as_ref().filter(|_| mission));
                     }
                     Command::Approve(id) => shared.resolve(id, true),
                     Command::Deny(id) => shared.resolve(id, false),
@@ -556,14 +578,46 @@ async fn actor(
                     }
                     shared.emit(Event::TurnFinished { turn });
                 }
-                if !reports.is_empty() {
+                if let Some(text) = queued.take() {
                     turns += 1;
-                    let task = run_turn(turns, Origin::Report(reports.split_off(0).join("\n\n")), history.clone(), Arc::clone(&shared), Arc::clone(&source), Arc::clone(&registry));
-                    running = Some((turns, tokio::spawn(limited(turns, Arc::clone(&shared), task))));
+                    running = Some(start(turns, Origin::User(text), &history));
+                    answering_report = false;
+                } else if !reports.is_empty() {
+                    turns += 1;
+                    running = Some(start(turns, Origin::Report(reports.split_off(0).join("\n\n")), &history));
+                    answering_report = true;
                 }
             }
         }
     }
+}
+
+/// Denies what waits for approval and, given the stop tool, stops the robot too.
+fn halt(shared: &Arc<Shared>, stop: Option<&Arc<dyn Tool>>) {
+    let pending: Vec<u64> = lock(&shared.approvals).keys().copied().collect();
+    for id in pending {
+        shared.resolve(id, false);
+    }
+    if let Some(stop) = stop.cloned() {
+        let shared = Arc::clone(shared);
+        tokio::spawn(async move {
+            let out = stop.call(json!({"reason": "operator"})).await;
+            let text = if out.status == Status::Succeeded {
+                format!("robot stopped: {}", out.data)
+            } else {
+                format!("stop failed: {}", out.message)
+            };
+            shared.emit(Event::Notice { text });
+        });
+    }
+    let reason = if stop.is_some() {
+        "stopped by the operator: reply and robot"
+    } else {
+        "reply stopped by the operator"
+    };
+    shared.emit(Event::Halted {
+        reason: reason.into(),
+    });
 }
 
 /// Runs a turn under its time limit. A turn over it ends with an error, as a stopped one does;
@@ -1007,7 +1061,7 @@ mod tests {
         );
     }
 
-    struct Slow(ToolSpec);
+    struct Slow(ToolSpec, Duration);
 
     #[async_trait]
     impl Tool for Slow {
@@ -1015,9 +1069,63 @@ mod tests {
             Cow::Borrowed(&self.0)
         }
         async fn call(&self, _args: Value) -> ToolOutcome {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(self.1).await;
             ToolOutcome::ok(json!({}))
         }
+    }
+
+    #[tokio::test]
+    async fn a_message_sent_while_a_report_is_answered_runs_after_it() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "find_objects", json!({})),
+            MockTurn::text("noted"),
+            MockTurn::text("hello"),
+        ]);
+        let mut r = Registry::default();
+        let spec = ToolSpec::new(
+            "find_objects",
+            "Slow.",
+            json!({"type": "object"}),
+            Risk::Observe,
+        );
+        r.add(Arc::new(Slow(spec, Duration::from_millis(300))))
+            .unwrap();
+        let guard = Arc::new(Guard::new(Policy::default()));
+        let session = Session::start(
+            Arc::new(Scripted(model)),
+            Arc::new(r),
+            guard,
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::Report("the camera slowed".into()));
+        let mut events = Vec::new();
+        let mut finished = 0;
+        while finished < 2 {
+            let e = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(e, Event::ToolStarted { .. }) {
+                session.send(Command::User("hi".into()));
+            }
+            finished += usize::from(matches!(e, Event::TurnFinished { .. }));
+            events.push(e);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Notice { text } if text.starts_with("queued")))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::User { turn: 2, text } if text == "hi"))
+        );
+        assert!(
+            matches!(events.iter().rev().nth(1), Some(Event::Reply { text, .. }) if text == "hello")
+        );
     }
 
     #[tokio::test]
@@ -1033,7 +1141,7 @@ mod tests {
             json!({"type": "object"}),
             Risk::Observe,
         );
-        r.add(Arc::new(Slow(spec))).unwrap();
+        r.add(Arc::new(Slow(spec, Duration::from_secs(5)))).unwrap();
         let config = SessionConfig {
             turn_time: Duration::from_millis(200),
             ..SessionConfig::default()

@@ -1,12 +1,17 @@
 //! The connection check: whether the robot offers everything the profile names. The CLI prints
-//! it and the GUI shows it on its Doctor tab.
+//! it and the GUI shows it on its Doctor tab; `health_check` gives the agent the same, with the
+//! cameras' rates, the robot's place on the map and the executor's state.
 
+use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use nervros_ros::RobotPort;
+use serde_json::{Value, json};
 
 use crate::profile::Profile;
-use crate::tools::ToolKind;
+use crate::tools::{Risk, Tool, ToolKind, ToolOutcome, ToolSpec};
 
 const SERVICE_WAIT: Duration = Duration::from_secs(5);
 
@@ -75,6 +80,129 @@ pub async fn run(profile: &Profile, robot: &dyn RobotPort) -> Vec<Check> {
         }
     }
     out
+}
+
+/// Well under any camera's rate, so only a stalled or starved one fails.
+const MIN_CAMERA_HZ: f64 = 2.0;
+const RATE_WINDOW: Duration = Duration::from_secs(1);
+
+/// The `health_check` tool.
+pub struct HealthCheck {
+    spec: ToolSpec,
+    profile: Arc<Profile>,
+    robot: Arc<dyn RobotPort>,
+}
+
+impl HealthCheck {
+    /// The check over a profile's robot.
+    #[must_use]
+    pub fn new(profile: &Profile, robot: Arc<dyn RobotPort>) -> Self {
+        let spec = ToolSpec::new(
+            "health_check",
+            "Checks the robot end to end, as a person would before blaming the model: every \
+             service and topic the profile uses, each camera's frame rate, whether the robot \
+             knows where it is on the map, and what the mission executor is doing. Returns the \
+             problems first.",
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            Risk::Observe,
+        );
+        Self {
+            spec,
+            profile: Arc::new(profile.clone()),
+            robot,
+        }
+    }
+
+    async fn checks(&self) -> Vec<Check> {
+        let mut out = run(&self.profile, self.robot.as_ref()).await;
+        for (name, camera) in self
+            .profile
+            .look
+            .iter()
+            .flat_map(crate::profile::LookConfig::all_cameras)
+        {
+            let frames = self
+                .robot
+                .sample_sizes(&camera.image, "sensor_msgs/msg/Image", RATE_WINDOW, 1000)
+                .await
+                .unwrap_or_default();
+            #[expect(clippy::cast_precision_loss, reason = "a count of frames")]
+            let hz = frames.len() as f64 / RATE_WINDOW.as_secs_f64();
+            out.push(Check {
+                ok: hz >= MIN_CAMERA_HZ,
+                what: format!("camera {name} ({}) at {hz:.0} Hz", camera.image),
+            });
+        }
+        let (map, base) = (&self.profile.ros.map_frame, &self.profile.ros.base_frame);
+        out.push(match self.robot.transform(map, base) {
+            Ok(t) => Check {
+                ok: true,
+                what: format!(
+                    "the robot is at ({:.2}, {:.2}) in {map}",
+                    t.translation[0], t.translation[1]
+                ),
+            },
+            Err(e) => Check {
+                ok: false,
+                what: format!("no {map} to {base} transform: localization is not running ({e})"),
+            },
+        });
+        if let Some(m) = &self.profile.mission {
+            let state = self
+                .robot
+                .latest(&m.state, "nervros_interfaces/msg/RobotState", RATE_WINDOW)
+                .await;
+            out.push(match state {
+                Ok(s) => {
+                    let said = s["message"]
+                        .as_str()
+                        .filter(|m| !m.is_empty())
+                        .map(|m| format!(": {m}"))
+                        .unwrap_or_default();
+                    let what = match s["mission_id"].as_str().filter(|id| !id.is_empty()) {
+                        Some(id) => format!("the executor runs mission {id}{said}"),
+                        None => format!("the executor is idle{said}"),
+                    };
+                    Check { ok: true, what }
+                }
+                Err(e) => Check {
+                    ok: false,
+                    what: format!("no executor state on {} ({e})", m.state),
+                },
+            });
+        }
+        out
+    }
+}
+
+#[async_trait]
+impl Tool for HealthCheck {
+    fn spec(&self) -> Cow<'_, ToolSpec> {
+        Cow::Borrowed(&self.spec)
+    }
+
+    async fn call(&self, _args: Value) -> ToolOutcome {
+        let checks = self.checks().await;
+        let problems: Vec<&str> = checks
+            .iter()
+            .filter(|c| !c.ok)
+            .map(|c| c.what.as_str())
+            .collect();
+        let fine: Vec<&str> = checks
+            .iter()
+            .filter(|c| c.ok)
+            .map(|c| c.what.as_str())
+            .collect();
+        let mut out = ToolOutcome::ok(
+            json!({"healthy": problems.is_empty(), "problems": problems, "fine": fine}),
+        );
+        out.message = if problems.is_empty() {
+            format!("all {} checks pass", checks.len())
+        } else {
+            format!("{} of {} checks fail", problems.len(), checks.len())
+        };
+        out
+    }
 }
 
 #[cfg(test)]
