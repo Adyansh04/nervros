@@ -28,6 +28,20 @@ pub struct ScriptedRun {
     pub step: Duration,
 }
 
+impl Default for ScriptedRun {
+    /// Succeeds at once with an empty result.
+    fn default() -> Self {
+        Self {
+            feedback: Vec::new(),
+            result: Ok(GoalResult {
+                status: GoalStatus::Succeeded,
+                result: Value::Object(serde_json::Map::new()),
+            }),
+            step: Duration::from_millis(10),
+        }
+    }
+}
+
 /// A scripted action: goal in, run out.
 pub type ActionFn = Arc<dyn Fn(&Value) -> ScriptedRun + Send + Sync>;
 

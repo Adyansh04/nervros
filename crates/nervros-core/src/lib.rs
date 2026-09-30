@@ -11,6 +11,7 @@ pub mod guard;
 pub mod llm;
 pub mod log;
 pub mod look;
+pub mod mission;
 pub mod profile;
 pub mod providers;
 pub mod schemas;

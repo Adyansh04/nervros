@@ -92,7 +92,44 @@ fn print_event(e: &Event, logs: &Path) {
         Event::Halted { reason } => println!("  [halted: {reason}]"),
         Event::Notice { text } => println!("  [{text}]"),
         Event::Error { text, .. } => println!("  [error: {text}]"),
-        Event::TurnStarted { .. } | Event::TurnFinished { .. } => {}
+        Event::Report { text, .. } => println!("report> {text}"),
+        Event::MissionPlanned {
+            hash,
+            steps,
+            worst_case_s,
+            ..
+        } => {
+            let short = hash.get(..8).unwrap_or(hash);
+            println!("  plan {short} ({worst_case_s:.0} s at most):");
+            for s in steps {
+                println!("    {} {}", s.id, s.summary);
+            }
+        }
+        Event::MissionStarted { id, .. } => println!("  [mission {id} started]"),
+        Event::MissionProgress {
+            step, node, status, ..
+        } => {
+            if node.is_empty() {
+                println!("  [{step} {status}]");
+            } else {
+                println!("  [{step} {node} {status}]");
+            }
+        }
+        Event::MissionFinished {
+            outcome,
+            failed_step,
+            reason,
+            elapsed_s,
+            ..
+        } => {
+            let why = if failed_step.is_empty() {
+                String::new()
+            } else {
+                format!(" at {failed_step}: {reason}")
+            };
+            println!("  [mission {outcome} after {elapsed_s:.0} s{why}]");
+        }
+        Event::User { .. } | Event::TurnStarted { .. } | Event::TurnFinished { .. } => {}
     }
 }
 
@@ -149,6 +186,8 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
     // Discovery and the camera need a moment after the node starts.
     tokio::time::sleep(Duration::from_secs(2)).await;
     if !options.say.is_empty() {
+        // Missions outlive the turn that started them: wait for their reports too.
+        let (mut open, mut awaiting_report) = (0u32, false);
         for text in options.say {
             println!("you> {text}");
             agent.session.send(SessionCommand::User(text));
@@ -160,8 +199,15 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
                     agent.session.send(SessionCommand::Approve(*id));
                 }
                 print_event(&e, &blobs);
-                if matches!(e, Event::TurnFinished { .. }) {
-                    break;
+                match e {
+                    Event::MissionStarted { .. } => open += 1,
+                    Event::MissionFinished { .. } => {
+                        open = open.saturating_sub(1);
+                        awaiting_report = true;
+                    }
+                    Event::Report { .. } => awaiting_report = false,
+                    Event::TurnFinished { .. } if open == 0 && !awaiting_report => break,
+                    _ => {}
                 }
             }
         }

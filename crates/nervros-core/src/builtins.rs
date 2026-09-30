@@ -3,6 +3,7 @@
 //! `look` lives in [`crate::look`]. `stop` is always allowed, armed or not: it only ever makes the
 //! robot do less.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,8 +99,8 @@ impl ListPlaces {
 
 #[async_trait]
 impl Tool for ListPlaces {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
+    fn spec(&self) -> Cow<'_, ToolSpec> {
+        Cow::Borrowed(&self.spec)
     }
 
     async fn call(&self, _args: Value) -> ToolOutcome {
@@ -156,8 +157,8 @@ impl RobotState {
 
 #[async_trait]
 impl Tool for RobotState {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
+    fn spec(&self) -> Cow<'_, ToolSpec> {
+        Cow::Borrowed(&self.spec)
     }
 
     async fn call(&self, _args: Value) -> ToolOutcome {
@@ -232,8 +233,8 @@ impl Stop {
 
 #[async_trait]
 impl Tool for Stop {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
+    fn spec(&self) -> Cow<'_, ToolSpec> {
+        Cow::Borrowed(&self.spec)
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {

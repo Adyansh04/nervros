@@ -2,9 +2,11 @@
 //! is drawn. Colours and sizes come from `re_ui`'s tokens so chat and viewer read as one app.
 
 use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nervros_core::mission::plan::PlannedStep;
 use nervros_core::session::{Command, Event};
 use rerun::external::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _, icons};
@@ -92,6 +94,25 @@ pub enum Item {
     Notice(String),
     /// A failed turn.
     Error(String),
+    /// A report from the robot, which the agent then answers.
+    Report(String),
+    /// A plan, and the mission that runs it.
+    Plan(PlanCard),
+}
+
+/// A plan from `plan_mission`, updated as its mission runs.
+#[derive(Clone)]
+pub struct PlanCard {
+    hash: String,
+    intent: String,
+    steps: Vec<PlannedStep>,
+    worst_case_s: f64,
+    mission: Option<String>,
+    started: Option<Instant>,
+    /// Per step: its status and the node running inside it.
+    progress: HashMap<String, (String, String)>,
+    /// `(outcome, failed step, reason, seconds)` once it ended.
+    finished: Option<(String, String, String, f64)>,
 }
 
 /// The conversation.
@@ -108,7 +129,7 @@ pub struct Chat {
 
 impl Chat {
     /// Adds the operator's message.
-    pub fn push_user(&mut self, text: String) {
+    fn push_user(&mut self, text: String) {
         self.last_user = Some(text.clone());
         self.items.push(Item::User(text));
     }
@@ -210,7 +231,97 @@ impl Chat {
             Event::Halted { reason } => self.items.push(Item::Notice(format!("Stopped: {reason}"))),
             Event::Notice { text } => self.items.push(Item::Notice(text.clone())),
             Event::Error { text, .. } => self.items.push(Item::Error(text.clone())),
+            Event::User { text, .. } => self.push_user(text.clone()),
+            Event::Report { text, .. } => self.items.push(Item::Report(text.clone())),
+            Event::MissionPlanned { .. }
+            | Event::MissionStarted { .. }
+            | Event::MissionProgress { .. }
+            | Event::MissionFinished { .. } => self.apply_mission(event),
         }
+    }
+
+    fn apply_mission(&mut self, event: &Event) {
+        match event {
+            Event::MissionPlanned {
+                hash,
+                intent,
+                steps,
+                worst_case_s,
+            } => self.items.push(Item::Plan(PlanCard {
+                hash: hash.clone(),
+                intent: intent.clone(),
+                steps: steps.clone(),
+                worst_case_s: *worst_case_s,
+                mission: None,
+                started: None,
+                progress: HashMap::new(),
+                finished: None,
+            })),
+            Event::MissionStarted { id, hash } => {
+                if let Some(p) = self.plan_mut(|p| p.hash == *hash) {
+                    p.mission = Some(id.clone());
+                    p.started = Some(Instant::now());
+                }
+            }
+            Event::MissionProgress {
+                id,
+                step,
+                node,
+                status,
+                ..
+            } => {
+                if let Some(p) = self.plan_mut(|p| p.mission.as_ref() == Some(id)) {
+                    let entry = p.progress.entry(step.clone()).or_default();
+                    if node.is_empty() {
+                        entry.0.clone_from(status);
+                    } else if status == "running" {
+                        entry.1.clone_from(node);
+                    }
+                }
+            }
+            Event::MissionFinished {
+                id,
+                outcome,
+                failed_step,
+                reason,
+                elapsed_s,
+            } => {
+                if let Some(p) = self.plan_mut(|p| p.mission.as_ref() == Some(id)) {
+                    p.finished = Some((
+                        outcome.clone(),
+                        failed_step.clone(),
+                        reason.clone(),
+                        *elapsed_s,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The newest plan matching `which`.
+    fn plan_mut(&mut self, which: impl Fn(&PlanCard) -> bool) -> Option<&mut PlanCard> {
+        self.items.iter_mut().rev().find_map(|i| match i {
+            Item::Plan(p) if which(p) => Some(p),
+            _ => None,
+        })
+    }
+
+    /// The plan an approval of `run_mission` refers to.
+    fn plan_for(&self, a: &Approval) -> Option<&PlanCard> {
+        let hash = a.args["hash"].as_str()?;
+        self.items.iter().rev().find_map(|i| match i {
+            Item::Plan(p) if !hash.is_empty() && p.hash.starts_with(hash) => Some(p),
+            _ => None,
+        })
+    }
+
+    /// The newest plan, for the dock.
+    pub fn latest_plan(&self) -> Option<&PlanCard> {
+        self.items.iter().rev().find_map(|i| match i {
+            Item::Plan(p) => Some(p),
+            _ => None,
+        })
     }
 
     /// Draws the conversation; clicks are appended to `actions`.
@@ -239,9 +350,13 @@ impl Chat {
                         });
                         image_card(ui, id, texture, actions);
                     }
-                    Item::Approval(a) => approval_card(ui, a, approval_ttl, actions),
+                    Item::Approval(a) => {
+                        approval_card(ui, a, self.plan_for(a), approval_ttl, actions);
+                    }
                     Item::Notice(text) => notice(ui, text),
                     Item::Error(text) => error_card(ui, text, self.last_user.as_deref(), actions),
+                    Item::Report(text) => report(ui, text),
+                    Item::Plan(p) => plan_card(ui, p, actions),
                 }
             });
         }
@@ -410,7 +525,13 @@ fn decode(jpeg: &[u8]) -> Option<egui::ColorImage> {
     ))
 }
 
-fn approval_card(ui: &mut egui::Ui, a: &Approval, ttl: Duration, actions: &mut Vec<Action>) {
+fn approval_card(
+    ui: &mut egui::Ui,
+    a: &Approval,
+    plan: Option<&PlanCard>,
+    ttl: Duration,
+    actions: &mut Vec<Action>,
+) {
     let t = ui.tokens();
     let stroke = if a.answer.is_none() {
         t.warn_fg_color
@@ -420,10 +541,27 @@ fn approval_card(ui: &mut egui::Ui, a: &Approval, ttl: Duration, actions: &mut V
     card(ui, stroke).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.small_icon(&icons::WARNING, Some(t.warn_fg_color));
-            ui.label(RichText::new(format!("Approve {}?", a.tool)).strong());
+            let title = match plan {
+                Some(p) => format!("Run \"{}\"?", p.intent),
+                None => format!("Approve {}?", a.tool),
+            };
+            ui.label(RichText::new(title).strong());
         });
-        ui.label(&a.reason);
-        code(ui, &pretty(&a.args));
+        if let Some(p) = plan {
+            steps_table(ui, p, "approval");
+            let short = p.hash.get(..8).unwrap_or(&p.hash);
+            ui.label(
+                RichText::new(format!(
+                    "plan {short} · at most {}",
+                    minutes(p.worst_case_s)
+                ))
+                .small()
+                .color(t.text_subdued),
+            );
+        } else {
+            ui.label(&a.reason);
+            code(ui, &pretty(&a.args));
+        }
         ui.horizontal(|ui| match a.answer {
             Some(true) => {
                 ui.label(RichText::new("Approved").color(t.success_text_color));
@@ -446,6 +584,124 @@ fn approval_card(ui: &mut egui::Ui, a: &Approval, ttl: Duration, actions: &mut V
             }
         });
     });
+}
+
+/// The plan's steps with each one's state; `salt` tells apart two tables of one plan.
+fn steps_table(ui: &mut egui::Ui, p: &PlanCard, salt: &str) {
+    let t = ui.tokens();
+    egui::Grid::new(("plan_steps", &p.hash, salt))
+        .num_columns(3)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            for s in &p.steps {
+                let (status, node) = p.progress.get(&s.id).cloned().unwrap_or_default();
+                let failed = p.finished.as_ref().is_some_and(|f| f.1 == s.id);
+                let (color, mark) = match (status.as_str(), failed) {
+                    (_, true) | ("failure", _) => (t.error_fg_color, "✗"),
+                    ("success", _) => (t.success_text_color, "✓"),
+                    ("running", _) => (t.info_text_color, "●"),
+                    ("skipped", _) => (t.text_subdued, "–"),
+                    _ => (t.text_subdued, "○"),
+                };
+                ui.label(RichText::new(mark).color(color));
+                ui.label(
+                    RichText::new(&s.id)
+                        .monospace()
+                        .size(12.0)
+                        .color(t.text_subdued),
+                );
+                let text = if status == "running" && !node.is_empty() {
+                    format!("{} · {node}", s.summary)
+                } else {
+                    s.summary.clone()
+                };
+                ui.label(RichText::new(text).monospace().size(12.0));
+                ui.end_row();
+            }
+        });
+}
+
+fn minutes(seconds: f64) -> String {
+    if seconds < 90.0 {
+        format!("{seconds:.0} s")
+    } else {
+        format!("{:.0} min", seconds / 60.0)
+    }
+}
+
+/// A plan and its mission: steps with live state, and one action while it runs.
+pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
+    let t = ui.tokens();
+    let stroke = match &p.finished {
+        Some((outcome, ..)) if outcome == "success" => t.success_text_color,
+        Some(_) => t.error_fg_color,
+        None if p.mission.is_some() => t.info_text_color,
+        None => t.widget_noninteractive_bg_stroke,
+    };
+    card(ui, stroke).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.small_icon(&icons::PLAN_PENDING, Some(t.text_subdued));
+            ui.label(RichText::new(format!("Plan · {}", p.intent)).strong());
+        });
+        steps_table(ui, p, "plan");
+        ui.horizontal(|ui| {
+            let state = match (&p.finished, p.started) {
+                (Some((outcome, .., secs)), _) if outcome == "success" => {
+                    RichText::new(format!("Done in {}", minutes(*secs))).color(t.success_text_color)
+                }
+                (Some((outcome, step, reason, _)), _) => {
+                    let at = if step.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" at {step}")
+                    };
+                    RichText::new(format!("{}{at}: {reason}", capitalise(outcome)))
+                        .color(t.error_fg_color)
+                }
+                (None, Some(since)) => {
+                    ui.ctx().request_repaint_after(Duration::from_secs(1));
+                    RichText::new(format!(
+                        "Running {}",
+                        minutes(since.elapsed().as_secs_f64())
+                    ))
+                    .color(t.info_text_color)
+                }
+                (None, None) => RichText::new(format!(
+                    "Checked · at most {} · waiting to run",
+                    minutes(p.worst_case_s)
+                ))
+                .color(t.text_subdued),
+            };
+            ui.label(state.small());
+            if p.mission.is_some() && p.finished.is_none() {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(ReButton::new("Stop").small().secondary()).clicked() {
+                        actions.push(Action::Send(Command::StopMission));
+                    }
+                });
+            }
+        });
+    });
+}
+
+fn capitalise(word: &str) -> String {
+    let mut c = word.chars();
+    c.next()
+        .map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
+}
+
+fn report(ui: &mut egui::Ui, text: &str) {
+    Frame::new()
+        .fill(ui.tokens().faint_bg_color)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.small_icon(&icons::AGENT, Some(ui.tokens().text_subdued));
+                ui.label(RichText::new("Robot report").small().strong());
+                ui.label(RichText::new(text).small().color(ui.tokens().text_subdued));
+            });
+        });
 }
 
 fn notice(ui: &mut egui::Ui, text: &str) {
@@ -578,6 +834,76 @@ pub(crate) mod tests {
     #[test]
     fn snapshot_empty_state() {
         render(Chat::default(), "chat_empty");
+    }
+
+    #[test]
+    fn snapshot_mission() {
+        let mut chat = Chat::default();
+        chat.apply(&Event::User {
+            turn: 1,
+            text: "Put the red mug in the basket".to_owned(),
+        });
+        let step = |id: &str, summary: &str| PlannedStep {
+            id: id.to_owned(),
+            skill: summary.split('(').next().unwrap_or_default().to_owned(),
+            summary: summary.to_owned(),
+            timeout_s: 300.0,
+        };
+        chat.apply(&Event::MissionPlanned {
+            hash: "a91f3c2e77d04b1e".to_owned(),
+            intent: "put the red mug in the basket".to_owned(),
+            steps: vec![
+                step("s1", "GoToPlace(place=kitchen)"),
+                step("s2", "PickObject(object_id=O17, phrase=red mug, arm=right)"),
+                step(
+                    "s3",
+                    "PlaceInto(container_id=O31, phrase=basket, arm=right)",
+                ),
+            ],
+            worst_case_s: 1140.0,
+        });
+        chat.apply(&Event::ApprovalRequested {
+            id: 3,
+            tool: "run_mission".to_owned(),
+            args: serde_json::json!({"hash": "a91f3c2e"}),
+            reason: "`run_mission` acts on the robot".to_owned(),
+        });
+        chat.apply(&Event::ApprovalResolved {
+            id: 3,
+            approved: true,
+        });
+        chat.apply(&Event::MissionStarted {
+            id: "m1".to_owned(),
+            hash: "a91f3c2e77d04b1e".to_owned(),
+        });
+        for (step, node, status) in [
+            ("s1", "", "running"),
+            ("s1", "", "success"),
+            ("s2", "", "running"),
+            ("s2", "Pick", "running"),
+            ("s2", "", "failure"),
+        ] {
+            chat.apply(&Event::MissionProgress {
+                id: "m1".to_owned(),
+                step: step.to_owned(),
+                node: node.to_owned(),
+                status: status.to_owned(),
+                elapsed_s: 0.0,
+            });
+        }
+        chat.apply(&Event::MissionFinished {
+            id: "m1".to_owned(),
+            outcome: "failure".to_owned(),
+            failed_step: "s2".to_owned(),
+            reason: "the grasp slipped".to_owned(),
+            elapsed_s: 94.0,
+        });
+        chat.apply(&Event::Report {
+            turn: 2,
+            text: "Mission m1 ended: failure after 94 s. Failed at s2: the grasp slipped."
+                .to_owned(),
+        });
+        render(chat, "chat_mission");
     }
 
     #[test]

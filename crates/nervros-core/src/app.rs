@@ -11,6 +11,7 @@ use crate::context::system_prompt;
 use crate::guard::Guard;
 use crate::llm::Llm;
 use crate::look::{LookTool, SnapshotStore};
+use crate::mission::Missions;
 use crate::profile::{PrivacyModeConfig, Profile};
 use crate::providers::ModelsConfig;
 use crate::providers::router::{PrivacyMode, Router};
@@ -159,6 +160,12 @@ pub fn start(
     )))?;
     let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
     registry.add(Arc::clone(&stop))?;
+    let missions = Missions::new(&profile, Arc::clone(&robot));
+    if let Some(m) = &missions {
+        for tool in m.tools() {
+            registry.add(tool)?;
+        }
+    }
     let tools = registry.iter().map(|t| t.spec().name.clone()).collect();
     let config = SessionConfig {
         preamble: system_prompt(&profile),
@@ -173,6 +180,9 @@ pub fn start(
         Some(stop),
         config,
     );
+    if let Some(m) = &missions {
+        m.attach(session.handle());
+    }
     Ok(Agent {
         session,
         profile,
