@@ -12,6 +12,7 @@ use nervros_ros::RobotPort;
 use serde_json::{Value, json};
 
 use crate::guard::Guard;
+use crate::mission::held_by;
 use crate::profile::{MissionConfig, PlaceConfig, Profile, TopicRef};
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
@@ -192,8 +193,8 @@ impl Tool for RobotState {
             out["executor"] = json!({
                 "mission": field("mission_id"),
                 "step": field("mission_step"),
-                "holding_left": field("holding_left"),
-                "holding_right": field("holding_right"),
+                "holding_left": held_by(&state, "left"),
+                "holding_right": held_by(&state, "right"),
                 "resources_held": field("resources_held"),
                 "stopped": field("stopped"),
             });
