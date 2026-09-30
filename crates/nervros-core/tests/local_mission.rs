@@ -60,22 +60,8 @@ const PROFILE: &str = r#"
     file = "models.toml"
 "#;
 
-const CATALOG: &str = r#"{"catalog_version": "test", "skills": [
-    {"name": "GoToPose", "description": "Walk to a pose.", "args": [{"name": "station", "type": "string", "description": "x;y;yaw", "enum": []}],
-     "effects": ["at(station)"], "resources": ["base"], "risk": "motion", "max_duration_s": 300, "template": "GoToPose"},
-    {"name": "GoToTarget", "description": "Walk up to a room or an object.", "args": [{"name": "target", "type": "world_id", "description": "a room or object id", "enum": []}],
-     "effects": ["at(target)"], "resources": ["base"], "risk": "motion", "max_duration_s": 300, "template": "GoToTarget"},
-    {"name": "PickObject", "description": "Pick up an object within reach with one hand.", "args": [
-        {"name": "object_id", "type": "world_id", "description": "the object's id in the world model", "enum": []},
-        {"name": "phrase", "type": "string", "description": "what the detector looks for", "enum": [], "default_from": "label(object_id)"},
-        {"name": "arm", "type": "string", "description": "which arm", "enum": ["left", "right"]}],
-     "requires": ["near(object_id)", "hand_empty(arm)"], "effects": ["holding(arm, object_id)"], "resources": ["base", "left_arm", "right_arm"], "risk": "manipulation", "max_duration_s": 420, "template": "PickObject"},
-    {"name": "PlaceInto", "description": "Put the held object into a container within reach.", "args": [
-        {"name": "container_id", "type": "world_id", "description": "the container's id in the world model", "enum": []},
-        {"name": "phrase", "type": "string", "description": "what the detector looks for", "enum": [], "default_from": "label(container_id)"},
-        {"name": "arm", "type": "string", "description": "the arm holding the object", "enum": ["left", "right"]}],
-     "requires": ["near(container_id)", "holding(arm, X)"], "effects": ["inside(X, container_id)", "hand_empty(arm)"], "resources": ["base", "left_arm", "right_arm"], "risk": "manipulation", "max_duration_s": 300, "template": "PlaceInto"}
-]}"#;
+/// The catalog grove-g1's executor serves, as fetched from it.
+const CATALOG: &str = include_str!("fixtures/g1_catalog.json");
 
 fn object(id: &str, label: &str, room: &str, x: f64, y: f64) -> Value {
     json!({"id": id, "label": label, "name": label, "room_id": room, "state": 0,
