@@ -96,6 +96,7 @@ mod parse;
 mod registry;
 mod schema;
 mod types;
+mod validate;
 mod value;
 
 pub use error::{Error, ParseError, ParseErrorKind, Result};
@@ -105,3 +106,4 @@ pub use schema::{FieldOverride, Overrides, flatten_refs, json_schema};
 pub use types::{
     Action, Array, Constant, Field, FieldType, Interface, Kind, Message, Part, Service, TypeName,
 };
+pub use validate::validate;

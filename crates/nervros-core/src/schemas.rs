@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use rosidl_schema::{FieldOverride, Overrides, Part, Registry, SearchPath, TypeName};
+use rosidl_schema::{FieldOverride, Interface, Overrides, Part, Registry, SearchPath, TypeName};
 use serde_json::Value;
 
 use crate::profile::Profile;
@@ -61,15 +61,23 @@ impl RosidlSchemas {
     }
 }
 
+fn rosidl_part(part: SchemaPart) -> Part {
+    match part {
+        SchemaPart::Request => Part::Request,
+        SchemaPart::Response => Part::Response,
+        SchemaPart::Message => Part::Message,
+        SchemaPart::Goal => Part::Goal,
+        SchemaPart::Result => Part::Result,
+        SchemaPart::Feedback => Part::Feedback,
+    }
+}
+
 impl SchemaSource for RosidlSchemas {
     fn schema(&self, ros_type: &str, part: SchemaPart, hide: &[String]) -> Result<Value, String> {
         let ty: TypeName = ros_type
             .parse()
             .map_err(|e| format!("bad type `{ros_type}`: {e}"))?;
-        let part = match part {
-            SchemaPart::Request => Part::Request,
-            SchemaPart::Message => Part::Message,
-        };
+        let part = rosidl_part(part);
         let mut overrides = Overrides::default();
         for field in hide {
             overrides.fields.insert(
@@ -84,5 +92,21 @@ impl SchemaSource for RosidlSchemas {
             .map_err(|e| e.to_string())?;
         // Inlined so providers that ignore `$ref` see every field.
         rosidl_schema::flatten_refs(&schema).map_err(|e| e.to_string())
+    }
+
+    fn validate(&self, ros_type: &str, part: SchemaPart, value: &Value) -> Result<(), String> {
+        let ty: TypeName = ros_type
+            .parse()
+            .map_err(|e| format!("bad type `{ros_type}`: {e}"))?;
+        rosidl_schema::validate(&self.registry, &ty, rosidl_part(part), value)
+    }
+
+    fn show(&self, ros_type: &str) -> Option<String> {
+        let ty: TypeName = ros_type.parse().ok()?;
+        Some(match self.registry.get(&ty)? {
+            Interface::Message(m) => m.to_string(),
+            Interface::Service(s) => format!("{}---\n{}", s.request, s.response),
+            Interface::Action(a) => format!("{}---\n{}---\n{}", a.goal, a.result, a.feedback),
+        })
     }
 }

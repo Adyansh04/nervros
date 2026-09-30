@@ -460,12 +460,12 @@ impl AgentSource for Llm {
 struct TurnHook {
     source: Arc<dyn AgentSource>,
     model: String,
-    acted: Arc<AtomicBool>,
+    started: Arc<AtomicBool>,
 }
 
 impl AgentHook for TurnHook {
     /// Takes each request from the model's quota before it is sent (a turn is up to `max_turns`
-    /// requests, not one), and once the robot has acted offers no more tools, so the model
+    /// requests, not one), and once a mission has started offers no more tools, so the model
     /// answers instead of spending the turn on checks the mission's report will answer anyway.
     async fn on_completion_call(
         &self,
@@ -475,7 +475,7 @@ impl AgentHook for TurnHook {
         if let Err(why) = self.source.take_request(&self.model) {
             return CompletionCallAction::stop(format!("{}: {why}", self.model));
         }
-        if self.acted.load(Ordering::SeqCst) {
+        if self.started.load(Ordering::SeqCst) {
             return CompletionCallAction::patch(
                 RequestPatch::new().active_tools(Vec::<String>::new()),
             );
@@ -512,8 +512,9 @@ pub struct TurnSetup<'a> {
     pub max_turns: usize,
     /// The tools on offer.
     pub tools: &'a [LoopTool],
-    /// Set once a tool has acted on the robot; the rest of the turn is the answer.
-    pub acted: Arc<AtomicBool>,
+    /// Set once a tool has started something that reports back, such as a mission; the rest of
+    /// the turn is the answer.
+    pub started: Arc<AtomicBool>,
 }
 
 /// Runs one user turn on a model from `source`: the model may call the tools up to
@@ -555,7 +556,7 @@ pub async fn chat(
         .add_hook(TurnHook {
             source,
             model: model_id.to_owned(),
-            acted: setup.acted,
+            started: setup.started,
         });
     let agent = builder.build();
     agent

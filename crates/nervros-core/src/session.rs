@@ -6,6 +6,7 @@
 //! that fails before any act-lane tool ran is replaced by the next one, and after one did, the turn
 //! ends instead of repeating an action. Every tool call passes the guard.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -21,7 +22,7 @@ use crate::llm::{self, AgentSource, History, LoopTool};
 use crate::mission::plan::PlannedStep;
 use crate::providers::Role;
 use crate::providers::router::Need;
-use crate::tools::{Lane, Registry, Status, Tool, ToolOutcome};
+use crate::tools::{Lane, Registry, Resource, Status, Tool, ToolOutcome};
 
 /// What a UI or the CLI asks the session to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,12 +286,11 @@ impl Shared {
         }
     }
 
-    async fn run(&self, tool: &Arc<dyn Tool>, args: Value) -> ToolOutcome {
-        let spec = tool.spec();
-        let _held = if spec.resources.is_empty() {
+    async fn run(&self, tool: &Arc<dyn Tool>, args: Value, resources: &[Resource]) -> ToolOutcome {
+        let _held = if resources.is_empty() {
             None
         } else {
-            match self.guard.lock(&spec.resources) {
+            match self.guard.lock(resources) {
                 Ok(l) => Some(l),
                 Err(r) => return ToolOutcome::refused(r.message),
             }
@@ -303,10 +303,20 @@ impl Shared {
         tool: &Arc<dyn Tool>,
         turn: u64,
         args: Value,
-        acted: &AtomicBool,
+        flags: &TurnFlags,
     ) -> Value {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
-        let spec = tool.spec();
+        // A tool whose risk depends on its arguments says what this call would do.
+        let assessment = tool.assess(&args);
+        let spec = match &assessment {
+            Some(a) => {
+                let mut spec = tool.spec().into_owned();
+                spec.risk = a.risk;
+                spec.resources.clone_from(&a.resources);
+                Cow::Owned(spec)
+            }
+            None => tool.spec(),
+        };
         self.emit(Event::ToolStarted {
             turn,
             call,
@@ -317,18 +327,23 @@ impl Shared {
         let outcome = match self.guard.decide(&spec, &args) {
             Decision::Deny(r) => ToolOutcome::refused(r.message),
             Decision::NeedApproval { reason } => {
+                let reason = assessment.map_or(reason, |a| a.reason);
                 if self.ask_approval(&spec.name, &args, reason).await {
-                    self.run(tool, args).await
+                    self.run(tool, args, &spec.resources).await
                 } else {
                     ToolOutcome::refused("the operator did not approve this")
                 }
             }
-            Decision::Allow => self.run(tool, args).await,
+            Decision::Allow => self.run(tool, args, &spec.resources).await,
         };
         if spec.lane() == Lane::Act
             && matches!(outcome.status, Status::Succeeded | Status::Accepted)
         {
-            acted.store(true, Ordering::SeqCst);
+            flags.acted.store(true, Ordering::SeqCst);
+        }
+        // Something now runs that will report back, such as a mission: the rest is the answer.
+        if outcome.status == Status::Accepted {
+            flags.started.store(true, Ordering::SeqCst);
         }
         let status = match outcome.status {
             Status::Succeeded => "succeeded",
@@ -583,26 +598,35 @@ enum Origin {
     Report(String),
 }
 
-/// This turn's tools, each call going through the guard; `acted` records any act that ran.
+/// What the tools of one turn have done so far.
+#[derive(Debug, Default)]
+struct TurnFlags {
+    /// An act ran, so the turn is not retried on another model.
+    acted: AtomicBool,
+    /// Something started that reports back later, so no more tools are offered.
+    started: Arc<AtomicBool>,
+}
+
+/// This turn's tools, each call going through the guard and recorded in `flags`.
 fn loop_tools(
     registry: &Registry,
     shared: &Arc<Shared>,
     turn: u64,
-    acted: &Arc<AtomicBool>,
+    flags: &Arc<TurnFlags>,
 ) -> Vec<LoopTool> {
     registry
         .iter()
         .map(|tool| {
-            let (tool, shared, acted) = (Arc::clone(tool), Arc::clone(shared), Arc::clone(acted));
+            let (tool, shared, flags) = (Arc::clone(tool), Arc::clone(shared), Arc::clone(flags));
             let spec = tool.spec().into_owned();
             LoopTool {
                 name: spec.name,
                 description: spec.description,
                 parameters: spec.parameters,
                 invoke: Arc::new(move |args| {
-                    let (tool, shared, acted) =
-                        (Arc::clone(&tool), Arc::clone(&shared), Arc::clone(&acted));
-                    Box::pin(async move { shared.invoke(&tool, turn, args, &acted).await })
+                    let (tool, shared, flags) =
+                        (Arc::clone(&tool), Arc::clone(&shared), Arc::clone(&flags));
+                    Box::pin(async move { shared.invoke(&tool, turn, args, &flags).await })
                 }),
             }
         })
@@ -635,8 +659,8 @@ async fn run_turn(
             format!("[Report from the robot, not the operator]\n{text}")
         }
     };
-    let acted = Arc::new(AtomicBool::new(false));
-    let tools = loop_tools(&registry, &shared, turn, &acted);
+    let flags = Arc::new(TurnFlags::default());
+    let tools = loop_tools(&registry, &shared, turn, &flags);
     let need = Need {
         tools: !tools.is_empty(),
         ..Need::default()
@@ -649,7 +673,7 @@ async fn run_turn(
             preamble: &shared.config.preamble,
             max_turns: shared.config.max_model_calls,
             tools: &tools,
-            acted: Arc::clone(&acted),
+            started: Arc::clone(&flags.started),
         };
         let result = llm::chat(&model, Arc::clone(&source), setup, &mut updated, &text).await;
         match result {
@@ -662,7 +686,7 @@ async fn run_turn(
                 updated.trim(shared.config.history_max);
                 return Some(updated);
             }
-            Err(e) if !acted.load(Ordering::SeqCst) => {
+            Err(e) if !flags.acted.load(Ordering::SeqCst) => {
                 if matches!(
                     e,
                     llm::LlmError::Turn {
@@ -797,16 +821,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn once_the_robot_has_acted_the_model_is_offered_no_tools() {
+    async fn a_synchronous_act_leaves_the_tools_offered_to_check_its_effect() {
         let model = MockCompletionModel::new([
             MockTurn::tool_call("c1", "find_objects", json!({})),
-            MockTurn::text("Started."),
+            MockTurn::text("Done."),
         ]);
         let guard = Arc::new(Guard::new(Policy::default()));
         guard.set_armed(true);
         let session = Session::start(
             Arc::new(Scripted(model.clone())),
             registry(Risk::Motion),
+            guard,
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("reset it".into()));
+        let approve = |e: &Event| match e {
+            Event::ApprovalRequested { id, .. } => Some(Command::Approve(*id)),
+            _ => None,
+        };
+        collect_until_finished(&mut rx, approve, &session).await;
+        let offered: Vec<usize> = model.requests().iter().map(|r| r.tools.len()).collect();
+        assert_eq!(offered, [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn once_a_mission_has_started_the_model_is_offered_no_tools() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "find_objects", json!({})),
+            MockTurn::text("Started."),
+        ]);
+        let guard = Arc::new(Guard::new(Policy::default()));
+        guard.set_armed(true);
+        let mut r = Registry::default();
+        let spec = ToolSpec::new(
+            "find_objects",
+            "Starts.",
+            json!({"type": "object"}),
+            Risk::Motion,
+        );
+        r.add(Arc::new(Starter(spec))).unwrap();
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            Arc::new(r),
             guard,
             None,
             SessionConfig::default(),
@@ -862,6 +920,22 @@ mod tests {
         }
         async fn call(&self, args: Value) -> ToolOutcome {
             ToolOutcome::ok(json!({"echo": args}))
+        }
+    }
+
+    /// Starts something in the background, as `run_mission` does.
+    struct Starter(ToolSpec);
+
+    #[async_trait]
+    impl Tool for Starter {
+        fn spec(&self) -> Cow<'_, ToolSpec> {
+            Cow::Borrowed(&self.0)
+        }
+        async fn call(&self, _args: Value) -> ToolOutcome {
+            ToolOutcome {
+                status: Status::Accepted,
+                ..ToolOutcome::ok(json!({"mission_id": "m1"}))
+            }
         }
     }
 
