@@ -88,8 +88,10 @@ The default `hard_deny` covers what commands motors, velocities or controllers d
 
 ### `[look]`
 
-The `look` tool: a camera frame with the current detections drawn on it as numbered marks, which
-the model and the operator both see.
+The `look` tool: a camera frame with the current detections drawn on it as numbered marks. The
+operator sees the frame; the chat model gets the marks and the answer of the `vision_check` model,
+which is shown the marked frame (768 px on its long side) with the chat model's `question`. With no
+vision model available, `look` returns the marks alone and says why.
 
 | Key | Default | |
 |---|---|---|
