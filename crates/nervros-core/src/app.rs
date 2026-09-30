@@ -60,9 +60,6 @@ pub enum StartError {
     /// The quota ledger.
     #[error("quota ledger: {0}")]
     Ledger(std::io::Error),
-    /// Provider keys.
-    #[error(transparent)]
-    Llm(#[from] crate::llm::LlmError),
     /// Interface files.
     #[error("interface files: {0}")]
     Schemas(#[from] rosidl_schema::Error),
@@ -159,7 +156,7 @@ pub fn start(
         PrivacyModeConfig::Home => PrivacyMode::Home,
     };
     let router = Router::with_ledger_file(models, ledger, privacy).map_err(StartError::Ledger)?;
-    let llm = Arc::new(Llm::new(router)?);
+    let llm = Arc::new(Llm::new(router));
     let guard = Arc::new(Guard::new(profile.policy.clone()));
     let schemas: Arc<dyn SchemaSource> = Arc::new(RosidlSchemas::load(&profile)?);
     let mut registry = Registry::from_config(&profile.tools, &robot, &schemas, &guard)?;

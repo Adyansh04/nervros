@@ -204,7 +204,7 @@ async fn models(path: &Path, check: bool) -> Result<()> {
     if !check {
         return Ok(());
     }
-    let llm = Llm::new(router).context("loading provider keys")?;
+    let llm = Llm::new(router);
     let http = reqwest::Client::new();
     for provider in &llm.router().config().providers {
         let Some(base) = provider
@@ -267,7 +267,7 @@ async fn ask(path: &Path, prompt: &str, role: Role, image: Option<PathBuf>) -> R
             Some(ImageInput { bytes, format })
         }
     };
-    let llm = Llm::new(router(path)?).context("loading provider keys")?;
+    let llm = Llm::new(router(path)?);
     let answer = llm
         .ask(Ask {
             role,

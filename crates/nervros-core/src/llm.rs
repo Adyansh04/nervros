@@ -133,6 +133,8 @@ fn describe(skipped: &[(String, Skip)], failed: &[(String, String)]) -> String {
 pub struct Llm {
     router: Router,
     keys: HashMap<String, SecretString>,
+    /// Why a provider's key could not be loaded; its models fail with this when asked.
+    missing_keys: HashMap<String, String>,
 }
 
 impl std::fmt::Debug for Llm {
@@ -145,23 +147,34 @@ impl std::fmt::Debug for Llm {
 }
 
 impl Llm {
-    /// Loads every provider key.
-    ///
-    /// # Errors
-    ///
-    /// [`LlmError::Key`] for a provider whose key cannot be read.
-    pub fn new(router: Router) -> Result<Self, LlmError> {
+    /// Loads every provider key. A key that cannot be read leaves its provider's models failing
+    /// with the reason, so a missing optional key does not stop the app.
+    #[must_use]
+    pub fn new(router: Router) -> Self {
         let mut keys = HashMap::new();
+        let mut missing_keys = HashMap::new();
         for provider in &router.config().providers {
             if let Some(source) = &provider.key {
-                let key = source.load().map_err(|source| LlmError::Key {
-                    provider: provider.id.clone(),
-                    source,
-                })?;
-                keys.insert(provider.id.clone(), key);
+                match source.load() {
+                    Ok(key) => {
+                        keys.insert(provider.id.clone(), key);
+                    }
+                    Err(e) => {
+                        let error = LlmError::Key {
+                            provider: provider.id.clone(),
+                            source: e,
+                        };
+                        tracing::warn!(%error, "its models are left out");
+                        missing_keys.insert(provider.id.clone(), error.to_string());
+                    }
+                }
             }
         }
-        Ok(Self { router, keys })
+        Self {
+            router,
+            keys,
+            missing_keys,
+        }
     }
 
     /// The router, for quota display and pool updates.
@@ -199,6 +212,12 @@ impl Llm {
                 .is_some_and(|u| u.contains("openrouter.ai"))
         {
             free_only::check_openrouter_id(&model.model)?;
+        }
+        if let Some(why) = self.missing_keys.get(&provider.id) {
+            return Err(LlmError::Client {
+                provider: provider.id.clone(),
+                message: why.clone(),
+            });
         }
         let key = self.keys.get(&provider.id);
         let http = http_client(provider)?;
@@ -246,7 +265,13 @@ impl Llm {
         let (candidates, skipped) = self.router.candidates(ask.role, need, SystemTime::now());
         let mut failed = Vec::new();
         for model in candidates {
-            let agent = self.agent_builder(model)?.preamble(ask.preamble).build();
+            let agent = match self.agent_builder(model) {
+                Ok(builder) => builder.preamble(ask.preamble).build(),
+                Err(e) => {
+                    failed.push((model.id.clone(), e.to_string()));
+                    continue;
+                }
+            };
             // Gemini segments from the prompt before the image; given the image first, Flash-Lite
             // answered with boxes where the outlines belong.
             let message = user_message(ask.prompt, ask.image.as_ref(), ask.role == Role::Segment);
@@ -627,6 +652,36 @@ fn without_provider_body(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_provider_without_its_key_is_passed_over_with_the_reason() {
+        let config = crate::providers::ModelsConfig::parse(
+            "[[provider]]\nid = \"gemini\"\nkind = \"gemini_interactions\"\n\
+             key = { file = \"/nonexistent/gemini.key\" }\n\
+             [[model]]\nid = \"g\"\nprovider = \"gemini\"\nmodel = \"m\"\nvision = true\n\
+             [roles]\nsegment = [\"g\"]\n",
+        )
+        .unwrap();
+        let llm = Llm::new(Router::new(
+            config,
+            crate::providers::ledger::Ledger::default(),
+            crate::providers::router::PrivacyMode::Sim,
+        ));
+        let err = llm
+            .ask(Ask {
+                role: Role::Segment,
+                preamble: "",
+                prompt: "the floor",
+                image: None,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("g failed") && err.contains("/nonexistent/gemini.key"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn the_image_goes_first_unless_the_text_must() {

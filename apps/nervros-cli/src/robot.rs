@@ -55,7 +55,7 @@ pub(crate) async fn segment(
     };
     let router =
         Router::with_ledger_file(models, &ledger, privacy).context("loading the quota ledger")?;
-    let llm = Arc::new(Llm::new(router).context("loading provider keys")?);
+    let llm = Arc::new(Llm::new(router));
     let robot = nervros_core::app::connect(&profile)?;
     let cameras = Cameras::start(&look, &robot).context("subscribing to the cameras")?;
     let tool = SegmentTool::new(
