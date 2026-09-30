@@ -1,21 +1,12 @@
 # The whole workspace in ROS 2 Jazzy: the r2r node, the Rerun viewer and the app, with clippy and
-# every test; the GUI snapshots render with the lavapipe software renderer. A cold build takes well
-# over an hour on a hosted runner and needs more disk than a container job gets, so it runs on the
-# runner itself after freeing its preinstalled toolchains, and only for changes that reach these
-# crates, or by hand.
+# every test; the GUI snapshots render with the lavapipe software renderer. A cold build takes over
+# an hour on a hosted runner, and caches saved on a pull request are not shared with the next one,
+# so it runs by hand (Actions > full > Run workflow) rather than on every change: the same checks
+# run locally before each pull request. It needs more disk than a container job gets, so it runs on
+# the runner itself after freeing its preinstalled toolchains.
 name: full
 
 on:
-  pull_request:
-    paths:
-      - "apps/**"
-      - "crates/nervros-ros/**"
-      - "crates/nervros-viz/**"
-      - "scripts/**"
-      - "ros/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/full.yml"
   workflow_dispatch:
 
 concurrency:
