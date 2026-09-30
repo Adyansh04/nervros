@@ -345,6 +345,8 @@ impl Missions {
             "next": "call run_mission with this hash; the operator approves it first"
         });
         let mut planned = lock(&self.planned);
+        // The same plan compiles to the same tree: keep one copy, or its hash reads as ambiguous.
+        planned.retain(|c| c.sha256 != compiled.sha256);
         planned.push_back(compiled);
         if planned.len() > KEPT_PLANS {
             planned.pop_front();
@@ -797,6 +799,16 @@ mod tests {
         assert!(text.contains("plan once more"), "{text}");
         missions.run_failures.store(2, Ordering::SeqCst);
         assert_eq!(missions.plan(steps()).await.status, Status::Refused);
+    }
+
+    #[tokio::test]
+    async fn the_same_plan_twice_runs_by_its_hash() {
+        let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
+        let missions = Missions::new(&profile(), robot).unwrap();
+        let first = missions.plan(steps()).await.data["hash"].clone();
+        let second = missions.plan(steps()).await.data["hash"].clone();
+        assert_eq!(first, second);
+        assert!(missions.find(first.as_str().unwrap()).is_ok());
     }
 
     #[test]

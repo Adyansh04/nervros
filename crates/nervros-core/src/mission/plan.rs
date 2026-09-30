@@ -583,20 +583,22 @@ fn ports_for(
 /// A navigation macro, its one port, and where it leaves the robot.
 type Resolved<'c> = (&'c Skill, Vec<(String, String)>, Spot);
 
-/// A derived argument's value: `label(x)` is the world model's label of what argument `x` names.
+/// A derived argument's value: `label(x)` is the world model's label of what argument `x` names,
+/// or, for something it does not know, such as a detector's `red_block`, that name in words.
 fn derive(rule: &str, step: &Step, world: &World) -> Option<String> {
     let ("label", args) = predicate(rule)? else {
         return None;
     };
     let from = args.first()?;
     let id = step.args.iter().find(|a| a.name == *from)?.value.trim();
-    world
+    let label = world
         .objects
         .iter()
         .chain(&world.rooms)
         .find(|t| t.id == id)
         .map(|t| t.name.clone())
-        .filter(|n| !n.is_empty())
+        .filter(|n| !n.is_empty());
+    label.or_else(|| Some(id.replace('_', " ")).filter(|w| !w.trim().is_empty()))
 }
 
 /// `GoToPlace(place)`: a profile place becomes `GoToPose` at its pose; a room or object id, or a
@@ -943,6 +945,32 @@ mod tests {
         // Node names must be identifiers, so the intent stays out of the tree.
         assert!(c.xml.contains("<Sequence name=\"mission\">"));
         assert!(!c.xml.contains("&lt;b&gt;"));
+    }
+
+    #[test]
+    fn a_name_the_world_model_does_not_know_gives_its_own_words() {
+        let mut c = catalog();
+        let pick = c
+            .skills
+            .iter_mut()
+            .find(|s| s.name == "PickObject")
+            .unwrap();
+        pick.args
+            .iter_mut()
+            .find(|a| a.name == "phrase")
+            .unwrap()
+            .default_from = Some("label(object_id)".to_owned());
+        let p = plan(
+            &json!([{"skill": "PickObject", "args": {"object_id": "red_block", "arm": "left"}}]),
+        );
+        let compiled = compile(&p, &c, &world()).unwrap();
+        assert!(
+            compiled
+                .xml
+                .contains(r#"object_id="red_block" phrase="red block""#),
+            "{}",
+            compiled.xml
+        );
     }
 
     #[test]
