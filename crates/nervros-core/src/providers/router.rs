@@ -187,6 +187,26 @@ impl Router {
         ledger.save()
     }
 
+    /// Counts one request if the model's limits still allow it, checked and counted under one
+    /// lock; persists the ledger. A failure to write the file is logged: the count stands.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused`] naming the limit that blocks the request, which is then not counted.
+    pub fn take_request(&self, model_id: &str, now: SystemTime) -> Result<(), Refused> {
+        let Some(model) = self.config.model(model_id) else {
+            return Ok(());
+        };
+        let zone = self.zone(model);
+        let mut ledger = self.ledger();
+        ledger.check(&model.id, &model.limits, self.pool_of(model), now, zone)?;
+        ledger.record(&model.id, model.limits.pool.as_deref(), now, zone);
+        if let Err(e) = ledger.save() {
+            tracing::warn!(model = %model.id, error = %e, "could not save the quota ledger");
+        }
+        Ok(())
+    }
+
     /// Parks a model after a 429; persists the ledger.
     ///
     /// # Errors
@@ -334,6 +354,23 @@ mod tests {
                 .all(|(_, s)| *s == Skip::Refused(Refused::Pool("or_free".into())))
         );
         assert_eq!(r.used_today("or_free", now), 2);
+    }
+
+    #[test]
+    fn a_request_is_taken_only_while_the_pool_has_room() {
+        let r = router(PrivacyMode::Sim);
+        let now = SystemTime::now();
+        assert_eq!(r.take_request("big", now), Ok(()));
+        assert_eq!(r.take_request("text", now), Ok(()));
+        assert_eq!(
+            r.take_request("big", now),
+            Err(Refused::Pool("or_free".into()))
+        );
+        assert_eq!(
+            r.used_today("or_free", now),
+            2,
+            "a refused request is not counted"
+        );
     }
 
     #[test]

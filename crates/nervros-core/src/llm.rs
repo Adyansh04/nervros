@@ -5,11 +5,13 @@
 //! transport failure moves on without parking, and the answer names the model that gave it.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use futures::future::BoxFuture;
 use rig::agent::tool::ToolOutput;
+use rig::agent::{AgentHook, CompletionCallAction, CompletionCallEvent, HookContext};
 use rig::client::CompletionClient as _;
 use rig::completion::{Chat as _, Message, Prompt as _, PromptError};
 use rig::message::{ImageMediaType, UserContent};
@@ -385,7 +387,11 @@ pub trait AgentSource: Send + Sync {
     fn builder(&self, model_id: &str) -> Result<AgentBuilder, LlmError>;
 
     /// Counts one request against the model's quota.
-    fn record_use(&self, model_id: &str);
+    ///
+    /// # Errors
+    ///
+    /// Why the quota refuses the request, which is then not counted.
+    fn take_request(&self, model_id: &str) -> Result<(), String>;
 
     /// Sets a model aside after a 429.
     fn park(&self, model_id: &str);
@@ -413,10 +419,10 @@ impl AgentSource for Llm {
         self.agent_builder(model)
     }
 
-    fn record_use(&self, model_id: &str) {
-        if let Err(e) = self.router.record_use(model_id, SystemTime::now()) {
-            tracing::warn!(model = %model_id, error = %e, "could not save the quota ledger");
-        }
+    fn take_request(&self, model_id: &str) -> Result<(), String> {
+        self.router
+            .take_request(model_id, SystemTime::now())
+            .map_err(|refused| refused.to_string())
     }
 
     fn park(&self, model_id: &str) {
@@ -426,15 +432,37 @@ impl AgentSource for Llm {
     }
 }
 
-/// Runs one user turn: the model may call the tools up to `max_turns` model calls in total.
-/// Committed messages, tool calls and results included, are appended to `history`.
+/// Takes each of a turn's requests from the model's quota before it is sent, and ends the turn
+/// when the quota refuses one: a turn is up to `max_turns` requests, not one.
+struct Quota {
+    source: Arc<dyn AgentSource>,
+    model: String,
+}
+
+impl AgentHook for Quota {
+    async fn on_completion_call(
+        &self,
+        _ctx: &HookContext,
+        _event: CompletionCallEvent<'_>,
+    ) -> CompletionCallAction {
+        match self.source.take_request(&self.model) {
+            Ok(()) => CompletionCallAction::continue_run(),
+            Err(why) => CompletionCallAction::stop(format!("{}: {why}", self.model)),
+        }
+    }
+}
+
+/// Runs one user turn on a model from `source`: the model may call the tools up to `max_turns`
+/// model calls in total, each taken from its quota. Committed messages, tool calls and results
+/// included, are appended to `history`.
 ///
 /// # Errors
 ///
-/// [`LlmError::Turn`] when the provider or the loop fails.
+/// The model cannot be built, or [`LlmError::Turn`] when the provider or the loop fails or the
+/// quota ends the turn.
 pub async fn chat(
     model_id: &str,
-    builder: AgentBuilder,
+    source: Arc<dyn AgentSource>,
     preamble: &str,
     max_turns: usize,
     tools: &[LoopTool],
@@ -456,10 +484,15 @@ pub async fn chat(
             )
         })
         .collect();
-    let builder = builder
+    let builder = source
+        .builder(model_id)?
         .preamble(preamble)
         .default_max_turns(max_turns)
-        .dynamic_tools(dynamic);
+        .dynamic_tools(dynamic)
+        .add_hook(Quota {
+            source,
+            model: model_id.to_owned(),
+        });
     let agent = builder.build();
     agent
         .chat(text, &mut history.0)
