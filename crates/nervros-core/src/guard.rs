@@ -20,10 +20,10 @@ use crate::tools::{Lane, Resource, ToolSpec};
 pub enum Autonomy {
     /// Observe tools only.
     Observe,
-    /// Act-lane tools need the operator's approval.
+    /// Edit and act tools need the operator's approval.
     #[default]
     Supervised,
-    /// Act-lane tools run without approval.
+    /// Edit and act tools run without approval.
     Autonomous,
 }
 
@@ -336,29 +336,37 @@ impl Guard {
                 ),
             ));
         }
-        if spec.lane() == Lane::Act {
-            if self.policy.autonomy == Autonomy::Observe {
-                return Decision::Deny(Refusal::new(
-                    "observe_only",
-                    "the agent is in observe mode; describe instead of acting",
-                ));
-            }
-            if !s.armed {
-                return Decision::Deny(Refusal::new(
-                    "disarmed",
-                    "the robot is disarmed; tell the user to arm it in the app before it can act",
-                ));
-            }
+        if spec.lane() != Lane::Observe && self.policy.autonomy == Autonomy::Observe {
+            return Decision::Deny(Refusal::new(
+                "observe_only",
+                "the agent is in observe mode; describe instead of acting",
+            ));
+        }
+        if spec.lane() == Lane::Act && !s.armed {
+            return Decision::Deny(Refusal::new(
+                "disarmed",
+                "the robot is disarmed; tell the user to arm it in the app before it can act",
+            ));
         }
         s.tool_calls += 1;
         s.last_calls.push_back(key);
         if s.last_calls.len() > 16 {
             s.last_calls.pop_front();
         }
-        if spec.lane() == Lane::Act && self.policy.autonomy == Autonomy::Supervised {
-            return Decision::NeedApproval {
-                reason: format!("`{}` acts on the robot", spec.name),
-            };
+        if self.policy.autonomy == Autonomy::Supervised {
+            match spec.lane() {
+                Lane::Act => {
+                    return Decision::NeedApproval {
+                        reason: format!("`{}` acts on the robot", spec.name),
+                    };
+                }
+                Lane::Edit => {
+                    return Decision::NeedApproval {
+                        reason: format!("`{}` changes the world model", spec.name),
+                    };
+                }
+                Lane::Observe => {}
+            }
         }
         Decision::Allow
     }
@@ -428,6 +436,30 @@ mod tests {
         assert!(!glob_match("/cmd_vel", "/cmd_vel_nav"));
         assert!(glob_match("a*b*c", "axxbyyc"));
         assert!(!glob_match("a*b*c", "axxc"));
+    }
+
+    #[test]
+    fn an_edit_needs_no_arming_but_is_approved_when_supervised() {
+        let g = Guard::new(Policy::default());
+        let edit = spec("edit_world", Risk::Annotate);
+        match g.decide(&edit, &json!({})) {
+            Decision::NeedApproval { reason } => {
+                assert!(reason.contains("world model"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            g.decide(&spec("walk", Risk::Motion), &json!({})),
+            Decision::Deny(r) if r.rule == "disarmed"
+        ));
+        let observing = Guard::new(Policy {
+            autonomy: Autonomy::Observe,
+            ..Policy::default()
+        });
+        assert!(matches!(
+            observing.decide(&edit, &json!({})),
+            Decision::Deny(r) if r.rule == "observe_only"
+        ));
     }
 
     #[test]

@@ -34,7 +34,7 @@ does not declare, is for the generic tools of [`[ros_tools]`](#ros_tools), behin
 | `ros_name` | required | The service or topic. |
 | `type` | required | `pkg/srv/Name` or `pkg/msg/Name`. |
 | `description` | from the interface | Replaces the interface file's comment. |
-| `risk` | required for a service; `observe` for a topic | `observe`, `world_edit`, `motion` or `manipulation`. Anything but `observe` is an act: it needs the robot armed and, when supervised, the operator's approval. A service can act on the robot, so a service tool without it fails the start instead of running as a read. |
+| `risk` | required for a service; `observe` for a topic | `observe`, `annotate`, `world_edit`, `motion` or `manipulation`. `annotate` changes only what the robot knows, such as the world model: no arming, the operator's approval when supervised. The rest are acts: they need the robot armed and, when supervised, approval. A service can act on the robot, so a service tool without it fails the start instead of running as a read. |
 | `resources` | none | `base`, `left_arm`, `right_arm`: two calls holding the same one cannot run at once. |
 | `timeout` | `"5s"` | Per call. |
 | `hide_fields` | none | Request fields the model neither sees nor fills, such as an embedding. |

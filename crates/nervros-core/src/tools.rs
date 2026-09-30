@@ -23,7 +23,10 @@ pub enum Risk {
     /// Reads only.
     #[default]
     Observe,
-    /// Changes stored state (the world model, a parameter), not the robot's body.
+    /// Changes what the robot knows, such as the world model's labels and boxes, never what it
+    /// does.
+    Annotate,
+    /// Changes stored state the robot acts on, such as a parameter, not the robot's body.
     WorldEdit,
     /// Moves the base.
     Motion,
@@ -31,12 +34,15 @@ pub enum Risk {
     Manipulation,
 }
 
-/// Observe tools run freely; act tools need the robot armed and, when supervised, approval.
+/// Observe tools run freely; edit tools need approval when supervised; act tools need the robot
+/// armed too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
     /// Read-only.
     Observe,
-    /// Changes something.
+    /// Changes what the robot knows.
+    Edit,
+    /// Changes the robot or what it acts on.
     Act,
 }
 
@@ -86,10 +92,10 @@ impl ToolSpec {
     /// Its lane.
     #[must_use]
     pub fn lane(&self) -> Lane {
-        if self.risk == Risk::Observe {
-            Lane::Observe
-        } else {
-            Lane::Act
+        match self.risk {
+            Risk::Observe => Lane::Observe,
+            Risk::Annotate => Lane::Edit,
+            _ => Lane::Act,
         }
     }
 }
