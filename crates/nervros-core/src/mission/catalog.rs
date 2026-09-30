@@ -1,5 +1,7 @@
 //! The robot's skill catalog, as its executor's `GetCatalog` serves it.
 
+use std::fmt::Write as _;
+
 use serde::Deserialize;
 
 /// The navigation macros a plan never names: it writes `GoToPlace`, which becomes one of these.
@@ -55,12 +57,32 @@ pub struct Skill {
 pub struct Arg {
     /// The port name.
     pub name: String,
+    /// `world_id` for an id from the world model, else `string`.
+    #[serde(default, rename = "type")]
+    pub kind: String,
     /// For the model.
     #[serde(default)]
     pub description: String,
     /// Allowed values; empty means any.
     #[serde(default, rename = "enum")]
     pub choices: Vec<String>,
+    /// Filled in by the planner instead of the model, as `label(<arg>)`: the world model's label
+    /// of the object another argument names.
+    #[serde(default)]
+    pub default_from: Option<String>,
+}
+
+impl Arg {
+    /// Whether the value must be a world model id. A catalog that gives no type falls back on the
+    /// `*_id` naming convention.
+    #[must_use]
+    pub fn is_world_id(&self) -> bool {
+        match self.kind.as_str() {
+            "world_id" => true,
+            "" => self.name.ends_with("_id"),
+            _ => false,
+        }
+    }
 }
 
 impl Catalog {
@@ -101,40 +123,63 @@ impl Catalog {
         names
     }
 
-    /// One line per plan skill, with its arguments, for the model.
-    #[must_use]
-    pub fn describe(&self) -> String {
-        let mut lines = Vec::new();
-        if self.can_travel() {
-            lines.push(format!(
-                "- {GO_TO_PLACE}(place): walk to a named place, a room id or an object id from \
-                 list_places or find_objects"
-            ));
-        }
-        for s in self
-            .skills
+    fn plan_facing(&self) -> impl Iterator<Item = &Skill> {
+        self.skills
             .iter()
             .filter(|s| s.name != GO_TO_POSE && s.name != GO_TO_TARGET)
-        {
-            let args: Vec<String> = s
-                .args
-                .iter()
-                .map(|a| {
-                    if a.choices.is_empty() {
-                        a.name.clone()
-                    } else {
-                        format!("{}={}", a.name, a.choices.join("|"))
-                    }
-                })
-                .collect();
-            lines.push(format!(
-                "- {}({}): {}",
-                s.name,
-                args.join(", "),
-                s.description
+    }
+
+    /// Each plan skill as `Name(arg, arg)`, with only the arguments the model fills.
+    #[must_use]
+    pub fn signatures(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.can_travel() {
+            out.push(format!("{GO_TO_PLACE}(place)"));
+        }
+        for s in self.plan_facing() {
+            let names: Vec<&str> = s.model_args().map(|a| a.name.as_str()).collect();
+            out.push(format!("{}({})", s.name, names.join(", ")));
+        }
+        out
+    }
+
+    /// Each plan skill with what it does, what it needs and its arguments, for the model.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let mut out = Vec::new();
+        if self.can_travel() {
+            out.push(format!(
+                "- {GO_TO_PLACE}(place): walk to a named place, a room, or up to an object.\n    \
+                 place: a place or room from list_places, or an object id from find_objects"
             ));
         }
-        lines.join("\n")
+        for (s, signature) in self.plan_facing().zip(
+            self.signatures()
+                .into_iter()
+                .skip(usize::from(self.can_travel())),
+        ) {
+            let mut text = format!("- {signature}: {}", s.description);
+            if !s.requires.is_empty() {
+                let _ = write!(text, " Needs {}.", s.requires.join(" and "));
+            }
+            for a in s.model_args() {
+                let what = if a.choices.is_empty() {
+                    a.description.clone()
+                } else {
+                    a.choices.join(" or ")
+                };
+                let _ = write!(text, "\n    {}: {what}", a.name);
+            }
+            out.push(text);
+        }
+        out.join("\n")
+    }
+}
+
+impl Skill {
+    /// The arguments the model fills: all but those the planner derives.
+    pub fn model_args(&self) -> impl Iterator<Item = &Arg> {
+        self.args.iter().filter(|a| a.default_from.is_none())
     }
 }
 
@@ -149,10 +194,15 @@ pub(crate) mod tests {
         {"name": "GoToTarget", "description": "Walk to a room or object.", "args": [{"name": "target", "type": "string", "description": "id", "enum": []}],
          "requires": [], "effects": ["at(target)"], "resources": ["base"], "idempotent": true, "risk": "motion", "max_duration_s": 300, "template": "GoToTarget"},
         {"name": "PickObject", "description": "Pick an object up.", "args": [
-            {"name": "object_id", "type": "string", "description": "world model id", "enum": []},
+            {"name": "object_id", "type": "string", "description": "its world model id, or the name the detector reports", "enum": []},
             {"name": "phrase", "type": "string", "description": "what the detector looks for", "enum": []},
             {"name": "arm", "type": "string", "description": "which arm", "enum": ["left", "right"]}],
-         "requires": ["near(object_id)"], "effects": ["holding(arm, object_id)"], "resources": ["base", "left_arm", "right_arm"], "idempotent": false, "risk": "manipulation", "max_duration_s": 420, "template": "PickObject"},
+         "requires": ["near(object_id)", "hand_empty(arm)"], "effects": ["holding(arm, object_id)"], "resources": ["base", "left_arm", "right_arm"], "idempotent": false, "risk": "manipulation", "max_duration_s": 420, "template": "PickObject"},
+        {"name": "PlaceInto", "description": "Put the held object into a container.", "args": [
+            {"name": "container_id", "type": "string", "description": "its world model id, or the name the detector reports", "enum": []},
+            {"name": "phrase", "type": "string", "description": "what the detector looks for", "enum": []},
+            {"name": "arm", "type": "string", "description": "the arm that holds it", "enum": ["left", "right"]}],
+         "requires": ["near(container_id)", "holding(arm, X)"], "effects": ["inside(X, container_id)", "hand_empty(arm)"], "resources": ["base", "left_arm", "right_arm"], "idempotent": false, "risk": "manipulation", "max_duration_s": 360, "template": "PlaceInto"},
         {"name": "TuckForTravel", "description": "Fold the arms for walking.", "args": [],
          "requires": [], "effects": [], "resources": ["left_arm", "right_arm"], "idempotent": true, "risk": "manipulation", "max_duration_s": 30, "template": "TuckForTravel"}
     ]}"#;
@@ -162,10 +212,14 @@ pub(crate) mod tests {
         let c = Catalog::parse(CATALOG).unwrap();
         assert_eq!(
             c.plan_skills(),
-            ["GoToPlace", "PickObject", "TuckForTravel"]
+            ["GoToPlace", "PickObject", "PlaceInto", "TuckForTravel"]
         );
         let text = c.describe();
-        assert!(text.contains("PickObject(object_id, phrase, arm=left|right)"));
+        assert!(text.contains(
+            "- PickObject(object_id, phrase, arm): Pick an object up. Needs near(object_id) and hand_empty(arm)."
+        ));
+        assert!(text.contains("\n    arm: left or right"));
+        assert!(text.contains("\n    phrase: what the detector looks for"));
         assert!(!text.contains("GoToPose"));
     }
 }

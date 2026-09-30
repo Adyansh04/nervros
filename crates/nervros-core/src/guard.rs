@@ -45,8 +45,9 @@ pub struct Budgets {
     pub repeat_break: u32,
 }
 
+// A mission takes a lookup, a plan or two, the run and the reply; small models need more.
 fn d_model_calls() -> u32 {
-    6
+    10
 }
 fn d_tool_calls() -> u32 {
     12

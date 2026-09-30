@@ -1,0 +1,155 @@
+{
+  "catalog_version": "cbbe158e62ac",
+  "skills": [
+    {
+      "name": "GoToTarget",
+      "description": "Walk to a room or an object in the world model and stop facing it. Use it to get within reach of an object before PickObject or PlaceInto.",
+      "args": [
+        {
+          "name": "target",
+          "type": "world_id",
+          "description": "The id of a room or an object in the world model, such as R2 or O17.",
+          "enum": []
+        }
+      ],
+      "requires": [],
+      "effects": [
+        "near(target)"
+      ],
+      "resources": [
+        "base"
+      ],
+      "idempotent": true,
+      "risk": "motion",
+      "max_duration_s": 240,
+      "template": "GoToTarget"
+    },
+    {
+      "name": "GoToPose",
+      "description": "Walk to a fixed place given as coordinates in the map frame, then turn to face the given heading. Use it for a named place whose coordinates are known.",
+      "args": [
+        {
+          "name": "station",
+          "type": "string",
+          "description": "Where to stand and face, as x;y;yaw in the map frame, metres and radians, such as 4.30;-5.60;1.5708.",
+          "enum": []
+        }
+      ],
+      "requires": [],
+      "effects": [
+        "at(station)"
+      ],
+      "resources": [
+        "base"
+      ],
+      "idempotent": true,
+      "risk": "motion",
+      "max_duration_s": 240,
+      "template": "GoToPose"
+    },
+    {
+      "name": "PickObject",
+      "description": "Pick an object up with one hand: look for it, close the last stretch to it, grasp and lift, then back away. The robot must already stand within about half a metre of the object, and the object must lie on a surface, not on the floor. The hand keeps holding it afterwards, even if the mission is stopped.",
+      "args": [
+        {
+          "name": "object_id",
+          "type": "string",
+          "description": "The object to pick: its id in the world model (such as O17) or, where there is no world model, the name the detector reports it under (such as red_block). Letters, digits and underscores. The detector reports what it finds under the lowercased id, and the later steps look for it there.",
+          "enum": []
+        },
+        {
+          "name": "phrase",
+          "type": "string",
+          "description": "Plain words the detector finds the object by, such as the world model's label for it (red mug). Wording that names colour and kind tells look-alikes apart better.",
+          "enum": [],
+          "default_from": "label(object_id)"
+        },
+        {
+          "name": "arm",
+          "type": "string",
+          "description": "Which hand picks it up.",
+          "enum": [
+            "left",
+            "right"
+          ]
+        }
+      ],
+      "requires": [
+        "near(object_id)",
+        "hand_empty(arm)"
+      ],
+      "effects": [
+        "holding(arm, object_id)"
+      ],
+      "resources": [
+        "base",
+        "left_arm",
+        "right_arm"
+      ],
+      "idempotent": false,
+      "risk": "manipulation",
+      "max_duration_s": 420,
+      "template": "PickObject"
+    },
+    {
+      "name": "PlaceInto",
+      "description": "Put the object a hand holds into a container: look for the container, close in, lower, release, and back away. The robot must already stand within about half a metre of the container, which must be a tray or box on a bench or table, not on the floor.",
+      "args": [
+        {
+          "name": "container_id",
+          "type": "string",
+          "description": "The container: its id in the world model (such as O31) or, where there is no world model, the name the detector reports it under (such as brown_box). Letters, digits and underscores.",
+          "enum": []
+        },
+        {
+          "name": "phrase",
+          "type": "string",
+          "description": "Plain words the detector finds the container by, such as the world model's label for it (basket). Wording that names colour and kind tells look-alikes apart better.",
+          "enum": [],
+          "default_from": "label(container_id)"
+        },
+        {
+          "name": "arm",
+          "type": "string",
+          "description": "Which hand holds the object.",
+          "enum": [
+            "left",
+            "right"
+          ]
+        }
+      ],
+      "requires": [
+        "near(container_id)",
+        "holding(arm, X)"
+      ],
+      "effects": [
+        "inside(X, container_id)",
+        "hand_empty(arm)"
+      ],
+      "resources": [
+        "base",
+        "left_arm",
+        "right_arm"
+      ],
+      "idempotent": false,
+      "risk": "manipulation",
+      "max_duration_s": 360,
+      "template": "PlaceInto"
+    },
+    {
+      "name": "TuckForTravel",
+      "description": "Fold both arms against the body so they do not disturb the walk. An arm whose hand holds something is left where it is. Use it before walking when the arms are out.",
+      "args": [],
+      "requires": [],
+      "effects": [],
+      "resources": [
+        "left_arm",
+        "right_arm"
+      ],
+      "idempotent": true,
+      "risk": "motion",
+      "max_duration_s": 120,
+      "template": "TuckForTravel"
+    }
+  ]
+}

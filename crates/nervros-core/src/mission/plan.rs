@@ -20,6 +20,9 @@ pub const MAX_STEPS: usize = 12;
 const MAX_RETRIES: u8 = 2;
 /// The mission's own timeout over its worst case, so a step's timeout fires first.
 const SLACK: f64 = 1.2;
+/// How near the robot must already stand for a skill that needs it near an object; the executor's
+/// skills ask for about half a metre.
+const NEAR_M: f64 = 0.6;
 
 /// What the model sends to `plan_mission`.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -87,16 +90,207 @@ fn args_list_or_map<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<StepArg>, D::
     })
 }
 
-/// What exists when a plan is compiled: the profile's places and the world model's rooms and
-/// objects, as `(id, name)`.
+/// Something in the world model a plan can name.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Thing {
+    /// Its id, such as `O17` or `R2`.
+    pub id: String,
+    /// Its name or label.
+    pub name: String,
+    /// Where it is on the map, when known.
+    pub xy: Option<(f64, f64)>,
+}
+
+/// What exists when a plan is compiled, and the robot as it starts.
 #[derive(Debug, Clone, Default)]
 pub struct World {
     /// Named places.
     pub places: Vec<PlaceConfig>,
-    /// Rooms.
-    pub rooms: Vec<(String, String)>,
+    /// Rooms, placed at their centroids.
+    pub rooms: Vec<Thing>,
     /// Objects.
-    pub objects: Vec<(String, String)>,
+    pub objects: Vec<Thing>,
+    /// The robot on the map, when known.
+    pub robot: Option<(f64, f64)>,
+    /// What each hand holds, by arm; empty when nothing.
+    pub holding: BTreeMap<String, String>,
+}
+
+impl World {
+    /// Whether an object or room with this id is in the world model.
+    fn knows(&self, id: &str) -> bool {
+        self.objects.iter().chain(&self.rooms).any(|t| t.id == id)
+    }
+}
+
+/// Where a `GoToPlace` leaves the robot.
+struct Spot {
+    id: String,
+    xy: Option<(f64, f64)>,
+}
+
+/// The robot as the plan so far leaves it.
+struct Sim {
+    at: Option<String>,
+    xy: Option<(f64, f64)>,
+    holding: BTreeMap<String, String>,
+}
+
+impl Sim {
+    fn near(&self, target: &str, world: &World) -> bool {
+        if self.at.as_deref() == Some(target) {
+            return true;
+        }
+        let thing = world.objects.iter().find(|o| o.id == target);
+        match (self.xy, thing.and_then(|t| t.xy)) {
+            (Some((x, y)), Some((tx, ty))) => (tx - x).hypot(ty - y) <= NEAR_M,
+            _ => false,
+        }
+    }
+
+    /// Checks a skill's needs against the robot so far, then applies what it does. Understands
+    /// `near(x)`, `holding(arm, x)` and `hand_empty(arm)`, where `x` names an argument or, as a
+    /// capital letter, any object; other predicates are left to the executor.
+    fn run(&mut self, id: &str, step: &Step, skill: &Skill, world: &World) -> Vec<Problem> {
+        let value = |name: &str| {
+            step.args
+                .iter()
+                .find(|a| a.name == name)
+                .map(|a| a.value.trim().to_owned())
+        };
+        let mut problems = Vec::new();
+        let mut problem = |field: &str, text: String| {
+            problems.push(Problem::new(id, field, format!("{} {text}", skill.name)));
+        };
+        for need in &skill.requires {
+            let Some((name, args)) = predicate(need) else {
+                continue;
+            };
+            match (name, args.as_slice()) {
+                // Only what the world model knows can be judged; nearness to anything else, such
+                // as a detector's name for an object, is the executor's to check.
+                ("near", [x]) => {
+                    if let Some(target) = value(x)
+                        && world.knows(&target)
+                        && !self.near(&target, world)
+                    {
+                        problem(
+                            x,
+                            format!(
+                                "needs the robot near {target} first: add {GO_TO_PLACE}(place={target}) before this step"
+                            ),
+                        );
+                    }
+                }
+                ("holding", [a, x]) => {
+                    let Some(arm) = value(a) else { continue };
+                    let held = self.held(&arm);
+                    let wanted = value(x);
+                    let ok = wanted.as_ref().map_or(!held.is_empty(), |obj| held == *obj);
+                    if !ok {
+                        let what = wanted.unwrap_or_else(|| "something".to_owned());
+                        problem(
+                            a,
+                            format!(
+                                "needs the {arm} hand to hold {what} first: pick it up earlier in the plan, or use the arm that holds it"
+                            ),
+                        );
+                    }
+                }
+                ("hand_empty", [a]) => {
+                    let Some(arm) = value(a) else { continue };
+                    let held = self.held(&arm);
+                    if !held.is_empty() {
+                        problem(
+                            a,
+                            format!(
+                                "needs the {arm} hand empty, but it holds {held}: place it first or use the other hand"
+                            ),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        for effect in &skill.effects {
+            let Some((name, args)) = predicate(effect) else {
+                continue;
+            };
+            match (name, args.as_slice()) {
+                ("holding", [a, x]) => {
+                    if let (Some(arm), Some(obj)) = (value(a), value(x)) {
+                        // A replan after a failed place tends to pick the object up again.
+                        if let Some((hand, _)) = self.holding.iter().find(|(_, held)| **held == obj)
+                        {
+                            problems.push(Problem::new(
+                                id,
+                                x,
+                                format!(
+                                    "{obj} is already in the {hand} hand: place it instead of picking it up again"
+                                ),
+                            ));
+                        }
+                        self.holding.insert(arm, obj);
+                    }
+                }
+                ("hand_empty", [a]) => {
+                    if let Some(arm) = value(a) {
+                        self.holding.insert(arm, String::new());
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A skill that takes the base may move it, as a pick backs off the surface afterwards, so
+        // the robot's position is unknown until the next walk.
+        if skill.resources.iter().any(|r| r == "base") {
+            self.at = None;
+            self.xy = None;
+        }
+        problems
+    }
+
+    fn held(&self, arm: &str) -> String {
+        self.holding.get(arm).cloned().unwrap_or_default()
+    }
+
+    /// The walk a step needs first: a `GoToPlace` up to the object or room, known to the world
+    /// model, that the step's skill needs the robot near and the plan has not reached yet.
+    fn walk_for(&self, step: &Step, catalog: &Catalog, world: &World) -> Option<Step> {
+        let skill = catalog.skill(&step.skill)?;
+        catalog.skill(GO_TO_TARGET)?;
+        skill.requires.iter().find_map(|need| {
+            let ("near", args) = predicate(need)? else {
+                return None;
+            };
+            let [x] = args.as_slice() else { return None };
+            let target = step
+                .args
+                .iter()
+                .find(|a| a.name == *x)?
+                .value
+                .trim()
+                .to_owned();
+            (world.knows(&target) && !self.near(&target, world)).then(|| Step {
+                skill: GO_TO_PLACE.to_owned(),
+                args: vec![StepArg {
+                    name: "place".to_owned(),
+                    value: target,
+                }],
+                retries: 0,
+                timeout_s: None,
+                optional: false,
+                why: format!("{} needs the robot near it", step.skill),
+            })
+        })
+    }
+}
+
+/// `name(a, b)` as `("name", ["a", "b"])`.
+pub(crate) fn predicate(text: &str) -> Option<(&str, Vec<&str>)> {
+    let (name, rest) = text.trim().split_once('(')?;
+    let args = rest.strip_suffix(')')?;
+    Some((name.trim(), args.split(',').map(str::trim).collect()))
 }
 
 /// A step as the operator sees it.
@@ -170,21 +364,41 @@ pub fn compile(plan: &Plan, catalog: &Catalog, world: &World) -> Result<Compiled
     let mut body = String::new();
     let mut steps = Vec::new();
     let mut worst = 0.0;
-    for (i, step) in plan.steps.iter().enumerate() {
-        let id = format!("s{}", i + 1);
-        match compile_step(&id, step, catalog, world) {
-            Ok((node, timeout_s)) => {
-                let attempts = f64::from(step.retries) + 1.0;
-                worst += timeout_s * attempts;
-                body.push_str(&wrap(&node, step, timeout_s));
-                steps.push(PlannedStep {
-                    id,
-                    skill: step.skill.clone(),
-                    summary: summary(step),
-                    timeout_s,
-                });
+    let mut sim = Sim {
+        at: None,
+        xy: world.robot,
+        holding: world.holding.clone(),
+    };
+    let mut n = 0;
+    for planned in &plan.steps {
+        let walk = sim.walk_for(planned, catalog, world);
+        for (step, added) in walk.iter().map(|w| (w, true)).chain([(planned, false)]) {
+            n += 1;
+            let id = format!("s{n}");
+            match compile_step(&id, step, catalog, world) {
+                Ok((node, timeout_s, spot)) => {
+                    if let Some(spot) = spot {
+                        sim.at = Some(spot.id);
+                        sim.xy = spot.xy;
+                    } else if let Some(skill) = catalog.skill(&step.skill) {
+                        problems.append(&mut sim.run(&id, step, skill, world));
+                    }
+                    let attempts = f64::from(step.retries) + 1.0;
+                    worst += timeout_s * attempts;
+                    body.push_str(&wrap(&node, step, timeout_s));
+                    let mut text = summary(step);
+                    if added {
+                        text.push_str(" (added)");
+                    }
+                    steps.push(PlannedStep {
+                        id,
+                        skill: step.skill.clone(),
+                        summary: text,
+                        timeout_s,
+                    });
+                }
+                Err(mut p) => problems.append(&mut p),
             }
-            Err(mut p) => problems.append(&mut p),
         }
     }
     if !problems.is_empty() {
@@ -192,10 +406,9 @@ pub fn compile(plan: &Plan, catalog: &Catalog, world: &World) -> Result<Compiled
     }
     let xml = format!(
         "<root BTCPP_format=\"4\" main_tree_to_execute=\"Mission\">\n  \
-         <BehaviorTree ID=\"Mission\">\n    <Timeout msec=\"{}\">\n      <Sequence name=\"{}\">\n\
+         <BehaviorTree ID=\"Mission\">\n    <Timeout msec=\"{}\">\n      <Sequence name=\"mission\">\n\
          {body}      </Sequence>\n    </Timeout>\n  </BehaviorTree>\n</root>\n",
         msec(worst * SLACK),
-        escape(&plan.intent),
     );
     let sha256 = format!("{:x}", Sha256::digest(xml.as_bytes()));
     Ok(Compiled {
@@ -208,13 +421,14 @@ pub fn compile(plan: &Plan, catalog: &Catalog, world: &World) -> Result<Compiled
     })
 }
 
-/// The step's `SubTree` element and its timeout in seconds.
+/// The step's `SubTree` element, its timeout in seconds and, for `GoToPlace`, where it leaves
+/// the robot.
 fn compile_step(
     id: &str,
     step: &Step,
     catalog: &Catalog,
     world: &World,
-) -> Result<(String, f64), Vec<Problem>> {
+) -> Result<(String, f64, Option<Spot>), Vec<Problem>> {
     let mut problems = Vec::new();
     if step.retries > MAX_RETRIES {
         problems.push(Problem::new(
@@ -223,9 +437,13 @@ fn compile_step(
             format!("retries is 0 to {MAX_RETRIES}"),
         ));
     }
+    let mut spot = None;
     let (skill, ports) = if step.skill == GO_TO_PLACE {
         match go_to_place(id, step, catalog, world) {
-            Ok(v) => v,
+            Ok((skill, ports, to)) => {
+                spot = Some(to);
+                (skill, ports)
+            }
             Err(p) => {
                 problems.push(p);
                 return Err(problems);
@@ -256,7 +474,7 @@ fn compile_step(
             format!(
                 "`{}` is not a skill of this robot; use one of: {}",
                 step.skill,
-                catalog.plan_skills().join(", ")
+                catalog.signatures().join(", ")
             ),
         ));
         return Err(problems);
@@ -281,7 +499,7 @@ fn compile_step(
         let _ = write!(node, " {name}=\"{}\"", escape(&value));
     }
     node.push_str("/>");
-    Ok((node, timeout_s))
+    Ok((node, timeout_s, spot))
 }
 
 /// Checks a skill's arguments: all given, none unknown, enums respected, ids known.
@@ -309,15 +527,37 @@ fn ports_for(
     }
     let mut ports = Vec::new();
     for arg in &skill.args {
-        let Some(given) = step.args.iter().find(|a| a.name == arg.name) else {
-            problems.push(Problem::new(
-                id,
-                &arg.name,
-                format!("{} needs `{}`", skill.name, arg.name),
-            ));
-            continue;
+        let derived;
+        let value = match (
+            step.args.iter().find(|a| a.name == arg.name),
+            &arg.default_from,
+        ) {
+            (Some(given), _) => given.value.trim(),
+            (None, Some(rule)) => {
+                if let Some(v) = derive(rule, step, world) {
+                    derived = v;
+                    derived.as_str()
+                } else {
+                    problems.push(Problem::new(
+                        id,
+                        &arg.name,
+                        format!(
+                            "give `{}`: it could not be filled in from `{rule}`",
+                            arg.name
+                        ),
+                    ));
+                    continue;
+                }
+            }
+            (None, None) => {
+                problems.push(Problem::new(
+                    id,
+                    &arg.name,
+                    format!("{} needs `{}`", skill.name, arg.name),
+                ));
+                continue;
+            }
         };
-        let value = given.value.trim();
         if !arg.choices.is_empty() && !arg.choices.iter().any(|c| c == value) {
             problems.push(Problem::new(
                 id,
@@ -325,8 +565,15 @@ fn ports_for(
                 format!("`{}` must be one of: {}", arg.name, arg.choices.join(", ")),
             ));
         }
-        // By the catalog's convention, `*_id` arguments are world model ids.
-        if arg.name.ends_with("_id") && !world.objects.iter().any(|(o, _)| o == value) {
+        // BehaviorTree.CPP reads `{name}` as a blackboard entry, not text.
+        if value.contains(['{', '}']) {
+            problems.push(Problem::new(
+                id,
+                &arg.name,
+                format!("`{}` may not contain {{ or }}", arg.name),
+            ));
+        }
+        if arg.is_world_id() && !world.knows(value) {
             problems.push(Problem::new(
                 id,
                 &arg.name,
@@ -344,8 +591,26 @@ fn ports_for(
     }
 }
 
-/// A navigation macro and its one port.
-type Resolved<'c> = (&'c Skill, Vec<(String, String)>);
+/// A navigation macro, its one port, and where it leaves the robot.
+type Resolved<'c> = (&'c Skill, Vec<(String, String)>, Spot);
+
+/// A derived argument's value: `label(x)` is the world model's label of what argument `x` names,
+/// or, for something it does not know, such as a detector's `red_block`, that name in words.
+fn derive(rule: &str, step: &Step, world: &World) -> Option<String> {
+    let ("label", args) = predicate(rule)? else {
+        return None;
+    };
+    let from = args.first()?;
+    let id = step.args.iter().find(|a| a.name == *from)?.value.trim();
+    let label = world
+        .objects
+        .iter()
+        .chain(&world.rooms)
+        .find(|t| t.id == id)
+        .map(|t| t.name.clone())
+        .filter(|n| !n.is_empty());
+    label.or_else(|| Some(id.replace('_', " ")).filter(|w| !w.trim().is_empty()))
+}
 
 /// `GoToPlace(place)`: a profile place becomes `GoToPose` at its pose; a room or object id, or a
 /// room's name, becomes `GoToTarget`.
@@ -370,22 +635,23 @@ fn go_to_place<'c>(
         .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)));
     if let (Some(p), Some(skill)) = (named, catalog.skill(GO_TO_POSE)) {
         let station = format!("{};{};{}", p.pose.x, p.pose.y, p.pose.yaw);
-        return Ok((skill, vec![(port(skill, "station"), station)]));
+        let spot = Spot {
+            id: p.name.clone(),
+            xy: Some((p.pose.x, p.pose.y)),
+        };
+        return Ok((skill, vec![(port(skill, "station"), station)], spot));
     }
     let target = world
         .rooms
         .iter()
-        .find(|(rid, name)| rid == place || same(name))
-        .map(|(rid, _)| rid)
-        .or_else(|| {
-            world
-                .objects
-                .iter()
-                .find(|(oid, _)| oid == place)
-                .map(|(oid, _)| oid)
-        });
+        .find(|r| r.id == place || same(&r.name))
+        .or_else(|| world.objects.iter().find(|o| o.id == place));
     if let (Some(t), Some(skill)) = (target, catalog.skill(GO_TO_TARGET)) {
-        return Ok((skill, vec![(port(skill, "target"), t.clone())]));
+        let spot = Spot {
+            id: t.id.clone(),
+            xy: t.xy,
+        };
+        return Ok((skill, vec![(port(skill, "target"), t.id.clone())], spot));
     }
     Err(Problem::new(
         id,
@@ -449,6 +715,14 @@ mod tests {
     use crate::profile::PlacePose;
     use serde_json::json;
 
+    fn thing(id: &str, name: &str, x: f64, y: f64) -> Thing {
+        Thing {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            xy: Some((x, y)),
+        }
+    }
+
     fn world() -> World {
         World {
             places: vec![PlaceConfig {
@@ -461,8 +735,13 @@ mod tests {
                     yaw: 0.5,
                 },
             }],
-            rooms: vec![("R2".to_owned(), "kitchen".to_owned())],
-            objects: vec![("O17".to_owned(), "red mug".to_owned())],
+            rooms: vec![thing("R2", "kitchen", 5.2, 1.3)],
+            objects: vec![
+                thing("O17", "red mug", 5.0, 1.0),
+                thing("O31", "basket", 5.3, 1.2),
+            ],
+            robot: Some((0.0, 0.0)),
+            holding: BTreeMap::new(),
         }
     }
 
@@ -513,13 +792,167 @@ mod tests {
         let problems = compile(&p, &catalog(), &world()).unwrap_err();
         let has =
             |step: &str, field: &str| problems.iter().any(|q| q.step == step && q.field == field);
-        assert!(
-            has("s1", "grip") && has("s1", "phrase") && has("s1", "arm") && has("s1", "object_id")
-        );
+        assert!(has("s1", "grip") && has("s1", "phrase") && has("s1", "arm"));
         assert!(
             has("s2", "skill") && has("s3", "skill") && has("s4", "place") && has("s5", "retries")
         );
         assert!(problems.iter().any(|q| q.message.contains("find_objects")));
+    }
+
+    #[test]
+    fn a_walk_is_added_before_a_skill_that_needs_the_robot_near() {
+        let pick = json!({"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}});
+        let c = compile(&plan(&json!([pick])), &catalog(), &world()).unwrap();
+        let summaries: Vec<&str> = c.steps.iter().map(|s| s.summary.as_str()).collect();
+        assert_eq!(
+            summaries,
+            [
+                "GoToPlace(place=O17) (added)",
+                "PickObject(arm=right, object_id=O17, phrase=red mug)"
+            ]
+        );
+        assert!(
+            c.xml
+                .contains(r#"<SubTree ID="GoToTarget" name="s1_GoToPlace" target="O17"/>"#)
+        );
+        assert!(c.xml.contains(r#"name="s2_PickObject""#));
+        let walked = plan(&json!([{"skill": "GoToPlace", "args": {"place": "O17"}}, pick]));
+        assert_eq!(
+            compile(&walked, &catalog(), &world()).unwrap().steps.len(),
+            2
+        );
+        let mut close = world();
+        close.robot = Some((5.2, 1.1));
+        assert_eq!(
+            compile(&plan(&json!([pick])), &catalog(), &close)
+                .unwrap()
+                .steps
+                .len(),
+            1
+        );
+        // An object the world model does not know, such as a detector's name for it, cannot be
+        // judged or walked to: the plan stands as written and the executor checks it.
+        let unknown = json!({"skill": "PickObject", "args": {"object_id": "red_block", "phrase": "red block", "arm": "right"}});
+        let c = compile(&plan(&json!([unknown])), &catalog(), &world()).unwrap();
+        assert_eq!(c.steps.len(), 1);
+    }
+
+    #[test]
+    fn a_place_needs_the_hand_that_holds_the_object() {
+        let steps = |place_arm: &str| {
+            plan(&json!([
+                {"skill": "GoToPlace", "args": {"place": "O17"}},
+                {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}},
+                {"skill": "PlaceInto", "args": {"container_id": "O31", "phrase": "basket", "arm": place_arm}},
+                {"skill": "PlaceInto", "args": {"container_id": "O31", "phrase": "basket", "arm": "right"}}
+            ]))
+        };
+        let wrong = compile(&steps("left"), &catalog(), &world()).unwrap_err();
+        assert!(
+            wrong
+                .iter()
+                .any(|p| p.step == "s4" && p.message.contains("left hand to hold something")),
+            "{wrong:?}"
+        );
+        // After the first place the right hand is empty, so placing again fails too.
+        let twice = compile(&steps("right"), &catalog(), &world()).unwrap_err();
+        assert_eq!(twice.len(), 1, "{twice:?}");
+        assert_eq!(twice[0].step, "s6", "a walk is added before each place");
+        let mut held = world();
+        held.robot = Some((5.0, 1.0));
+        held.holding.insert("left".to_owned(), "O17".to_owned());
+        let place = plan(
+            &json!([{"skill": "PlaceInto", "args": {"container_id": "O31", "phrase": "basket", "arm": "left"}}]),
+        );
+        assert!(
+            compile(&place, &catalog(), &held).is_ok(),
+            "a hand may hold something from before"
+        );
+    }
+
+    #[test]
+    fn after_a_skill_that_moves_the_base_the_next_one_walks_again() {
+        let p = plan(&json!([
+            {"skill": "GoToPlace", "args": {"place": "O17"}},
+            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}},
+            {"skill": "PlaceInto", "args": {"container_id": "O31", "phrase": "basket", "arm": "right"}}
+        ]));
+        let c = compile(&p, &catalog(), &world()).unwrap();
+        let summaries: Vec<&str> = c.steps.iter().map(|s| s.summary.as_str()).collect();
+        assert_eq!(
+            summaries[2], "GoToPlace(place=O31) (added)",
+            "{summaries:?}"
+        );
+        // Folding the arms does not take the base, so the robot stays where it was.
+        let tuck = plan(&json!([
+            {"skill": "GoToPlace", "args": {"place": "O17"}},
+            {"skill": "TuckForTravel"},
+            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}}
+        ]));
+        assert_eq!(compile(&tuck, &catalog(), &world()).unwrap().steps.len(), 3);
+    }
+
+    #[test]
+    fn a_pick_needs_an_empty_hand() {
+        let mut full = world();
+        full.robot = Some((5.0, 1.0));
+        full.holding.insert("left".to_owned(), "O31".to_owned());
+        let pick = |arm: &str| {
+            plan(
+                &json!([{"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": arm}}]),
+            )
+        };
+        let problems = compile(&pick("left"), &catalog(), &full).unwrap_err();
+        assert!(
+            problems[0]
+                .message
+                .contains("left hand empty, but it holds O31"),
+            "{problems:?}"
+        );
+        assert!(compile(&pick("right"), &catalog(), &full).is_ok());
+    }
+
+    #[test]
+    fn an_object_in_hand_is_not_picked_up_again() {
+        let mut held = world();
+        held.robot = Some((5.0, 1.0));
+        held.holding.insert("right".to_owned(), "O17".to_owned());
+        let p = plan(
+            &json!([{"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "left"}}]),
+        );
+        let problems = compile(&p, &catalog(), &held).unwrap_err();
+        assert!(
+            problems[0].message.contains("already in the right hand"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_derived_argument_comes_from_the_world_model() {
+        let mut c = catalog();
+        let pick = c
+            .skills
+            .iter_mut()
+            .find(|s| s.name == "PickObject")
+            .unwrap();
+        pick.args
+            .iter_mut()
+            .find(|a| a.name == "phrase")
+            .unwrap()
+            .default_from = Some("label(object_id)".to_owned());
+        assert!(c.describe().contains("PickObject(object_id, arm)"));
+        let p = plan(&json!([
+            {"skill": "GoToPlace", "args": {"place": "O17"}},
+            {"skill": "PickObject", "args": {"object_id": "O17", "arm": "right"}}
+        ]));
+        let compiled = compile(&p, &c, &world()).unwrap();
+        assert!(
+            compiled
+                .xml
+                .contains(r#"object_id="O17" phrase="red mug" arm="right""#),
+            "{}",
+            compiled.xml
+        );
     }
 
     #[test]
@@ -528,11 +961,55 @@ mod tests {
             &json!([{"skill": "PickObject", "args": {"object_id": "O17", "phrase": "\"mug\" & <cup>", "arm": "left"}}]),
         );
         p.intent = "a <b> & \"c\"".to_owned();
-        let c = compile(&p, &catalog(), &world()).unwrap();
+        let mut near = world();
+        near.robot = Some((5.0, 1.0));
+        let c = compile(&p, &catalog(), &near).unwrap();
         assert!(
             c.xml
                 .contains("phrase=\"&quot;mug&quot; &amp; &lt;cup&gt;\"")
         );
-        assert!(c.xml.contains("name=\"a &lt;b&gt; &amp; &quot;c&quot;\""));
+        // Node names must be identifiers, so the intent stays out of the tree.
+        assert!(c.xml.contains("<Sequence name=\"mission\">"));
+        assert!(!c.xml.contains("&lt;b&gt;"));
+    }
+
+    #[test]
+    fn a_name_the_world_model_does_not_know_gives_its_own_words() {
+        let mut c = catalog();
+        let pick = c
+            .skills
+            .iter_mut()
+            .find(|s| s.name == "PickObject")
+            .unwrap();
+        pick.args
+            .iter_mut()
+            .find(|a| a.name == "phrase")
+            .unwrap()
+            .default_from = Some("label(object_id)".to_owned());
+        let p = plan(
+            &json!([{"skill": "PickObject", "args": {"object_id": "red_block", "arm": "left"}}]),
+        );
+        let compiled = compile(&p, &c, &world()).unwrap();
+        assert!(
+            compiled
+                .xml
+                .contains(r#"object_id="red_block" phrase="red block""#),
+            "{}",
+            compiled.xml
+        );
+    }
+
+    #[test]
+    fn braces_are_refused() {
+        let p = plan(
+            &json!([{"skill": "PickObject", "args": {"object_id": "O17", "phrase": "{secret}", "arm": "left"}}]),
+        );
+        let mut near = world();
+        near.robot = Some((5.0, 1.0));
+        let problems = compile(&p, &catalog(), &near).unwrap_err();
+        assert!(
+            problems[0].message.contains("may not contain { or }"),
+            "{problems:?}"
+        );
     }
 }

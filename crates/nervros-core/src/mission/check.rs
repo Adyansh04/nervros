@@ -4,6 +4,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use super::plan::predicate as predicate_of;
 use crate::builtins::inside;
 use crate::profile::PlaceConfig;
 
@@ -40,13 +41,6 @@ pub struct Observed {
     pub state: Value,
 }
 
-/// `name(a, b)` as `("name", ["a", "b"])`.
-fn parse(predicate: &str) -> Option<(&str, Vec<&str>)> {
-    let (name, rest) = predicate.trim().split_once('(')?;
-    let args = rest.strip_suffix(')')?;
-    Some((name.trim(), args.split(',').map(str::trim).collect()))
-}
-
 fn object<'v>(objects: &'v Value, id: &str) -> Option<&'v Value> {
     objects["objects"]
         .as_array()?
@@ -73,7 +67,7 @@ fn verdict(predicate: &str, seen: &Observed) -> Verdict {
         ok,
         detail,
     };
-    match parse(predicate) {
+    match predicate_of(predicate) {
         Some(("at", args)) if args.len() == 1 => at(args[0], seen, out),
         Some(("holding", args)) if args.len() == 2 => {
             let held = seen.state[format!("holding_{}", args[0])].as_str();
