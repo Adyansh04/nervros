@@ -223,6 +223,14 @@ pub fn start(
             registry.add(tool)?;
         }
     }
+    let watches = crate::watch::Watches::new(Arc::clone(&robot));
+    for tool in watches.tools() {
+        registry.add(tool)?;
+    }
+    registry.add(Arc::new(crate::doctor::HealthCheck::new(
+        &profile,
+        Arc::clone(&robot),
+    )))?;
     let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
     registry.add(Arc::clone(&stop))?;
     let missions = Missions::new(&profile, Arc::clone(&robot));
@@ -249,6 +257,7 @@ pub fn start(
     if let Some(m) = &missions {
         m.attach(session.handle());
     }
+    watches.attach(session.handle());
     if let Some(state) = profile.mission.as_ref().map(|m| m.state.clone()) {
         // A mission started before this session runs on unwatched: say so, once, at start.
         let (robot, handle) = (Arc::clone(&robot), session.handle());

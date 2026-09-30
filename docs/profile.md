@@ -274,3 +274,11 @@ pose = { x = 0.0, y = 0.0, yaw = 0.0 }   # in frame, default "map"
 Every robot gets `list_places`, `robot_state` and `stop`. `stop` is always allowed, armed or not,
 because it only makes the robot do less. `look` comes with `[look]`, `segment` with `[segment]`,
 and `plan_mission` and `run_mission` with `[mission]`.
+
+The rest are the checks you would run yourself before blaming the model:
+
+| Tool | What it does |
+|---|---|
+| `health_check` | The connection check, plus each camera's frame rate, whether the robot knows where it is on the map, and the executor's state. Returns what is wrong and what is fine. |
+| `watch` | Watches a topic in the background and posts to the chat when a condition holds: its rate drops below a floor, a field crosses a value, or a text field matches. Once, or each time it comes back; at most 8 at a time, all ended with the session. |
+| `watches` | Lists the running watches, or cancels one or all. |

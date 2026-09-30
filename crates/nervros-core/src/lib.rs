@@ -21,3 +21,4 @@ pub mod secret;
 pub mod segment;
 pub mod session;
 pub mod tools;
+pub mod watch;
