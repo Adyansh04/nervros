@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::guard::{Decision, Guard};
 use crate::llm::{self, AgentSource, History, LoopTool};
+use crate::mission::plan::PlannedStep;
 use crate::providers::Role;
 use crate::providers::router::Need;
 use crate::tools::{Lane, Registry, Status, Tool, ToolOutcome};
@@ -39,6 +40,9 @@ pub enum Command {
     Arm,
     /// Disable act-lane tools.
     Disarm,
+    /// Something the robot reports, such as a finished mission; the model answers it in a turn
+    /// of its own, after any running turn.
+    Report(String),
 }
 
 /// What the session reports.
@@ -49,6 +53,20 @@ pub enum Event {
     TurnStarted {
         /// Turn number.
         turn: u64,
+    },
+    /// The operator's message that started a turn.
+    User {
+        /// Turn number.
+        turn: u64,
+        /// The text.
+        text: String,
+    },
+    /// A robot report that started a turn.
+    Report {
+        /// Turn number.
+        turn: u64,
+        /// The text.
+        text: String,
     },
     /// The model's reply.
     Reply {
@@ -141,6 +159,50 @@ pub enum Event {
     TurnFinished {
         /// Turn number.
         turn: u64,
+    },
+    /// A plan passed its checks and can be run by its hash.
+    MissionPlanned {
+        /// SHA-256 of the tree.
+        hash: String,
+        /// What the operator asked for.
+        intent: String,
+        /// The steps.
+        steps: Vec<PlannedStep>,
+        /// The longest it can take.
+        worst_case_s: f64,
+    },
+    /// The executor started a mission.
+    MissionStarted {
+        /// Mission id.
+        id: String,
+        /// The plan's hash.
+        hash: String,
+    },
+    /// A step, or a node inside it, changed state.
+    MissionProgress {
+        /// Mission id.
+        id: String,
+        /// `s1`, `s2`, ...
+        step: String,
+        /// The node inside the step, or empty for the step itself.
+        node: String,
+        /// `running`, `success`, `failure` or `skipped`.
+        status: String,
+        /// Since the mission started.
+        elapsed_s: f64,
+    },
+    /// A mission ended.
+    MissionFinished {
+        /// Mission id.
+        id: String,
+        /// `success`, `failure`, `canceled`, `timeout`, `rejected` or `error`.
+        outcome: String,
+        /// The step that failed, or empty.
+        failed_step: String,
+        /// The skill's own text.
+        reason: String,
+        /// How long it ran.
+        elapsed_s: f64,
     },
 }
 
@@ -287,6 +349,46 @@ impl Shared {
     }
 }
 
+/// Lets background work, such as a running mission, report into a session without keeping it
+/// alive.
+#[derive(Debug, Clone)]
+pub struct SessionHandle {
+    tx: mpsc::WeakUnboundedSender<Command>,
+    events: broadcast::Sender<Event>,
+}
+
+impl SessionHandle {
+    /// Sends a command; ignored once the session has ended.
+    pub fn send(&self, command: Command) {
+        if let Some(tx) = self.tx.upgrade() {
+            let _ = tx.send(command);
+        }
+    }
+
+    /// Publishes an event to the session's subscribers.
+    pub fn emit(&self, event: Event) {
+        let _ = self.events.send(event);
+    }
+
+    /// A new event stream.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.events.subscribe()
+    }
+
+    /// A handle onto bare channels, for tests of background work.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        tx: &mpsc::UnboundedSender<Command>,
+        events: broadcast::Sender<Event>,
+    ) -> Self {
+        Self {
+            tx: tx.downgrade(),
+            events,
+        }
+    }
+}
+
 /// A running session. Dropping it ends the actor.
 pub struct Session {
     tx: mpsc::UnboundedSender<Command>,
@@ -333,6 +435,15 @@ impl Session {
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
     }
+
+    /// A handle for background work.
+    #[must_use]
+    pub fn handle(&self) -> SessionHandle {
+        SessionHandle {
+            tx: self.tx.downgrade(),
+            events: self.events.clone(),
+        }
+    }
 }
 
 async fn actor(
@@ -345,6 +456,7 @@ async fn actor(
     let mut history = History::default();
     let mut turns = 0u64;
     let mut running: Option<(u64, JoinHandle<Option<History>>)> = None;
+    let mut reports: Vec<String> = Vec::new();
     loop {
         let finished = async {
             match running.as_mut() {
@@ -363,8 +475,16 @@ async fn actor(
                             continue;
                         }
                         turns += 1;
-                        let task = run_turn(turns, text, history.clone(), Arc::clone(&shared), Arc::clone(&source), Arc::clone(&registry));
+                        let task = run_turn(turns, Origin::User(text), history.clone(), Arc::clone(&shared), Arc::clone(&source), Arc::clone(&registry));
                         running = Some((turns, tokio::spawn(task)));
+                    }
+                    Command::Report(text) => {
+                        reports.push(text);
+                        if running.is_none() {
+                            turns += 1;
+                            let task = run_turn(turns, Origin::Report(reports.split_off(0).join("\n\n")), history.clone(), Arc::clone(&shared), Arc::clone(&source), Arc::clone(&registry));
+                            running = Some((turns, tokio::spawn(task)));
+                        }
                     }
                     Command::StopGeneration | Command::StopMission => {
                         let mission = cmd == Command::StopMission;
@@ -403,14 +523,25 @@ async fn actor(
                     }
                     shared.emit(Event::TurnFinished { turn });
                 }
+                if !reports.is_empty() {
+                    turns += 1;
+                    let task = run_turn(turns, Origin::Report(reports.split_off(0).join("\n\n")), history.clone(), Arc::clone(&shared), Arc::clone(&source), Arc::clone(&registry));
+                    running = Some((turns, tokio::spawn(task)));
+                }
             }
         }
     }
 }
 
+/// Who started a turn.
+enum Origin {
+    User(String),
+    Report(String),
+}
+
 async fn run_turn(
     turn: u64,
-    text: String,
+    origin: Origin,
     history: History,
     shared: Arc<Shared>,
     source: Arc<dyn AgentSource>,
@@ -418,6 +549,22 @@ async fn run_turn(
 ) -> Option<History> {
     shared.guard.begin_turn();
     shared.emit(Event::TurnStarted { turn });
+    let text = match origin {
+        Origin::User(text) => {
+            shared.emit(Event::User {
+                turn,
+                text: text.clone(),
+            });
+            text
+        }
+        Origin::Report(text) => {
+            shared.emit(Event::Report {
+                turn,
+                text: text.clone(),
+            });
+            format!("[Report from the robot, not the operator]\n{text}")
+        }
+    };
     let acted = Arc::new(AtomicBool::new(false));
     let tools: Vec<LoopTool> = registry
         .iter()
@@ -499,12 +646,12 @@ async fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::borrow::Cow;
     use crate::guard::Policy;
     use crate::llm::{AgentBuilder, LlmError};
     use crate::tools::{Risk, ToolSpec};
     use async_trait::async_trait;
     use rig::test_utils::{MockCompletionModel, MockTurn};
+    use std::borrow::Cow;
 
     struct Scripted(MockCompletionModel);
 
