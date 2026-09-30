@@ -26,6 +26,9 @@ const OBJECTS_PERIOD: Duration = Duration::from_secs(1);
 const SLOW_PERIOD: Duration = Duration::from_secs(5);
 const TOPIC_WAIT: Duration = Duration::from_secs(1);
 const CAMERA_QUALITY: u8 = 75;
+/// Where the frame goes: on its own, or in the world with the camera's pose and lens, where 3D
+/// views draw it as a frustum.
+const CAMERA_PATH: [&str; 2] = ["/camera", "/world/robot/camera"];
 const REMOVED: u64 = 2;
 const STALE: u64 = 1;
 /// canopy's coverage grid values: seen, still to see, written off (no pose can see it).
@@ -70,7 +73,13 @@ pub fn spawn(
     events: broadcast::Receiver<Event>,
 ) -> JoinSet<()> {
     put_static(rec, "world", &rerun::ViewCoordinates::RIGHT_HAND_Z_UP());
-    layout(rec);
+    layout(
+        rec,
+        profile
+            .viz
+            .as_ref()
+            .is_some_and(|v| v.camera_info.is_some()),
+    );
     let mut tasks = JoinSet::new();
     tasks.spawn(pose(
         rec.clone(),
@@ -78,8 +87,16 @@ pub fn spawn(
         profile.ros.map_frame.clone(),
         profile.ros.base_frame.clone(),
     ));
+    let camera_info = profile.viz.as_ref().and_then(|v| v.camera_info.clone());
     if let Some(look) = &profile.look {
-        tasks.spawn(camera(rec.clone(), Arc::clone(robot), look.image.clone()));
+        tasks.spawn(camera(
+            rec.clone(),
+            Arc::clone(robot),
+            look.image.clone(),
+            camera_info
+                .clone()
+                .map(|info| (info, profile.ros.base_frame.clone())),
+        ));
     }
     if let Some(world) = &profile.world {
         let mut watch = |topic: &Option<TopicRef>, period, draw: Drawer| {
@@ -95,7 +112,12 @@ pub fn spawn(
         };
         watch(&world.map, SLOW_PERIOD, Box::new(draw_map));
         watch(&world.coverage, OBJECTS_PERIOD, Box::new(draw_coverage));
-        watch(&world.rooms, SLOW_PERIOD, Box::new(draw_rooms));
+        let mut rooms_drawn = BTreeSet::new();
+        watch(
+            &world.rooms,
+            SLOW_PERIOD,
+            Box::new(move |rec, msg| draw_rooms(rec, msg, &mut rooms_drawn)),
+        );
         watch(&world.trail, SLOW_PERIOD, Box::new(draw_trail));
         let mut drawn = BTreeSet::new();
         watch(
@@ -104,24 +126,38 @@ pub fn spawn(
             Box::new(move |rec, msg| draw_objects(rec, msg, &mut drawn)),
         );
     }
+    if let Some(plan) = profile.viz.as_ref().and_then(|v| v.plan.clone()) {
+        tasks.spawn(sample(
+            rec.clone(),
+            Arc::clone(robot),
+            plan,
+            POSE_PERIOD * 5,
+            Box::new(draw_plan),
+        ));
+    }
     tasks.spawn(agent(rec.clone(), events));
     tasks
 }
 
 /// The default layout: the world large on the left; the camera, the agent's last marked image and
 /// its log on the right. Only a default, so a layout the operator arranges is kept.
-fn layout(rec: &RecordingStream) {
+fn layout(rec: &RecordingStream, camera_in_world: bool) {
     use rerun::blueprint::{
-        Blueprint, BlueprintActivation, Horizontal, Spatial2DView, Spatial3DView, Tabs,
-        TextLogView, TimeSeriesView, Vertical,
+        Blueprint, BlueprintActivation, Horizontal, Spatial2DView, Spatial3DView,
+        StateTimelineView, Tabs, TextLogView, TimeSeriesView, Vertical,
     };
     let side = Vertical::new([
-        Spatial2DView::new("Camera").with_origin("/camera").into(),
+        Spatial2DView::new("Camera")
+            .with_origin(CAMERA_PATH[usize::from(camera_in_world)])
+            .into(),
         Spatial2DView::new("Last look")
             .with_origin("/agent/look")
             .into(),
         Tabs::new([
             TextLogView::new("Agent").with_origin("/agent/log").into(),
+            StateTimelineView::new("Mission")
+                .with_origin("/mission")
+                .into(),
             TimeSeriesView::new("Exploring")
                 .with_origin("/mapping")
                 .into(),
@@ -196,7 +232,12 @@ async fn pose(rec: RecordingStream, robot: Arc<dyn RobotPort>, map: String, base
     }
 }
 
-async fn camera(rec: RecordingStream, robot: Arc<dyn RobotPort>, topic: String) {
+async fn camera(
+    rec: RecordingStream,
+    robot: Arc<dyn RobotPort>,
+    topic: String,
+    lens: Option<(TopicRef, String)>,
+) {
     let rx = match robot.frames(&topic) {
         Ok(rx) => rx,
         Err(e) => {
@@ -204,9 +245,11 @@ async fn camera(rec: RecordingStream, robot: Arc<dyn RobotPort>, topic: String) 
             return;
         }
     };
+    let path = CAMERA_PATH[usize::from(lens.is_some())];
     let mut tick = interval(CAMERA_PERIOD);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_stamp = f64::NAN;
+    let mut pinhole_drawn = false;
     loop {
         tick.tick().await;
         let Some(frame) = rx.borrow().clone() else {
@@ -216,6 +259,26 @@ async fn camera(rec: RecordingStream, robot: Arc<dyn RobotPort>, topic: String) 
             continue;
         }
         last_stamp = frame.stamp_s;
+        if let Some((info, base)) = &lens {
+            // Where the camera is on the robot, which a waist or head joint can change.
+            if let Ok(t) = robot.transform(base, &frame.frame_id) {
+                put(
+                    &rec,
+                    path,
+                    &rerun::Transform3D::from_translation_rotation(
+                        f32s(t.translation),
+                        rerun::Quaternion::from_xyzw(f32s(t.rotation)),
+                    ),
+                );
+            }
+            if !pinhole_drawn
+                && let Ok(msg) = robot.latest(&info.topic, &info.msg_type, TOPIC_WAIT).await
+                && let Some(pinhole) = pinhole(&msg)
+            {
+                put_static(&rec, path, &pinhole);
+                pinhole_drawn = true;
+            }
+        }
         let jpeg = tokio::task::spawn_blocking(move || {
             frame
                 .to_rgb()
@@ -224,13 +287,30 @@ async fn camera(rec: RecordingStream, robot: Arc<dyn RobotPort>, topic: String) 
         })
         .await;
         if let Ok(Some(bytes)) = jpeg {
-            put(
-                &rec,
-                "camera",
-                &rerun::EncodedImage::from_file_contents(bytes),
-            );
+            put(&rec, path, &rerun::EncodedImage::from_file_contents(bytes));
         }
     }
+}
+
+/// The lens of a `sensor_msgs/msg/CameraInfo`: focal lengths and principal point from `k`.
+fn pinhole(msg: &Value) -> Option<rerun::Pinhole> {
+    let k: Vec<f64> = msg["k"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_f64)
+        .collect();
+    let (w, h) = (msg["width"].as_u64()?, msg["height"].as_u64()?);
+    if k.len() != 9 || k[0] <= 0.0 || w == 0 || h == 0 {
+        return None;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "image sizes are far below 2^24")]
+    let size = [w as f32, h as f32];
+    let [fx, fy, cx, cy] = f32s([k[0], k[4], k[2], k[5]]);
+    Some(
+        rerun::Pinhole::from_focal_length_and_resolution([fx, fy], size)
+            .with_principal_point([cx, cy])
+            .with_image_plane_distance(0.4),
+    )
 }
 
 /// Draws one topic's message; objects keep state between calls.
@@ -413,16 +493,18 @@ fn area(points: &[[f32; 3]]) -> f64 {
     twice.abs() / 2.0
 }
 
-/// Room outlines from a `canopy_msgs/msg/RoomArray`, labelled, and coloured by how much the
-/// camera has seen of each; the share seen overall, by area, goes on the "Exploring" plot.
-fn draw_rooms(rec: &RecordingStream, msg: &Value) {
+/// Room outlines from a `canopy_msgs/msg/RoomArray`, one entity each so a click in the viewer
+/// names the room, labelled and coloured by how much the camera has seen of it; rooms that went
+/// away are cleared. The share seen overall, by area, goes on the "Exploring" plot.
+fn draw_rooms(rec: &RecordingStream, msg: &Value, drawn: &mut BTreeSet<String>) {
     let list = msg["rooms"].as_array().map_or(&[][..], Vec::as_slice);
-    let mut strips = Vec::new();
-    let mut labels = Vec::new();
-    let mut colours = Vec::new();
+    let mut now = BTreeSet::new();
     let (mut seen_area, mut total_area) = (0.0, 0.0);
     for room in list {
-        let Some(points) = room["outline"]["points"].as_array() else {
+        let (Some(id), Some(points)) = (
+            room["id"].as_str().filter(|i| !i.is_empty()),
+            room["outline"]["points"].as_array(),
+        ) else {
             continue;
         };
         let mut strip: Vec<[f32; 3]> = points
@@ -438,27 +520,29 @@ fn draw_rooms(rec: &RecordingStream, msg: &Value) {
         if let Some(first) = strip.first().copied() {
             strip.push(first);
         }
-        strips.push(strip);
-        let text = |k: &str| room[k].as_str().unwrap_or_default().to_owned();
-        labels.push(match room_seen {
-            Some(f) => format!("{} {} {:.0}%", text("id"), text("name"), f * 100.0),
-            None => format!("{} {}", text("id"), text("name")),
-        });
-        colours.push(room_seen.map_or(rerun::Color::from_rgb(200, 200, 210), seen_colour));
+        let name = room["name"].as_str().unwrap_or_default();
+        let label = match room_seen {
+            Some(f) => format!("{id} {name} {:.0}%", f * 100.0),
+            None => format!("{id} {name}"),
+        };
+        put_static(
+            rec,
+            &format!("world/rooms/{id}"),
+            &rerun::LineStrips3D::new([strip])
+                .with_labels([label])
+                .with_colors([room_seen.map_or(rerun::Color::from_rgb(200, 200, 210), seen_colour)])
+                .with_radii([0.03]),
+        );
+        now.insert(id.to_owned());
     }
-    put_static(
-        rec,
-        "world/rooms",
-        &rerun::LineStrips3D::new(strips)
-            .with_labels(labels)
-            .with_colors(colours)
-            .with_radii([0.03]),
-    );
+    for gone in drawn.difference(&now) {
+        put_static(rec, &format!("world/rooms/{gone}"), &rerun::Clear::flat());
+    }
     #[expect(clippy::cast_precision_loss, reason = "a handful of rooms")]
     put(
         rec,
         "mapping/rooms",
-        &rerun::Scalars::single(list.len() as f64),
+        &rerun::Scalars::single(now.len() as f64),
     );
     if total_area > 0.0 {
         put(
@@ -467,6 +551,27 @@ fn draw_rooms(rec: &RecordingStream, msg: &Value) {
             &rerun::Scalars::single(100.0 * seen_area / total_area),
         );
     }
+    *drawn = now;
+}
+
+/// The path the navigation stack is following, from a `nav_msgs/msg/Path`.
+fn draw_plan(rec: &RecordingStream, msg: &Value) {
+    let points: Vec<[f32; 3]> = msg["poses"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .map(|p| {
+            let [x, y, _] = xyz(&p["pose"]["position"]);
+            [x, y, 0.05]
+        })
+        .collect();
+    put_static(
+        rec,
+        "world/plan",
+        &rerun::LineStrips3D::new([points])
+            .with_radii([0.02])
+            .with_colors([rerun::Color::from_rgb(255, 120, 200)]),
+    );
 }
 
 /// Where the robot has been, from a `nav_msgs/msg/Path`.
@@ -549,6 +654,19 @@ fn draw_objects(rec: &RecordingStream, msg: &Value, drawn: &mut BTreeSet<String>
     *drawn = now;
 }
 
+/// How a mission step's states look on the "Mission" timeline.
+fn step_states() -> rerun::StateConfiguration {
+    rerun::StateConfiguration::new()
+        .with_values(["running", "success", "failure", "skipped", "idle"])
+        .with_colors([
+            rerun::Color::from_rgb(235, 170, 40),
+            rerun::Color::from_rgb(70, 180, 90),
+            rerun::Color::from_rgb(220, 80, 60),
+            rerun::Color::from_rgb(140, 140, 150),
+            rerun::Color::from_rgb(90, 90, 100),
+        ])
+}
+
 /// The agent's replies and tool calls as a text log, and its marked images.
 async fn agent(rec: RecordingStream, mut events: broadcast::Receiver<Event>) {
     use rerun::TextLogLevel as L;
@@ -562,6 +680,19 @@ async fn agent(rec: RecordingStream, mut events: broadcast::Receiver<Event>) {
             Event::Snapshot { jpeg, .. } => {
                 let image = rerun::EncodedImage::from_file_contents(jpeg.to_vec());
                 put(&rec, "agent/look", &image);
+                continue;
+            }
+            Event::MissionStarted { .. } => {
+                // A new mission's steps start from empty lanes.
+                put(&rec, "mission", &rerun::Clear::recursive());
+                continue;
+            }
+            Event::MissionProgress {
+                step, node, status, ..
+            } if node.is_empty() && !step.is_empty() => {
+                let path = format!("mission/{step}");
+                put_static(&rec, &path, &step_states());
+                put(&rec, &path, &rerun::StateChange::single(status.as_str()));
                 continue;
             }
             Event::Reply { text, model, .. } => (L::INFO, format!("{model}: {text}")),
@@ -659,6 +790,18 @@ mod tests {
             [0.0, 3.0, 0.0],
         ];
         assert!((area(&square) - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_camera_info_gives_the_lens() {
+        let info = serde_json::json!({"width": 848, "height": 480,
+            "k": [600.0, 0.0, 424.0, 0.0, 600.0, 240.0, 0.0, 0.0, 1.0]});
+        assert!(pinhole(&info).is_some());
+        let blank = serde_json::json!({"width": 848, "height": 480, "k": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]});
+        assert!(
+            pinhole(&blank).is_none(),
+            "an uncalibrated camera draws no frustum"
+        );
     }
 
     #[test]

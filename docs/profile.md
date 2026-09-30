@@ -112,6 +112,14 @@ how much of each the camera has seen, and plots that share with the room and obj
 `list_places`, `robot_state` and missions read rooms and objects. The app's World tab lists the
 rooms with their floor and walls seen, and its Explore button asks the agent to explore.
 
+### `[viz]`
+
+What the viewer draws beyond the world model, each `{ topic, type }` and each optional: `plan`
+(the `nav_msgs/msg/Path` the navigation stack follows, Nav2's `/plan`) and `camera_info` (the
+`[look]` camera's `sensor_msgs/msg/CameraInfo`). With `camera_info`, the camera frame is drawn in
+the world where the camera is, as a frustum placed by TF from `[ros] base_frame` to the image's
+frame; without it, the frame is drawn on its own.
+
 ### `[mission]`
 
 The robot's mission executor, which runs behaviour trees; see

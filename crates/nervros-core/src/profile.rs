@@ -39,6 +39,8 @@ pub struct Profile {
     pub tools: Vec<ToolConfig>,
     /// The world model's topics, when one runs.
     pub world: Option<WorldConfig>,
+    /// What the viewer draws beyond the world model.
+    pub viz: Option<VizConfig>,
     /// The models file, relative to the profile.
     pub models: ModelsRef,
     #[serde(skip)]
@@ -224,6 +226,17 @@ pub struct WorldConfig {
     pub coverage: Option<TopicRef>,
     /// Where the robot has been (`nav_msgs/msg/Path`), drawn as a line.
     pub trail: Option<TopicRef>,
+}
+
+/// What the viewer draws beyond the world model.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VizConfig {
+    /// The path the navigation stack follows (`nav_msgs/msg/Path`, Nav2's `/plan`).
+    pub plan: Option<TopicRef>,
+    /// The `[look]` camera's `sensor_msgs/msg/CameraInfo`: with it, the frame is drawn in the world
+    /// where the camera is, as a frustum, placed by TF from the base frame to the image's frame.
+    pub camera_info: Option<TopicRef>,
 }
 
 /// A named place.
