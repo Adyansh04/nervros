@@ -125,6 +125,22 @@ pub fn connect(profile: &Profile) -> Result<Arc<dyn RobotPort>, StartError> {
     ))
 }
 
+/// How long start-up waits for the executor's latched `RobotState`.
+const ORPHAN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What to tell the operator when the robot is running a mission this session did not start.
+fn orphan_notice(state: &serde_json::Value) -> Option<String> {
+    let id = state["mission_id"].as_str().filter(|id| !id.is_empty())?;
+    let step = state["mission_step"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map_or_else(String::new, |s| format!(", at {s}"));
+    Some(format!(
+        "The robot is running mission {id}{step}, started before this session. It carries on \
+         unwatched until it ends; Stop ends it now."
+    ))
+}
+
 /// Starts an agent. Must run inside a tokio runtime.
 ///
 /// # Errors
@@ -185,6 +201,18 @@ pub fn start(
     if let Some(m) = &missions {
         m.attach(session.handle());
     }
+    if let Some(state) = profile.mission.as_ref().map(|m| m.state.clone()) {
+        // A mission started before this session runs on unwatched: say so, once, at start.
+        let (robot, handle) = (Arc::clone(&robot), session.handle());
+        tokio::spawn(async move {
+            let latched = robot
+                .latest(&state, "nervros_interfaces/msg/RobotState", ORPHAN_WAIT)
+                .await;
+            if let Some(text) = latched.ok().as_ref().and_then(orphan_notice) {
+                handle.emit(crate::session::Event::Notice { text });
+            }
+        });
+    }
     Ok(Agent {
         session,
         profile,
@@ -194,4 +222,17 @@ pub fn start(
         llm,
         tools,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mission_left_running_is_told_and_an_idle_robot_is_not() {
+        let running = serde_json::json!({"mission_id": "m7", "mission_step": "s2_GoToPlace"});
+        let text = orphan_notice(&running).unwrap();
+        assert!(text.contains("m7, at s2_GoToPlace"), "{text}");
+        assert!(orphan_notice(&serde_json::json!({"mission_id": ""})).is_none());
+    }
 }
