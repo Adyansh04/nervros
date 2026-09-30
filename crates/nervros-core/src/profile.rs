@@ -41,6 +41,9 @@ pub struct Profile {
     pub world: Option<WorldConfig>,
     /// What the viewer draws beyond the world model.
     pub viz: Option<VizConfig>,
+    /// Generic ROS tools: the graph, topics, parameters and logs, and where listed, calls and
+    /// publishing.
+    pub ros_tools: Option<crate::ros_tools::RosToolsConfig>,
     /// The models file, relative to the profile.
     pub models: ModelsRef,
     #[serde(skip)]

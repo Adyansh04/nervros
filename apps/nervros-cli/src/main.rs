@@ -67,6 +67,17 @@ enum Command {
         #[arg(long, default_value = "look.jpg")]
         out: PathBuf,
     },
+    /// Run one read-only ROS tool against the live graph, without a model: `ros_graph`,
+    /// `topic_sample`, `interface_show`, `tf`, `params`, `log_tail`, or `service_call` on a
+    /// service that only reads.
+    #[cfg(feature = "ros")]
+    Ros {
+        /// The tool.
+        tool: String,
+        /// Its arguments as JSON, such as '{"topic": "/odom", "mode": "hz"}'.
+        #[arg(default_value = "{}")]
+        args: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -127,6 +138,8 @@ async fn main() -> Result<()> {
         }
         #[cfg(feature = "ros")]
         Command::Doctor => robot::doctor(&cli.profile).await,
+        #[cfg(feature = "ros")]
+        Command::Ros { tool, args } => robot::ros(&cli.profile, &tool, &args).await,
     }
 }
 

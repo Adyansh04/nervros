@@ -24,7 +24,8 @@ risk = "observe"
 The model sees the service's comment as the tool's description and gets a JSON Schema of the
 request made from the `.srv` file: field comments become descriptions, constants become enums, and
 byte arrays are hidden. The interface files are found through `[ros] interfaces`. A `topic` tool
-returns the newest message on the topic. No tool can publish.
+returns the newest message on the topic. Publishing, and calling services or actions the profile
+does not declare, is for the generic tools of [`[ros_tools]`](#ros_tools), behind the same guard.
 
 | Key | Default | |
 |---|---|---|
@@ -76,16 +77,61 @@ models, and sends text only to models that are local or do not train on it.
 | `start_armed` | `false` | Whether acts are allowed from the start; the app's switch changes it. |
 | `autonomy` | `supervised` | `observe` refuses every act; `supervised` asks the operator for each; `autonomous` runs them. |
 | `approval_ttl` | `"60s"` | An unanswered approval is a no after this. |
-| `budgets.model_calls` | `10` | Model calls per turn. Once the robot has acted in a turn, the model is offered no more tools and answers. |
+| `budgets.model_calls` | `10` | Model calls per turn. Once a mission has started in a turn, the model is offered no more tools and answers; after a call that finished, it can check what it did. |
 | `budgets.tool_calls` | `12` | Tool calls per turn. |
 | `budgets.wall_time` | `"90s"` | A turn is stopped after this, not counting the operator's time on approvals. Missions run outside turns. Free cloud endpoints can take 20 s a call; give them `"180s"`. |
 | `budgets.repeat_break` | `3` | The same call with the same arguments this many times in a row is refused. |
 | `hard_deny` | see below | ROS names no tool may reach; `*` matches anything. Setting it replaces the defaults. |
+| `hard_deny_types` | see below | Interface types no generic tool may call, send or publish, globbed the same way. |
 
 The default `hard_deny` covers what commands motors, velocities or controllers directly:
-`rt/lowcmd`, `/lowcmd`, `/cmd_vel`, `*/cmd_vel`, `/controller_manager/*`, `*/set_parameters`,
+`rt/lowcmd`, `/lowcmd`, `/rt/*`, `*cmd_vel*`, `/controller_manager/*`, `*/set_parameters`,
 `*/set_parameters_atomically`, `*/joint_trajectory`, `*/follow_joint_trajectory`, `/servo_node/*`,
-`/apply_planning_scene` and `/clear_octomap`.
+`/apply_planning_scene` and `/clear_octomap`. The default `hard_deny_types` are
+`geometry_msgs/msg/Twist`, `geometry_msgs/msg/TwistStamped`, `trajectory_msgs/msg/*`,
+`control_msgs/action/*`, `control_msgs/msg/JointJog`, `controller_manager_msgs/srv/*`,
+`lifecycle_msgs/srv/ChangeState` and `rcl_interfaces/srv/SetParameters*` (only `param_set` sets
+parameters). A name from the model must be absolute: `cmd_vel` would otherwise reach `/cmd_vel`
+past a list written for absolute names.
+
+### `[ros_tools]`
+
+Generic ROS tools, what `ros2 topic/service/action/param/node` and `tf2_echo` do, natively and
+without a shell. With the table present, six read tools are always there:
+
+| Tool | Does |
+|---|---|
+| `ros_graph` | Lists topics, services, actions or nodes (filtered by a substring or a glob), or describes one name: a topic's publishers and subscribers with their QoS, and which subscribers receive nothing because they ask for more than a publisher gives; a node's topics, services and clients; a service's or action's type and definition. |
+| `topic_sample` | `echo` up to 10 messages, long arrays and strings shortened, `fields` to pick some; `hz` for the rate and its jitter; `bw` for bytes per second. Images, point clouds and maps are too large to echo. |
+| `interface_show` | A message, service or action definition. |
+| `tf` | Where one frame is in another, or every link with its parent, whether it is static and its age. |
+| `params` | A node's parameters: names, values (all of them when none are named) and descriptions. |
+| `log_tail` | Recent `/rosout` lines, warnings and errors by default. |
+
+Four act tools exist only when their list names something. Each call needs the robot armed and,
+when supervised, the operator's approval of the resolved target, type and payload. It is checked
+against the interface, the hard deny lists and the profile's list before anyone is asked, and it
+holds every resource while it runs, so it cannot overlap a mission.
+
+| Tool | Does |
+|---|---|
+| `service_call` | Calls a service; its type is looked up when not given. |
+| `action_goal` | Sends a goal and waits for the result, up to 120 s, then cancels it; or cancels every goal of an action. A goal is cancelled too when its turn is stopped. |
+| `param_set` | Sets one parameter, converted to its current type, and reads it back. A world edit: approval, no arming. |
+| `topic_publish` | Publishes a message up to 10 times, at up to 10 Hz, with the agent's own QoS. |
+
+| Key | Default | |
+|---|---|---|
+| `hidden` | action internals, `/rosout`, `/parameter_events`, parameter services | Left out of listings unless `all` is asked; not a boundary. |
+| `read_deny` | none | Topics never sampled or echoed. |
+| `param_read_deny` | `*key*`, `*token*`, `*secret*`, `*password*` | Parameter values shown as hidden. |
+| `service_observe` | `*/get_*`, `*/list_*`, `*/describe_*` | Services that only read: `service_call` runs them unarmed and unapproved. |
+| `service_call` | none | Services `service_call` may call. |
+| `action_send` | none | Actions `action_goal` may reach. |
+| `publish` | none | Topics `topic_publish` may publish on. |
+| `param_set` | none | `node:parameter` globs `param_set` may change. |
+
+`nervros-cli ros <tool> '<json>'` runs one read tool against the live graph, without a model.
 
 ### `[look]`
 

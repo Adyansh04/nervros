@@ -14,6 +14,7 @@ pub mod look;
 pub mod mission;
 pub mod profile;
 pub mod providers;
+pub mod ros_tools;
 pub mod schemas;
 pub mod secret;
 pub mod session;

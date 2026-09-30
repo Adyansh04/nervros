@@ -21,6 +21,10 @@ _nervros_idl="std_msgs;builtin_interfaces;geometry_msgs;sensor_msgs;nav_msgs;nav
 _nervros_idl="${_nervros_idl};action_msgs;unique_identifier_msgs;rcl_interfaces;lifecycle_msgs"
 _nervros_idl="${_nervros_idl};std_srvs;vision_msgs;trajectory_msgs;service_msgs"
 _nervros_idl="${_nervros_idl};type_description_interfaces;visualization_msgs;geographic_msgs;nervros_interfaces"
+# For the generic ROS tools: controllers, diagnostics, logs, maps, SLAM, localization.
+_nervros_idl="${_nervros_idl};control_msgs;controller_manager_msgs;diagnostic_msgs;rosgraph_msgs"
+_nervros_idl="${_nervros_idl};statistics_msgs;shape_msgs;map_msgs;octomap_msgs;slam_toolbox"
+_nervros_idl="${_nervros_idl};robot_localization;composition_interfaces;rosbag2_interfaces;example_interfaces"
 export IDL_PACKAGE_FILTER="${_nervros_idl}${NERVROS_EXTRA_IDL_PACKAGES:+;${NERVROS_EXTRA_IDL_PACKAGES}}"
 unset _nervros_idl
 

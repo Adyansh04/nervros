@@ -4,8 +4,9 @@
 //! detections; add time-indexed buffers if a caller needs a transform at a past stamp.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
-use crate::RosError;
+use crate::{RosError, TfLink};
 
 /// A rigid transform: rotation (unit quaternion x, y, z, w) then translation.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -89,6 +90,8 @@ fn rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
 #[derive(Debug, Default)]
 pub struct TfBuffer {
     parents: HashMap<String, (String, Transform)>,
+    // When each child's link last arrived, and whether it came from /tf_static.
+    seen: HashMap<String, (Instant, bool)>,
 }
 
 /// TF allows at most this many hops; a longer walk means a loop in bad data.
@@ -97,9 +100,45 @@ const MAX_DEPTH: usize = 64;
 impl TfBuffer {
     /// Records `child`'s pose in `parent`'s frame (a `geometry_msgs/TransformStamped`).
     pub fn insert(&mut self, parent: &str, child: &str, transform: Transform) {
+        self.insert_from(parent, child, transform, false);
+    }
+
+    /// As [`Self::insert`], noting whether the link came from `/tf_static`.
+    pub fn insert_from(
+        &mut self,
+        parent: &str,
+        child: &str,
+        transform: Transform,
+        is_static: bool,
+    ) {
         let strip = |f: &str| f.trim_start_matches('/').to_owned();
         self.parents
             .insert(strip(child), (strip(parent), transform));
+        self.seen.insert(strip(child), (Instant::now(), is_static));
+    }
+
+    /// Every link, parent first, sorted by child.
+    #[must_use]
+    pub fn links(&self) -> Vec<TfLink> {
+        let mut out: Vec<TfLink> = self
+            .parents
+            .iter()
+            .map(|(child, (parent, _))| {
+                let (at, is_static) = self
+                    .seen
+                    .get(child)
+                    .copied()
+                    .unwrap_or((Instant::now(), false));
+                TfLink {
+                    parent: parent.clone(),
+                    child: child.clone(),
+                    is_static,
+                    age: at.elapsed(),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.child.cmp(&b.child));
+        out
     }
 
     /// Frames from `frame` up to its root, each with the transform root <- that frame.

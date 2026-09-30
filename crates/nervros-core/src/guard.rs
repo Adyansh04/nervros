@@ -90,6 +90,10 @@ pub struct Policy {
     /// defaults, so a robot that truly needs one of them must list the rest itself.
     #[serde(default = "default_hard_deny")]
     pub hard_deny: Vec<String>,
+    /// Interface types no generic tool may call, send or publish, globbed like `hard_deny`:
+    /// velocity and joint commands, controller switches, lifecycle changes.
+    #[serde(default = "default_hard_deny_types")]
+    pub hard_deny_types: Vec<String>,
 }
 
 fn d_ttl() -> Duration {
@@ -102,8 +106,8 @@ pub fn default_hard_deny() -> Vec<String> {
     [
         "rt/lowcmd",
         "/lowcmd",
-        "/cmd_vel",
-        "*/cmd_vel",
+        "/rt/*",
+        "*cmd_vel*",
         "/controller_manager/*",
         "*/set_parameters",
         "*/set_parameters_atomically",
@@ -117,6 +121,23 @@ pub fn default_hard_deny() -> Vec<String> {
     .to_vec()
 }
 
+/// Interface types that command motors, velocities, controllers or lifecycles directly.
+#[must_use]
+pub fn default_hard_deny_types() -> Vec<String> {
+    [
+        "geometry_msgs/msg/Twist",
+        "geometry_msgs/msg/TwistStamped",
+        "trajectory_msgs/msg/*",
+        "control_msgs/action/*",
+        "control_msgs/msg/JointJog",
+        "controller_manager_msgs/srv/*",
+        "lifecycle_msgs/srv/ChangeState",
+        "rcl_interfaces/srv/SetParameters*",
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
 impl Default for Policy {
     fn default() -> Self {
         Self {
@@ -125,7 +146,39 @@ impl Default for Policy {
             approval_ttl: d_ttl(),
             budgets: Budgets::default(),
             hard_deny: default_hard_deny(),
+            hard_deny_types: default_hard_deny_types(),
         }
+    }
+}
+
+/// A ROS name from the model, as it will be used: absolute, each part a letter or `_` then
+/// letters, digits or `_`. A relative name is refused rather than resolved, since `cmd_vel` would
+/// reach `/cmd_vel` past a deny list written for absolute names.
+///
+/// # Errors
+///
+/// Why the name is not one.
+pub fn canonical_ros_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    let Some(rest) = name.strip_prefix('/') else {
+        return Err(format!(
+            "`{name}` must be an absolute ROS name, starting with /"
+        ));
+    };
+    let valid = !rest.is_empty()
+        && rest.split('/').all(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+    if valid {
+        Ok(name.to_owned())
+    } else {
+        Err(format!(
+            "`{name}` is not a ROS name: parts of letters, digits and _, split by /"
+        ))
     }
 }
 
@@ -229,6 +282,15 @@ impl Guard {
             .hard_deny
             .iter()
             .any(|p| glob_match(p, ros_name))
+    }
+
+    /// Whether an interface type is on the hard-deny list for generic calls and publishing.
+    #[must_use]
+    pub fn hard_denied_type(&self, ros_type: &str) -> bool {
+        self.policy
+            .hard_deny_types
+            .iter()
+            .any(|p| glob_match(p, ros_type))
     }
 
     /// Whether act-lane tools are enabled.
@@ -376,10 +438,40 @@ mod tests {
             "/cmd_vel",
             "/controller_manager/switch_controller",
             "/arm/joint_trajectory",
+            "/cmd_vel_nav",
+            "/g1/cmd_vel_smoothed",
+            "/rt/lowcmd",
         ] {
             assert!(g.hard_denied(name), "{name}");
         }
         assert!(!g.hard_denied("/canopy/find_objects"));
+        for ty in [
+            "geometry_msgs/msg/Twist",
+            "trajectory_msgs/msg/JointTrajectory",
+            "control_msgs/action/FollowJointTrajectory",
+            "controller_manager_msgs/srv/SwitchController",
+            "rcl_interfaces/srv/SetParametersAtomically",
+        ] {
+            assert!(g.hard_denied_type(ty), "{ty}");
+        }
+        assert!(!g.hard_denied_type("std_srvs/srv/Trigger"));
+    }
+
+    #[test]
+    fn a_name_from_the_model_must_be_absolute_and_plain() {
+        assert_eq!(canonical_ros_name(" /a/b_2 "), Ok("/a/b_2".to_owned()));
+        for bad in [
+            "cmd_vel",
+            "~/cmd_vel",
+            "//cmd_vel",
+            "/cmd_vel/",
+            "/",
+            "/a/{x}",
+            "/1a",
+            "/a b",
+        ] {
+            assert!(canonical_ros_name(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

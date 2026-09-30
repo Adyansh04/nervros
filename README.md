@@ -42,7 +42,17 @@ source scripts/ros-env.sh             # bash; add NERVROS_UDP_ONLY=1 if the grap
 cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 ```
 
-`nervros-cli` does the same headless: `chat`, `doctor`, `look`, `models` and `ask`.
+`nervros-cli` does the same headless: `chat`, `doctor`, `look`, `models`, `ask`, and `ros`, which
+runs one of the ROS debugging tools against the live graph without a model:
+
+```bash
+nervros-cli --profile my.toml ros topic_sample '{"topic": "/odom", "mode": "hz"}'
+```
+
+With a [`[ros_tools]`](docs/profile.md#ros_tools) table the agent can look at any part of the
+graph as `ros2` would (topics with their QoS, rates, messages, nodes, services, actions,
+parameters, TF and logs), and, where the profile lists them, call services, send action goals,
+set parameters and publish, each approved by you.
 
 In the window, Enter sends, Esc stops the reply and Ctrl+Shift+S stops the mission. Ctrl+1 to
 Ctrl+6 switch the dock between the mission, the world model, approvals, events, models and the

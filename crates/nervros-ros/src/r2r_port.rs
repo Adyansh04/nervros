@@ -14,12 +14,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt as _;
+use futures::stream::BoxStream;
 use r2r::QosProfile;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::tf::TfBuffer;
-use crate::{Frame, Goal, GoalResult, GoalStatus, Graph, RobotPort, RosError, Transform};
+use crate::{
+    Endpoint, Frame, Goal, GoalResult, GoalStatus, Graph, GraphDetail, NamesAndTypes, NodeEntities,
+    QosInfo, RobotPort, RosError, TfLink, TopicEndpoints, Transform,
+};
 
 /// How the node is set up.
 #[derive(Debug, Clone)]
@@ -64,6 +68,36 @@ enum Cmd {
     },
     Graph {
         reply: oneshot::Sender<r2r::Result<HashMap<String, Vec<String>>>>,
+    },
+    GraphDetail {
+        reply: oneshot::Sender<Result<GraphDetail, RosError>>,
+    },
+    Endpoints {
+        topic: String,
+        reply: oneshot::Sender<Result<TopicEndpoints, RosError>>,
+    },
+    NodeEntities {
+        name: String,
+        namespace: String,
+        reply: oneshot::Sender<Result<NodeEntities, RosError>>,
+    },
+    SubscribeRaw {
+        topic: String,
+        ty: String,
+        reply: oneshot::Sender<Result<BoxStream<'static, Vec<u8>>, RosError>>,
+    },
+    SubscribeSample {
+        topic: String,
+        ty: String,
+        reply: oneshot::Sender<Result<BoxStream<'static, r2r::Result<Value>>, RosError>>,
+    },
+    Publisher {
+        topic: String,
+        ty: String,
+        reply: oneshot::Sender<r2r::Result<r2r::PublisherUntyped>>,
+    },
+    DestroyPublisher {
+        publisher: r2r::PublisherUntyped,
     },
 }
 
@@ -233,20 +267,21 @@ fn listen_tf(
             .reliable()
             .transient_local(),
     )?;
-    for mut stream in [dynamic.boxed(), statics.boxed()] {
+    for (mut stream, is_static) in [(dynamic.boxed(), false), (statics.boxed(), true)] {
         let tf = Arc::clone(tf);
         runtime.spawn(async move {
             while let Some(msg) = stream.next().await {
                 let mut buf = lock(&tf);
                 for t in msg.transforms {
                     let (p, q) = (t.transform.translation, t.transform.rotation);
-                    buf.insert(
+                    buf.insert_from(
                         &t.header.frame_id,
                         &t.child_frame_id,
                         Transform {
                             translation: [p.x, p.y, p.z],
                             rotation: [q.x, q.y, q.z, q.w],
                         },
+                        is_static,
                     );
                 }
             }
@@ -283,8 +318,140 @@ fn auto_qos(node: &r2r::Node, topic: &str, depth: usize) -> QosProfile {
     }
 }
 
+fn sorted(map: HashMap<String, Vec<String>>) -> NamesAndTypes {
+    let mut v: NamesAndTypes = map.into_iter().collect();
+    v.sort();
+    v
+}
+
+fn full_name(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() || namespace == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", namespace.trim_end_matches('/'))
+    }
+}
+
+fn qos_info(q: &QosProfile) -> QosInfo {
+    use r2r::qos::{DurabilityPolicy as D, HistoryPolicy as H, ReliabilityPolicy as R};
+    let word = |s: &str| s.to_owned();
+    QosInfo {
+        reliability: word(match q.reliability {
+            R::Reliable => "reliable",
+            R::BestEffort => "best_effort",
+            _ => "system_default",
+        }),
+        durability: word(match q.durability {
+            D::TransientLocal => "transient_local",
+            D::Volatile => "volatile",
+            _ => "system_default",
+        }),
+        history: word(match q.history {
+            H::KeepLast => "keep_last",
+            H::KeepAll => "keep_all",
+            _ => "system_default",
+        }),
+        depth: q.depth,
+    }
+}
+
+fn endpoints(infos: Vec<r2r::TopicEndpointInfo>) -> Vec<Endpoint> {
+    let mut out: Vec<Endpoint> = infos
+        .into_iter()
+        .map(|i| Endpoint {
+            node: full_name(&i.node_namespace, &i.node_name),
+            topic_type: i.topic_type,
+            qos: qos_info(&i.qos_profile),
+        })
+        .collect();
+    out.sort_by(|a, b| a.node.cmp(&b.node));
+    out
+}
+
+fn graph_detail(node: &r2r::Node) -> Result<GraphDetail, RosError> {
+    let topics = node.get_topic_names_and_types().map_err(mw)?;
+    let services = node.get_service_names_and_types().map_err(mw)?;
+    let mut nodes: Vec<String> = node
+        .get_node_names()
+        .map_err(mw)?
+        .into_iter()
+        .map(|(name, ns)| full_name(&ns, &name))
+        .collect();
+    nodes.sort();
+    nodes.dedup();
+    Ok(GraphDetail {
+        topics: sorted(topics),
+        services: sorted(services),
+        nodes,
+    })
+}
+
+fn node_entities(node: &r2r::Node, name: &str, ns: &str) -> Result<NodeEntities, RosError> {
+    Ok(NodeEntities {
+        publishers: sorted(
+            node.get_publisher_names_and_types_by_node(name, ns)
+                .map_err(mw)?,
+        ),
+        subscribers: sorted(
+            node.get_subscriber_names_and_types_by_node(name, ns)
+                .map_err(mw)?,
+        ),
+        services: sorted(
+            node.get_service_names_and_types_by_node(name, ns)
+                .map_err(mw)?,
+        ),
+        clients: sorted(
+            node.get_client_names_and_types_by_node(name, ns)
+                .map_err(mw)?,
+        ),
+    })
+}
+
 fn handle(node: &mut r2r::Node, runtime: &tokio::runtime::Handle, cmd: Cmd) {
     match cmd {
+        Cmd::GraphDetail { reply } => {
+            let _ = reply.send(graph_detail(node));
+        }
+        Cmd::Endpoints { topic, reply } => {
+            let both = node
+                .get_publishers_info_by_topic(&topic, false)
+                .and_then(|p| Ok((p, node.get_subscriptions_info_by_topic(&topic, false)?)))
+                .map(|(p, s)| TopicEndpoints {
+                    publishers: endpoints(p),
+                    subscribers: endpoints(s),
+                })
+                .map_err(mw);
+            let _ = reply.send(both);
+        }
+        Cmd::NodeEntities {
+            name,
+            namespace,
+            reply,
+        } => {
+            let _ = reply.send(node_entities(node, &name, &namespace));
+        }
+        Cmd::SubscribeRaw { topic, ty, reply } => {
+            // Best effort, as `ros2 topic hz` subscribes: it matches every publisher.
+            let stream = node
+                .subscribe_raw(&topic, &ty, QosProfile::sensor_data())
+                .map(futures::StreamExt::boxed)
+                .map_err(|e| type_error(&ty, &e));
+            let _ = reply.send(stream);
+        }
+        Cmd::SubscribeSample { topic, ty, reply } => {
+            let qos = auto_qos(node, &topic, 10);
+            let stream = node
+                .subscribe_untyped(&topic, &ty, qos)
+                .map(futures::StreamExt::boxed)
+                .map_err(|e| type_error(&ty, &e));
+            let _ = reply.send(stream);
+        }
+        Cmd::Publisher { topic, ty, reply } => {
+            // Our own QoS, never the caller's: a raw QoS could reach a DDS topic such as rt/lowcmd.
+            let qos = QosProfile::default().keep_last(10).reliable().volatile();
+            let _ = reply.send(node.create_publisher_untyped(&topic, &ty, qos));
+        }
+        Cmd::DestroyPublisher { publisher } => node.destroy_publisher_untyped(publisher),
         Cmd::Client { name, ty, reply } => {
             let _ =
                 reply.send(node.create_client_untyped(&name, &ty, QosProfile::services_default()));
@@ -502,5 +669,136 @@ impl RobotPort for R2rPort {
                 .is_ok(),
             Err(_) => false,
         }
+    }
+
+    async fn graph_detail(&self) -> Result<GraphDetail, RosError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::GraphDetail { reply })?;
+        rx.await.map_err(mw)?
+    }
+
+    async fn endpoints(&self, topic: &str) -> Result<TopicEndpoints, RosError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::Endpoints {
+            topic: topic.to_owned(),
+            reply,
+        })?;
+        rx.await.map_err(mw)?
+    }
+
+    async fn node_entities(&self, node: &str) -> Result<NodeEntities, RosError> {
+        let (namespace, name) = match node.rsplit_once('/') {
+            Some(("", name)) => ("/".to_owned(), name.to_owned()),
+            Some((ns, name)) => (ns.to_owned(), name.to_owned()),
+            None => ("/".to_owned(), node.to_owned()),
+        };
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::NodeEntities {
+            name,
+            namespace,
+            reply,
+        })?;
+        rx.await.map_err(mw)?
+    }
+
+    async fn sample_sizes(
+        &self,
+        topic: &str,
+        ty: &str,
+        window: Duration,
+        max: usize,
+    ) -> Result<Vec<(Duration, usize)>, RosError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::SubscribeRaw {
+            topic: topic.to_owned(),
+            ty: ty.to_owned(),
+            reply,
+        })?;
+        let mut stream = rx.await.map_err(mw)??;
+        let start = tokio::time::Instant::now();
+        let mut out = Vec::new();
+        while out.len() < max {
+            match tokio::time::timeout_at(start + window, stream.next()).await {
+                Ok(Some(bytes)) => out.push((start.elapsed(), bytes.len())),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    async fn sample_messages(
+        &self,
+        topic: &str,
+        ty: &str,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Value>, RosError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::SubscribeSample {
+            topic: topic.to_owned(),
+            ty: ty.to_owned(),
+            reply,
+        })?;
+        let mut stream = rx.await.map_err(mw)??;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut out = Vec::new();
+        while out.len() < count {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(Ok(v))) => out.push(v),
+                Ok(Some(Err(e))) => {
+                    return Err(RosError::Conversion {
+                        name: topic.to_owned(),
+                        message: e.to_string(),
+                    });
+                }
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    async fn publish(
+        &self,
+        topic: &str,
+        ty: &str,
+        message: Value,
+        count: usize,
+        period: Duration,
+    ) -> Result<usize, RosError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::Publisher {
+            topic: topic.to_owned(),
+            ty: ty.to_owned(),
+            reply,
+        })?;
+        let publisher = rx.await.map_err(mw)?.map_err(|e| type_error(ty, &e))?;
+        // A new publisher is not matched at once; waiting a moment keeps the first message.
+        if let Ok(wait) = publisher.wait_for_inter_process_subscribers() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), wait).await;
+        }
+        let matched = publisher
+            .get_inter_process_subscription_count()
+            .unwrap_or(0);
+        let mut result = Ok(matched);
+        for i in 0..count {
+            if i > 0 {
+                tokio::time::sleep(period).await;
+            }
+            if let Err(e) = publisher.publish(message.clone()) {
+                result = Err(RosError::Conversion {
+                    name: topic.to_owned(),
+                    message: e.to_string(),
+                });
+                break;
+            }
+        }
+        // Reliable delivery needs the publisher a moment longer.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.send(Cmd::DestroyPublisher { publisher })?;
+        result
+    }
+
+    fn tf_links(&self) -> Vec<TfLink> {
+        lock(&self.tf).links()
     }
 }

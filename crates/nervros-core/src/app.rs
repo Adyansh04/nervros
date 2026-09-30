@@ -17,7 +17,7 @@ use crate::providers::ModelsConfig;
 use crate::providers::router::{PrivacyMode, Router};
 use crate::schemas::RosidlSchemas;
 use crate::session::{Session, SessionConfig};
-use crate::tools::{Registry, Tool};
+use crate::tools::{Registry, SchemaSource, Tool};
 
 /// A running agent.
 pub struct Agent {
@@ -160,7 +160,7 @@ pub fn start(
     let router = Router::with_ledger_file(models, ledger, privacy).map_err(StartError::Ledger)?;
     let llm = Arc::new(Llm::new(router)?);
     let guard = Arc::new(Guard::new(profile.policy.clone()));
-    let schemas = RosidlSchemas::load(&profile)?;
+    let schemas: Arc<dyn SchemaSource> = Arc::new(RosidlSchemas::load(&profile)?);
     let mut registry = Registry::from_config(&profile.tools, &robot, &schemas, &guard)?;
     let snapshots = Arc::new(SnapshotStore::default());
     if let Some(look) = profile.look.clone() {
@@ -175,6 +175,11 @@ pub fn start(
         Arc::clone(&robot),
         Arc::clone(&guard),
     )))?;
+    if let Some(config) = &profile.ros_tools {
+        for tool in crate::ros_tools::tools(config, &robot, &schemas, &guard) {
+            registry.add(tool)?;
+        }
+    }
     let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
     registry.add(Arc::clone(&stop))?;
     let missions = Missions::new(&profile, Arc::clone(&robot));

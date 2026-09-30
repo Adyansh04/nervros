@@ -195,11 +195,29 @@ fn cap(data: &Value, max_chars: usize) -> Value {
     json!({ "truncated": true, "chars": text.len(), "head": cut })
 }
 
+/// What one call of a tool would do, when that depends on its arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assessment {
+    /// Its risk for these arguments.
+    pub risk: Risk,
+    /// What it occupies while it runs.
+    pub resources: Vec<Resource>,
+    /// What the operator is asked to approve, such as "calls /x (pkg/srv/T)".
+    pub reason: String,
+}
+
 /// A callable tool.
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Its spec; borrowed unless it changes while the agent runs.
     fn spec(&self) -> Cow<'_, ToolSpec>;
+
+    /// For a tool whose risk depends on its arguments, such as a call to any service: what this
+    /// call would do, checked before anyone is asked to approve it. `None` means the spec says it
+    /// all; an error is the answer when the call cannot go out at all.
+    async fn assess(&self, _args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
+        None
+    }
 
     /// Runs it. Errors are outcomes, never panics.
     async fn call(&self, args: Value) -> ToolOutcome;
@@ -214,15 +232,38 @@ pub trait SchemaSource: Send + Sync {
     ///
     /// A description of why the type has no schema.
     fn schema(&self, ros_type: &str, part: SchemaPart, hide: &[String]) -> Result<Value, String>;
+
+    /// Checks a value against a part of an interface before anything turns it into a ROS
+    /// message, which would panic on a wrong array length. A source that cannot check passes it.
+    ///
+    /// # Errors
+    ///
+    /// The first problem, with its field path.
+    fn validate(&self, _ros_type: &str, _part: SchemaPart, _value: &Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// An interface as its `.msg`, `.srv` or `.action` text, when known.
+    fn show(&self, _ros_type: &str) -> Option<String> {
+        None
+    }
 }
 
-/// Which half of an interface.
+/// Which part of an interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaPart {
     /// A service request.
     Request,
+    /// A service response.
+    Response,
     /// A topic message.
     Message,
+    /// An action goal.
+    Goal,
+    /// An action result.
+    Result,
+    /// An action's feedback.
+    Feedback,
 }
 
 /// Kinds of config-declared tools.
@@ -281,6 +322,7 @@ pub struct ServiceTool {
     ros_type: String,
     defaults: Map<String, Value>,
     robot: Arc<dyn RobotPort>,
+    schemas: Arc<dyn SchemaSource>,
 }
 
 /// A tool that returns a topic's newest message.
@@ -311,6 +353,15 @@ impl Tool for ServiceTool {
 
     async fn call(&self, args: Value) -> ToolOutcome {
         let request = merge(&self.defaults, args);
+        if let Err(why) = self
+            .schemas
+            .validate(&self.ros_type, SchemaPart::Request, &request)
+        {
+            return ToolOutcome::failed(format!(
+                "the request does not fit {}: {why}",
+                self.ros_type
+            ));
+        }
         match self
             .robot
             .call(&self.ros_name, &self.ros_type, request, self.spec.timeout)
@@ -401,7 +452,7 @@ impl Registry {
     pub fn from_config(
         configs: &[ToolConfig],
         robot: &Arc<dyn RobotPort>,
-        schemas: &dyn SchemaSource,
+        schemas: &Arc<dyn SchemaSource>,
         guard: &Guard,
     ) -> Result<Self, RegistryError> {
         let mut registry = Self::default();
@@ -463,6 +514,7 @@ impl Registry {
                     ros_type: c.ros_type.clone(),
                     defaults: c.defaults.clone(),
                     robot: Arc::clone(robot),
+                    schemas: Arc::clone(schemas),
                 }),
                 ToolKind::Topic => Arc::new(TopicTool {
                     spec,
@@ -513,6 +565,10 @@ mod tests {
 
     struct Fixed;
 
+    fn fixed() -> Arc<dyn SchemaSource> {
+        Arc::new(Fixed)
+    }
+
     impl SchemaSource for Fixed {
         fn schema(
             &self,
@@ -545,7 +601,7 @@ mod tests {
             "name = \"reset\"\nkind = \"service\"\nros_name = \"/reset\"\ntype = \"x/srv/Find\"\n",
         )
         .unwrap();
-        let refused = Registry::from_config(&[unclassified], &robot(), &Fixed, &guard);
+        let refused = Registry::from_config(&[unclassified], &robot(), &fixed(), &guard);
         assert!(
             matches!(&refused, Err(RegistryError::Unclassified(t)) if t == "reset"),
             "{refused:?}"
@@ -554,7 +610,7 @@ mod tests {
             "name = \"objects\"\nkind = \"topic\"\nros_name = \"/objects\"\ntype = \"x/msg/Objects\"\n",
         )
         .unwrap();
-        let reg = Registry::from_config(&[topic], &robot(), &Fixed, &guard).unwrap();
+        let reg = Registry::from_config(&[topic], &robot(), &fixed(), &guard).unwrap();
         assert_eq!(reg.get("objects").unwrap().spec().risk, Risk::Observe);
     }
 
@@ -564,7 +620,7 @@ mod tests {
         let reg = Registry::from_config(
             &[config("find_objects", "/find", "x/srv/Find")],
             &robot(),
-            &Fixed,
+            &fixed(),
             &guard,
         )
         .unwrap();
@@ -580,17 +636,17 @@ mod tests {
         let guard = Guard::new(Policy::default());
         let denied = config("switch", "/controller_manager/switch_controller", "x/srv/S");
         assert!(matches!(
-            Registry::from_config(&[denied], &robot(), &Fixed, &guard),
+            Registry::from_config(&[denied], &robot(), &fixed(), &guard),
             Err(RegistryError::Denied { .. })
         ));
         let bad = config("has space", "/find", "x/srv/Find");
         assert!(matches!(
-            Registry::from_config(&[bad], &robot(), &Fixed, &guard),
+            Registry::from_config(&[bad], &robot(), &fixed(), &guard),
             Err(RegistryError::BadName(_))
         ));
         let missing = config("m", "/find", "x/srv/Missing");
         assert!(matches!(
-            Registry::from_config(&[missing], &robot(), &Fixed, &guard),
+            Registry::from_config(&[missing], &robot(), &fixed(), &guard),
             Err(RegistryError::Schema { .. })
         ));
     }
@@ -601,7 +657,7 @@ mod tests {
         let reg = Registry::from_config(
             &[config("gone", "/gone", "x/srv/Find")],
             &robot(),
-            &Fixed,
+            &fixed(),
             &guard,
         )
         .unwrap();
