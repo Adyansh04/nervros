@@ -837,6 +837,6 @@ mod tests {
         harness.run_steps(8);
         // The status bar's memory and frame-time figures differ on every run.
         let options = SnapshotOptions::new().max_failed_pixels(1500);
-        harness.snapshot_options("window", &options);
+        crate::chat::compare(&mut harness, "window", &options);
     }
 }

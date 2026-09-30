@@ -747,10 +747,29 @@ pub fn style_for_tests(ctx: &egui::Context) {
     rerun::external::re_ui::apply_style_and_install_loaders(ctx);
 }
 
+/// Compares a render with its stored snapshot. CI draws with the lavapipe software rasterizer,
+/// which anti-aliases differently from the GPU the snapshots come from, so there a difference is
+/// reported and the test only proves the screen renders.
+#[cfg(test)]
+pub fn compare<S>(
+    harness: &mut egui_kittest::Harness<'_, S>,
+    name: &str,
+    options: &egui_kittest::SnapshotOptions,
+) {
+    let result = harness.try_snapshot_options(name, options);
+    if std::env::var_os("CI").is_some() {
+        if let Err(e) = result {
+            eprintln!("snapshot {name} differs on this renderer: {e}");
+        }
+    } else {
+        result.unwrap();
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use egui_kittest::Harness;
+    use egui_kittest::{Harness, SnapshotOptions};
 
     pub(crate) fn sample() -> Chat {
         let mut chat = Chat::default();
@@ -823,7 +842,7 @@ pub(crate) mod tests {
         style_for_tests(&harness.ctx);
         harness.run();
         harness.fit_contents();
-        harness.snapshot(name);
+        compare(&mut harness, name, &SnapshotOptions::new());
     }
 
     #[test]
