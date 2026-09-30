@@ -250,9 +250,10 @@ pub struct ToolConfig {
     pub ros_type: String,
     /// Overrides the description taken from the interface file.
     pub description: Option<String>,
-    /// How much it can change.
+    /// How much it can change. Required for a service, which can act on the robot; a topic read
+    /// is `observe`.
     #[serde(default)]
-    pub risk: Risk,
+    pub risk: Option<Risk>,
     /// What it occupies while running.
     #[serde(default)]
     pub resources: Vec<Resource>,
@@ -357,6 +358,11 @@ pub enum RegistryError {
         /// Its ROS name.
         ros_name: String,
     },
+    /// A service tool without a risk class: it could act on the robot unattended.
+    #[error(
+        "tool `{0}` calls a service, which can act on the robot: say how much with risk = \"observe\", \"world_edit\", \"motion\" or \"manipulation\""
+    )]
+    Unclassified(String),
     /// No schema for its type.
     #[error("tool `{tool}`: {message}")]
     Schema {
@@ -410,6 +416,14 @@ impl Registry {
                 ToolKind::Service => SchemaPart::Request,
                 ToolKind::Topic => SchemaPart::Message,
             };
+            // Fail closed: a service nobody classified would otherwise run as a read.
+            let risk = match (c.risk, c.kind) {
+                (Some(risk), _) => risk,
+                (None, ToolKind::Topic) => Risk::Observe,
+                (None, ToolKind::Service) => {
+                    return Err(RegistryError::Unclassified(c.name.clone()));
+                }
+            };
             let parameters = match (&c.schema, c.kind) {
                 (Some(schema), _) => schema.clone(),
                 // A topic read takes no arguments.
@@ -438,7 +452,7 @@ impl Registry {
                 name: c.name.clone(),
                 description,
                 parameters,
-                risk: c.risk,
+                risk,
                 resources: c.resources.clone(),
                 timeout: c.timeout,
             };
@@ -515,13 +529,33 @@ mod tests {
 
     fn config(name: &str, ros_name: &str, ros_type: &str) -> ToolConfig {
         toml::from_str(&format!(
-            "name = \"{name}\"\nkind = \"service\"\nros_name = \"{ros_name}\"\ntype = \"{ros_type}\"\ndefaults = {{ max_results = 5 }}\n"
+            "name = \"{name}\"\nkind = \"service\"\nros_name = \"{ros_name}\"\ntype = \"{ros_type}\"\nrisk = \"observe\"\ndefaults = {{ max_results = 5 }}\n"
         ))
         .unwrap()
     }
 
     fn robot() -> Arc<dyn RobotPort> {
         Arc::new(FakeRobot::new().with_service("/find", |req| Ok(json!({"got": req}))))
+    }
+
+    #[test]
+    fn a_service_nobody_classified_is_refused_and_a_topic_reads() {
+        let guard = Guard::new(Policy::default());
+        let unclassified: ToolConfig = toml::from_str(
+            "name = \"reset\"\nkind = \"service\"\nros_name = \"/reset\"\ntype = \"x/srv/Find\"\n",
+        )
+        .unwrap();
+        let refused = Registry::from_config(&[unclassified], &robot(), &Fixed, &guard);
+        assert!(
+            matches!(&refused, Err(RegistryError::Unclassified(t)) if t == "reset"),
+            "{refused:?}"
+        );
+        let topic: ToolConfig = toml::from_str(
+            "name = \"objects\"\nkind = \"topic\"\nros_name = \"/objects\"\ntype = \"x/msg/Objects\"\n",
+        )
+        .unwrap();
+        let reg = Registry::from_config(&[topic], &robot(), &Fixed, &guard).unwrap();
+        assert_eq!(reg.get("objects").unwrap().spec().risk, Risk::Observe);
     }
 
     #[tokio::test]

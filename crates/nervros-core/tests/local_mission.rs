@@ -54,6 +54,7 @@ const PROFILE: &str = r#"
     kind = "service"
     ros_name = "/canopy/find_objects"
     type = "canopy_msgs/srv/FindObjects"
+    risk = "observe"
     description = "Finds objects in the world model by what they are: ids, labels and rooms."
     schema = { type = "object", properties = { query = { type = "string" } }, required = ["query"] }
     [models]
