@@ -578,7 +578,12 @@ fn summarise(result: Result<GoalResult, RosError>) -> (String, String, String) {
                 |o| (*o).to_owned(),
             );
             let text = |k: &str| r.result[k].as_str().unwrap_or_default().to_owned();
-            (outcome, text("failed_step_id"), text("failure_reason"))
+            // A rejected mission says why in its diagnostics, not in the failure reason.
+            let mut reason = text("failure_reason");
+            if reason.is_empty() {
+                reason = text("diagnostics_json");
+            }
+            (outcome, text("failed_step_id"), reason)
         }
         Err(e) => ("error".to_owned(), String::new(), e.to_string()),
     }

@@ -116,6 +116,13 @@ pub struct World {
     pub holding: BTreeMap<String, String>,
 }
 
+impl World {
+    /// Whether an object or room with this id is in the world model.
+    fn knows(&self, id: &str) -> bool {
+        self.objects.iter().chain(&self.rooms).any(|t| t.id == id)
+    }
+}
+
 /// Where a `GoToPlace` leaves the robot.
 struct Spot {
     id: String,
@@ -160,8 +167,11 @@ impl Sim {
                 continue;
             };
             match (name, args.as_slice()) {
+                // Only what the world model knows can be judged; nearness to anything else, such
+                // as a detector's name for an object, is the executor's to check.
                 ("near", [x]) => {
                     if let Some(target) = value(x)
+                        && world.knows(&target)
                         && !self.near(&target, world)
                     {
                         problem(
@@ -250,12 +260,7 @@ impl Sim {
                 .value
                 .trim()
                 .to_owned();
-            let known = world
-                .objects
-                .iter()
-                .chain(&world.rooms)
-                .any(|t| t.id == target);
-            (known && !self.near(&target, world)).then(|| Step {
+            (world.knows(&target) && !self.near(&target, world)).then(|| Step {
                 skill: GO_TO_PLACE.to_owned(),
                 args: vec![StepArg {
                     name: "place".to_owned(),
@@ -390,10 +395,9 @@ pub fn compile(plan: &Plan, catalog: &Catalog, world: &World) -> Result<Compiled
     }
     let xml = format!(
         "<root BTCPP_format=\"4\" main_tree_to_execute=\"Mission\">\n  \
-         <BehaviorTree ID=\"Mission\">\n    <Timeout msec=\"{}\">\n      <Sequence name=\"{}\">\n\
+         <BehaviorTree ID=\"Mission\">\n    <Timeout msec=\"{}\">\n      <Sequence name=\"mission\">\n\
          {body}      </Sequence>\n    </Timeout>\n  </BehaviorTree>\n</root>\n",
         msec(worst * SLACK),
-        escape(&plan.intent),
     );
     let sha256 = format!("{:x}", Sha256::digest(xml.as_bytes()));
     Ok(Compiled {
@@ -550,12 +554,15 @@ fn ports_for(
                 format!("`{}` must be one of: {}", arg.name, arg.choices.join(", ")),
             ));
         }
-        let known = world
-            .objects
-            .iter()
-            .chain(&world.rooms)
-            .any(|t| t.id == value);
-        if arg.is_world_id() && !known {
+        // BehaviorTree.CPP reads `{name}` as a blackboard entry, not text.
+        if value.contains(['{', '}']) {
+            problems.push(Problem::new(
+                id,
+                &arg.name,
+                format!("`{}` may not contain {{ or }}", arg.name),
+            ));
+        }
+        if arg.is_world_id() && !world.knows(value) {
             problems.push(Problem::new(
                 id,
                 &arg.name,
@@ -810,15 +817,11 @@ mod tests {
                 .len(),
             1
         );
-        // An object the world model does not know cannot be walked to: the plan must say how.
+        // An object the world model does not know, such as a detector's name for it, cannot be
+        // judged or walked to: the plan stands as written and the executor checks it.
         let unknown = json!({"skill": "PickObject", "args": {"object_id": "red_block", "phrase": "red block", "arm": "right"}});
-        let problems = compile(&plan(&json!([unknown])), &catalog(), &world()).unwrap_err();
-        assert!(
-            problems[0]
-                .message
-                .contains("add GoToPlace(place=red_block)"),
-            "{problems:?}"
-        );
+        let c = compile(&plan(&json!([unknown])), &catalog(), &world()).unwrap();
+        assert_eq!(c.steps.len(), 1);
     }
 
     #[test]
@@ -937,6 +940,22 @@ mod tests {
             c.xml
                 .contains("phrase=\"&quot;mug&quot; &amp; &lt;cup&gt;\"")
         );
-        assert!(c.xml.contains("name=\"a &lt;b&gt; &amp; &quot;c&quot;\""));
+        // Node names must be identifiers, so the intent stays out of the tree.
+        assert!(c.xml.contains("<Sequence name=\"mission\">"));
+        assert!(!c.xml.contains("&lt;b&gt;"));
+    }
+
+    #[test]
+    fn braces_are_refused() {
+        let p = plan(
+            &json!([{"skill": "PickObject", "args": {"object_id": "O17", "phrase": "{secret}", "arm": "left"}}]),
+        );
+        let mut near = world();
+        near.robot = Some((5.0, 1.0));
+        let problems = compile(&p, &catalog(), &near).unwrap_err();
+        assert!(
+            problems[0].message.contains("may not contain { or }"),
+            "{problems:?}"
+        );
     }
 }
