@@ -63,6 +63,9 @@ pub enum RosError {
     /// The node is gone or another middleware error.
     #[error("ROS: {0}")]
     Middleware(String),
+    /// This robot connection cannot do that.
+    #[error("not supported here: {0}")]
+    Unsupported(String),
 }
 
 /// How an action ended.
@@ -149,6 +152,83 @@ pub struct Graph {
     pub topics: Vec<(String, Vec<String>)>,
 }
 
+/// Names and their types, sorted by name.
+pub type NamesAndTypes = Vec<(String, Vec<String>)>;
+
+/// The whole graph: topics, services and nodes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphDetail {
+    /// Topics and their types.
+    pub topics: NamesAndTypes,
+    /// Services and their types.
+    pub services: NamesAndTypes,
+    /// Full node names, `/namespace/name`.
+    pub nodes: Vec<String>,
+}
+
+/// The `QoS` an endpoint uses, as words.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct QosInfo {
+    /// `reliable` or `best_effort`.
+    pub reliability: String,
+    /// `volatile` or `transient_local`.
+    pub durability: String,
+    /// `keep_last` or `keep_all`.
+    pub history: String,
+    /// The queue depth for `keep_last`.
+    pub depth: usize,
+}
+
+/// One publisher or subscriber of a topic.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Endpoint {
+    /// Full node name.
+    pub node: String,
+    /// The type it uses.
+    pub topic_type: String,
+    /// Its `QoS`.
+    pub qos: QosInfo,
+}
+
+/// Who publishes and who subscribes to a topic.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TopicEndpoints {
+    /// Its publishers.
+    pub publishers: Vec<Endpoint>,
+    /// Its subscribers.
+    pub subscribers: Vec<Endpoint>,
+}
+
+/// What a node publishes, subscribes to, serves and calls.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeEntities {
+    /// Topics it publishes.
+    pub publishers: NamesAndTypes,
+    /// Topics it subscribes to.
+    pub subscribers: NamesAndTypes,
+    /// Services it offers.
+    pub services: NamesAndTypes,
+    /// Services it calls.
+    pub clients: NamesAndTypes,
+}
+
+/// One frame link in TF.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TfLink {
+    /// The parent frame.
+    pub parent: String,
+    /// The child frame.
+    pub child: String,
+    /// From `/tf_static`.
+    pub is_static: bool,
+    /// Since the newest message for this link arrived.
+    pub age: Duration,
+}
+
+fn unsupported<T>(what: &str) -> Result<T, RosError> {
+    Err(RosError::Unsupported(what.to_owned()))
+}
+
 /// Everything the agent core needs from a robot.
 #[async_trait]
 pub trait RobotPort: Send + Sync {
@@ -192,4 +272,60 @@ pub trait RobotPort: Send + Sync {
 
     /// Whether a service server is reachable within `wait`.
     async fn service_available(&self, service: &str, service_type: &str, wait: Duration) -> bool;
+
+    /// Topics, services and nodes.
+    async fn graph_detail(&self) -> Result<GraphDetail, RosError> {
+        unsupported("listing services and nodes")
+    }
+
+    /// A topic's publishers and subscribers.
+    async fn endpoints(&self, _topic: &str) -> Result<TopicEndpoints, RosError> {
+        unsupported("listing a topic's endpoints")
+    }
+
+    /// What a node (`/namespace/name`) publishes, subscribes to, serves and calls.
+    async fn node_entities(&self, _node: &str) -> Result<NodeEntities, RosError> {
+        unsupported("listing a node's topics and services")
+    }
+
+    /// Arrival times since the start and serialized sizes of a topic's messages over `window`,
+    /// at most `max` of them, subscribing best effort as `ros2 topic hz` does.
+    async fn sample_sizes(
+        &self,
+        _topic: &str,
+        _msg_type: &str,
+        _window: Duration,
+        _max: usize,
+    ) -> Result<Vec<(Duration, usize)>, RosError> {
+        unsupported("sampling a topic")
+    }
+
+    /// Up to `count` messages from a new subscription, as JSON, waiting up to `timeout`.
+    async fn sample_messages(
+        &self,
+        _topic: &str,
+        _msg_type: &str,
+        _count: usize,
+        _timeout: Duration,
+    ) -> Result<Vec<Value>, RosError> {
+        unsupported("echoing a topic")
+    }
+
+    /// Publishes `message` `count` times, `period` apart, and returns how many subscribers were
+    /// matched when it started.
+    async fn publish(
+        &self,
+        _topic: &str,
+        _msg_type: &str,
+        _message: Value,
+        _count: usize,
+        _period: Duration,
+    ) -> Result<usize, RosError> {
+        unsupported("publishing")
+    }
+
+    /// Every frame link TF has seen.
+    fn tf_links(&self) -> Vec<TfLink> {
+        Vec::new()
+    }
 }

@@ -12,7 +12,10 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::tf::TfBuffer;
-use crate::{Frame, Goal, GoalResult, GoalStatus, Graph, RobotPort, RosError, Transform};
+use crate::{
+    Frame, Goal, GoalResult, GoalStatus, Graph, GraphDetail, NodeEntities, RobotPort, RosError,
+    TfLink, TopicEndpoints, Transform,
+};
 
 /// A scripted service: request in, response out.
 pub type ServiceFn = Arc<dyn Fn(&Value) -> Result<Value, RosError> + Send + Sync>;
@@ -55,6 +58,11 @@ pub struct FakeRobot {
     tf: Mutex<TfBuffer>,
     latency: Duration,
     calls: Arc<Mutex<Vec<(String, Value)>>>,
+    graph: Option<GraphDetail>,
+    endpoints: HashMap<String, TopicEndpoints>,
+    nodes: HashMap<String, NodeEntities>,
+    rates: HashMap<String, (f64, usize)>,
+    published: Arc<Mutex<Vec<(String, Value)>>>,
 }
 
 impl std::fmt::Debug for FakeRobot {
@@ -137,6 +145,40 @@ impl FakeRobot {
     #[must_use]
     pub fn calls(&self) -> Vec<(String, Value)> {
         lock(&self.calls).clone()
+    }
+
+    /// Scripts the graph: topics, services and nodes.
+    #[must_use]
+    pub fn with_graph(mut self, graph: GraphDetail) -> Self {
+        self.graph = Some(graph);
+        self
+    }
+
+    /// Scripts a topic's publishers and subscribers.
+    #[must_use]
+    pub fn with_endpoints(mut self, topic: &str, endpoints: TopicEndpoints) -> Self {
+        self.endpoints.insert(topic.to_owned(), endpoints);
+        self
+    }
+
+    /// Scripts what a node publishes, subscribes to, serves and calls.
+    #[must_use]
+    pub fn with_node(mut self, node: &str, entities: NodeEntities) -> Self {
+        self.nodes.insert(node.to_owned(), entities);
+        self
+    }
+
+    /// Makes a topic arrive at `hz`, each message `bytes` long.
+    #[must_use]
+    pub fn with_rate(mut self, topic: &str, hz: f64, bytes: usize) -> Self {
+        self.rates.insert(topic.to_owned(), (hz, bytes));
+        self
+    }
+
+    /// Every message published so far, as (topic, message).
+    #[must_use]
+    pub fn published(&self) -> Vec<(String, Value)> {
+        lock(&self.published).clone()
     }
 }
 
@@ -240,6 +282,72 @@ impl RobotPort for FakeRobot {
 
     async fn service_available(&self, service: &str, _ty: &str, _wait: Duration) -> bool {
         self.services.contains_key(service)
+    }
+
+    async fn graph_detail(&self) -> Result<GraphDetail, RosError> {
+        self.graph
+            .clone()
+            .ok_or_else(|| RosError::Unsupported("no scripted graph".to_owned()))
+    }
+
+    async fn endpoints(&self, topic: &str) -> Result<TopicEndpoints, RosError> {
+        Ok(self.endpoints.get(topic).cloned().unwrap_or_default())
+    }
+
+    async fn node_entities(&self, node: &str) -> Result<NodeEntities, RosError> {
+        Ok(self.nodes.get(node).cloned().unwrap_or_default())
+    }
+
+    async fn sample_sizes(
+        &self,
+        topic: &str,
+        _ty: &str,
+        window: Duration,
+        max: usize,
+    ) -> Result<Vec<(Duration, usize)>, RosError> {
+        // Synthesised rather than waited for, so tests stay fast.
+        let Some(&(hz, bytes)) = self.rates.get(topic) else {
+            return Ok(Vec::new());
+        };
+        let step = Duration::from_secs_f64(1.0 / hz);
+        Ok((1..)
+            .map(|i| step * i)
+            .take_while(|t| *t <= window)
+            .take(max)
+            .map(|t| (t, bytes))
+            .collect())
+    }
+
+    async fn sample_messages(
+        &self,
+        topic: &str,
+        _ty: &str,
+        count: usize,
+        _timeout: Duration,
+    ) -> Result<Vec<Value>, RosError> {
+        Ok(lock(&self.topics)
+            .get(topic)
+            .map(|v| vec![v.clone(); count])
+            .unwrap_or_default())
+    }
+
+    async fn publish(
+        &self,
+        topic: &str,
+        _ty: &str,
+        message: Value,
+        count: usize,
+        _period: Duration,
+    ) -> Result<usize, RosError> {
+        let mut log = lock(&self.published);
+        for _ in 0..count {
+            log.push((topic.to_owned(), message.clone()));
+        }
+        Ok(self.endpoints.get(topic).map_or(0, |e| e.subscribers.len()))
+    }
+
+    fn tf_links(&self) -> Vec<TfLink> {
+        lock(&self.tf).links()
     }
 }
 
