@@ -20,8 +20,9 @@ pub const MAX_STEPS: usize = 12;
 const MAX_RETRIES: u8 = 2;
 /// The mission's own timeout over its worst case, so a step's timeout fires first.
 const SLACK: f64 = 1.2;
-/// Within arm's reach after a short approach: how near an object counts as near it.
-pub(crate) const NEAR_M: f64 = 1.2;
+/// How near the robot must already stand for a skill that needs it near an object; the executor's
+/// skills ask for about half a metre.
+const NEAR_M: f64 = 0.6;
 
 /// What the model sends to `plan_mission`.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -140,8 +141,9 @@ impl Sim {
         }
     }
 
-    /// Checks a skill's needs against the robot so far, then applies what it does. A skill that
-    /// needs a held object and does not say it keeps one puts it down.
+    /// Checks a skill's needs against the robot so far, then applies what it does. Understands
+    /// `near(x)`, `holding(arm, x)` and `hand_empty(arm)`, where `x` names an argument or, as a
+    /// capital letter, any object; other predicates are left to the executor.
     fn run(&mut self, id: &str, step: &Step, skill: &Skill, world: &World) -> Vec<Problem> {
         let value = |name: &str| {
             step.args
@@ -150,7 +152,9 @@ impl Sim {
                 .map(|a| a.value.trim().to_owned())
         };
         let mut problems = Vec::new();
-        let mut releases = Vec::new();
+        let mut problem = |field: &str, text: String| {
+            problems.push(Problem::new(id, field, format!("{} {text}", skill.name)));
+        };
         for need in &skill.requires {
             let Some((name, args)) = predicate(need) else {
                 continue;
@@ -160,56 +164,103 @@ impl Sim {
                     if let Some(target) = value(x)
                         && !self.near(&target, world)
                     {
-                        problems.push(Problem::new(
-                            id,
+                        problem(
                             x,
                             format!(
-                                "{} needs the robot near {target} first: add {GO_TO_PLACE}(place={target}) before this step",
-                                skill.name
+                                "needs the robot near {target} first: add {GO_TO_PLACE}(place={target}) before this step"
                             ),
-                        ));
+                        );
                     }
                 }
-                ("holding", [a, rest @ ..]) => {
+                ("holding", [a, x]) => {
                     let Some(arm) = value(a) else { continue };
-                    let held = self.holding.get(&arm).cloned().unwrap_or_default();
-                    let wanted = rest.first().and_then(|x| value(x));
-                    let ok = match &wanted {
-                        Some(obj) => held == *obj,
-                        None => !held.is_empty(),
-                    };
+                    let held = self.held(&arm);
+                    let wanted = value(x);
+                    let ok = wanted.as_ref().map_or(!held.is_empty(), |obj| held == *obj);
                     if !ok {
-                        problems.push(Problem::new(
-                            id,
+                        let what = wanted.unwrap_or_else(|| "something".to_owned());
+                        problem(
                             a,
                             format!(
-                                "{} needs the {arm} hand to hold {} first: pick it up earlier in the plan, or use the arm that holds it",
-                                skill.name,
-                                wanted.as_deref().unwrap_or("something")
+                                "needs the {arm} hand to hold {what} first: pick it up earlier in the plan, or use the arm that holds it"
                             ),
-                        ));
+                        );
                     }
-                    releases.push(arm);
+                }
+                ("hand_empty", [a]) => {
+                    let Some(arm) = value(a) else { continue };
+                    let held = self.held(&arm);
+                    if !held.is_empty() {
+                        problem(
+                            a,
+                            format!(
+                                "needs the {arm} hand empty, but it holds {held}: place it first or use the other hand"
+                            ),
+                        );
+                    }
                 }
                 _ => {}
             }
         }
-        let mut keeps = false;
         for effect in &skill.effects {
-            if let Some(("holding", args)) = predicate(effect)
-                && let [a, x] = args.as_slice()
-                && let (Some(arm), Some(obj)) = (value(a), value(x))
-            {
-                self.holding.insert(arm, obj);
-                keeps = true;
-            }
-        }
-        if !keeps {
-            for arm in releases {
-                self.holding.insert(arm, String::new());
+            let Some((name, args)) = predicate(effect) else {
+                continue;
+            };
+            match (name, args.as_slice()) {
+                ("holding", [a, x]) => {
+                    if let (Some(arm), Some(obj)) = (value(a), value(x)) {
+                        self.holding.insert(arm, obj);
+                    }
+                }
+                ("hand_empty", [a]) => {
+                    if let Some(arm) = value(a) {
+                        self.holding.insert(arm, String::new());
+                    }
+                }
+                _ => {}
             }
         }
         problems
+    }
+
+    fn held(&self, arm: &str) -> String {
+        self.holding.get(arm).cloned().unwrap_or_default()
+    }
+
+    /// The walk a step needs first: a `GoToPlace` up to the object or room, known to the world
+    /// model, that the step's skill needs the robot near and the plan has not reached yet.
+    fn walk_for(&self, step: &Step, catalog: &Catalog, world: &World) -> Option<Step> {
+        let skill = catalog.skill(&step.skill)?;
+        catalog.skill(GO_TO_TARGET)?;
+        skill.requires.iter().find_map(|need| {
+            let ("near", args) = predicate(need)? else {
+                return None;
+            };
+            let [x] = args.as_slice() else { return None };
+            let target = step
+                .args
+                .iter()
+                .find(|a| a.name == *x)?
+                .value
+                .trim()
+                .to_owned();
+            let known = world
+                .objects
+                .iter()
+                .chain(&world.rooms)
+                .any(|t| t.id == target);
+            (known && !self.near(&target, world)).then(|| Step {
+                skill: GO_TO_PLACE.to_owned(),
+                args: vec![StepArg {
+                    name: "place".to_owned(),
+                    value: target,
+                }],
+                retries: 0,
+                timeout_s: None,
+                optional: false,
+                why: format!("{} needs the robot near it", step.skill),
+            })
+        })
     }
 }
 
@@ -296,27 +347,36 @@ pub fn compile(plan: &Plan, catalog: &Catalog, world: &World) -> Result<Compiled
         xy: world.robot,
         holding: world.holding.clone(),
     };
-    for (i, step) in plan.steps.iter().enumerate() {
-        let id = format!("s{}", i + 1);
-        match compile_step(&id, step, catalog, world) {
-            Ok((node, timeout_s, spot)) => {
-                if let Some(spot) = spot {
-                    sim.at = Some(spot.id);
-                    sim.xy = spot.xy;
-                } else if let Some(skill) = catalog.skill(&step.skill) {
-                    problems.append(&mut sim.run(&id, step, skill, world));
+    let mut n = 0;
+    for planned in &plan.steps {
+        let walk = sim.walk_for(planned, catalog, world);
+        for (step, added) in walk.iter().map(|w| (w, true)).chain([(planned, false)]) {
+            n += 1;
+            let id = format!("s{n}");
+            match compile_step(&id, step, catalog, world) {
+                Ok((node, timeout_s, spot)) => {
+                    if let Some(spot) = spot {
+                        sim.at = Some(spot.id);
+                        sim.xy = spot.xy;
+                    } else if let Some(skill) = catalog.skill(&step.skill) {
+                        problems.append(&mut sim.run(&id, step, skill, world));
+                    }
+                    let attempts = f64::from(step.retries) + 1.0;
+                    worst += timeout_s * attempts;
+                    body.push_str(&wrap(&node, step, timeout_s));
+                    let mut text = summary(step);
+                    if added {
+                        text.push_str(" (added)");
+                    }
+                    steps.push(PlannedStep {
+                        id,
+                        skill: step.skill.clone(),
+                        summary: text,
+                        timeout_s,
+                    });
                 }
-                let attempts = f64::from(step.retries) + 1.0;
-                worst += timeout_s * attempts;
-                body.push_str(&wrap(&node, step, timeout_s));
-                steps.push(PlannedStep {
-                    id,
-                    skill: step.skill.clone(),
-                    summary: summary(step),
-                    timeout_s,
-                });
+                Err(mut p) => problems.append(&mut p),
             }
-            Err(mut p) => problems.append(&mut p),
         }
     }
     if !problems.is_empty() {
@@ -649,7 +709,7 @@ mod tests {
                     yaw: 0.5,
                 },
             }],
-            rooms: vec![thing("R2", "kitchen", 5.5, 1.5)],
+            rooms: vec![thing("R2", "kitchen", 5.2, 1.3)],
             objects: vec![
                 thing("O17", "red mug", 5.0, 1.0),
                 thing("O31", "basket", 5.3, 1.2),
@@ -706,9 +766,7 @@ mod tests {
         let problems = compile(&p, &catalog(), &world()).unwrap_err();
         let has =
             |step: &str, field: &str| problems.iter().any(|q| q.step == step && q.field == field);
-        assert!(
-            has("s1", "grip") && has("s1", "phrase") && has("s1", "arm") && has("s1", "object_id")
-        );
+        assert!(has("s1", "grip") && has("s1", "phrase") && has("s1", "arm"));
         assert!(
             has("s2", "skill") && has("s3", "skill") && has("s4", "place") && has("s5", "retries")
         );
@@ -716,18 +774,45 @@ mod tests {
     }
 
     #[test]
-    fn a_pick_needs_the_robot_near_the_object() {
+    fn a_walk_is_added_before_a_skill_that_needs_the_robot_near() {
         let pick = json!({"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}});
-        let far = compile(&plan(&json!([pick])), &catalog(), &world()).unwrap_err();
-        assert!(
-            far[0].message.contains("add GoToPlace(place=O17)"),
-            "{far:?}"
+        let c = compile(&plan(&json!([pick])), &catalog(), &world()).unwrap();
+        let summaries: Vec<&str> = c.steps.iter().map(|s| s.summary.as_str()).collect();
+        assert_eq!(
+            summaries,
+            [
+                "GoToPlace(place=O17) (added)",
+                "PickObject(arm=right, object_id=O17, phrase=red mug)"
+            ]
         );
+        assert!(
+            c.xml
+                .contains(r#"<SubTree ID="GoToTarget" name="s1_GoToPlace" target="O17"/>"#)
+        );
+        assert!(c.xml.contains(r#"name="s2_PickObject""#));
         let walked = plan(&json!([{"skill": "GoToPlace", "args": {"place": "O17"}}, pick]));
-        assert!(compile(&walked, &catalog(), &world()).is_ok());
+        assert_eq!(
+            compile(&walked, &catalog(), &world()).unwrap().steps.len(),
+            2
+        );
         let mut close = world();
-        close.robot = Some((4.5, 1.0));
-        assert!(compile(&plan(&json!([pick])), &catalog(), &close).is_ok());
+        close.robot = Some((5.2, 1.1));
+        assert_eq!(
+            compile(&plan(&json!([pick])), &catalog(), &close)
+                .unwrap()
+                .steps
+                .len(),
+            1
+        );
+        // An object the world model does not know cannot be walked to: the plan must say how.
+        let unknown = json!({"skill": "PickObject", "args": {"object_id": "red_block", "phrase": "red block", "arm": "right"}});
+        let problems = compile(&plan(&json!([unknown])), &catalog(), &world()).unwrap_err();
+        assert!(
+            problems[0]
+                .message
+                .contains("add GoToPlace(place=red_block)"),
+            "{problems:?}"
+        );
     }
 
     #[test]
@@ -761,6 +846,26 @@ mod tests {
             compile(&place, &catalog(), &held).is_ok(),
             "a hand may hold something from before"
         );
+    }
+
+    #[test]
+    fn a_pick_needs_an_empty_hand() {
+        let mut full = world();
+        full.robot = Some((5.0, 1.0));
+        full.holding.insert("left".to_owned(), "O31".to_owned());
+        let pick = |arm: &str| {
+            plan(
+                &json!([{"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": arm}}]),
+            )
+        };
+        let problems = compile(&pick("left"), &catalog(), &full).unwrap_err();
+        assert!(
+            problems[0]
+                .message
+                .contains("left hand empty, but it holds O31"),
+            "{problems:?}"
+        );
+        assert!(compile(&pick("right"), &catalog(), &full).is_ok());
     }
 
     #[test]

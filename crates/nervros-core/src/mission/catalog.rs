@@ -194,15 +194,15 @@ pub(crate) mod tests {
         {"name": "GoToTarget", "description": "Walk to a room or object.", "args": [{"name": "target", "type": "string", "description": "id", "enum": []}],
          "requires": [], "effects": ["at(target)"], "resources": ["base"], "idempotent": true, "risk": "motion", "max_duration_s": 300, "template": "GoToTarget"},
         {"name": "PickObject", "description": "Pick an object up.", "args": [
-            {"name": "object_id", "type": "world_id", "description": "world model id", "enum": []},
+            {"name": "object_id", "type": "string", "description": "its world model id, or the name the detector reports", "enum": []},
             {"name": "phrase", "type": "string", "description": "what the detector looks for", "enum": []},
             {"name": "arm", "type": "string", "description": "which arm", "enum": ["left", "right"]}],
-         "requires": ["near(object_id)"], "effects": ["holding(arm, object_id)"], "resources": ["base", "left_arm", "right_arm"], "idempotent": false, "risk": "manipulation", "max_duration_s": 420, "template": "PickObject"},
+         "requires": ["near(object_id)", "hand_empty(arm)"], "effects": ["holding(arm, object_id)"], "resources": ["base", "left_arm", "right_arm"], "idempotent": false, "risk": "manipulation", "max_duration_s": 420, "template": "PickObject"},
         {"name": "PlaceInto", "description": "Put the held object into a container.", "args": [
-            {"name": "container_id", "type": "world_id", "description": "world model id", "enum": []},
+            {"name": "container_id", "type": "string", "description": "its world model id, or the name the detector reports", "enum": []},
             {"name": "phrase", "type": "string", "description": "what the detector looks for", "enum": []},
             {"name": "arm", "type": "string", "description": "the arm that holds it", "enum": ["left", "right"]}],
-         "requires": ["holding(arm)", "near(container_id)"], "effects": ["inside(held, container_id)"], "resources": ["base", "left_arm", "right_arm"], "idempotent": false, "risk": "manipulation", "max_duration_s": 300, "template": "PlaceInto"},
+         "requires": ["near(container_id)", "holding(arm, X)"], "effects": ["inside(X, container_id)", "hand_empty(arm)"], "resources": ["base", "left_arm", "right_arm"], "idempotent": false, "risk": "manipulation", "max_duration_s": 360, "template": "PlaceInto"},
         {"name": "TuckForTravel", "description": "Fold the arms for walking.", "args": [],
          "requires": [], "effects": [], "resources": ["left_arm", "right_arm"], "idempotent": true, "risk": "manipulation", "max_duration_s": 30, "template": "TuckForTravel"}
     ]}"#;
@@ -216,7 +216,7 @@ pub(crate) mod tests {
         );
         let text = c.describe();
         assert!(text.contains(
-            "- PickObject(object_id, phrase, arm): Pick an object up. Needs near(object_id)."
+            "- PickObject(object_id, phrase, arm): Pick an object up. Needs near(object_id) and hand_empty(arm)."
         ));
         assert!(text.contains("\n    arm: left or right"));
         assert!(text.contains("\n    phrase: what the detector looks for"));

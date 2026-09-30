@@ -231,7 +231,7 @@ impl Missions {
         let (skills, listing) = match &catalog {
             Some(c) => (
                 json!({"type": "string", "enum": c.plan_skills()}),
-                c.describe(),
+                format!("{}\n{}", c.signatures().join(", "), c.describe()),
             ),
             None => (
                 json!({"type": "string"}),
@@ -242,7 +242,8 @@ impl Missions {
             "Checks a plan for the robot without moving it and returns the plan's hash; then call \
              run_mission with the hash. Each step names a skill and gives every one of its arguments \
              as {{name, value}}, such as {{\"skill\": \"GoToPlace\", \"args\": [{{\"name\": \"place\", \
-             \"value\": \"kitchen\"}}]}}. Use ids from list_places and find_objects. Skills:\n{listing}"
+             \"value\": \"kitchen\"}}]}}. Use ids from list_places and find_objects. A walk up to an \
+             object that a step must be near is added for you. Skills, by their exact names: {listing}"
         );
         let parameters = json!({
             "type": "object",
@@ -687,7 +688,7 @@ mod tests {
     fn steps() -> Value {
         json!({"intent": "fetch the mug", "goal": ["at(dock)", "holding(right, O17)"], "steps": [
             {"skill": "GoToPlace", "args": [{"name": "place", "value": "dock"}]},
-            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}}
+            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "left"}}
         ]})
     }
 

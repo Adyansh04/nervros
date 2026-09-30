@@ -69,12 +69,12 @@ const CATALOG: &str = r#"{"catalog_version": "test", "skills": [
         {"name": "object_id", "type": "world_id", "description": "the object's id in the world model", "enum": []},
         {"name": "phrase", "type": "string", "description": "what the detector looks for", "enum": [], "default_from": "label(object_id)"},
         {"name": "arm", "type": "string", "description": "which arm", "enum": ["left", "right"]}],
-     "requires": ["near(object_id)"], "effects": ["holding(arm, object_id)"], "resources": ["base", "left_arm", "right_arm"], "risk": "manipulation", "max_duration_s": 420, "template": "PickObject"},
+     "requires": ["near(object_id)", "hand_empty(arm)"], "effects": ["holding(arm, object_id)"], "resources": ["base", "left_arm", "right_arm"], "risk": "manipulation", "max_duration_s": 420, "template": "PickObject"},
     {"name": "PlaceInto", "description": "Put the held object into a container within reach.", "args": [
         {"name": "container_id", "type": "world_id", "description": "the container's id in the world model", "enum": []},
         {"name": "phrase", "type": "string", "description": "what the detector looks for", "enum": [], "default_from": "label(container_id)"},
         {"name": "arm", "type": "string", "description": "the arm holding the object", "enum": ["left", "right"]}],
-     "requires": ["holding(arm)", "near(container_id)"], "effects": ["inside(held, container_id)"], "resources": ["base", "left_arm", "right_arm"], "risk": "manipulation", "max_duration_s": 300, "template": "PlaceInto"}
+     "requires": ["near(container_id)", "holding(arm, X)"], "effects": ["inside(X, container_id)", "hand_empty(arm)"], "resources": ["base", "left_arm", "right_arm"], "risk": "manipulation", "max_duration_s": 300, "template": "PlaceInto"}
 ]}"#;
 
 fn object(id: &str, label: &str, room: &str, x: f64, y: f64) -> Value {
