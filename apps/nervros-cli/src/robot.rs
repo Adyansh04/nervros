@@ -290,7 +290,9 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
         let (mut open, mut awaiting_report) = (0u32, false);
         for text in options.say {
             println!("you> {text}");
-            agent.session.send(SessionCommand::User(text));
+            agent.session.send(SessionCommand::User(text.clone()));
+            // A report's reply can run first: wait for the turn this message starts.
+            let mut mine = None;
             loop {
                 let e = events.recv().await.context("the session ended")?;
                 if let Event::ApprovalRequested { id, .. } = &e
@@ -306,7 +308,12 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
                         awaiting_report = true;
                     }
                     Event::Report { .. } => awaiting_report = false,
-                    Event::TurnFinished { .. } if open == 0 && !awaiting_report => break,
+                    Event::User { turn, text: sent } if sent == text => mine = Some(turn),
+                    Event::TurnFinished { turn }
+                        if mine.is_some_and(|m| turn >= m) && open == 0 && !awaiting_report =>
+                    {
+                        break;
+                    }
                     _ => {}
                 }
             }
