@@ -678,8 +678,11 @@ mod tests {
             .with_action("/x/execute", move |_| lock(&run).take().unwrap_or_default())
             .with_topic(
                 "/objects",
-                json!({"objects": [{"id": "O17", "label": "red mug", "state": 0,
-                    "pose": {"position": {"x": 1.0, "y": 2.0}}, "size": {"x": 0.1, "y": 0.1}}]}),
+                json!({"objects": [
+                    {"id": "O17", "label": "red mug", "state": 0,
+                     "pose": {"position": {"x": 1.0, "y": 2.0}}, "size": {"x": 0.1, "y": 0.1}},
+                    {"id": "O18", "label": "blue cup", "state": 0,
+                     "pose": {"position": {"x": 1.1, "y": 2.0}}, "size": {"x": 0.1, "y": 0.1}}]}),
             )
             .with_topic("/x/state", json!({"holding_left": "", "holding_right": "O17"}))
             .with_transform(
@@ -695,7 +698,7 @@ mod tests {
     fn steps() -> Value {
         json!({"intent": "fetch the mug", "goal": ["at(dock)", "holding(right, O17)"], "steps": [
             {"skill": "GoToPlace", "args": [{"name": "place", "value": "dock"}]},
-            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "left"}}
+            {"skill": "PickObject", "args": {"object_id": "O18", "phrase": "blue cup", "arm": "left"}}
         ]})
     }
 

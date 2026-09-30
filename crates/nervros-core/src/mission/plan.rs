@@ -219,6 +219,17 @@ impl Sim {
             match (name, args.as_slice()) {
                 ("holding", [a, x]) => {
                     if let (Some(arm), Some(obj)) = (value(a), value(x)) {
+                        // A replan after a failed place tends to pick the object up again.
+                        if let Some((hand, _)) = self.holding.iter().find(|(_, held)| **held == obj)
+                        {
+                            problems.push(Problem::new(
+                                id,
+                                x,
+                                format!(
+                                    "{obj} is already in the {hand} hand: place it instead of picking it up again"
+                                ),
+                            ));
+                        }
                         self.holding.insert(arm, obj);
                     }
                 }
@@ -899,6 +910,21 @@ mod tests {
             "{problems:?}"
         );
         assert!(compile(&pick("right"), &catalog(), &full).is_ok());
+    }
+
+    #[test]
+    fn an_object_in_hand_is_not_picked_up_again() {
+        let mut held = world();
+        held.robot = Some((5.0, 1.0));
+        held.holding.insert("right".to_owned(), "O17".to_owned());
+        let p = plan(
+            &json!([{"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "left"}}]),
+        );
+        let problems = compile(&p, &catalog(), &held).unwrap_err();
+        assert!(
+            problems[0].message.contains("already in the right hand"),
+            "{problems:?}"
+        );
     }
 
     #[test]
