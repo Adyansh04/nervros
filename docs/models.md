@@ -69,7 +69,7 @@ openrouter_free = { rpd = 50 }
 [roles]
 routine = ["qwen3.5-9b-local"]        # conversation and tool calls
 plan = ["qwen3.5-9b-local"]           # writing mission plans
-vision_check = ["qwen3.5-9b-local"]   # spatial checks on images
+vision_check = ["qwen3.5-9b-local"]   # what `look` sees: questions about the camera frame
 summarise = ["qwen3.5-9b-local"]      # captions and summaries
 ```
 

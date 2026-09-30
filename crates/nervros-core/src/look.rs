@@ -17,8 +17,49 @@ use image::{Rgb, RgbImage};
 use nervros_ros::{Frame, RobotPort};
 use serde_json::{Value, json};
 
+use crate::llm::{ImageFormat, ImageInput};
 use crate::profile::LookConfig;
 use crate::tools::{ImageArtifact, Risk, Tool, ToolOutcome, ToolSpec};
+
+/// The longest side of the frame a vision model gets: enough to read a label across a room, and
+/// a fraction of the tokens a full 1280 px frame costs.
+const MODEL_EDGE_PX: u32 = 768;
+
+/// What `look` asks when the model gave no question.
+const DEFAULT_QUESTION: &str =
+    "Describe what the robot sees, briefly, naming what matters for finding or handling things.";
+
+/// A vision model that answers a question about one frame.
+#[async_trait]
+pub trait Eyes: Send + Sync {
+    /// The answer and the id of the model that gave it.
+    ///
+    /// # Errors
+    ///
+    /// Why no model answered.
+    async fn see(&self, prompt: &str, image: ImageInput) -> Result<(String, String), String>;
+}
+
+/// The frame scaled so its longest side is at most `edge` pixels.
+fn capped(img: &RgbImage, edge: u32) -> RgbImage {
+    let (w, h) = img.dimensions();
+    let longest = w.max(h);
+    if longest <= edge {
+        return img.clone();
+    }
+    // side * edge / longest <= edge, so it fits a u32.
+    let scaled = |side: u32| {
+        u32::try_from(u64::from(side) * u64::from(edge) / u64::from(longest))
+            .unwrap_or(edge)
+            .max(1)
+    };
+    image::imageops::resize(
+        img,
+        scaled(w),
+        scaled(h),
+        image::imageops::FilterType::Triangle,
+    )
+}
 
 /// Frames kept for matching detection stamps: 4 s at 10 Hz.
 const FRAME_HISTORY: usize = 40;
@@ -350,6 +391,7 @@ pub struct LookTool {
     robot: Arc<dyn RobotPort>,
     history: Arc<History>,
     snapshots: Arc<SnapshotStore>,
+    eyes: Option<Arc<dyn Eyes>>,
 }
 
 impl LookTool {
@@ -362,6 +404,7 @@ impl LookTool {
         config: LookConfig,
         robot: Arc<dyn RobotPort>,
         snapshots: Arc<SnapshotStore>,
+        eyes: Option<Arc<dyn Eyes>>,
     ) -> Result<Self, nervros_ros::RosError> {
         let mut frames = robot.frames(&config.image)?;
         let history = Arc::new(History::default());
@@ -379,10 +422,13 @@ impl LookTool {
         });
         let spec = ToolSpec::new(
             "look",
-            "Looks through the robot's camera now. Returns what the detector sees as numbered marks \
-             (label, score, box) and shows the user the marked image. Refer to things as `mark N` of \
-             the returned snapshot.",
-            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            "Looks through the robot's camera now. The detector's finds are drawn on the frame as \
+             numbered marks (label, score, box), a vision model looks at that frame and answers \
+             `question`, and the operator sees it too. Refer to things as `mark N` of the returned \
+             snapshot.",
+            json!({"type": "object", "properties": {
+                "question": {"type": "string", "description": "What to find out from the frame, such as \"is there a red mug on the table?\". Leave it out for a short description."}
+            }, "additionalProperties": false}),
             Risk::Observe,
         );
         Ok(Self {
@@ -391,10 +437,11 @@ impl LookTool {
             robot,
             history,
             snapshots,
+            eyes,
         })
     }
 
-    async fn run(&self) -> Result<ToolOutcome, String> {
+    async fn run(&self, question: Option<&str>) -> Result<ToolOutcome, String> {
         let msg = self
             .robot
             .latest(
@@ -434,18 +481,72 @@ impl LookTool {
                 json!({"mark": i + 1, "label": inst.label, "score": (f64::from(inst.score) * 100.0).round() / 100.0, "box": [x, y, w, h]})
             })
             .collect();
+        let seen = self.see(question, &img, &dets.instances).await;
         let snapshot = self.snapshots.put(Snapshot {
             id: id.clone(),
             stamp_s: frame.stamp_s,
             marks: dets.instances,
             image: image.clone(),
         });
-        let data =
+        let mut data =
             json!({"snapshot": snapshot.id, "age_s": (age * 10.0).round() / 10.0, "marks": marks});
+        match seen {
+            Some(Ok((answer, model))) => {
+                data["answer"] = Value::String(answer);
+                data["seen_by"] = Value::String(model);
+            }
+            Some(Err(why)) => data["not_seen"] = Value::String(why),
+            None => {}
+        }
         let mut out = ToolOutcome::ok(data);
         out.message = format!("{} marks; the user sees the marked image", marks.len());
         out.images.push(image);
         Ok(out)
+    }
+
+    /// The vision model's answer about the marked frame, when there is one to ask.
+    async fn see(
+        &self,
+        question: Option<&str>,
+        marked: &RgbImage,
+        instances: &[Instance],
+    ) -> Option<Result<(String, String), String>> {
+        let eyes = self.eyes.as_ref()?;
+        let small = capped(marked, MODEL_EDGE_PX);
+        let bytes = match nervros_ros::image::encode_jpeg(&small, 80) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e.to_string())),
+        };
+        let question = question.map(str::trim).filter(|q| !q.is_empty());
+        let marks = if instances.is_empty() {
+            // Said plainly: told of "marks: none", a small model reports marks it never saw.
+            "The detector marked nothing on this frame.".to_owned()
+        } else {
+            let list = instances
+                .iter()
+                .enumerate()
+                .map(|(i, m)| format!("{} {} ({:.2})", i + 1, m.label, m.score))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "The detector's numbered marks on this frame: {list}. Refer to a mark by its number \
+                 when you mention it."
+            )
+        };
+        let about = self
+            .config
+            .about
+            .as_deref()
+            .map_or(String::new(), |a| format!(" About this camera: {a}"));
+        let prompt = format!(
+            "{}\n\n{marks} Say so when something cannot be seen.{about}",
+            question.unwrap_or(DEFAULT_QUESTION)
+        );
+        let image = ImageInput {
+            bytes,
+            format: ImageFormat::Jpeg,
+        };
+        Some(eyes.see(&prompt, image).await)
     }
 }
 
@@ -455,8 +556,10 @@ impl Tool for LookTool {
         Cow::Borrowed(&self.spec)
     }
 
-    async fn call(&self, _args: Value) -> ToolOutcome {
-        self.run().await.unwrap_or_else(ToolOutcome::failed)
+    async fn call(&self, args: Value) -> ToolOutcome {
+        self.run(args["question"].as_str())
+            .await
+            .unwrap_or_else(ToolOutcome::failed)
     }
 }
 
@@ -528,7 +631,7 @@ mod tests {
         )
         .unwrap();
         let store = Arc::new(SnapshotStore::default());
-        let look = LookTool::start(config, robot, Arc::clone(&store)).unwrap();
+        let look = LookTool::start(config, robot, Arc::clone(&store), None).unwrap();
         tokio::task::yield_now().await;
         let out = look.call(json!({})).await;
         assert_eq!(
@@ -542,5 +645,127 @@ mod tests {
         let snap = store.get(out.data["snapshot"].as_str().unwrap()).unwrap();
         assert_eq!(snap.marks.len(), 2);
         assert_eq!(&out.images[0].jpeg[..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn the_model_gets_a_frame_no_longer_than_768_px() {
+        let wide = RgbImage::new(1280, 720);
+        assert_eq!(capped(&wide, MODEL_EDGE_PX).dimensions(), (768, 432));
+        let small = RgbImage::new(64, 48);
+        assert_eq!(capped(&small, MODEL_EDGE_PX).dimensions(), (64, 48));
+    }
+
+    struct FakeEyes {
+        answer: Result<String, String>,
+        asked: Mutex<Vec<(String, usize)>>,
+    }
+
+    #[async_trait]
+    impl Eyes for FakeEyes {
+        async fn see(&self, prompt: &str, image: ImageInput) -> Result<(String, String), String> {
+            assert_eq!(&image.bytes[..2], &[0xFF, 0xD8], "a JPEG");
+            guard(&self.asked).push((prompt.to_owned(), image.bytes.len()));
+            self.answer.clone().map(|a| (a, "fake-vlm".to_owned()))
+        }
+    }
+
+    async fn look_with(eyes: Arc<FakeEyes>, question: Value) -> ToolOutcome {
+        let robot: Arc<dyn RobotPort> = Arc::new(
+            FakeRobot::new()
+                .with_frame("/camera", frame(12.0))
+                .with_topic("/masks", masks(12.0)),
+        );
+        let config: LookConfig = toml::from_str(
+            "image = \"/camera\"\ndetections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n",
+        )
+        .unwrap();
+        let look = LookTool::start(
+            config,
+            robot,
+            Arc::new(SnapshotStore::default()),
+            Some(eyes as Arc<dyn Eyes>),
+        )
+        .unwrap();
+        tokio::task::yield_now().await;
+        look.call(question).await
+    }
+
+    #[tokio::test]
+    async fn a_vision_model_answers_the_question_about_the_marked_frame() {
+        let eyes = Arc::new(FakeEyes {
+            answer: Ok("Mark 1 is a dustbin by the wall.".into()),
+            asked: Mutex::new(Vec::new()),
+        });
+        let out = look_with(
+            Arc::clone(&eyes),
+            json!({"question": "Is there a dustbin?"}),
+        )
+        .await;
+        assert_eq!(out.data["answer"], "Mark 1 is a dustbin by the wall.");
+        assert_eq!(out.data["seen_by"], "fake-vlm");
+        let asked = guard(&eyes.asked);
+        assert!(
+            asked[0].0.starts_with("Is there a dustbin?"),
+            "{}",
+            asked[0].0
+        );
+        assert!(
+            asked[0].0.contains("1 dustbin (0.90), 2 cup (0.40)"),
+            "{}",
+            asked[0].0
+        );
+        assert!(!asked[0].0.contains("About this camera"), "{}", asked[0].0);
+    }
+
+    #[tokio::test]
+    async fn with_no_marks_the_vision_model_is_told_so_plainly() {
+        let robot: Arc<dyn RobotPort> = Arc::new(
+            FakeRobot::new()
+                .with_frame("/camera", frame(12.0))
+                .with_topic(
+                    "/masks",
+                    json!({"header": {"stamp": {"sec": 12, "nanosec": 0}}, "instances": []}),
+                ),
+        );
+        let config: LookConfig = toml::from_str(
+            "image = \"/camera\"\ndetections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\nabout = \"It points down at the floor.\"\n",
+        )
+        .unwrap();
+        let eyes = Arc::new(FakeEyes {
+            answer: Ok("A wooden floor.".into()),
+            asked: Mutex::new(Vec::new()),
+        });
+        let look = LookTool::start(
+            config,
+            robot,
+            Arc::new(SnapshotStore::default()),
+            Some(Arc::clone(&eyes) as Arc<dyn Eyes>),
+        )
+        .unwrap();
+        tokio::task::yield_now().await;
+        let _ = look.call(json!({})).await;
+        let asked = guard(&eyes.asked);
+        assert!(asked[0].0.contains("marked nothing"), "{}", asked[0].0);
+        assert!(!asked[0].0.contains("numbered"), "{}", asked[0].0);
+        assert!(
+            asked[0]
+                .0
+                .ends_with("About this camera: It points down at the floor."),
+            "{}",
+            asked[0].0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_vision_call_still_returns_the_marks() {
+        let eyes = Arc::new(FakeEyes {
+            answer: Err("no vision model is available".into()),
+            asked: Mutex::new(Vec::new()),
+        });
+        let out = look_with(eyes, json!({})).await;
+        assert_eq!(out.status, crate::tools::Status::Succeeded);
+        assert_eq!(out.data["marks"][0]["label"], "dustbin");
+        assert_eq!(out.data["not_seen"], "no vision model is available");
+        assert!(out.data.get("answer").is_none());
     }
 }

@@ -148,7 +148,8 @@ pub fn start(
     let mut registry = Registry::from_config(&profile.tools, &robot, &schemas, &guard)?;
     let snapshots = Arc::new(SnapshotStore::default());
     if let Some(look) = profile.look.clone() {
-        let tool = LookTool::start(look, Arc::clone(&robot), Arc::clone(&snapshots))
+        let eyes: Arc<dyn crate::look::Eyes> = Arc::clone(&llm) as Arc<dyn crate::look::Eyes>;
+        let tool = LookTool::start(look, Arc::clone(&robot), Arc::clone(&snapshots), Some(eyes))
             .map_err(StartError::Look)?;
         registry.add(Arc::new(tool))?;
     }

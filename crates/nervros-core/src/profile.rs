@@ -161,6 +161,10 @@ pub struct LookConfig {
     /// Detections older than this are ignored.
     #[serde(default = "default_look_age", deserialize_with = "duration")]
     pub max_age: Duration,
+    /// What the vision model should know about this camera, such as where it points and how far
+    /// it sees, so it does not take a view of the floor for an empty room.
+    #[serde(default)]
+    pub about: Option<String>,
 }
 
 fn default_marks() -> usize {

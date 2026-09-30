@@ -16,7 +16,7 @@ pub(crate) async fn look(profile_path: &Path, out: &Path) -> Result<()> {
         .clone()
         .context("the profile has no [look] section")?;
     let robot = nervros_core::app::connect(&profile)?;
-    let tool = LookTool::start(config, robot, Arc::new(SnapshotStore::default()))
+    let tool = LookTool::start(config, robot, Arc::new(SnapshotStore::default()), None)
         .context("subscribing to the camera")?;
     // Frames and discovery need a moment after the node starts.
     tokio::time::sleep(Duration::from_secs(2)).await;
