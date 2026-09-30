@@ -197,6 +197,9 @@ pub struct Gui {
     picked: Rc<RefCell<Option<Picked>>>,
     closing: Closing,
     bridge: nervros_viz::Bridge,
+    /// The world editor, when the profile names one; `editing` shows it in place of the viewer.
+    editor: Option<crate::editor::WorldEditor>,
+    editing: bool,
 }
 
 impl Gui {
@@ -243,6 +246,10 @@ impl Gui {
         panels.blueprint = Some(PanelState::Collapsed);
         panels.selection = Some(PanelState::Collapsed);
         panels.time = Some(PanelState::Collapsed);
+        let editor = agent
+            .editor
+            .clone()
+            .map(|client| crate::editor::WorldEditor::new(client, runtime.clone()));
         let mut viewer = re_viewer::App::new(
             main_thread,
             re_viewer::build_info(),
@@ -278,6 +285,8 @@ impl Gui {
             picked,
             closing: Closing::Open,
             bridge: feed.bridge,
+            editor,
+            editing: false,
         })
     }
 
@@ -471,6 +480,23 @@ impl Gui {
                     .selected(self.dock_open);
                 if ui.add(toggle).clicked() {
                     self.dock_open = !self.dock_open;
+                }
+                if self.editor.is_some() {
+                    let edit = ReButton::new("Edit world")
+                        .small()
+                        .secondary()
+                        .selected(self.editing);
+                    if ui
+                        .add(edit)
+                        .on_hover_text("The saved world on its floor plan, to fix by hand")
+                        .clicked()
+                    {
+                        self.editing = !self.editing;
+                        if self.editing {
+                            self.tab = Tab::World;
+                            self.dock_open = true;
+                        }
+                    }
                 }
                 let reset = ReButton::new("Reset layout").small().secondary();
                 if ui
@@ -728,6 +754,18 @@ impl Gui {
     }
 
     fn world_tab(&mut self, ui: &mut egui::Ui) {
+        if let (true, Some(editor)) = (self.editing, &mut self.editor) {
+            editor.panel(ui);
+            return;
+        }
+        if self.editor.is_some()
+            && ui
+                .add(ReButton::new("Edit the world").small())
+                .on_hover_text("Fix labels, boxes and rooms on the saved floor plan")
+                .clicked()
+        {
+            self.editing = true;
+        }
         let (rooms, objects) = {
             let l = self.live();
             (l.rooms.clone(), l.objects)
@@ -1088,7 +1126,12 @@ impl eframe::App for Gui {
                 )
                 .show(ui, |ui| self.dock(ui));
         }
-        self.viewer.ui(ui, frame);
+        match (&mut self.editor, self.editing) {
+            (Some(editor), true) => {
+                egui::CentralPanel::no_frame().show(ui, |ui| editor.canvas(ui));
+            }
+            _ => self.viewer.ui(ui, frame),
+        }
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {

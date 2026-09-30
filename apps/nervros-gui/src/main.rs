@@ -2,6 +2,7 @@
 
 mod app;
 mod chat;
+mod editor;
 
 use std::path::PathBuf;
 

@@ -7480,6 +7480,7 @@ dependencies = [
  "nervros-ros",
  "nervros-viz",
  "rerun",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

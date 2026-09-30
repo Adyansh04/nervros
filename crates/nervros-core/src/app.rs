@@ -36,6 +36,8 @@ pub struct Agent {
     pub llm: Arc<Llm>,
     /// Tool names, in order.
     pub tools: Vec<String>,
+    /// The world editor, when the profile names one.
+    pub editor: Option<Arc<crate::editor::EditorClient>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -139,6 +141,54 @@ fn orphan_notice(state: &serde_json::Value) -> Option<String> {
     ))
 }
 
+/// `look`, `segment` and the world editor's tools, as the profile has them; the editor client too,
+/// for the app.
+fn seeing_tools(
+    profile: &Profile,
+    robot: &Arc<dyn RobotPort>,
+    llm: &Arc<Llm>,
+    snapshots: &Arc<SnapshotStore>,
+    registry: &mut Registry,
+) -> Result<Option<Arc<crate::editor::EditorClient>>, StartError> {
+    let robot = Arc::clone(robot);
+    let snapshots = Arc::clone(snapshots);
+    let llm = Arc::clone(llm);
+    if let Some(look) = profile.look.clone() {
+        let cameras = Cameras::start(&look, &robot).map_err(StartError::Look)?;
+        let eyes: Arc<dyn crate::look::Eyes> = Arc::clone(&llm) as Arc<dyn crate::look::Eyes>;
+        registry.add(Arc::new(LookTool::new(
+            look,
+            Arc::clone(&cameras),
+            Arc::clone(&robot),
+            Arc::clone(&snapshots),
+            Some(eyes),
+        )))?;
+        if let Some(segment) = profile.segment.clone() {
+            let outliner = Arc::clone(&llm) as Arc<dyn crate::segment::Outliner>;
+            registry.add(Arc::new(SegmentTool::new(
+                segment,
+                cameras,
+                Arc::clone(&robot),
+                Arc::clone(&snapshots),
+                Some(outliner),
+            )))?;
+        }
+    }
+    let editor = match &profile.editor {
+        Some(config) => Some(Arc::new(
+            crate::editor::EditorClient::new(config).map_err(StartError::Environment)?,
+        )),
+        None => None,
+    };
+    if let Some(editor) = &editor {
+        let eyes: Arc<dyn crate::look::Eyes> = Arc::clone(&llm) as Arc<dyn crate::look::Eyes>;
+        for tool in crate::editor::tools(editor, &robot, &snapshots, Some(eyes)) {
+            registry.add(tool)?;
+        }
+    }
+    Ok(editor)
+}
+
 /// Starts an agent. Must run inside a tokio runtime.
 ///
 /// # Errors
@@ -161,27 +211,7 @@ pub fn start(
     let schemas: Arc<dyn SchemaSource> = Arc::new(RosidlSchemas::load(&profile)?);
     let mut registry = Registry::from_config(&profile.tools, &robot, &schemas, &guard)?;
     let snapshots = Arc::new(SnapshotStore::default());
-    if let Some(look) = profile.look.clone() {
-        let cameras = Cameras::start(&look, &robot).map_err(StartError::Look)?;
-        let eyes: Arc<dyn crate::look::Eyes> = Arc::clone(&llm) as Arc<dyn crate::look::Eyes>;
-        registry.add(Arc::new(LookTool::new(
-            look,
-            Arc::clone(&cameras),
-            Arc::clone(&robot),
-            Arc::clone(&snapshots),
-            Some(eyes),
-        )))?;
-        if let Some(segment) = profile.segment.clone() {
-            let outliner = Arc::clone(&llm) as Arc<dyn crate::segment::Outliner>;
-            registry.add(Arc::new(SegmentTool::new(
-                segment,
-                cameras,
-                Arc::clone(&robot),
-                Arc::clone(&snapshots),
-                Some(outliner),
-            )))?;
-        }
-    }
+    let editor = seeing_tools(&profile, &robot, &llm, &snapshots, &mut registry)?;
     registry.add(Arc::new(ListPlaces::new(&profile, Arc::clone(&robot))))?;
     registry.add(Arc::new(RobotState::new(
         &profile,
@@ -239,6 +269,7 @@ pub fn start(
         snapshots,
         llm,
         tools,
+        editor,
     })
 }
 

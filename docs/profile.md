@@ -180,6 +180,21 @@ share of the frame, as marks of the snapshot. It needs `[look]`'s cameras.
 `nervros-cli segment "the floor" --camera head --out floor.jpg` runs it once, without the chat
 model.
 
+### `[editor]`
+
+canopy's world editor (`editor/canopy_editor.py <world_dir>`), which serves one saved world over
+HTTP. With it the agent gets `review_world` and `inspect_object` (reads), and `edit_world` and
+`world_edits` (edits, approved when supervised, no arming); and the app gets Edit world, the saved
+world on its floor plan, where objects are picked, moved, resized, turned, split, merged and added
+and rooms typed, as on canopy's own editor page. Both go through the editor, so each sees the
+other's edits.
+
+| Key | Default | |
+|---|---|---|
+| `url` | `"http://127.0.0.1:8765"` | The editor. |
+| `token` | none | `{ file = "..." }` or `{ env = "..." }`, when it serves off loopback. |
+| `reload` | none | A `std_srvs/srv/Trigger` that makes the running world model read the saved world again, called after `world_edits` saves: canopy's `/canopy/reload`. |
+
 ### `[world]`
 
 The world model's topics, each `{ topic, type }` and each optional: `map` (a

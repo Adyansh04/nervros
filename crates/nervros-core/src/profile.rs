@@ -32,6 +32,8 @@ pub struct Profile {
     pub look: Option<LookConfig>,
     /// The `segment` builtin; it needs `[look]`'s cameras.
     pub segment: Option<SegmentConfig>,
+    /// The world editor the agent and the app edit the saved world through.
+    pub editor: Option<EditorConfig>,
     /// The robot's mission executor.
     pub mission: Option<MissionConfig>,
     /// Named places beyond the world model's rooms.
@@ -211,6 +213,24 @@ impl LookConfig {
 
 fn default_camera_name() -> String {
     "main".to_owned()
+}
+
+/// canopy's world editor (`editor/canopy_editor.py`), which serves a saved world over HTTP.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorConfig {
+    /// Its address.
+    #[serde(default = "default_editor_url")]
+    pub url: String,
+    /// Its token, when it serves off loopback.
+    pub token: Option<crate::secret::KeySource>,
+    /// A `std_srvs/srv/Trigger` service that makes the running world model read the saved world
+    /// again, called after a save.
+    pub reload: Option<String>,
+}
+
+fn default_editor_url() -> String {
+    "http://127.0.0.1:8765".to_owned()
 }
 
 /// Where `segment`'s masks come from.
