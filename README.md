@@ -24,5 +24,5 @@ cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 `nervros-cli` does the same headless: `chat`, `doctor`, `look`, `models` and `ask`.
 
 In the window, Enter sends, Esc stops the reply and Ctrl+Shift+S stops the mission. Ctrl+1 to
-Ctrl+4 switch the dock between approvals, events, models and the connection check. The embedded
+Ctrl+5 switch the dock between the mission, approvals, events, models and the connection check. The embedded
 viewer is [Rerun](https://rerun.io), which keeps the camera, map, rooms and objects on a timeline.

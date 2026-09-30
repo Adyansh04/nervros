@@ -44,6 +44,7 @@ type SharedLive = Arc<Mutex<Live>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Mission,
     Approvals,
     Events,
     Models,
@@ -51,7 +52,8 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: [(Self, &'static str); 4] = [
+    const ALL: [(Self, &'static str); 5] = [
+        (Self::Mission, "Mission"),
         (Self::Approvals, "Approvals"),
         (Self::Events, "Events"),
         (Self::Models, "Models"),
@@ -158,10 +160,11 @@ impl Gui {
         }
     }
 
+    /// The bubble appears when the session starts the turn, so a message it turns away shows
+    /// only as its notice.
     fn say(&mut self, text: String) {
         self.history.push(text.clone());
         self.history_pos = None;
-        self.chat.push_user(text.clone());
         self.agent.session.send(Command::User(text));
     }
 
@@ -183,7 +186,7 @@ impl Gui {
         let (esc, stop, tab) = ctx.input_mut(|i| {
             let esc = working && i.consume_key(Modifiers::NONE, Key::Escape);
             let stop = i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::S);
-            let keys = [Key::Num1, Key::Num2, Key::Num3, Key::Num4];
+            let keys = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5];
             let tab = keys.iter().position(|k| i.consume_key(Modifiers::CTRL, *k));
             (esc, stop, tab)
         });
@@ -404,11 +407,24 @@ impl Gui {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| match self.tab {
+                Tab::Mission => self.mission_tab(ui),
                 Tab::Approvals => self.approvals_tab(ui),
                 Tab::Events => self.events_tab(ui),
                 Tab::Models => self.models_tab(ui),
                 Tab::Doctor => self.doctor_tab(ui),
             });
+    }
+
+    fn mission_tab(&mut self, ui: &mut egui::Ui) {
+        let mut actions = Vec::new();
+        match self.chat.latest_plan() {
+            Some(p) => crate::chat::plan_card(ui, p, &mut actions),
+            None => empty(
+                ui,
+                "No plan yet. Ask the robot to do something; its plan appears here.",
+            ),
+        }
+        self.act(ui.ctx(), actions);
     }
 
     fn approvals_tab(&mut self, ui: &mut egui::Ui) {
