@@ -53,7 +53,7 @@ fn main() -> Result<()> {
     )
     .context("opening the session log")?;
     let (rec, viewer_input) = nervros_viz::in_process().context("creating the recording")?;
-    let _bridge = nervros_viz::spawn(
+    let bridge = nervros_viz::spawn(
         &rec,
         &agent.robot,
         &agent.profile,
@@ -73,15 +73,12 @@ fn main() -> Result<()> {
         "NervROS",
         options,
         Box::new(move |cc| {
-            let gui = app::Gui::start(
-                main_thread,
-                cc,
-                agent,
-                viewer_input,
+            let feed = app::ViewerFeed {
+                input: viewer_input,
+                bridge,
                 memory_limit,
-                handle,
-                log_path,
-            )?;
+            };
+            let gui = app::Gui::start(main_thread, cc, agent, feed, handle, log_path)?;
             Ok(Box::new(gui))
         }),
     )

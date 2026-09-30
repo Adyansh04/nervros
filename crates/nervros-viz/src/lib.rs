@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use nervros_core::profile::{Profile, TopicRef};
+use nervros_core::profile::{LayerConfig, LookConfig, Profile, TopicRef};
 use nervros_core::session::Event;
 use nervros_ros::image::encode_jpeg;
 use nervros_ros::{RobotPort, Transform};
@@ -21,7 +21,12 @@ use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 
+mod layers;
+
+pub use layers::Layers;
+
 const POSE_PERIOD: Duration = Duration::from_millis(100);
+const SCAN_PERIOD: Duration = Duration::from_millis(200);
 const CAMERA_PERIOD: Duration = Duration::from_millis(500);
 const OBJECTS_PERIOD: Duration = Duration::from_secs(1);
 const SLOW_PERIOD: Duration = Duration::from_secs(5);
@@ -69,100 +74,336 @@ pub fn in_process() -> rerun::RecordingStreamResult<(RecordingStream, LogReceive
     Ok((rec, rx))
 }
 
-/// Starts the bridge: robot pose, camera, map, rooms and objects from ROS, and the agent's events.
-/// The tasks end when the set is dropped.
+/// The bridge's tasks and the switches for what it draws; the tasks end when it is dropped.
+pub struct Bridge {
+    /// Every layer the viewer draws, which the operator can hide.
+    pub layers: Arc<Layers>,
+    _tasks: JoinSet<()>,
+}
+
+/// A layer as a task draws it: its name in [`Layers`] and the entity it draws under.
+#[derive(Clone)]
+struct Layer {
+    name: String,
+    path: String,
+    layers: Arc<Layers>,
+}
+
+impl Layer {
+    fn shown(&self) -> bool {
+        self.layers.shown(&self.name)
+    }
+
+    /// Takes everything the layer drew out of the viewer.
+    fn clear(&self, rec: &RecordingStream) {
+        put_static(rec, &self.path, &rerun::Clear::recursive());
+        put(rec, &self.path, &rerun::Clear::recursive());
+    }
+}
+
+/// Starts the bridge: robot pose, cameras, map, rooms and objects from ROS, the profile's layers,
+/// and the agent's events.
 pub fn spawn(
     rec: &RecordingStream,
     robot: &Arc<dyn RobotPort>,
     profile: &Profile,
     events: broadcast::Receiver<Event>,
-) -> JoinSet<()> {
+) -> Bridge {
     put_static(rec, "world", &rerun::ViewCoordinates::RIGHT_HAND_Z_UP());
-    layout(
-        rec,
-        profile
-            .viz
-            .as_ref()
-            .is_some_and(|v| v.camera_info.is_some()),
-    );
-    let mut tasks = JoinSet::new();
-    tasks.spawn(pose(
+    let mut bridge = Spawner {
+        rec: rec.clone(),
+        robot: Arc::clone(robot),
+        layers: Arc::default(),
+        tasks: JoinSet::new(),
+    };
+    bridge.tasks.spawn(pose(
         rec.clone(),
         Arc::clone(robot),
         profile.ros.map_frame.clone(),
         profile.ros.base_frame.clone(),
     ));
-    if let Some(urdf) = profile.viz.as_ref().and_then(|v| v.urdf.as_ref()) {
-        tasks.spawn(robot_model(
-            rec.clone(),
-            Arc::clone(robot),
-            profile.resolve(urdf),
-            profile.ros.base_frame.clone(),
-        ));
+    bridge.robot_model(profile);
+    bridge.cameras(profile);
+    bridge.world(profile);
+    bridge.profile_layers(profile);
+    bridge.tasks.spawn(agent(rec.clone(), events));
+    Bridge {
+        layers: bridge.layers,
+        _tasks: bridge.tasks,
     }
-    let camera_info = profile.viz.as_ref().and_then(|v| v.camera_info.clone());
-    if let Some(look) = &profile.look {
-        tasks.spawn(camera(
-            rec.clone(),
-            Arc::clone(robot),
-            look.image.clone(),
-            camera_info
-                .clone()
-                .map(|info| (info, profile.ros.base_frame.clone())),
-        ));
-    }
-    if let Some(world) = &profile.world {
-        let mut watch = |topic: &Option<TopicRef>, period, draw: Drawer| {
-            if let Some(topic) = topic {
-                tasks.spawn(sample(
-                    rec.clone(),
-                    Arc::clone(robot),
-                    topic.clone(),
-                    period,
-                    draw,
-                ));
-            }
-        };
-        watch(&world.map, SLOW_PERIOD, Box::new(draw_map));
-        watch(&world.coverage, OBJECTS_PERIOD, Box::new(draw_coverage));
-        let mut rooms_drawn = BTreeSet::new();
-        watch(
-            &world.rooms,
-            SLOW_PERIOD,
-            Box::new(move |rec, msg| draw_rooms(rec, msg, &mut rooms_drawn)),
-        );
-        watch(&world.trail, SLOW_PERIOD, Box::new(draw_trail));
-        let mut drawn = BTreeSet::new();
-        watch(
-            &world.objects,
-            OBJECTS_PERIOD,
-            Box::new(move |rec, msg| draw_objects(rec, msg, &mut drawn)),
-        );
-    }
-    if let Some(plan) = profile.viz.as_ref().and_then(|v| v.plan.clone()) {
-        tasks.spawn(sample(
-            rec.clone(),
-            Arc::clone(robot),
-            plan,
-            POSE_PERIOD * 5,
-            Box::new(draw_plan),
-        ));
-    }
-    tasks.spawn(agent(rec.clone(), events));
-    tasks
 }
 
-/// The default layout: the world large on the left; the camera, the agent's last marked image and
+/// What `spawn` starts the tasks with.
+struct Spawner {
+    rec: RecordingStream,
+    robot: Arc<dyn RobotPort>,
+    layers: Arc<Layers>,
+    tasks: JoinSet<()>,
+}
+
+impl Spawner {
+    fn layer(&self, name: &str, path: &str, shown: bool) -> Layer {
+        self.layers.add(name, shown);
+        Layer {
+            name: name.to_owned(),
+            path: path.to_owned(),
+            layers: Arc::clone(&self.layers),
+        }
+    }
+
+    fn watch(&mut self, topic: Option<TopicRef>, period: Duration, layer: Layer, draw: Drawer) {
+        if let Some(topic) = topic {
+            let (rec, robot) = (self.rec.clone(), Arc::clone(&self.robot));
+            self.tasks
+                .spawn(sample(rec, robot, topic, period, layer, draw));
+        }
+    }
+
+    fn robot_model(&mut self, profile: &Profile) {
+        if let Some(urdf) = profile.viz.as_ref().and_then(|v| v.urdf.as_ref()) {
+            let layer = self.layer("Robot model", MODEL_PATH, true);
+            self.tasks.spawn(robot_model(
+                self.rec.clone(),
+                Arc::clone(&self.robot),
+                profile.resolve(urdf),
+                profile.ros.base_frame.clone(),
+                layer,
+            ));
+        }
+    }
+
+    /// Every camera the profile names, each in its own view, the first in the world when the
+    /// profile gives its lens; with the detector's boxes on the frames.
+    fn cameras(&mut self, profile: &Profile) {
+        let lens = profile
+            .viz
+            .as_ref()
+            .and_then(|v| v.camera_info.clone())
+            .map(|info| (info, profile.ros.base_frame.clone()));
+        let cameras = profile
+            .look
+            .as_ref()
+            .map(LookConfig::all_cameras)
+            .unwrap_or_default();
+        let mut views = Vec::new();
+        for (i, (name, config)) in cameras.into_iter().enumerate() {
+            let path = if i == 0 {
+                CAMERA_PATH[usize::from(lens.is_some())].to_owned()
+            } else {
+                format!("/cameras/{}", layers::slug(&name))
+            };
+            self.tasks.spawn(camera(
+                self.rec.clone(),
+                Arc::clone(&self.robot),
+                config.image,
+                path.clone(),
+                if i == 0 { lens.clone() } else { None },
+            ));
+            let boxes = self.layer("Detections", &format!("{path}/detections"), true);
+            self.watch(
+                config.detections,
+                CAMERA_PERIOD,
+                boxes,
+                Box::new(draw_detections),
+            );
+            views.push((name, path));
+        }
+        layout(&self.rec, &views);
+    }
+
+    fn world(&mut self, profile: &Profile) {
+        if let Some(world) = &profile.world {
+            let map = self.layer("Map", "world/map", true);
+            self.watch(world.map.clone(), SLOW_PERIOD, map, Box::new(draw_map));
+            let coverage = self.layer("Camera coverage", "world/coverage", true);
+            self.watch(
+                world.coverage.clone(),
+                OBJECTS_PERIOD,
+                coverage,
+                Box::new(draw_coverage),
+            );
+            let (rooms, mut drawn) = (self.layer("Rooms", "world/rooms", true), BTreeSet::new());
+            self.watch(
+                world.rooms.clone(),
+                SLOW_PERIOD,
+                rooms,
+                Box::new(move |rec, path, msg| draw_rooms(rec, path, msg, &mut drawn)),
+            );
+            let trail = self.layer("Trail", "world/trail", true);
+            self.watch(
+                world.trail.clone(),
+                SLOW_PERIOD,
+                trail,
+                Box::new(draw_trail),
+            );
+            let (objects, mut drawn) = (
+                self.layer("Objects", "world/objects", true),
+                BTreeSet::new(),
+            );
+            self.watch(
+                world.objects.clone(),
+                OBJECTS_PERIOD,
+                objects,
+                Box::new(move |rec, path, msg| draw_objects(rec, path, msg, &mut drawn)),
+            );
+        }
+        let plan = self.layer("Plan", "world/plan", true);
+        let topic = profile.viz.as_ref().and_then(|v| v.plan.clone());
+        self.watch(topic, POSE_PERIOD * 5, plan, Box::new(draw_plan));
+    }
+
+    fn profile_layers(&mut self, profile: &Profile) {
+        for (i, config) in profile.viz.iter().flat_map(|v| &v.layers).enumerate() {
+            let path = format!("world/layers/{}", layers::slug(&config.name));
+            let layer = self.layer(&config.name, &path, !config.hidden);
+            if config.msg_type == "sensor_msgs/msg/LaserScan" {
+                self.tasks.spawn(scan(
+                    self.rec.clone(),
+                    Arc::clone(&self.robot),
+                    config.topic.clone(),
+                    profile.ros.map_frame.clone(),
+                    layer,
+                    OBJECT_PALETTE[i % OBJECT_PALETTE.len()],
+                ));
+                continue;
+            }
+            let topic = TopicRef {
+                topic: config.topic.clone(),
+                msg_type: config.msg_type.clone(),
+            };
+            let draw = profile_layer(config, i, &self.robot, &profile.ros.map_frame);
+            self.watch(Some(topic), OBJECTS_PERIOD, layer, draw);
+        }
+    }
+}
+
+/// How a `[[viz.layer]]` grid or marker array is drawn; the scan has its own task.
+fn profile_layer(
+    config: &LayerConfig,
+    index: usize,
+    robot: &Arc<dyn RobotPort>,
+    map: &str,
+) -> Drawer {
+    if config.msg_type == "visualization_msgs/msg/MarkerArray" {
+        let (robot, map, namespaces) =
+            (Arc::clone(robot), map.to_owned(), config.namespaces.clone());
+        let mut drawn = BTreeSet::new();
+        return Box::new(move |rec, path, msg| {
+            let to_map = |frame: &str| {
+                if frame.is_empty() || frame == map {
+                    Some(Transform::IDENTITY)
+                } else {
+                    robot.transform(&map, frame).ok()
+                }
+            };
+            layers::draw_markers(rec, path, msg, &namespaces, &to_map, &mut drawn);
+        });
+    }
+    let (r, g, b) = OBJECT_PALETTE[index % OBJECT_PALETTE.len()];
+    // Above the map and coverage, one layer over the next.
+    #[expect(clippy::cast_precision_loss, reason = "a handful of layers")]
+    let lift = 0.02 + 0.005 * index as f32;
+    Box::new(move |rec, path, msg| layers::draw_occupied(rec, path, msg, [r, g, b], lift))
+}
+
+/// A laser scan as points in the map, redrawn as scans arrive.
+async fn scan(
+    rec: RecordingStream,
+    robot: Arc<dyn RobotPort>,
+    topic: String,
+    map: String,
+    layer: Layer,
+    (r, g, b): (u8, u8, u8),
+) {
+    let mut tick = interval(SCAN_PERIOD);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let (mut last, mut drawn) = (Value::Null, false);
+    loop {
+        tick.tick().await;
+        if !layer.shown() {
+            if drawn {
+                layer.clear(&rec);
+                drawn = false;
+            }
+            continue;
+        }
+        let Ok(msg) = robot
+            .latest(&topic, "sensor_msgs/msg/LaserScan", TOPIC_WAIT)
+            .await
+        else {
+            continue;
+        };
+        let stamp = msg["header"]["stamp"].clone();
+        if drawn && stamp == last {
+            continue;
+        }
+        let frame = msg["header"]["frame_id"].as_str().unwrap_or_default();
+        let Ok(to_map) = robot.transform(&map, frame) else {
+            continue;
+        };
+        put_static(
+            &rec,
+            &layer.path,
+            &rerun::Points3D::new(layers::scan_points(&msg, &to_map))
+                .with_radii([0.025])
+                .with_colors([rerun::Color::from_rgb(r, g, b)]),
+        );
+        (last, drawn) = (stamp, true);
+    }
+}
+
+/// The detector's boxes on a camera frame, labelled and coloured by label.
+fn draw_detections(rec: &RecordingStream, path: &str, msg: &Value) {
+    let found = nervros_core::look::parse_detections(msg).instances;
+    let (mins, sizes): (Vec<[f32; 2]>, Vec<[f32; 2]>) = found
+        .iter()
+        .map(|d| {
+            #[expect(clippy::cast_precision_loss, reason = "pixel coordinates")]
+            let (x, y, w, h) = (
+                d.bbox.0 as f32,
+                d.bbox.1 as f32,
+                d.bbox.2 as f32,
+                d.bbox.3 as f32,
+            );
+            ([x, y], [w, h])
+        })
+        .unzip();
+    put(
+        rec,
+        path,
+        &rerun::Boxes2D::from_mins_and_sizes(mins, sizes)
+            .with_labels(found.iter().map(|d| d.label.clone()))
+            .with_colors(found.iter().map(|d| object_colour(&d.label, 255))),
+    );
+}
+
+/// The default layout: the world large on the left; the cameras, the agent's last marked image and
 /// its log on the right. Only a default, so a layout the operator arranges is kept.
-fn layout(rec: &RecordingStream, camera_in_world: bool) {
+fn layout(rec: &RecordingStream, cameras: &[(String, String)]) {
     use rerun::blueprint::{
         Blueprint, BlueprintActivation, Horizontal, Spatial2DView, Spatial3DView,
         StateTimelineView, Tabs, TextLogView, TimeSeriesView, Vertical,
     };
-    let side = Vertical::new([
-        Spatial2DView::new("Camera")
-            .with_origin(CAMERA_PATH[usize::from(camera_in_world)])
+    let view = |(name, path): &(String, String)| -> rerun::blueprint::ContainerLike {
+        let mut title: String = name.clone();
+        if let Some(first) = title.get_mut(0..1) {
+            first.make_ascii_uppercase();
+        }
+        Spatial2DView::new(format!("{title} camera"))
+            .with_origin(path.as_str())
+            .into()
+    };
+    let camera_slot: rerun::blueprint::ContainerLike = match cameras {
+        [] => Spatial2DView::new("Camera")
+            .with_origin(CAMERA_PATH[0])
             .into(),
+        [(_, path)] => Spatial2DView::new("Camera")
+            .with_origin(path.as_str())
+            .into(),
+        many => Tabs::new(many.iter().map(view)).into(),
+    };
+    let side = Vertical::new([
+        camera_slot,
         Spatial2DView::new("Last look")
             .with_origin("/agent/look")
             .into(),
@@ -288,23 +529,43 @@ fn load_model(rec: &RecordingStream, urdf: &Path, base: &str) -> Result<Vec<Mode
 }
 
 /// The robot's model, posed from TF as often as the robot's pose is drawn.
-async fn robot_model(rec: RecordingStream, robot: Arc<dyn RobotPort>, urdf: PathBuf, base: String) {
-    let sender = rec.clone();
-    let loaded = tokio::task::spawn_blocking(move || load_model(&sender, &urdf, &base)).await;
-    let frames = match loaded {
-        Ok(Ok(frames)) => frames,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "the viewer shows no robot model");
-            return;
-        }
-        Err(_) => return,
-    };
-    let mut last = vec![None; frames.len()];
+/// The robot's model, posed by TF; hidden, it is cleared, and loaded again when shown.
+async fn robot_model(
+    rec: RecordingStream,
+    robot: Arc<dyn RobotPort>,
+    urdf: PathBuf,
+    base: String,
+    layer: Layer,
+) {
+    let mut frames: Option<Vec<ModelFrame>> = None;
+    let mut last = Vec::new();
     let mut tick = interval(POSE_PERIOD);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
-        pose_model(&rec, robot.as_ref(), &frames, &mut last);
+        if !layer.shown() {
+            if frames.take().is_some() {
+                layer.clear(&rec);
+            }
+            continue;
+        }
+        let model = if let Some(model) = &frames {
+            model
+        } else {
+            let (sender, urdf, base) = (rec.clone(), urdf.clone(), base.clone());
+            match tokio::task::spawn_blocking(move || load_model(&sender, &urdf, &base)).await {
+                Ok(Ok(model)) => {
+                    last = vec![None; model.len()];
+                    frames.insert(model)
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "the viewer shows no robot model");
+                    return;
+                }
+                Err(_) => return,
+            }
+        };
+        pose_model(&rec, robot.as_ref(), model, &mut last);
     }
 }
 
@@ -340,6 +601,7 @@ async fn camera(
     rec: RecordingStream,
     robot: Arc<dyn RobotPort>,
     topic: String,
+    path: String,
     lens: Option<(TopicRef, String)>,
 ) {
     let rx = match robot.frames(&topic) {
@@ -349,7 +611,7 @@ async fn camera(
             return;
         }
     };
-    let path = CAMERA_PATH[usize::from(lens.is_some())];
+    let path = path.as_str();
     let mut tick = interval(CAMERA_PERIOD);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_stamp = f64::NAN;
@@ -417,15 +679,16 @@ fn pinhole(msg: &Value) -> Option<rerun::Pinhole> {
     )
 }
 
-/// Draws one topic's message; objects keep state between calls.
-type Drawer = Box<dyn FnMut(&RecordingStream, &Value) + Send>;
+/// Draws one topic's message under the layer's entity path; objects keep state between calls.
+type Drawer = Box<dyn FnMut(&RecordingStream, &str, &Value) + Send>;
 
-/// Polls a topic and redraws when its message changed.
+/// Polls a topic and redraws when its message changed, or clears the layer while it is hidden.
 async fn sample(
     rec: RecordingStream,
     robot: Arc<dyn RobotPort>,
     topic: TopicRef,
     period: Duration,
+    layer: Layer,
     mut draw: Drawer,
 ) {
     let mut tick = interval(period);
@@ -433,6 +696,13 @@ async fn sample(
     let mut last = Value::Null;
     loop {
         tick.tick().await;
+        if !layer.shown() {
+            if !last.is_null() {
+                layer.clear(&rec);
+                last = Value::Null;
+            }
+            continue;
+        }
         let Ok(msg) = robot
             .latest(&topic.topic, &topic.msg_type, TOPIC_WAIT)
             .await
@@ -440,7 +710,7 @@ async fn sample(
             continue;
         };
         if msg != last {
-            draw(&rec, &msg);
+            draw(&rec, &layer.path, &msg);
             last = msg;
         }
     }
@@ -535,22 +805,15 @@ fn coverage_colour(v: i64) -> [u8; 4] {
     }
 }
 
-fn draw_map(rec: &RecordingStream, msg: &Value) {
+fn draw_map(rec: &RecordingStream, path: &str, msg: &Value) {
     if let Some(g) = grid(msg, occupancy) {
-        put_grid(rec, "world/map", g, rerun::ColorModel::L, 0.0, true);
+        put_grid(rec, path, g, rerun::ColorModel::L, 0.0, true);
     }
 }
 
-fn draw_coverage(rec: &RecordingStream, msg: &Value) {
+fn draw_coverage(rec: &RecordingStream, path: &str, msg: &Value) {
     if let Some(g) = grid(msg, coverage_colour) {
-        put_grid(
-            rec,
-            "world/coverage",
-            g,
-            rerun::ColorModel::RGBA,
-            0.01,
-            false,
-        );
+        put_grid(rec, path, g, rerun::ColorModel::RGBA, 0.01, false);
     }
 }
 
@@ -600,7 +863,7 @@ fn area(points: &[[f32; 3]]) -> f64 {
 /// Room outlines from a `canopy_msgs/msg/RoomArray`, one entity each so a click in the viewer
 /// names the room, labelled and coloured by how much the camera has seen of it; rooms that went
 /// away are cleared. The share seen overall, by area, goes on the "Exploring" plot.
-fn draw_rooms(rec: &RecordingStream, msg: &Value, drawn: &mut BTreeSet<String>) {
+fn draw_rooms(rec: &RecordingStream, path: &str, msg: &Value, drawn: &mut BTreeSet<String>) {
     let list = msg["rooms"].as_array().map_or(&[][..], Vec::as_slice);
     let mut now = BTreeSet::new();
     let (mut seen_area, mut total_area) = (0.0, 0.0);
@@ -636,7 +899,7 @@ fn draw_rooms(rec: &RecordingStream, msg: &Value, drawn: &mut BTreeSet<String>) 
         };
         put_static(
             rec,
-            &format!("world/rooms/{id}"),
+            &format!("{path}/{id}"),
             &rerun::LineStrips3D::new([strip])
                 .with_labels([label])
                 .with_colors([room_seen.map_or(rerun::Color::from_rgb(200, 200, 210), seen_colour)])
@@ -645,7 +908,7 @@ fn draw_rooms(rec: &RecordingStream, msg: &Value, drawn: &mut BTreeSet<String>) 
         now.insert(id.to_owned());
     }
     for gone in drawn.difference(&now) {
-        put_static(rec, &format!("world/rooms/{gone}"), &rerun::Clear::flat());
+        put_static(rec, &format!("{path}/{gone}"), &rerun::Clear::flat());
     }
     #[expect(clippy::cast_precision_loss, reason = "a handful of rooms")]
     put(
@@ -664,7 +927,7 @@ fn draw_rooms(rec: &RecordingStream, msg: &Value, drawn: &mut BTreeSet<String>) 
 }
 
 /// The path the navigation stack is following, from a `nav_msgs/msg/Path`.
-fn draw_plan(rec: &RecordingStream, msg: &Value) {
+fn draw_plan(rec: &RecordingStream, path: &str, msg: &Value) {
     let points: Vec<[f32; 3]> = msg["poses"]
         .as_array()
         .map_or(&[][..], Vec::as_slice)
@@ -676,7 +939,7 @@ fn draw_plan(rec: &RecordingStream, msg: &Value) {
         .collect();
     put_static(
         rec,
-        "world/plan",
+        path,
         &rerun::LineStrips3D::new([points])
             .with_radii([0.02])
             .with_colors([rerun::Color::from_rgb(255, 120, 200)]),
@@ -684,7 +947,7 @@ fn draw_plan(rec: &RecordingStream, msg: &Value) {
 }
 
 /// Where the robot has been, from a `nav_msgs/msg/Path`.
-fn draw_trail(rec: &RecordingStream, msg: &Value) {
+fn draw_trail(rec: &RecordingStream, path: &str, msg: &Value) {
     let points: Vec<[f32; 3]> = msg["poses"]
         .as_array()
         .map_or(&[][..], Vec::as_slice)
@@ -696,7 +959,7 @@ fn draw_trail(rec: &RecordingStream, msg: &Value) {
         .collect();
     put_static(
         rec,
-        "world/trail",
+        path,
         &rerun::LineStrips3D::new([points])
             .with_radii([0.015])
             .with_colors([rerun::Color::from_rgb(90, 170, 255)]),
@@ -714,7 +977,7 @@ fn object_colour(label: &str, alpha: u8) -> rerun::Color {
 
 /// Objects from a `canopy_msgs/msg/WorldObjectArray`, one entity each so a click in the viewer
 /// names the object; stale ones are faded, and ones that went away are cleared.
-fn draw_objects(rec: &RecordingStream, msg: &Value, drawn: &mut BTreeSet<String>) {
+fn draw_objects(rec: &RecordingStream, path: &str, msg: &Value, drawn: &mut BTreeSet<String>) {
     let list = msg["objects"].as_array().map_or(&[][..], Vec::as_slice);
     let mut now = BTreeSet::new();
     for o in list.iter().filter(|o| o["state"].as_u64() != Some(REMOVED)) {
@@ -735,7 +998,7 @@ fn draw_objects(rec: &RecordingStream, msg: &Value, drawn: &mut BTreeSet<String>
         };
         put_static(
             rec,
-            &format!("world/objects/{id}"),
+            &format!("{path}/{id}"),
             &rerun::Boxes3D::from_centers_and_half_sizes(
                 [xyz(&o["pose"]["position"])],
                 [xyz(&o["size"]).map(|v| v / 2.0)],
@@ -752,7 +1015,7 @@ fn draw_objects(rec: &RecordingStream, msg: &Value, drawn: &mut BTreeSet<String>
         now.insert(id.to_owned());
     }
     for gone in drawn.difference(&now) {
-        put_static(rec, &format!("world/objects/{gone}"), &rerun::Clear::flat());
+        put_static(rec, &format!("{path}/{gone}"), &rerun::Clear::flat());
     }
     #[expect(clippy::cast_precision_loss, reason = "far fewer objects than 2^52")]
     put(

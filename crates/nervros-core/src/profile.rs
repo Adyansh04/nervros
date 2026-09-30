@@ -314,7 +314,36 @@ pub struct VizConfig {
     /// The robot's URDF, relative to the profile: the viewer draws the robot with it, posed by TF.
     /// `package://` meshes are found through `ROS_PACKAGE_PATH` or `AMENT_PREFIX_PATH`.
     pub urdf: Option<PathBuf>,
+    /// More topics the viewer draws, as RViz would.
+    #[serde(rename = "layer", default)]
+    pub layers: Vec<LayerConfig>,
 }
+
+/// A topic the viewer draws in the world as RViz would.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LayerConfig {
+    /// What the app's Layers list calls it.
+    pub name: String,
+    /// The topic.
+    pub topic: String,
+    /// One of [`LAYER_TYPES`].
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// For a marker array, the namespaces to draw; all when empty.
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    /// Starts hidden.
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// The message types a `[[viz.layer]]` can draw.
+pub const LAYER_TYPES: [&str; 3] = [
+    "nav_msgs/msg/OccupancyGrid",
+    "visualization_msgs/msg/MarkerArray",
+    "sensor_msgs/msg/LaserScan",
+];
 
 /// A named place.
 #[derive(Debug, Clone, Deserialize)]
@@ -429,6 +458,16 @@ impl Profile {
                 });
             }
         }
+        for layer in self.viz.iter().flat_map(|v| &v.layers) {
+            if !LAYER_TYPES.contains(&layer.msg_type.as_str()) {
+                return Err(ProfileError::Invalid(format!(
+                    "[[viz.layer]] `{}`: the viewer draws {}, not {}",
+                    layer.name,
+                    LAYER_TYPES.join(", "),
+                    layer.msg_type
+                )));
+            }
+        }
         if let Some(look) = &self.look
             && look.cameras.contains_key(&look.name)
         {
@@ -526,7 +565,7 @@ mod tests {
         detections = { topic = \"/d\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n";
 
     #[test]
-    fn cameras_are_listed_own_first_and_segment_needs_them() {
+    fn cameras_segment_and_layers_are_checked() {
         let text = format!("{BASE}{LOOK}[look.cameras.head]\nimage = \"/head\"\n");
         let profile: Profile = toml::from_str(&text).unwrap();
         let names: Vec<String> = profile
@@ -558,6 +597,15 @@ mod tests {
         );
         let fine = format!("{BASE}{LOOK}[segment]\nservice = \"/segmenter/segment\"\n");
         assert!(check(&fine).is_ok());
+        let odd = format!(
+            "{BASE}[[viz.layer]]\nname = \"Cloud\"\ntopic = \"/c\"\ntype = \"sensor_msgs/msg/PointCloud2\"\n"
+        );
+        assert!(
+            check(&odd)
+                .unwrap_err()
+                .to_string()
+                .contains("the viewer draws")
+        );
     }
 
     #[test]

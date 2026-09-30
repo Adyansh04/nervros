@@ -57,11 +57,12 @@ segments whatever you name in a camera's view, "the floor" or "every mug", and s
 regions.
 
 In the window, Enter sends, Esc stops the reply and Ctrl+Shift+S stops the mission. Ctrl+1 to
-Ctrl+6 switch the dock between the mission, the world model, approvals, events, models and the
-connection check. Closing the window while a mission runs asks first whether to stop the robot,
+Ctrl+7 switch the dock between the mission, the world model, the viewer's layers, approvals, events,
+models and the connection check. Closing the window while a mission runs asks first whether to stop the robot,
 and a new session tells you when the robot is already running one.
-The embedded viewer is [Rerun](https://rerun.io), which keeps the camera, map, rooms, objects and
-mission steps on a timeline. Clicking an object, a room or a point on the map offers messages about
+The embedded viewer is [Rerun](https://rerun.io), which keeps the cameras, map, rooms, objects and
+mission steps on a timeline. [`[[viz.layer]]`](docs/profile.md#viz) adds what RViz would draw:
+occupancy grids, marker arrays and laser scans, each with a switch in the Layers tab. Clicking an object, a room or a point on the map offers messages about
 it, such as "Walk to O17 (shelf).", filled into the composer for you to read and send.
 
 ## Documentation

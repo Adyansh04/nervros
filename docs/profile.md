@@ -201,7 +201,28 @@ frustum placed by TF from `[ros] base_frame` to the image's frame; without it, t
 on its own. With `urdf`, the robot is drawn as its model, posed by TF: the model's root from
 `[ros] base_frame`, and each joint that is not fixed from its parent link to its child link.
 `package://` meshes are found through `ROS_PACKAGE_PATH` or `AMENT_PREFIX_PATH`. The robot's
-heading arrow is drawn either way.
+heading arrow is drawn either way. Every camera in `[look]` gets its own view, with the detector's
+boxes on its frames.
+
+`[[viz.layer]]` adds a topic the viewer draws in the world as RViz would:
+
+```toml
+[[viz.layer]]
+name = "Next viewpoint"                   # its switch in the app's Layers tab
+topic = "/canopy/markers"
+type = "visualization_msgs/msg/MarkerArray"
+namespaces = ["viewpoint", "visited"]     # a marker array's namespaces to draw; all when left out
+hidden = false                            # starts hidden
+```
+
+| Type | Drawn as |
+|---|---|
+| `nav_msgs/msg/OccupancyGrid` | Its occupied cells, over the map in the layer's colour. |
+| `visualization_msgs/msg/MarkerArray` | Each marker by its type: arrows, cubes, spheres, cylinders, lines, point lists, triangle lists and text. Mesh markers are left out. |
+| `sensor_msgs/msg/LaserScan` | Points in the map, by TF from the scan's frame. |
+
+The Layers tab also switches the viewer's own drawings: the map, coverage, rooms, objects, trail,
+plan, the robot model and the detector's boxes.
 
 ### `[mission]`
 
