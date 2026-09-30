@@ -57,7 +57,8 @@ segments whatever you name in a camera's view, "the floor" or "every mug", and s
 regions. With [`[editor]`](docs/profile.md#editor) it reviews and fixes the saved world model when
 you ask ("the chair by the window is a stool", "merge the two halves of the sofa"), and Edit world
 opens the same world on its floor plan to fix by hand. It also runs the checks you would: "check
-the robot's health", "tell me if the chest camera drops below 5 Hz".
+the robot's health", "tell me if the chest camera drops below 5 Hz", "remember this spot as the
+reading corner".
 
 In the window, Enter sends, Esc stops the reply and Ctrl+Shift+S stops the mission. Ctrl+1 to
 Ctrl+7 switch the dock between the mission, the world model, the viewer's layers, approvals, events,

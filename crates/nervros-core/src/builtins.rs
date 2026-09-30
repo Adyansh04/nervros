@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::guard::Guard;
 use crate::mission::held_by;
-use crate::profile::{MissionConfig, PlaceConfig, Profile, TopicRef};
+use crate::profile::{MissionConfig, Profile, TopicRef};
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
 const WORLD_WAIT: Duration = Duration::from_secs(2);
@@ -97,15 +97,19 @@ pub fn inside(point: (f64, f64), polygon: &[(f64, f64)]) -> bool {
 /// `list_places`: named places and the world model's rooms.
 pub struct ListPlaces {
     spec: ToolSpec,
-    places: Vec<PlaceConfig>,
+    places: Arc<crate::places::Places>,
     rooms: Option<TopicRef>,
     robot: Arc<dyn RobotPort>,
 }
 
 impl ListPlaces {
-    /// From the profile.
+    /// The profile's places and the remembered ones.
     #[must_use]
-    pub fn new(profile: &Profile, robot: Arc<dyn RobotPort>) -> Self {
+    pub fn new(
+        profile: &Profile,
+        places: Arc<crate::places::Places>,
+        robot: Arc<dyn RobotPort>,
+    ) -> Self {
         let spec = ToolSpec::new(
             "list_places",
             "Lists the places the robot can go to: named places with their aliases, and the rooms the \
@@ -118,7 +122,7 @@ impl ListPlaces {
         let rooms = profile.world.as_ref().and_then(|w| w.rooms.clone());
         Self {
             spec,
-            places: profile.places.clone(),
+            places,
             rooms,
             robot,
         }
@@ -134,8 +138,16 @@ impl Tool for ListPlaces {
     async fn call(&self, _args: Value) -> ToolOutcome {
         let places: Vec<Value> = self
             .places
+            .all()
             .iter()
-            .map(|p| json!({"id": p.name, "aliases": p.aliases, "kind": "place"}))
+            .map(|p| {
+                let kind = if self.places.is_tagged(&p.name) {
+                    "remembered place"
+                } else {
+                    "place"
+                };
+                json!({"id": p.name, "aliases": p.aliases, "kind": kind})
+            })
             .collect();
         let rooms: Vec<Value> = rooms(self.robot.as_ref(), self.rooms.as_ref())
             .await
@@ -344,7 +356,13 @@ mod tests {
     async fn places_and_rooms_are_listed() {
         let robot: Arc<dyn RobotPort> =
             Arc::new(FakeRobot::new().with_topic("/rooms", rooms_msg()));
-        let out = ListPlaces::new(&profile(), robot).call(json!({})).await;
+        let out = ListPlaces::new(
+            &profile(),
+            crate::places::Places::new(&profile(), None),
+            robot,
+        )
+        .call(json!({}))
+        .await;
         assert_eq!(out.data["places"][0]["id"], "zone_a");
         assert_eq!(out.data["rooms"][0]["name"], "kitchen");
         assert!(
@@ -360,7 +378,13 @@ mod tests {
         msg["rooms"][0]["face_coverage"] = json!(0.31);
         msg["rooms"][0]["object_count"] = json!(5);
         let robot: Arc<dyn RobotPort> = Arc::new(FakeRobot::new().with_topic("/rooms", msg));
-        let out = ListPlaces::new(&profile(), robot).call(json!({})).await;
+        let out = ListPlaces::new(
+            &profile(),
+            crate::places::Places::new(&profile(), None),
+            robot,
+        )
+        .call(json!({}))
+        .await;
         let room = &out.data["rooms"][0];
         assert_eq!(room["floor_seen"], 0.72);
         assert_eq!(room["walls_seen"], 0.31);

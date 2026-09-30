@@ -13,6 +13,7 @@ pub mod llm;
 pub mod log;
 pub mod look;
 pub mod mission;
+pub mod places;
 pub mod profile;
 pub mod providers;
 pub mod ros_tools;
