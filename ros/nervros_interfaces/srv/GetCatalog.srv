@@ -3,7 +3,8 @@
 # JSON: skills with their args (type, enum, unit, default), requires, effects, resources,
 # idempotent, risk, max_duration_s, and a template for the approval text.
 string catalog_json
-# BehaviorTree.CPP's TreeNodesModel XML for every node a mission may use.
+# BehaviorTree.CPP's TreeNodesModel XML: the leaves' models, then a SubTree entry for each skill's
+# macro. A mission may use only those SubTrees and the plain control nodes, never a leaf.
 string tree_nodes_model_xml
 string bt_cpp_version
 # Changes whenever the catalog or the node model changes.

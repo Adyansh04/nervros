@@ -23,7 +23,9 @@ uint8 OUTCOME_TIMEOUT=3
 uint8 OUTCOME_REJECTED=4
 uint8 OUTCOME_ERROR=5
 uint8 outcome
-# Path of the first node that failed, empty on success.
+# Path of the leaf that failed last before the tree failed, or of the Timeout that ran out.
+# After a cancel, a stop, the watchdog or a shutdown: the name of the step that was running.
+# Empty on success.
 string failed_node
 # The step id the failed node belongs to, such as "s2", taken from its "s<N>_" name prefix.
 string failed_step_id
