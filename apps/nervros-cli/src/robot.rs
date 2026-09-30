@@ -38,6 +38,47 @@ pub(crate) async fn look(profile_path: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Runs one read-only ROS tool once and prints what it returns.
+pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<()> {
+    use nervros_core::guard::Guard;
+    use nervros_core::schemas::RosidlSchemas;
+    use nervros_core::tools::{Risk, SchemaSource};
+
+    let args: serde_json::Value =
+        serde_json::from_str(args).context("the arguments are not JSON")?;
+    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let robot = nervros_core::app::connect(&profile)?;
+    let schemas: Arc<dyn SchemaSource> =
+        Arc::new(RosidlSchemas::load(&profile).context("loading the interfaces")?);
+    let guard = Arc::new(Guard::new(profile.policy.clone()));
+    let config = profile.ros_tools.clone().unwrap_or_default();
+    let tools = nervros_core::ros_tools::tools(&config, &robot, &schemas, &guard);
+    let names: Vec<String> = tools.iter().map(|t| t.spec().name.clone()).collect();
+    let tool = tools
+        .iter()
+        .find(|t| t.spec().name == name)
+        .with_context(|| format!("no ROS tool `{name}`; there are {}", names.join(", ")))?;
+    // Discovery needs a moment after the node starts.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let risk = match tool.assess(&args).await {
+        Some(Ok(a)) => a.risk,
+        Some(Err(out)) => bail!("{name}: {}", out.message),
+        None => tool.spec().risk,
+    };
+    if risk != Risk::Observe {
+        bail!("`{name}` would act on the robot; ask for it in `chat`, where it is approved");
+    }
+    let outcome = tool.call(args).await;
+    if !outcome.message.is_empty() {
+        eprintln!("{}", outcome.message);
+    }
+    println!("{}", serde_json::to_string_pretty(&outcome.data)?);
+    if outcome.status != Status::Succeeded {
+        bail!("{name} did not succeed");
+    }
+    Ok(())
+}
+
 use nervros_core::session::{Command as SessionCommand, Event};
 use tokio::io::AsyncBufReadExt as _;
 
