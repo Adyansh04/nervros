@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use nervros_core::llm::{Ask, ImageFormat, ImageInput, Llm};
+use nervros_core::profile::Profile;
 use nervros_core::providers::router::{PrivacyMode, Router};
 use nervros_core::providers::{ModelsConfig, Role, free_only, openrouter};
 
@@ -15,10 +16,7 @@ mod robot;
 #[derive(Parser)]
 #[command(version, about = "Headless NervROS")]
 struct Cli {
-    /// The models file.
-    #[arg(long, global = true, default_value = "profiles/example/models.toml")]
-    models: PathBuf,
-    /// The robot profile.
+    /// The robot profile, which also names the models file.
     #[arg(long, global = true, default_value = "profiles/example/nervros.toml")]
     profile: PathBuf,
     #[command(subcommand)]
@@ -90,6 +88,12 @@ impl From<RoleArg> for Role {
     }
 }
 
+/// The models file the profile names, the one the app and `chat` use too.
+fn models_file(profile: &Path) -> Result<PathBuf> {
+    let profile = Profile::load(profile).context("loading the profile")?;
+    Ok(profile.resolve(&profile.models.file))
+}
+
 fn router(models: &Path) -> Result<Router> {
     let config = ModelsConfig::load(models).context("loading the models file")?;
     let ledger = nervros_core::app::state_dir().join("quota.json");
@@ -104,12 +108,12 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.command {
-        Command::Models { check } => models(&cli.models, check).await,
+        Command::Models { check } => models(&models_file(&cli.profile)?, check).await,
         Command::Ask {
             prompt,
             role,
             image,
-        } => ask(&cli.models, &prompt, role.into(), image).await,
+        } => ask(&models_file(&cli.profile)?, &prompt, role.into(), image).await,
         #[cfg(feature = "ros")]
         Command::Look { out } => robot::look(&cli.profile, &out).await,
         #[cfg(feature = "ros")]
