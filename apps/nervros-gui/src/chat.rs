@@ -550,11 +550,15 @@ fn approval_card(
             ui.label(RichText::new(title).strong());
         });
         if let Some(p) = plan {
-            steps_table(ui, p, "approval");
+            // The plan's card above lists the steps and follows them; this only asks.
             let short = p.hash.get(..8).unwrap_or(&p.hash);
+            let steps = match p.steps.len() {
+                1 => "1 step".to_owned(),
+                n => format!("{n} steps"),
+            };
             ui.label(
                 RichText::new(format!(
-                    "plan {short} · at most {}",
+                    "plan {short} · {steps} · at most {}",
                     minutes(p.worst_case_s)
                 ))
                 .small()
@@ -588,10 +592,10 @@ fn approval_card(
     });
 }
 
-/// The plan's steps with each one's state; `salt` tells apart two tables of one plan.
-fn steps_table(ui: &mut egui::Ui, p: &PlanCard, salt: &str) {
+/// The plan's steps with each one's state.
+fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
     let t = ui.tokens();
-    egui::Grid::new(("plan_steps", &p.hash, salt))
+    egui::Grid::new(("plan_steps", &p.hash))
         .num_columns(3)
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
@@ -645,7 +649,7 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
             ui.small_icon(&icons::PLAN_PENDING, Some(t.text_subdued));
             ui.label(RichText::new(format!("Plan · {}", p.intent)).strong());
         });
-        steps_table(ui, p, "plan");
+        steps_table(ui, p);
         ui.horizontal(|ui| {
             let state = match (&p.finished, p.started) {
                 (Some((outcome, .., secs)), _) if outcome == "success" => {
