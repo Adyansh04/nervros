@@ -101,6 +101,67 @@ impl Tab {
     ];
 }
 
+/// Where closing the window stands while a mission runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closing {
+    Open,
+    /// Asking the operator what to do with the running mission.
+    Asking,
+    /// Stop sent; the window closes once the robot says it stopped, or after a few seconds.
+    Stopping(std::time::Instant),
+    Allowed,
+}
+
+/// The operator's answer when they close the window with a mission running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseChoice {
+    StopAndClose,
+    LeaveRunning,
+    Cancel,
+}
+
+/// What a request to close the window does: whether it is cancelled, and the state after it.
+fn on_close(closing: Closing, mission_running: bool) -> (bool, Closing) {
+    match closing {
+        Closing::Open if mission_running => (true, Closing::Asking),
+        Closing::Open | Closing::Allowed => (false, closing),
+        Closing::Asking | Closing::Stopping(_) => (true, closing),
+    }
+}
+
+/// How long closing waits for the robot to say it stopped.
+const STOP_BEFORE_CLOSE: Duration = Duration::from_secs(5);
+
+/// The question asked when the window is closed with a mission running.
+fn close_dialog(ctx: &egui::Context) -> Option<CloseChoice> {
+    let mut choice = None;
+    let modal = egui::Modal::new(egui::Id::new("nervros_close")).show(ctx, |ui| {
+        ui.set_max_width(380.0);
+        ui.label(RichText::new("A mission is running").strong());
+        ui.add_space(6.0);
+        ui.label(
+            "Closing leaves it running with nobody watching. Stop the robot first, or leave it \
+             to finish.",
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.button("Stop it and close").clicked() {
+                choice = Some(CloseChoice::StopAndClose);
+            }
+            if ui.button("Leave it running").clicked() {
+                choice = Some(CloseChoice::LeaveRunning);
+            }
+            if ui.button("Cancel").clicked() {
+                choice = Some(CloseChoice::Cancel);
+            }
+        });
+    });
+    if modal.should_close() && choice.is_none() {
+        choice = Some(CloseChoice::Cancel);
+    }
+    choice
+}
+
 /// The app.
 pub struct Gui {
     viewer: re_viewer::App,
@@ -118,6 +179,7 @@ pub struct Gui {
     recheck: tokio::sync::mpsc::UnboundedSender<()>,
     /// Set by the viewer on the UI thread when the selection changes.
     picked: Rc<RefCell<Option<Picked>>>,
+    closing: Closing,
 }
 
 impl Gui {
@@ -191,7 +253,49 @@ impl Gui {
             dock_open: true,
             recheck,
             picked,
+            closing: Closing::Open,
         })
+    }
+
+    /// Whether the executor says a mission runs.
+    fn mission_running(&self) -> bool {
+        self.live()
+            .executor
+            .as_ref()
+            .and_then(|s| s["mission_id"].as_str())
+            .is_some_and(|id| !id.is_empty())
+    }
+
+    /// Closing the window with a mission running asks first: the mission would go on unwatched.
+    fn guard_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            let cancel;
+            (cancel, self.closing) = on_close(self.closing, self.mission_running());
+            if cancel {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+        }
+        match self.closing {
+            Closing::Asking => match close_dialog(ctx) {
+                Some(CloseChoice::StopAndClose) => {
+                    self.agent.session.send(Command::StopMission);
+                    self.closing = Closing::Stopping(std::time::Instant::now());
+                }
+                Some(CloseChoice::LeaveRunning) => {
+                    self.closing = Closing::Allowed;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Some(CloseChoice::Cancel) => self.closing = Closing::Open,
+                None => {}
+            },
+            Closing::Stopping(since) if since.elapsed() >= STOP_BEFORE_CLOSE => {
+                self.closing = Closing::Allowed;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Closing::Stopping(_) => ctx.request_repaint_after(Duration::from_millis(200)),
+            Closing::Allowed => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Closing::Open => {}
+        }
     }
 
     fn live(&self) -> std::sync::MutexGuard<'_, Live> {
@@ -203,6 +307,11 @@ impl Gui {
             match self.events.try_recv() {
                 Ok(e) => {
                     self.chat.apply(&e);
+                    if let (Closing::Stopping(_), Event::Notice { text }) = (self.closing, &e)
+                        && (text.starts_with("robot stopped") || text.starts_with("stop failed"))
+                    {
+                        self.closing = Closing::Allowed;
+                    }
                     if self.event_log.len() == EVENT_LOG {
                         self.event_log.pop_back();
                     }
@@ -855,6 +964,7 @@ impl eframe::App for Gui {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.drain_events();
         self.keys(ui.ctx());
+        self.guard_close(ui.ctx());
         let t = ui.tokens();
         egui::Panel::top("nervros_top")
             .frame(
@@ -1119,6 +1229,16 @@ mod tests {
         harness.run();
         harness.fit_contents();
         crate::chat::compare(&mut harness, "world", &SnapshotOptions::new());
+    }
+
+    #[test]
+    fn closing_with_a_mission_running_asks_first() {
+        assert_eq!(on_close(Closing::Open, false), (false, Closing::Open));
+        assert_eq!(on_close(Closing::Open, true), (true, Closing::Asking));
+        assert_eq!(on_close(Closing::Asking, true), (true, Closing::Asking));
+        let stopping = Closing::Stopping(std::time::Instant::now());
+        assert_eq!(on_close(stopping, true), (true, stopping));
+        assert_eq!(on_close(Closing::Allowed, true), (false, Closing::Allowed));
     }
 
     #[test]
