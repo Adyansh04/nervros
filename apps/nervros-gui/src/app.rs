@@ -21,6 +21,9 @@ use rerun::external::egui::{
 use rerun::external::re_log_channel::LogReceiver;
 use rerun::external::re_sdk_types::blueprint::components::PanelState;
 use rerun::external::re_ui::{ReButton, UiExt as _};
+use rerun::external::re_viewer::external::re_viewer_context::{
+    SystemCommand, SystemCommandSender as _,
+};
 use rerun::external::{eframe, re_memory, re_viewer};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -201,6 +204,8 @@ impl Gui {
         let mut startup = re_viewer::StartupOptions {
             hide_welcome_screen: true,
             expect_data_soon: Some(true),
+            // Tests must neither load nor overwrite the layout a user saved.
+            persist_state: !cfg!(test),
             ..re_viewer::StartupOptions::default()
         };
         // A click on an object or a room offers what the agent can do with it.
@@ -218,7 +223,8 @@ impl Gui {
                 });
             }
         }));
-        // Our own top bar replaces the viewer's; its side panels start collapsed.
+        // Our own top bar replaces the viewer's, and its side panels stay shut: the app is the
+        // interface, and Reset layout brings back any view closed by mistake.
         let panels = &mut startup.panel_state_overrides;
         panels.top = Some(PanelState::Hidden);
         panels.blueprint = Some(PanelState::Collapsed);
@@ -227,7 +233,11 @@ impl Gui {
         let mut viewer = re_viewer::App::new(
             main_thread,
             re_viewer::build_info(),
-            re_viewer::AppEnvironment::Custom("NervROS".to_owned()),
+            if cfg!(test) {
+                re_viewer::AppEnvironment::Test
+            } else {
+                re_viewer::AppEnvironment::Custom("NervROS".to_owned())
+            },
             startup,
             cc,
             None,
@@ -389,6 +399,18 @@ impl Gui {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let t = ui.tokens();
+        // With the viewer drawing the window's decorations, its hidden top bar took the window
+        // buttons and the drag handle with it; ours has them instead.
+        let window_chrome = self.viewer.app_options().custom_window_decorations;
+        if window_chrome {
+            let bar = ui.interact(ui.max_rect(), ui.id().with("drag"), egui::Sense::click());
+            if bar.double_clicked() {
+                let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+                ui.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            } else if bar.is_pointer_button_down_on() {
+                ui.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+        }
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.label(RichText::new("NervROS").strong().size(15.0));
@@ -413,6 +435,10 @@ impl Gui {
             let (model, quota) = self.model_status();
             chip(ui, t.info_text_color, format!("{model} · {quota}"));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if window_chrome {
+                    ui.native_window_buttons_ui();
+                    ui.add_space(4.0);
+                }
                 let stop = egui::Button::new(
                     RichText::new(self.stop_label())
                         .strong()
@@ -430,6 +456,16 @@ impl Gui {
                     .selected(self.dock_open);
                 if ui.add(toggle).clicked() {
                     self.dock_open = !self.dock_open;
+                }
+                let reset = ReButton::new("Reset layout").small().secondary();
+                if ui
+                    .add(reset)
+                    .on_hover_text("Put the viewer's panes back the way NervROS lays them out")
+                    .clicked()
+                {
+                    self.viewer
+                        .command_sender
+                        .send_system(SystemCommand::ClearActiveBlueprint);
                 }
                 let mut armed = self.agent.guard.armed();
                 let label = if armed { "Armed" } else { "Observe only" };
