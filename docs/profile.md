@@ -268,7 +268,12 @@ place cannot take a name the profile already uses.
 name = "dock"
 aliases = ["the charging dock"]
 pose = { x = 0.0, y = 0.0, yaw = 0.0 }   # in frame, default "map"
+near = ["charger_1"]                     # reached from here; see below
 ```
+
+`near` lists what the robot reaches from the place that the world model may not know, such as a
+detector's name for an object. A plan step that needs the robot near one of them walks to the
+place first, as it walks to any object the world model knows.
 
 ### `[models]`
 

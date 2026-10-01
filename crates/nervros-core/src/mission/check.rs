@@ -170,6 +170,7 @@ mod tests {
         Observed {
             pose: Some((1.0, 1.0)),
             places: vec![PlaceConfig {
+                near: Vec::new(),
                 name: "dock".to_owned(),
                 aliases: vec![],
                 frame: "map".to_owned(),

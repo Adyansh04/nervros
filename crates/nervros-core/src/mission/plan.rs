@@ -143,6 +143,14 @@ impl Sim {
         if self.at.as_deref() == Some(target) {
             return true;
         }
+        if let Some(at) = &self.at
+            && world
+                .places
+                .iter()
+                .any(|p| p.name == *at && p.near.iter().any(|n| n == target))
+        {
+            return true;
+        }
         let thing = world.objects.iter().find(|o| o.id == target);
         match (self.xy, thing.and_then(|t| t.xy)) {
             (Some((x, y)), Some((tx, ty))) => (tx - x).hypot(ty - y) <= NEAR_M,
@@ -323,11 +331,25 @@ impl Sim {
                 .value
                 .trim()
                 .to_owned();
-            (world.knows(&target) && !self.near(&target, world)).then(|| Step {
+            if self.near(&target, world) {
+                return None;
+            }
+            // A thing only the detector knows is reached from the place the profile says.
+            let place = if world.knows(&target) {
+                target
+            } else {
+                world
+                    .places
+                    .iter()
+                    .find(|p| p.near.contains(&target))?
+                    .name
+                    .clone()
+            };
+            Some(Step {
                 skill: GO_TO_PLACE.to_owned(),
                 args: vec![StepArg {
                     name: "place".to_owned(),
-                    value: target,
+                    value: place,
                 }],
                 retries: 0,
                 timeout_s: None,
@@ -803,6 +825,7 @@ mod tests {
     fn world() -> World {
         World {
             places: vec![PlaceConfig {
+                near: Vec::new(),
                 name: "dock".to_owned(),
                 aliases: vec!["charging dock".to_owned()],
                 frame: "map".to_owned(),
@@ -850,6 +873,39 @@ mod tests {
                 .contains("could be 2 objects (O31, O32)"),
             "{problems:?}"
         );
+    }
+
+    #[test]
+    fn a_thing_only_the_detector_knows_is_walked_to_from_its_place() {
+        let mut w = world();
+        for (name, thing, x) in [("table_side", "cup_9", 2.0), ("shelf", "bin_2", 4.0)] {
+            w.places.push(PlaceConfig {
+                near: vec![thing.to_owned()],
+                name: name.to_owned(),
+                aliases: Vec::new(),
+                frame: "map".to_owned(),
+                pose: PlacePose {
+                    x,
+                    y: 0.0,
+                    yaw: 0.0,
+                },
+            });
+        }
+        let p = plan(&json!([
+            {"skill": "PickObject", "args": {"object_id": "cup_9", "phrase": "cup", "arm": "right"}},
+            {"skill": "PlaceInto", "args": {"container_id": "bin_2", "phrase": "bin", "arm": "right"}}
+        ]));
+        let c = compile(&p, &catalog(), &w).unwrap();
+        let summaries: Vec<&str> = c.steps.iter().map(|s| s.summary.as_str()).collect();
+        assert_eq!(
+            summaries[0], "GoToPlace(place=table_side) (added)",
+            "{summaries:?}"
+        );
+        assert_eq!(
+            summaries[2], "GoToPlace(place=shelf) (added)",
+            "{summaries:?}"
+        );
+        assert_eq!(c.goal, ["inside(cup_9, bin_2)"]);
     }
 
     #[test]
