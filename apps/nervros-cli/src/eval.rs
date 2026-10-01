@@ -66,6 +66,8 @@ struct Expect {
     moved_m: Option<[f64; 2]>,
     /// How far it turned, degrees, `[min, max]`.
     turned_deg: Option<[f64; 2]>,
+    /// Whether the conversation had to be condensed.
+    compacted: Option<bool>,
 }
 
 /// Words a reply should not use to ask for what the approval card asks.
@@ -87,6 +89,7 @@ struct Seen {
     replies: Vec<String>,
     errors: Vec<String>,
     notices: Vec<String>,
+    compactions: usize,
     moved_m: Option<f64>,
     turned_deg: Option<f64>,
     seconds: f64,
@@ -189,6 +192,9 @@ async fn run_case(
             .context("opening the case log")?;
     let mut events = agent.session.subscribe();
     agent.session.send(Command::Arm);
+    // A fresh agent fetches the robot's skill catalog first; asked at once, the model would see
+    // no skills, as no operator types that fast in the window.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let mut seen = Seen::default();
     let deadline = Instant::now() + Duration::from_secs(case.max_s);
     for text in &case.setup {
@@ -254,6 +260,7 @@ async fn say(
             Event::Reply { text, .. } => seen.replies.push(text),
             Event::Error { text, .. } => seen.errors.push(text),
             Event::Notice { text } => seen.notices.push(text),
+            Event::Compacted { .. } => seen.compactions += 1,
             Event::User { turn, text: sent } if sent == text => mine = Some(turn),
             Event::TurnFinished { turn }
                 if mine.is_some_and(|m| turn >= m) && open == 0 && !awaiting_report =>
@@ -343,6 +350,11 @@ fn judge(expect: &Expect, seen: &Seen) -> Vec<String> {
         };
     if let Some(range) = expect.moved_m {
         within(seen.moved_m, range, "moved m", &mut problems);
+    }
+    if let Some(want) = expect.compacted
+        && want != (seen.compactions > 0)
+    {
+        problems.push(format!("compacted {} times", seen.compactions));
     }
     if let Some(range) = expect.turned_deg {
         within(seen.turned_deg, range, "turned deg", &mut problems);
