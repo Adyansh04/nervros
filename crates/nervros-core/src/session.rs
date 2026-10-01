@@ -387,7 +387,7 @@ impl Shared {
             call,
             tool: spec.name.clone(),
             status,
-            message: outcome.message.clone(),
+            message: crate::tools::clip(&outcome.message, 2000),
             ms,
         });
         outcome.for_model(self.config.result_chars)

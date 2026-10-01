@@ -185,10 +185,25 @@ impl ToolOutcome {
         let data = cap(&self.data, max_chars);
         let mut out = json!({ "status": status, "data": data });
         if !self.message.is_empty() {
-            out["message"] = Value::String(self.message.clone());
+            out["message"] = Value::String(clip(&self.message, MESSAGE_CHARS));
         }
         out
     }
+}
+
+/// A message longer than this is cut: one line for the model, not a payload. A value quoted
+/// whole into an error once filled a 16k context by itself.
+const MESSAGE_CHARS: usize = 600;
+
+/// `text`, cut to `max` characters with a note of how much was left out.
+#[must_use]
+pub fn clip(text: &str, max: usize) -> String {
+    let len = text.chars().count();
+    if len <= max {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(max).collect();
+    format!("{head}… ({} more characters)", len - max)
 }
 
 /// Replaces data that serialises longer than `max_chars` with a truncated string and a note.

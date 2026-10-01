@@ -97,6 +97,21 @@ pub fn field<'a>(msg: &'a Value, path: &str) -> Option<&'a Value> {
         })
 }
 
+/// What a value is, in a few words: a list is never quoted whole.
+fn kind(v: &Value, path: &str) -> String {
+    match v {
+        Value::Array(a) => format!("a list of {} values; plot one, such as {path}.0", a.len()),
+        Value::Object(o) => {
+            let fields: Vec<&str> = o.keys().map(String::as_str).take(8).collect();
+            format!(
+                "a message with {}; plot one of its fields",
+                fields.join(", ")
+            )
+        }
+        other => crate::tools::clip(&other.to_string(), 80),
+    }
+}
+
 /// Whether `found op wanted` holds: numbers as numbers, anything else by equality.
 fn compare(found: &Value, op: &str, wanted: &Value) -> bool {
     if let (Some(a), Some(b)) = (found.as_f64(), wanted.as_f64()) {
@@ -315,9 +330,9 @@ impl Watches {
             .await
             .map_err(|e| format!("nothing arrived on {topic} to plot ({e})"))?;
         let now = match field(&msg, &path) {
-            Some(v) => v
-                .as_f64()
-                .ok_or_else(|| format!("`{path}` in {topic} is {v}, not a number"))?,
+            Some(v) => v.as_f64().ok_or_else(|| {
+                format!("`{path}` in {topic} is {}, not a number", kind(v, &path))
+            })?,
             None => {
                 return Err(format!(
                     "{topic} has no `{path}`; topic_sample shows its fields"
@@ -574,7 +589,8 @@ mod tests {
     async fn a_plot_needs_a_number_and_asks_the_viewer_for_it() {
         let robot: Arc<dyn RobotPort> = Arc::new(FakeRobot::new().with_topic(
             "/odom",
-            json!({"twist": {"twist": {"linear": {"x": 0.4}}}, "child_frame_id": "pelvis"}),
+            json!({"twist": {"twist": {"linear": {"x": 0.4}}}, "child_frame_id": "pelvis",
+                   "data": vec![0; 40_000]}),
         ));
         let watches = Watches::new(robot);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -592,6 +608,15 @@ mod tests {
             .plot(&json!({"topic": "/odom", "field": "child_frame_id"}))
             .await;
         assert!(text.unwrap_err().contains("not a number"));
+        // A grid's cells are named, not quoted: 40 000 of them once filled the model's context.
+        let grid = watches
+            .plot(&json!({"topic": "/odom", "field": "data"}))
+            .await
+            .unwrap_err();
+        assert!(
+            grid.contains("a list of 40000 values") && grid.len() < 200,
+            "{grid}"
+        );
         let missing = watches
             .plot(&json!({"topic": "/odom", "field": "pose.x"}))
             .await;
