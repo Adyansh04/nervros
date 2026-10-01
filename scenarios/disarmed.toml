@@ -1,0 +1,15 @@
+# Disarmed, the robot does not move: the plan is refused before anyone is asked.
+say = ["Walk forward one metre."]
+armed = false
+
+[[model]]
+call = "run_mission"
+args = { intent = "walk forward 1 m", steps = [{ skill = "WalkStraight", args = [{ name = "direction", value = "forward" }, { name = "distance_m", value = "1" }] }] }
+
+[[model]]
+reply = "I cannot move while disarmed; arm me first."
+
+[expect]
+tool_said = ["the robot is disarmed"]
+mission = "none"
+approvals_max = 0

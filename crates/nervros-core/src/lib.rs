@@ -4,17 +4,21 @@
 //! a rig upgrade touches one module.
 
 pub mod app;
+pub mod argcheck;
 pub mod builtins;
 pub mod context;
 pub mod doctor;
 pub mod editor;
+pub mod evalcase;
 pub mod guard;
 pub mod llm;
 pub mod log;
 pub mod look;
+pub mod mcp;
 pub mod memory;
 pub mod mission;
 pub mod places;
+pub mod point;
 pub mod profile;
 pub mod providers;
 pub mod ros_tools;
@@ -23,5 +27,7 @@ pub mod schemas;
 pub mod secret;
 pub mod segment;
 pub mod session;
+pub mod skills;
+pub mod telemetry;
 pub mod tools;
 pub mod watch;

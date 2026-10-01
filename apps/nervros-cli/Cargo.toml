@@ -1,6 +1,6 @@
 [package]
 name = "nervros-cli"
-description = "Headless NervROS: chat, doctor, scenarios and replay."
+description = "Headless NervROS: chat, doctor, evals and replay."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,8 @@ workspace = true
 default = ["ros"]
 # Talk to a live ROS graph through r2r; needs a sourced ROS environment (scripts/ros-env.sh).
 ros = ["nervros-core/rcl"]
+# Spans to an OpenTelemetry collector when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+otlp = ["nervros-core/otlp"]
 
 [dependencies]
 anyhow.workspace = true
@@ -25,5 +27,6 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 reqwest.workspace = true
+sha2.workspace = true
+humantime.workspace = true
 tokio.workspace = true
-tracing-subscriber.workspace = true

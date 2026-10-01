@@ -7,22 +7,27 @@
 //! ends instead of repeating an action. Every tool call passes the guard.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 
-use crate::guard::{Decision, Guard};
+use crate::guard::{Decision, Guard, Refusal, RuleAction};
 use crate::llm::{self, AgentSource, History, LoopTool};
 use crate::mission::plan::PlannedStep;
+use crate::mission::sanity::Concern;
 use crate::providers::Role;
 use crate::providers::router::Need;
-use crate::tools::{Lane, Registry, Resource, Status, Tool, ToolOutcome};
+use crate::tools::{
+    Assessment, Lane, Registry, Resource, Risk, Status, Tool, ToolOutcome, ToolSpec,
+};
 
 /// What a UI or the CLI asks the session to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,8 +40,28 @@ pub enum Command {
     StopMission,
     /// Approve a pending request.
     Approve(u64),
+    /// Approve a pending request, and let its tool run without asking for the rest of the
+    /// session, unless it moves the robot or the profile's rules ask for it.
+    AllowForSession(u64),
     /// Refuse a pending request.
     Deny(u64),
+    /// Check changed arguments for a pending request, such as an edited plan; it then waits on
+    /// those, or keeps the old ones when they fail their checks.
+    Edit {
+        /// The request.
+        id: u64,
+        /// What to check instead.
+        args: Value,
+    },
+    /// Call a tool for the operator, such as a plan made by a click on the map: checked and
+    /// approved as a call of the model's is, outside any turn. The model hears of it only
+    /// through what the tool reports, such as a mission's end.
+    Run {
+        /// The tool.
+        tool: String,
+        /// Its arguments.
+        args: Value,
+    },
     /// Enable act-lane tools.
     Arm,
     /// Disable act-lane tools.
@@ -47,6 +72,12 @@ pub enum Command {
     /// Condense the conversation now, as it is condensed when it grows past half the model's
     /// window.
     Compact,
+    /// Condense the conversation up to one of the operator's messages: everything before their
+    /// last `keep` messages is summarised, and those stay as they are.
+    CompactUpTo {
+        /// The operator's newest messages to keep.
+        keep: usize,
+    },
     /// Carry on an earlier conversation instead of this one.
     Restore(History),
 }
@@ -59,6 +90,14 @@ pub enum Event {
     TurnStarted {
         /// Turn number.
         turn: u64,
+    },
+    /// A message the operator sent while a turn ran: the model reads it with its next tool
+    /// result, or in a turn of its own when the turn ends first.
+    Steer {
+        /// The running turn.
+        turn: u64,
+        /// The text.
+        text: String,
     },
     /// The operator's message that started a turn.
     User {
@@ -120,6 +159,9 @@ pub enum Event {
         width: u32,
         /// Height.
         height: u32,
+        /// What each numbered mark on it is, mark 1 first.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        marks: Vec<String>,
     },
     /// A number in a topic's messages to draw over time, in the viewer's Plots tab.
     Plot {
@@ -140,6 +182,21 @@ pub enum Event {
         turn: u64,
         /// The new text.
         text: String,
+    },
+    /// A model call ended: what it cost, for the log and the evals.
+    ModelCall {
+        /// Turn number.
+        turn: u64,
+        /// The model id from `models.toml`.
+        model: String,
+        /// Prompt tokens, as the provider counted them.
+        input_tokens: u64,
+        /// Of those, read from the provider's prompt cache.
+        cached_tokens: u64,
+        /// Reply tokens.
+        output_tokens: u64,
+        /// From the request to the whole reply.
+        ms: u64,
     },
     /// How full the model's context was on the turn's latest request.
     Context {
@@ -164,7 +221,7 @@ pub enum Event {
     },
     /// The operator must approve a call.
     ApprovalRequested {
-        /// Answer with `Approve(id)` or `Deny(id)`.
+        /// Answer with `Approve(id)`, `Deny(id)` or `Edit`.
         id: u64,
         /// The tool.
         tool: String,
@@ -172,6 +229,24 @@ pub enum Event {
         args: Value,
         /// Why approval is needed.
         reason: String,
+        /// Whether `AllowForSession` would spare asking again: never for what moves the robot.
+        can_allow: bool,
+    },
+    /// An edit to a pending approval passed its checks: it waits on these arguments now.
+    ApprovalEdited {
+        /// The request.
+        id: u64,
+        /// What it runs with if approved.
+        args: Value,
+        /// What it does now.
+        reason: String,
+    },
+    /// An edit to a pending approval failed its checks; it still waits on what it had.
+    EditRejected {
+        /// The request.
+        id: u64,
+        /// What is wrong with the edit.
+        message: String,
     },
     /// An approval was answered or expired.
     ApprovalResolved {
@@ -217,6 +292,16 @@ pub enum Event {
         steps: Vec<PlannedStep>,
         /// The longest it can take.
         worst_case_s: f64,
+        /// Ways it may not do what the operator asked.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        concerns: Vec<Concern>,
+    },
+    /// Where a checked plan would take the robot, for the viewer; follows its `MissionPlanned`.
+    MissionPreview {
+        /// The plan's hash.
+        hash: String,
+        /// Each step's predicted end and path.
+        steps: Vec<crate::mission::preview::PreviewStep>,
     },
     /// The executor started a mission.
     MissionStarted {
@@ -233,6 +318,9 @@ pub enum Event {
         step: String,
         /// The node inside the step, or empty for the step itself.
         node: String,
+        /// The node's path in the tree, `/` between the subtrees it is in.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        path: String,
         /// `running`, `success`, `failure` or `skipped`.
         status: String,
         /// Since the mission started.
@@ -274,6 +362,45 @@ pub struct SessionConfig {
     pub resume: Option<History>,
     /// Added to the system prompt on every turn, such as what the operator asked to remember.
     pub notes: Option<Arc<dyn crate::memory::Notes>>,
+    /// Called from the session's own loop, the one that serves Stop, every [`PULSE_PERIOD`]:
+    /// a heartbeat fed from it stops when that loop does.
+    pub pulse: Option<Arc<dyn Pulse>>,
+    /// Where requests waiting on the operator are kept while they wait, so that a session
+    /// that ends first leaves them for the next to ask again ([`take_unanswered`]).
+    pub pending_file: Option<std::path::PathBuf>,
+}
+
+/// A request the operator had not answered when its session ended.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Unanswered {
+    /// The tool.
+    pub tool: String,
+    /// Its arguments, as they would be sent anew.
+    pub args: Value,
+    /// Why it asked.
+    pub reason: String,
+}
+
+/// The requests an earlier session left unanswered in `file`; the file goes, so each is offered
+/// once.
+#[must_use]
+pub fn take_unanswered(file: &std::path::Path) -> Vec<Unanswered> {
+    let Ok(text) = std::fs::read(file) else {
+        return Vec::new();
+    };
+    if let Err(e) = std::fs::remove_file(file) {
+        tracing::warn!(error = %e, "the unanswered requests stay");
+    }
+    serde_json::from_slice(&text).unwrap_or_default()
+}
+
+/// How often the session's loop calls [`SessionConfig::pulse`].
+pub const PULSE_PERIOD: Duration = Duration::from_millis(200);
+
+/// Something the session's loop proves alive by calling it.
+pub trait Pulse: Send + Sync + std::fmt::Debug {
+    /// One beat.
+    fn pulse(&self);
 }
 
 impl Default for SessionConfig {
@@ -288,17 +415,60 @@ impl Default for SessionConfig {
             history_file: None,
             resume: None,
             notes: None,
+            pulse: None,
+            pending_file: None,
         }
     }
 }
 
+/// Who asked for a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caller {
+    /// The model, in a turn.
+    Model,
+    /// The operator, from the window.
+    Operator,
+}
+
+/// The operator's answer to an approval.
+#[derive(Debug)]
+enum Answer {
+    Approve,
+    /// Approve, and stop asking about this tool for the session.
+    AllowForSession,
+    Deny,
+    /// Check these arguments instead, and wait again.
+    Edit(Value),
+}
+
+/// What an approval settled: the arguments to run with and what they occupy.
+struct Approved {
+    args: Value,
+    resources: Vec<Resource>,
+}
+
+/// Denials in a row after which the model is told to stop asking and ask the operator instead.
+const DENIAL_BREAK: u32 = 3;
+/// The same failure this many times in a row in a turn is stuck, not unlucky.
+const STUCK_AFTER: u32 = 3;
+
 struct Shared {
     events: broadcast::Sender<Event>,
-    approvals: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
+    approvals: Mutex<HashMap<u64, oneshot::Sender<Answer>>>,
+    /// Approvals the operator turned down in a row since they last approved one or spoke.
+    denials: AtomicU32,
+    /// This turn's last failed result, as tool and message, and how often it came in a row.
+    repeated: Mutex<(String, u32)>,
+    /// What the operator said during the running turn, for its next tool result.
+    steer: Mutex<Vec<String>>,
     calls: AtomicU64,
     next_approval: AtomicU64,
     /// Milliseconds this turn spent waiting for the operator.
     waited_ms: AtomicU64,
+    /// Tools the operator let run without asking for the rest of the session.
+    allowed: Mutex<HashSet<String>>,
+    /// Requests waiting on the operator, by approval id, as `pending_file` keeps them.
+    waiting: Mutex<BTreeMap<u64, Unanswered>>,
     guard: Arc<Guard>,
     config: SessionConfig,
 }
@@ -313,31 +483,158 @@ impl Shared {
         let _ = self.events.send(e);
     }
 
-    async fn ask_approval(&self, tool: &str, args: &Value, reason: String) -> bool {
+    /// Asks the operator, who may approve, deny or edit; an edit that passes its checks replaces
+    /// what is asked and the wait starts again. `None` when denied or expired.
+    #[tracing::instrument(
+        name = "nervros.approval",
+        skip_all,
+        fields(nervros.tool = name, nervros.outcome = tracing::field::Empty)
+    )]
+    async fn ask_approval(
+        &self,
+        tool: &Arc<dyn Tool>,
+        name: &str,
+        reason: String,
+        risk: Risk,
+        mut approved: Approved,
+    ) -> Option<Approved> {
+        let can_allow = !matches!(risk, Risk::Motion | Risk::Manipulation);
         let id = self.next_approval.fetch_add(1, Ordering::Relaxed) + 1;
-        let (tx, rx) = oneshot::channel();
-        lock(&self.approvals).insert(id, tx);
+        let mut rx = self.listen(id);
+        self.keep_waiting(id, tool, name, &reason, &approved.args);
         self.emit(Event::ApprovalRequested {
             id,
-            tool: tool.to_owned(),
-            args: args.clone(),
-            reason,
+            tool: name.to_owned(),
+            args: approved.args.clone(),
+            reason: reason.clone(),
+            can_allow,
         });
         let asked = Instant::now();
-        let approved = matches!(
-            tokio::time::timeout(self.config.approval_ttl, rx).await,
-            Ok(Ok(true))
-        );
+        let mut early = None;
+        let yes = loop {
+            let answer = match early.take() {
+                Some(answer) => Ok(Ok(answer)),
+                None => tokio::time::timeout(self.config.approval_ttl, &mut rx).await,
+            };
+            match answer {
+                Ok(Ok(Answer::Approve)) => break true,
+                Ok(Ok(Answer::AllowForSession)) => {
+                    let text = if can_allow {
+                        lock(&self.allowed).insert(name.to_owned());
+                        format!(
+                            "`{name}` runs without asking for the rest of this session, except \
+                             what moves the robot"
+                        )
+                    } else {
+                        format!("`{name}` moves the robot, so it still asks every time")
+                    };
+                    self.emit(Event::Notice { text });
+                    break true;
+                }
+                Ok(Ok(Answer::Edit(edited))) => {
+                    // Waiting again before the check, so a stop during it still lands.
+                    rx = self.listen(id);
+                    let passed = match tool.assess_operator(edited).await {
+                        Some(Ok(a)) => {
+                            if let Some(args) = a.args {
+                                approved.args = args;
+                            }
+                            approved.resources = a.resources;
+                            self.keep_waiting(id, tool, name, &reason, &approved.args);
+                            self.emit(Event::ApprovalEdited {
+                                id,
+                                args: approved.args.clone(),
+                                reason: a.reason,
+                            });
+                            true
+                        }
+                        Some(Err(out)) => {
+                            self.emit(Event::EditRejected {
+                                id,
+                                message: out.message,
+                            });
+                            false
+                        }
+                        None => {
+                            self.emit(Event::EditRejected {
+                                id,
+                                message: format!("{name} cannot be edited"),
+                            });
+                            false
+                        }
+                    };
+                    // An approval sent during the check was for the plan before it, so it does
+                    // not approve an edit nobody has seen; a denial or a newer edit stands.
+                    match rx.try_recv() {
+                        Ok(Answer::Approve) if passed => rx = self.listen(id),
+                        Ok(answer) => early = Some(answer),
+                        Err(_) => {}
+                    }
+                }
+                Ok(Ok(Answer::Deny) | Err(_)) | Err(_) => break false,
+            }
+        };
         let waited = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.waited_ms.fetch_add(waited, Ordering::Relaxed);
         lock(&self.approvals).remove(&id);
-        self.emit(Event::ApprovalResolved { id, approved });
-        approved
+        self.done_waiting(id);
+        tracing::Span::current().record("nervros.outcome", if yes { "approved" } else { "denied" });
+        self.emit(Event::ApprovalResolved { id, approved: yes });
+        yes.then_some(approved)
     }
 
-    fn resolve(&self, id: u64, approved: bool) {
+    /// Keeps approval `id` where the next session finds it if this one ends first.
+    fn keep_waiting(&self, id: u64, tool: &Arc<dyn Tool>, name: &str, reason: &str, args: &Value) {
+        if self.config.pending_file.is_none() {
+            return;
+        }
+        if let Some(args) = tool.ask_again(args) {
+            let entry = Unanswered {
+                tool: name.to_owned(),
+                args,
+                reason: reason.to_owned(),
+            };
+            lock(&self.waiting).insert(id, entry);
+            self.write_waiting();
+        }
+    }
+
+    fn done_waiting(&self, id: u64) {
+        if lock(&self.waiting).remove(&id).is_some() {
+            self.write_waiting();
+        }
+    }
+
+    fn write_waiting(&self) {
+        let Some(file) = &self.config.pending_file else {
+            return;
+        };
+        let waiting = lock(&self.waiting);
+        let written = if waiting.is_empty() {
+            match std::fs::remove_file(file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            serde_json::to_vec(&waiting.values().collect::<Vec<_>>())
+                .map_err(std::io::Error::other)
+                .and_then(|json| std::fs::write(file, json))
+        };
+        if let Err(e) = written {
+            tracing::warn!(error = %e, "the requests waiting on the operator were not kept");
+        }
+    }
+
+    /// A fresh channel for the next answer to approval `id`.
+    fn listen(&self, id: u64) -> oneshot::Receiver<Answer> {
+        let (tx, rx) = oneshot::channel();
+        lock(&self.approvals).insert(id, tx);
+        rx
+    }
+
+    fn answer(&self, id: u64, answer: Answer) {
         if let Some(tx) = lock(&self.approvals).remove(&id) {
-            let _ = tx.send(approved);
+            let _ = tx.send(answer);
         }
     }
 
@@ -353,17 +650,121 @@ impl Shared {
         tool.call(args).await
     }
 
+    /// What a call would do, for a tool whose risk depends on its arguments, and the answer when
+    /// it cannot go out at all, before anyone is asked to approve it. The model's arguments are
+    /// checked against the schema first: a skill name it made up ends here.
+    async fn assess(
+        tool: &Arc<dyn Tool>,
+        args: &Value,
+        caller: Caller,
+    ) -> Option<Result<Assessment, ToolOutcome>> {
+        match caller {
+            Caller::Model => {
+                let invalid = crate::argcheck::check(&tool.spec().parameters, args);
+                if invalid.is_empty() {
+                    tool.assess(args).await
+                } else {
+                    Some(Err(ToolOutcome::failed(format!(
+                        "{}; call it again with arguments that fit",
+                        invalid.join("; ")
+                    ))))
+                }
+            }
+            Caller::Operator => match tool.assess_operator(args.clone()).await {
+                Some(checked) => Some(checked),
+                None => tool.assess(args).await,
+            },
+        }
+    }
+
+    /// Asks the operator, then runs it if they approve. After `DENIAL_BREAK` denials in a row the
+    /// model is told to stop asking, and asks no more until the operator approves or speaks.
+    async fn approved_run(
+        &self,
+        tool: &Arc<dyn Tool>,
+        spec: &ToolSpec,
+        args: Value,
+        reason: String,
+        caller: Caller,
+    ) -> ToolOutcome {
+        if caller == Caller::Model && self.denials.load(Ordering::SeqCst) >= DENIAL_BREAK {
+            return ToolOutcome::refused(format!(
+                "the operator turned down the last {DENIAL_BREAK} requests: stop asking, and ask \
+                 them what they want instead"
+            ));
+        }
+        let asked = Approved {
+            args,
+            resources: spec.resources.clone(),
+        };
+        if let Some(a) = self
+            .ask_approval(tool, &spec.name, reason, spec.risk, asked)
+            .await
+        {
+            self.denials.store(0, Ordering::SeqCst);
+            return self.run(tool, a.args, &a.resources).await;
+        }
+        let n = self.denials.fetch_add(1, Ordering::SeqCst) + 1;
+        ToolOutcome::refused(if n >= DENIAL_BREAK {
+            format!(
+                "the operator did not approve this, {n} times in a row: stop acting and ask them \
+                 what they want"
+            )
+        } else {
+            "the operator did not approve this".to_owned()
+        })
+    }
+
+    /// The guard's decision, tightened by the profile's rule for this call: its refusal stands
+    /// over everything, and its question makes an allowed call ask.
+    fn decide(
+        &self,
+        spec: &ToolSpec,
+        args: &Value,
+        caller: Caller,
+        rule: Option<crate::guard::ArgRule>,
+    ) -> Decision {
+        if let Some(r) = rule.as_ref().filter(|r| r.then == RuleAction::Deny) {
+            return Decision::Deny(Refusal::new("rule", r.reason.clone()));
+        }
+        let decision = match caller {
+            Caller::Model => self.guard.decide(spec, args),
+            Caller::Operator => self.guard.decide_operator(spec),
+        };
+        let decision = match (decision, rule) {
+            (Decision::Allow, Some(r)) => Decision::NeedApproval { reason: r.reason },
+            // Allowed for the session, unless this call moves the robot.
+            (Decision::NeedApproval { .. }, None)
+                if caller == Caller::Model
+                    && !matches!(spec.risk, Risk::Motion | Risk::Manipulation)
+                    && lock(&self.allowed).contains(&spec.name) =>
+            {
+                Decision::Allow
+            }
+            (decision, _) => decision,
+        };
+        let (verdict, why) = match &decision {
+            Decision::Allow => ("allow", ""),
+            Decision::NeedApproval { reason } => ("ask", reason.as_str()),
+            Decision::Deny(r) => ("deny", r.message.as_str()),
+        };
+        tracing::info!(nervros.tool = %spec.name, nervros.guard = verdict, why, "guard");
+        decision
+    }
+
     async fn invoke(
         &self,
         tool: &Arc<dyn Tool>,
         turn: u64,
         args: Value,
         flags: &TurnFlags,
+        caller: Caller,
     ) -> Value {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
-        // A tool whose risk depends on its arguments says what this call would do, and a call
-        // that cannot go out fails here, before anyone is asked to approve it.
-        let (mut assessment, early) = match tool.assess(&args).await {
+        let assessed = Self::assess(tool, &args, caller).await;
+        // The profile's rules read the arguments as they were sent, before checking settled them.
+        let rule = self.guard.rule(&tool.spec().name, &args).cloned();
+        let (mut assessment, early) = match assessed {
             Some(Ok(a)) => (Some(a), None),
             Some(Err(out)) => (None, Some(out)),
             None => (None, None),
@@ -388,17 +789,14 @@ impl Shared {
             args: args.clone(),
         });
         let started = Instant::now();
+        let decision = self.decide(&spec, &args, caller, rule);
         let outcome = match early {
             Some(out) => out,
-            None => match self.guard.decide(&spec, &args) {
+            None => match decision {
                 Decision::Deny(r) => ToolOutcome::refused(r.message),
                 Decision::NeedApproval { reason } => {
                     let reason = assessment.map_or(reason, |a| a.reason);
-                    if self.ask_approval(&spec.name, &args, reason).await {
-                        self.run(tool, args, &spec.resources).await
-                    } else {
-                        ToolOutcome::refused("the operator did not approve this")
-                    }
+                    self.approved_run(tool, &spec, args, reason, caller).await
                 }
                 Decision::Allow => self.run(tool, args, &spec.resources).await,
             },
@@ -425,6 +823,7 @@ impl Shared {
                 jpeg: Arc::clone(&image.jpeg),
                 width: image.width,
                 height: image.height,
+                marks: image.marks.clone(),
             });
         }
         let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -436,7 +835,41 @@ impl Shared {
             message: crate::tools::clip(&outcome.message, 2000),
             ms,
         });
+        let mut outcome = outcome;
+        if caller == Caller::Model {
+            let said = std::mem::take(&mut *lock(&self.steer));
+            if !said.is_empty() {
+                let _ = write!(
+                    outcome.message,
+                    " The operator said while you worked: \"{}\". Take it into account now.",
+                    said.join(" ")
+                );
+            }
+        }
+        if let Some(n) = self.stuck(&spec.name, &outcome) {
+            let _ = write!(
+                outcome.message,
+                " This came back the same {n} times in a row: do not try it again; tell the \
+                 operator what is stuck."
+            );
+        }
         outcome.for_model(self.config.result_chars)
+    }
+
+    /// How often this turn's failures have come back the same in a row, once that is stuck.
+    fn stuck(&self, tool: &str, outcome: &ToolOutcome) -> Option<u32> {
+        let mut last = lock(&self.repeated);
+        if matches!(outcome.status, Status::Succeeded | Status::Accepted) {
+            *last = (String::new(), 0);
+            return None;
+        }
+        let said = format!("{tool}: {}", outcome.message);
+        if last.0 == said {
+            last.1 += 1;
+        } else {
+            *last = (said, 1);
+        }
+        (last.1 >= STUCK_AFTER).then_some(last.1)
     }
 }
 
@@ -509,7 +942,12 @@ impl Session {
             approvals: Mutex::default(),
             calls: AtomicU64::new(0),
             next_approval: AtomicU64::new(0),
+            denials: AtomicU32::new(0),
+            repeated: Mutex::default(),
+            steer: Mutex::default(),
             waited_ms: AtomicU64::new(0),
+            allowed: Mutex::default(),
+            waiting: Mutex::default(),
             guard,
             config,
         });
@@ -551,11 +989,14 @@ async fn actor(
 ) {
     let mut history = shared.config.resume.clone().unwrap_or_default();
     let mut turns = 0u64;
+    let mut pulse = tokio::time::interval(PULSE_PERIOD);
+    pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut running: Option<(u64, JoinHandle<Option<History>>)> = None;
     let mut reports: Vec<String> = Vec::new();
     // Nobody asked for a report's reply, so a message sent during one waits for it, not refused.
     let (mut answering_report, mut queued) = (false, None::<String>);
     let start = |turn: u64, origin: Origin, history: &History| {
+        let span = turn_span(turn, &origin);
         let task = run_turn(
             turn,
             origin,
@@ -564,7 +1005,8 @@ async fn actor(
             Arc::clone(&source),
             Arc::clone(&registry),
         );
-        (turn, tokio::spawn(limited(turn, Arc::clone(&shared), task)))
+        let task = limited(turn, Arc::clone(&shared), task).instrument(span);
+        (turn, tokio::spawn(task))
     };
     loop {
         let finished = async {
@@ -575,18 +1017,30 @@ async fn actor(
         };
         tokio::select! {
             biased;
+            _ = pulse.tick(), if shared.config.pulse.is_some() => {
+                if let Some(p) = &shared.config.pulse {
+                    p.pulse();
+                }
+            }
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     Command::User(text) => {
-                        if running.is_some() {
-                            let note = if answering_report && queued.is_none() {
-                                queued = Some(text);
-                                "queued until the reply to the report ends"
+                        // The operator speaking is a new say on what they want.
+                        shared.denials.store(0, Ordering::SeqCst);
+                        if let Some((turn, _)) = &running {
+                            if answering_report {
+                                if queued.is_none() {
+                                    queued = Some(text);
+                                    shared.emit(Event::Notice { text: "queued until the reply to the report ends".into() });
+                                } else {
+                                    shared.emit(Event::Notice { text: "one message is queued already; wait or stop it".into() });
+                                }
                             } else {
-                                "still working on the last message; wait or stop it"
-                            };
-                            shared.emit(Event::Notice { text: note.into() });
+                                // Steering: the model reads it with its next tool result.
+                                lock(&shared.steer).push(text.clone());
+                                shared.emit(Event::Steer { turn: *turn, text });
+                            }
                             continue;
                         }
                         turns += 1;
@@ -611,14 +1065,26 @@ async fn actor(
                             shared.emit(Event::TurnFinished { turn });
                         }
                         halt(&shared, stop.as_ref().filter(|_| mission));
+                        // Esc stops the reply to say something else: what was said meanwhile goes
+                        // now. A stop of the robot drops it.
+                        let said = std::mem::take(&mut *lock(&shared.steer));
+                        if !said.is_empty() && !mission {
+                            turns += 1;
+                            running = Some(start(turns, Origin::User(said.join(" ")), &history));
+                            answering_report = false;
+                        }
                     }
-                    Command::Compact => {
+                    Command::Compact | Command::CompactUpTo { .. } => {
                         if running.is_some() {
                             shared.emit(Event::Notice { text: "still working on the last message; compact after it".into() });
                             continue;
                         }
+                        let how = match cmd {
+                            Command::CompactUpTo { keep } => Condense::UpTo(keep),
+                            _ => Condense::Now,
+                        };
                         turns += 1;
-                        running = Some((turns, compaction(turns, &shared, &source, &registry, history.clone())));
+                        running = Some((turns, compaction(turns, &shared, &source, &registry, history.clone(), how)));
                         answering_report = false;
                     }
                     Command::Restore(earlier) => {
@@ -629,8 +1095,20 @@ async fn actor(
                         shared.emit(Event::Restored { exchanges: earlier.exchanges() });
                         history = earlier;
                     }
-                    Command::Approve(id) => shared.resolve(id, true),
-                    Command::Deny(id) => shared.resolve(id, false),
+                    Command::Approve(id) => shared.answer(id, Answer::Approve),
+                    Command::AllowForSession(id) => shared.answer(id, Answer::AllowForSession),
+                    Command::Deny(id) => shared.answer(id, Answer::Deny),
+                    Command::Edit { id, args } => shared.answer(id, Answer::Edit(args)),
+                    Command::Run { tool, args } => match registry.get(&tool).cloned() {
+                        Some(tool) => {
+                            let shared = Arc::clone(&shared);
+                            tokio::spawn(async move {
+                                let flags = TurnFlags::default();
+                                shared.invoke(&tool, 0, args, &flags, Caller::Operator).await;
+                            });
+                        }
+                        None => shared.emit(Event::Notice { text: format!("there is no tool {tool}") }),
+                    },
                     Command::Arm | Command::Disarm => {
                         let armed = cmd == Command::Arm;
                         shared.guard.set_armed(armed);
@@ -646,7 +1124,9 @@ async fn actor(
                     }
                     shared.emit(Event::TurnFinished { turn });
                 }
-                if let Some(text) = queued.take() {
+                // What the operator said that no tool result carried goes in a turn of its own.
+                let unread = std::mem::take(&mut *lock(&shared.steer));
+                if let Some(text) = queued.take().or_else(|| (!unread.is_empty()).then(|| unread.join(" "))) {
                     turns += 1;
                     running = Some(start(turns, Origin::User(text), &history));
                     answering_report = false;
@@ -667,12 +1147,13 @@ fn compaction(
     source: &Arc<dyn AgentSource>,
     registry: &Arc<Registry>,
     mut history: History,
+    how: Condense,
 ) -> JoinHandle<Option<History>> {
     let (shared, source, registry) = (Arc::clone(shared), Arc::clone(source), Arc::clone(registry));
     tokio::spawn(async move {
         shared.emit(Event::TurnStarted { turn });
         let room = room_for(&shared, &source, &registry).unwrap_or(COMPACT_ROOM);
-        compact(&shared, &source, &mut history, room).await;
+        compact(&shared, &source, &mut history, room, how).await;
         Some(history)
     })
 }
@@ -700,8 +1181,26 @@ async fn fit_window(
     let room =
         window.saturating_sub(llm::fixed_cost(&preamble(shared), tools) + llm::RESERVE_TOKENS);
     if history.size() > room / 2 {
-        compact(shared, source, history, room).await;
+        compact(shared, source, history, room, Condense::ToFit).await;
     }
+}
+
+/// Each model call's cost, to the log and to `used`, the context gauge's count.
+fn costs(shared: &Arc<Shared>, turn: u64, model: &str, used: &Arc<AtomicU64>) -> llm::OnCall {
+    let (shared, model, used) = (Arc::clone(shared), model.to_owned(), Arc::clone(used));
+    Arc::new(move |cost: llm::CallCost| {
+        if cost.input_tokens > 0 {
+            used.store(cost.input_tokens, Ordering::Relaxed);
+        }
+        shared.emit(Event::ModelCall {
+            turn,
+            model: model.clone(),
+            input_tokens: cost.input_tokens,
+            cached_tokens: cost.cached_tokens,
+            output_tokens: cost.output_tokens,
+            ms: cost.ms,
+        });
+    })
 }
 
 /// Passes a streamed reply's pieces to the UI.
@@ -738,7 +1237,7 @@ fn report_context(
 fn halt(shared: &Arc<Shared>, stop: Option<&Arc<dyn Tool>>) {
     let pending: Vec<u64> = lock(&shared.approvals).keys().copied().collect();
     for id in pending {
-        shared.resolve(id, false);
+        shared.answer(id, Answer::Deny);
     }
     if let Some(stop) = stop.cloned() {
         let shared = Arc::clone(shared);
@@ -764,6 +1263,31 @@ fn halt(shared: &Arc<Shared>, stop: Option<&Arc<dyn Tool>>) {
 
 /// Runs a turn under its time limit. A turn over it ends with an error, as a stopped one does;
 /// the operator's time on approvals is added back, and never runs out while one is open.
+/// A turn's span, named and shaped as OpenTelemetry's `GenAI` conventions name an agent's run, so
+/// rig records the turn's token use on it and nests its model and tool calls inside.
+fn turn_span(turn: u64, origin: &Origin) -> tracing::Span {
+    let empty = tracing::field::Empty;
+    tracing::info_span!(
+        "invoke_agent",
+        otel.name = "invoke_agent nervros",
+        gen_ai.operation.name = "invoke_agent",
+        gen_ai.agent.name = "nervros",
+        nervros.turn = turn,
+        nervros.origin = match origin {
+            Origin::User(_) => "operator",
+            Origin::Report(_) => "report",
+        },
+        gen_ai.prompt = empty,
+        gen_ai.completion = empty,
+        gen_ai.usage.input_tokens = empty,
+        gen_ai.usage.output_tokens = empty,
+        gen_ai.usage.cache_read.input_tokens = empty,
+        gen_ai.usage.cache_creation.input_tokens = empty,
+        gen_ai.usage.tool_use_prompt_tokens = empty,
+        gen_ai.usage.reasoning_tokens = empty,
+    )
+}
+
 async fn limited(
     turn: u64,
     shared: Arc<Shared>,
@@ -834,15 +1358,33 @@ fn room_for(shared: &Shared, source: &Arc<dyn AgentSource>, registry: &Registry)
 
 /// Condenses the history to about a quarter of `room`: the older part summarised by a model,
 /// or, when none answers, old results cut and the oldest exchanges dropped.
+/// How far a compaction goes.
+#[derive(Debug, Clone, Copy)]
+enum Condense {
+    /// Past half the window: old results cut first, and a summary only when that is not enough.
+    ToFit,
+    /// The operator's `/compact`: old results cut, and the older part summarised.
+    Now,
+    /// "Condense up to here": all but the operator's last `n` messages summarised.
+    UpTo(usize),
+}
+
 async fn compact(
     shared: &Shared,
     source: &Arc<dyn AgentSource>,
     history: &mut History,
     room: usize,
+    how: Condense,
 ) {
     let before = history.size();
+    history.mask();
+    let older = match how {
+        Condense::ToFit if history.size() <= room / 2 => None,
+        Condense::ToFit | Condense::Now => history.older(room / 4),
+        Condense::UpTo(keep) => history.before_last(keep),
+    };
     let mut summarised = false;
-    if let Some((n, text)) = history.older(room / 4)
+    if let Some((n, text)) = older
         && let Some(summary) = llm::summarise(source, &text).await
     {
         history.summarised(n, &summary);
@@ -892,7 +1434,10 @@ fn loop_tools(
                 invoke: Arc::new(move |args| {
                     let (tool, shared, flags) =
                         (Arc::clone(&tool), Arc::clone(&shared), Arc::clone(&flags));
-                    Box::pin(async move { shared.invoke(&tool, turn, args, &flags).await })
+                    Box::pin(async move {
+                        let caller = Caller::Model;
+                        shared.invoke(&tool, turn, args, &flags, caller).await
+                    })
                 }),
             }
         })
@@ -908,6 +1453,7 @@ async fn run_turn(
     registry: Arc<Registry>,
 ) -> Option<History> {
     shared.guard.begin_turn();
+    *lock(&shared.repeated) = (String::new(), 0);
     shared.emit(Event::TurnStarted { turn });
     let text = match origin {
         Origin::User(text) => {
@@ -922,7 +1468,7 @@ async fn run_turn(
                 turn,
                 text: text.clone(),
             });
-            format!("[Report from the robot, not the operator]\n{text}")
+            format!("{}\n{text}", llm::REPORT_MARK)
         }
     };
     let flags = Arc::new(TurnFlags::default());
@@ -949,7 +1495,7 @@ async fn run_turn(
             tools: &tools,
             started: Arc::clone(&flags.started),
             window,
-            used: Arc::clone(&used),
+            on_call: Some(costs(&shared, turn, &model, &used)),
             delta: Some(deltas(&shared, turn)),
         };
         let result = llm::chat(&model, Arc::clone(&source), setup, &mut updated, &text).await;
@@ -1090,6 +1636,11 @@ mod tests {
             2,
             "the tool call and the reply are two requests"
         );
+        let costed = events
+            .iter()
+            .filter(|e| matches!(e, Event::ModelCall { model, turn: 1, .. } if model == "mock"))
+            .count();
+        assert_eq!(costed, 2, "each request's cost is logged: {events:?}");
     }
 
     #[tokio::test]
@@ -1357,6 +1908,18 @@ mod tests {
             events.iter().any(|e| matches!(e, Event::Compacted { summarised: true, before, after } if after < before)),
             "{events:?}"
         );
+        session.send(Command::CompactUpTo { keep: 1 });
+        let events = collect_until_finished(&mut rx, |_| None, &session).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::Compacted {
+                    summarised: false,
+                    ..
+                }
+            )),
+            "a second summary needs a model turn the script lacks, so it only cuts: {events:?}"
+        );
         session.send(Command::Restore(History::sample(2, 10)));
         let restored = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -1463,6 +2026,98 @@ mod tests {
         assert!(!events.iter().any(|e| matches!(e, Event::Reply { .. })));
     }
 
+    /// Two calls of the one tool in one turn, the second with other arguments.
+    fn twice() -> MockCompletionModel {
+        MockCompletionModel::new([
+            MockTurn::tool_call("c1", "find_objects", json!({"n": 1})),
+            MockTurn::tool_call("c2", "find_objects", json!({"n": 2})),
+            MockTurn::text("done"),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_tool_allowed_for_the_session_stops_asking_unless_it_moves_the_robot() {
+        for (risk, asked) in [(Risk::WorldEdit, 1), (Risk::Motion, 2)] {
+            let guard = Arc::new(Guard::new(Policy::default()));
+            guard.set_armed(true);
+            let session = Session::start(
+                Arc::new(Scripted(twice())),
+                registry(risk),
+                guard,
+                None,
+                SessionConfig::default(),
+            );
+            let mut rx = session.subscribe();
+            session.send(Command::User("go".into()));
+            let allow = |e: &Event| match e {
+                Event::ApprovalRequested { id, .. } => Some(Command::AllowForSession(*id)),
+                _ => None,
+            };
+            let events = collect_until_finished(&mut rx, allow, &session).await;
+            let n = events
+                .iter()
+                .filter(|e| matches!(e, Event::ApprovalRequested { .. }))
+                .count();
+            assert_eq!(n, asked, "{risk:?}: {events:?}");
+            let ran = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        Event::ToolFinished {
+                            status: "succeeded",
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(ran, 2, "{risk:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_left_waiting_is_kept_for_the_next_session_and_dropped_once_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pending.json");
+        let guard = Arc::new(Guard::new(Policy::default()));
+        guard.set_armed(true);
+        let config = SessionConfig {
+            pending_file: Some(file.clone()),
+            ..SessionConfig::default()
+        };
+        let session = Session::start(
+            Arc::new(Scripted(twice())),
+            registry(Risk::WorldEdit),
+            guard,
+            None,
+            config,
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("go".into()));
+        let id = loop {
+            if let Event::ApprovalRequested { id, .. } = rx.recv().await.unwrap() {
+                break id;
+            }
+        };
+        let kept: Vec<Unanswered> = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            (kept[0].tool.as_str(), &kept[0].args),
+            ("find_objects", &json!({"n": 1}))
+        );
+        session.send(Command::Deny(id));
+        let deny = |e: &Event| match e {
+            Event::ApprovalRequested { id, .. } => Some(Command::Deny(*id)),
+            _ => None,
+        };
+        collect_until_finished(&mut rx, deny, &session).await;
+        assert!(!file.exists(), "answered, nothing waits");
+
+        std::fs::write(&file, serde_json::to_vec(&kept).unwrap()).unwrap();
+        assert_eq!(take_unanswered(&file), kept);
+        assert!(take_unanswered(&file).is_empty(), "offered once");
+    }
+
     #[tokio::test]
     async fn act_tools_are_refused_while_disarmed_and_run_after_approval() {
         let script = || {
@@ -1555,5 +2210,372 @@ mod tests {
             }
         });
         assert!(halted.await.is_ok() || events.iter().any(|e| matches!(e, Event::Halted { .. })));
+    }
+
+    /// Checks an edit as `run_mission` checks an edited plan: `{"ok": true}` passes as a new hash.
+    struct Editable(ToolSpec);
+
+    #[async_trait]
+    impl Tool for Editable {
+        fn spec(&self) -> Cow<'_, ToolSpec> {
+            Cow::Borrowed(&self.0)
+        }
+        async fn assess_operator(&self, edited: Value) -> Option<Result<Assessment, ToolOutcome>> {
+            if edited["slow"] == true {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Some(if edited["ok"] == true {
+                Ok(Assessment {
+                    risk: Risk::Motion,
+                    resources: Vec::new(),
+                    reason: "runs the edited plan".into(),
+                    args: Some(json!({"hash": "edited"})),
+                })
+            } else {
+                Err(ToolOutcome::failed("s1: no such place"))
+            })
+        }
+        async fn call(&self, args: Value) -> ToolOutcome {
+            ToolOutcome::ok(json!({"ran": args}))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_fails_its_checks_keeps_the_request_and_one_that_passes_replaces_it() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "run_mission", json!({"hash": "planned"})),
+            MockTurn::text("Done."),
+        ]);
+        let guard = Arc::new(Guard::new(Policy::default()));
+        guard.set_armed(true);
+        let mut r = Registry::default();
+        let spec = ToolSpec::new(
+            "run_mission",
+            "Runs.",
+            json!({"type": "object"}),
+            Risk::Motion,
+        );
+        r.add(Arc::new(Editable(spec))).unwrap();
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            Arc::new(r),
+            guard,
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("go".into()));
+        let operator = |e: &Event| match e {
+            Event::ApprovalRequested { id, .. } => Some(Command::Edit {
+                id: *id,
+                args: json!({"ok": false}),
+            }),
+            Event::EditRejected { id, .. } => Some(Command::Edit {
+                id: *id,
+                args: json!({"ok": true}),
+            }),
+            Event::ApprovalEdited { id, .. } => Some(Command::Approve(*id)),
+            _ => None,
+        };
+        let events = collect_until_finished(&mut rx, operator, &session).await;
+        assert!(
+            events.iter().any(|e| matches!(e, Event::EditRejected { message, .. } if message == "s1: no such place")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, Event::ApprovalEdited { args, .. } if args["hash"] == "edited")
+            ),
+            "{events:?}"
+        );
+        let resolved: Vec<bool> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ApprovalResolved { approved, .. } => Some(*approved),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved, [true], "one request, answered once");
+        let ran = format!("{:?}", model.requests()[1].chat_history);
+        assert!(ran.contains("edited"), "it ran with the edit: {ran}");
+    }
+
+    #[tokio::test]
+    async fn an_approval_sent_while_an_edit_is_checked_does_not_approve_the_edit() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "run_mission", json!({"hash": "planned"})),
+            MockTurn::text("Not run."),
+        ]);
+        let guard = Arc::new(Guard::new(Policy::default()));
+        guard.set_armed(true);
+        let mut r = Registry::default();
+        let spec = ToolSpec::new(
+            "run_mission",
+            "Runs.",
+            json!({"type": "object"}),
+            Risk::Motion,
+        );
+        r.add(Arc::new(Editable(spec))).unwrap();
+        let session = Session::start(
+            Arc::new(Scripted(model)),
+            Arc::new(r),
+            guard,
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("go".into()));
+        let mut resolved = Vec::new();
+        loop {
+            let e = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match e {
+                Event::ApprovalRequested { id, .. } => {
+                    let args = json!({"ok": true, "slow": true});
+                    session.send(Command::Edit { id, args });
+                    session.send(Command::Approve(id));
+                }
+                // Not approved after the edit: nothing may run.
+                Event::ApprovalEdited { id, .. } => session.send(Command::Deny(id)),
+                Event::ApprovalResolved { approved, .. } => resolved.push(approved),
+                Event::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(resolved, [false]);
+    }
+
+    #[tokio::test]
+    async fn the_operator_runs_a_tool_checked_as_their_own_and_approves_it() {
+        let guard = Arc::new(Guard::new(Policy::default()));
+        let mut r = Registry::default();
+        let spec = ToolSpec::new(
+            "run_mission",
+            "Runs.",
+            json!({"type": "object"}),
+            Risk::Motion,
+        );
+        r.add(Arc::new(Editable(spec))).unwrap();
+        let session = Session::start(
+            Arc::new(Scripted(MockCompletionModel::new([]))),
+            Arc::new(r),
+            Arc::clone(&guard),
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        let run = || Command::Run {
+            tool: "run_mission".into(),
+            args: json!({"ok": true}),
+        };
+        let mut next = async || {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        session.send(run());
+        let refused = loop {
+            if let Event::ToolFinished {
+                status, message, ..
+            } = next().await
+            {
+                break (status, message);
+            }
+        };
+        assert_eq!(refused.0, "refused");
+        assert!(refused.1.contains("arm it"), "{}", refused.1);
+
+        guard.set_armed(true);
+        session.send(run());
+        loop {
+            match next().await {
+                Event::ToolStarted { args, .. } => {
+                    assert_eq!(args["hash"], "edited", "run as checked");
+                }
+                Event::ApprovalRequested { id, .. } => session.send(Command::Approve(id)),
+                Event::ToolFinished { status, .. } => {
+                    assert_eq!(status, "succeeded");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Fails the same way every time, whatever it is asked.
+    struct Broken(ToolSpec);
+
+    #[async_trait]
+    impl Tool for Broken {
+        fn spec(&self) -> Cow<'_, ToolSpec> {
+            Cow::Borrowed(&self.0)
+        }
+        async fn call(&self, _args: Value) -> ToolOutcome {
+            ToolOutcome::failed("the camera is not publishing")
+        }
+    }
+
+    fn one_tool(tool: Arc<dyn Tool>) -> Arc<Registry> {
+        let mut r = Registry::default();
+        r.add(tool).unwrap();
+        Arc::new(r)
+    }
+
+    #[tokio::test]
+    async fn after_three_denials_in_a_row_the_model_is_told_to_stop_asking() {
+        let calls: Vec<MockTurn> = (1..=4)
+            .map(|n| MockTurn::tool_call(format!("c{n}"), "find_objects", json!({"n": n})))
+            .chain([MockTurn::text("I will ask what you want.")])
+            .collect();
+        let model = MockCompletionModel::new(calls);
+        let guard = Arc::new(Guard::new(Policy::default()));
+        guard.set_armed(true);
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            registry(Risk::Motion),
+            guard,
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("go".into()));
+        let deny = |e: &Event| match e {
+            Event::ApprovalRequested { id, .. } => Some(Command::Deny(*id)),
+            _ => None,
+        };
+        let events = collect_until_finished(&mut rx, deny, &session).await;
+        let asked = events
+            .iter()
+            .filter(|e| matches!(e, Event::ApprovalRequested { .. }))
+            .count();
+        assert_eq!(asked, 3, "the fourth is not asked");
+        let seen = format!("{:?}", model.requests().last().unwrap().chat_history);
+        assert!(seen.contains("3 times in a row"), "{seen}");
+        assert!(seen.contains("turned down the last 3 requests"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn the_same_failure_three_times_in_a_row_is_called_stuck() {
+        let calls: Vec<MockTurn> = (1..=3)
+            .map(|n| MockTurn::tool_call(format!("c{n}"), "look", json!({"n": n})))
+            .chain([MockTurn::text("The camera is stuck.")])
+            .collect();
+        let model = MockCompletionModel::new(calls);
+        let spec = ToolSpec::new("look", "Looks.", json!({"type": "object"}), Risk::Observe);
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            one_tool(Arc::new(Broken(spec))),
+            Arc::new(Guard::new(Policy::default())),
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("look".into()));
+        collect_until_finished(&mut rx, |_| None, &session).await;
+        let requests = model.requests();
+        let second = format!("{:?}", requests[2].chat_history);
+        assert!(!second.contains("came back the same"), "twice is not stuck");
+        let third = format!("{:?}", requests[3].chat_history);
+        assert!(
+            third.contains("came back the same 3 times in a row"),
+            "{third}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_sent_mid_turn_reaches_the_model_with_its_next_tool_result() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "look", json!({})),
+            MockTurn::text("Looking at the kitchen too."),
+        ]);
+        let spec = ToolSpec::new("look", "Looks.", json!({"type": "object"}), Risk::Observe);
+        let slow = Slow(spec, Duration::from_millis(300));
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            one_tool(Arc::new(slow)),
+            Arc::new(Guard::new(Policy::default())),
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("look around".into()));
+        let mut steered = false;
+        loop {
+            let e = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match e {
+                Event::ToolStarted { .. } => session.send(Command::User("and the kitchen".into())),
+                Event::Steer { text, .. } => steered = text == "and the kitchen",
+                Event::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(steered, "shown as said during the turn");
+        let read = format!("{:?}", model.requests()[1].chat_history);
+        assert!(
+            read.contains("The operator said while you worked: \\\"and the kitchen\\\""),
+            "{read}"
+        );
+        assert_eq!(model.requests().len(), 2, "no turn of its own: it was read");
+    }
+
+    #[tokio::test]
+    async fn a_profile_rule_refuses_one_value_and_asks_before_another() {
+        let policy: crate::guard::Policy = toml::from_str(
+            r#"
+            [[rule]]
+            tool = "find_objects"
+            arg = "query"
+            matches = "*knife*"
+            then = "deny"
+            reason = "do not look for knives"
+            [[rule]]
+            tool = "find_objects"
+            arg = "query"
+            matches = "*bedroom*"
+            then = "ask"
+            reason = "the bedroom is private"
+            "#,
+        )
+        .unwrap();
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "find_objects", json!({"query": "the knife"})),
+            MockTurn::tool_call("c2", "find_objects", json!({"query": "the bedroom lamp"})),
+            MockTurn::text("Done."),
+        ]);
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            registry(Risk::Observe),
+            Arc::new(Guard::new(policy)),
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("find things".into()));
+        let approve = |e: &Event| match e {
+            Event::ApprovalRequested { id, .. } => Some(Command::Approve(*id)),
+            _ => None,
+        };
+        let events = collect_until_finished(&mut rx, approve, &session).await;
+        let finished: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolFinished {
+                    status, message, ..
+                } => Some((*status, message.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished[0], ("refused", "do not look for knives"));
+        assert_eq!(finished[1].0, "succeeded", "asked, then run");
+        assert!(events.iter().any(
+            |e| matches!(e, Event::ApprovalRequested { reason, .. } if reason == "the bedroom is private")
+        ));
     }
 }

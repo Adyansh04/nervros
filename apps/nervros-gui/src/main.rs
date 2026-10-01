@@ -1,9 +1,15 @@
 //! The NervROS desktop app: chat beside an embedded Rerun viewer, in one process with the agent.
 
 mod app;
+mod attach;
 mod chat;
 mod editor;
+mod history;
+mod palette;
+mod plan_edit;
+mod robot;
 mod sessions;
+mod toasts;
 
 use std::path::PathBuf;
 
@@ -29,10 +35,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+    let _telemetry = nervros_core::telemetry::init();
     let main_thread = re_viewer::MainThreadToken::i_promise_i_am_on_the_main_thread();
     let args = Args::parse();
     let memory_limit = re_memory::MemoryLimit::parse(&args.memory_limit).map_err(|e| anyhow!(e))?;
@@ -46,13 +49,13 @@ fn main() -> Result<()> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let files = nervros_core::app::SessionFiles {
+    let files = nervros_core::app::StartOptions {
         history: Some(
             state
                 .join("logs")
                 .join(format!("session-{stamp}.history.json")),
         ),
-        resume: None,
+        ..Default::default()
     };
     let agent =
         nervros_core::app::start_with(&args.profile, robot, &state.join("quota.json"), files)

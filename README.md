@@ -50,13 +50,23 @@ nervros-cli --profile my.toml ros topic_sample '{"topic": "/odom", "mode": "hz"}
 ```
 
 `eval` runs a suite of requests against the live robot, each in a fresh session with every approval
-granted, and judges what the agent did: the tools and skills it used, the mission's outcome, the
-approvals it asked for, its reply, and how far the robot moved. A suite is a TOML list of cases (see
-grove-g1's `g1_bringup/config/nervros/eval/apartment.toml`):
+granted, and judges what the agent did: the tools and skills it used, what the tools said, the
+mission's outcome, the approvals it asked for, its reply, and how far the robot moved, on the
+simulator's own pose when the suite names it. `--repeat k` runs each case k times for pass^k, and
+`--models a,b` runs it on each model in turn to compare them; the report gives each model's pass
+rate with its interval, its calls, model time and tokens per case, and where the run came from. A
+suite is a TOML list of cases (see grove-g1's `g1_bringup/config/nervros/eval/apartment.toml`):
 
 ```bash
-nervros-cli --profile my.toml eval suite.toml --only pick   # the cases whose ids hold "pick"
+nervros-cli --profile my.toml eval suite.toml --only pick --repeat 3
 ```
+
+The same kind of case with a scripted model and a scripted robot lives in `scenarios/`, and
+`cargo test -p nervros-core --test scenarios` runs each through the whole agent, with no model and
+no ROS. `RUST_LOG=nervros_core=info` logs what the agent decides. Built with `--features otlp` and
+run with `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`, the apps send spans over OTLP/HTTP to
+a collector such as Jaeger: a span per turn with each model call and tool call inside it, and one
+per mission, schedule and watch. Prompts and replies stay out of them.
 
 With a [`[ros_tools]`](docs/profile.md#ros_tools) table the agent can look at any part of the
 graph as `ros2` would (topics with their QoS, rates, messages, nodes, services, actions,
@@ -72,14 +82,22 @@ the robot's health", "tell me if the chest camera drops below 5 Hz", "plot the r
 walk through the rooms, 6 times").
 
 To act, the agent writes a plan and the app asks you to approve it, once: the agent never asks you
-first in the chat, and you deny what is wrong. A failed mission comes back with what went wrong, and
-the agent proposes a changed plan for you to approve.
+first in the chat, and you deny what is wrong. The plan's card shows its steps, how each went on
+this robot before, and what NervROS found when it checked the plan against your words (a left turn
+planned as a right one comes with a one-click fix); the viewer previews where its walks end. Edit
+changes, drops or moves a step before you approve. A failed mission comes back with what went
+wrong, and the agent proposes a changed plan for you to approve. While a mission runs the app
+sends the executor a heartbeat, so a mission whose app closed or hung stops by itself.
 
-In the window, Enter sends, Esc stops the reply and Ctrl+Shift+S stops the mission. Ctrl+1 to
-Ctrl+7 switch the dock between the mission, the world model, the viewer's layers, approvals, events,
-the agent (earlier sessions to resume, what it remembers, the models) and the connection check. The
-status bar shows how full the model's context is; the conversation is condensed before it fills,
-and `/compact` condenses it at once. Every conversation is saved, so Resume in the Agent tab, or
+In the window, Enter sends, Esc stops the reply and Ctrl+Shift+S stops the mission; Ctrl+K opens
+the command palette. Ctrl+1 to Ctrl+8 switch the dock between the mission (its live behaviour tree,
+recent missions, saved plans and the requests no skill could do), the world model, the viewer's
+layers, approvals, events, the agent (earlier sessions to resume, what it remembers, the models),
+the connection check and the robot (its state, hands and motors, and driving it by hand). The status
+bar shows how full the model's context is and how much of it came from the model server's cache;
+the conversation is condensed before it fills, `/compact` condenses it at once, and right-clicking a
+message condenses up to it. An image pasted or dropped on the window goes to the agent with your
+next message. Every conversation is saved, so Resume in the Agent tab, or
 `nervros-cli chat --resume last`, carries one on. Closing the window while a mission runs asks first
 whether to stop the robot, and a new session tells you when the robot is already running one.
 The embedded viewer is [Rerun](https://rerun.io), which keeps the cameras, map, rooms, objects and
@@ -87,6 +105,10 @@ mission steps on a timeline. [`[[viz.layer]]`](docs/profile.md#viz) adds what RV
 occupancy grids, marker arrays and laser scans, each with a switch in the Layers tab. Clicking an
 object, a room or a point on the map offers messages about it, such as "Walk to O17 (shelf).",
 filled into the composer for you to read and send.
+
+The agent can also use tools from MCP servers the profile lists, each tool pinned to the
+definition you approved, and read skills: short procedures for the robot's rare troubles, kept as
+`SKILL.md` folders beside the profile.
 
 ## Documentation
 

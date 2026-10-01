@@ -1,0 +1,20 @@
+# The usual flow: the model plans a short walk, the operator approves it, the robot walks, and the
+# model answers the robot's report.
+say = ["Walk forward one metre."]
+
+[[model]]
+call = "run_mission"
+args = { intent = "walk forward 1 m", steps = [{ skill = "WalkStraight", args = [{ name = "direction", value = "forward" }, { name = "distance_m", value = "1" }] }] }
+
+[[model]]
+reply = "Walking one metre forward."
+
+[[model]]
+reply = "Done: I walked one metre forward."
+
+[expect]
+tools = ["run_mission"]
+skills = ["WalkStraight"]
+mission = "success"
+approvals_max = 1
+reply_has = ["walked"]

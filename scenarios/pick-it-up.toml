@@ -1,0 +1,16 @@
+# "It", said first in a session, names nothing: the plan is refused before anyone is asked, and
+# the model asks which thing.
+say = ["Pick it up."]
+
+[[model]]
+call = "run_mission"
+args = { intent = "pick it up", steps = [{ skill = "PickObject", args = [{ name = "object_id", value = "O17" }, { name = "phrase", value = "red mug" }, { name = "arm", value = "right" }] }] }
+
+[[model]]
+reply = "Which thing should I pick up?"
+
+[expect]
+tool_said = ["which thing they mean"]
+mission = "none"
+approvals_max = 0
+reply_has = ["which"]

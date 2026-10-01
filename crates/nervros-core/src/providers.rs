@@ -178,7 +178,7 @@ pub struct PoolConfig {
 pub enum Role {
     /// Conversation and tool calls.
     Routine,
-    /// Writing a mission plan.
+    /// Advice when the routine model's plans keep failing their checks; only the models listed.
     Plan,
     /// Spatial checks and pointing.
     VisionCheck,
@@ -186,16 +186,19 @@ pub enum Role {
     Summarise,
     /// Outlining what a prompt names in a camera frame, for `segment`.
     Segment,
+    /// A second opinion on a plan before the operator approves it; off while its chain is empty.
+    PlanCheck,
 }
 
 impl Role {
     /// Every role.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Routine,
         Self::Plan,
         Self::VisionCheck,
         Self::Summarise,
         Self::Segment,
+        Self::PlanCheck,
     ];
 }
 
@@ -218,6 +221,9 @@ pub struct RolesConfig {
     /// See [`Role::Segment`].
     #[serde(default)]
     pub segment: Vec<String>,
+    /// See [`Role::PlanCheck`].
+    #[serde(default)]
+    pub plan_check: Vec<String>,
 }
 
 impl RolesConfig {
@@ -230,6 +236,7 @@ impl RolesConfig {
             Role::VisionCheck => &self.vision_check,
             Role::Summarise => &self.summarise,
             Role::Segment => &self.segment,
+            Role::PlanCheck => &self.plan_check,
         }
     }
 }

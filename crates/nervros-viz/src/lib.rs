@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use nervros_core::mission::preview::PreviewStep;
 use nervros_core::profile::{LayerConfig, LookConfig, Profile, TopicRef};
 use nervros_core::session::Event;
 use nervros_ros::image::encode_jpeg;
@@ -37,6 +38,8 @@ const CAMERA_QUALITY: u8 = 75;
 const CAMERA_PATH: [&str; 2] = ["/camera", "/world/robot/camera"];
 /// Where the robot's model goes, under the robot's pose.
 const MODEL_PATH: &str = "world/robot/model";
+/// The plan awaiting approval or running: its walks and where each step ends.
+const PLAN_PATH: &str = "world/plan";
 /// The viewer's name for the frame of the `world/robot` entity, which the model hangs from.
 const ROBOT_FRAME: &str = "tf#/world/robot";
 const REMOVED: u64 = 2;
@@ -975,6 +978,54 @@ fn draw_plan(rec: &RecordingStream, path: &str, msg: &Value) {
     );
 }
 
+/// Where a plan would take the robot: each walk's path, and an arrow where each step ends,
+/// labelled with its step.
+fn draw_preview(rec: &RecordingStream, steps: &[PreviewStep]) {
+    const LIFT: f32 = 0.06;
+    let colour = rerun::Color::from_rgb(255, 196, 64);
+    put(rec, PLAN_PATH, &rerun::Clear::recursive());
+    let paths: Vec<Vec<[f32; 3]>> = steps
+        .iter()
+        .filter(|s| s.path.len() > 1)
+        .map(|s| {
+            s.path
+                .iter()
+                .map(|&(x, y)| {
+                    let [x, y] = f32s([x, y]);
+                    [x, y, LIFT]
+                })
+                .collect()
+        })
+        .collect();
+    if !paths.is_empty() {
+        put(
+            rec,
+            &format!("{PLAN_PATH}/paths"),
+            &rerun::LineStrips3D::new(paths)
+                .with_radii([0.025])
+                .with_colors([colour]),
+        );
+    }
+    let ends: Vec<(&str, [f32; 3])> = steps
+        .iter()
+        .filter_map(|s| s.goal.map(|g| (s.id.as_str(), f32s([g.0, g.1, g.2]))))
+        .collect();
+    if !ends.is_empty() {
+        put(
+            rec,
+            &format!("{PLAN_PATH}/ends"),
+            &rerun::Arrows3D::from_vectors(
+                ends.iter()
+                    .map(|(_, [_, _, yaw])| [0.4 * yaw.cos(), 0.4 * yaw.sin(), 0.0]),
+            )
+            .with_origins(ends.iter().map(|(_, [x, y, _])| [*x, *y, LIFT]))
+            .with_labels(ends.iter().map(|(id, _)| *id))
+            .with_radii([0.03])
+            .with_colors([colour]),
+        );
+    }
+}
+
 /// Where the robot has been, from a `nav_msgs/msg/Path`.
 fn draw_trail(rec: &RecordingStream, path: &str, msg: &Value) {
     let points: Vec<[f32; 3]> = msg["poses"]
@@ -1099,6 +1150,41 @@ fn step_states() -> rerun::StateConfiguration {
 }
 
 /// The agent's replies and tool calls as a text log, and its marked images.
+/// Draws one number from a topic's messages over `for_s` seconds; `source` is the topic, its
+/// type and the field.
+fn plot(
+    rec: &RecordingStream,
+    robot: &Arc<dyn RobotPort>,
+    name: &str,
+    (topic, ty, field): (&str, &str, &str),
+    for_s: u64,
+) -> impl Future<Output = ()> + Send + 'static {
+    let path = format!("plots/{}", layers::slug(name));
+    put_static(rec, &path, &rerun::SeriesLines::new().with_names([name]));
+    let (rec, robot) = (rec.clone(), Arc::clone(robot));
+    let (topic, ty, field) = (topic.to_owned(), ty.to_owned(), field.to_owned());
+    let until = tokio::time::Instant::now() + Duration::from_secs(for_s);
+    async move {
+        let mut tick = interval(POSE_PERIOD);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut last = Value::Null;
+        while tokio::time::Instant::now() < until {
+            tick.tick().await;
+            let Ok(msg) = robot.latest(&topic, &ty, TOPIC_WAIT).await else {
+                continue;
+            };
+            // The newest message stays until the next arrives: draw each once.
+            if msg != last {
+                let value = nervros_core::watch::field(&msg, &field).and_then(Value::as_f64);
+                if let Some(v) = value {
+                    put(&rec, &path, &rerun::Scalars::single(v));
+                }
+                last = msg;
+            }
+        }
+    }
+}
+
 async fn agent(
     rec: RecordingStream,
     robot: Arc<dyn RobotPort>,
@@ -1121,35 +1207,7 @@ async fn agent(
                 field,
                 for_s,
             } => {
-                let (topic, ty, field) = (topic.clone(), msg_type.clone(), field.clone());
-                let path = format!("plots/{}", layers::slug(name));
-                put_static(
-                    &rec,
-                    &path,
-                    &rerun::SeriesLines::new().with_names([name.as_str()]),
-                );
-                let (rec, robot) = (rec.clone(), Arc::clone(&robot));
-                let until = tokio::time::Instant::now() + Duration::from_secs(*for_s);
-                plots.spawn(async move {
-                    let mut tick = interval(POSE_PERIOD);
-                    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                    let mut last = Value::Null;
-                    while tokio::time::Instant::now() < until {
-                        tick.tick().await;
-                        let Ok(msg) = robot.latest(&topic, &ty, TOPIC_WAIT).await else {
-                            continue;
-                        };
-                        // The newest message stays until the next arrives: draw each once.
-                        if msg != last {
-                            let value =
-                                nervros_core::watch::field(&msg, &field).and_then(Value::as_f64);
-                            if let Some(v) = value {
-                                put(&rec, &path, &rerun::Scalars::single(v));
-                            }
-                            last = msg;
-                        }
-                    }
-                });
+                plots.spawn(plot(&rec, &robot, name, (topic, msg_type, field), *for_s));
                 continue;
             }
             Event::Snapshot { jpeg, .. } => {
@@ -1160,6 +1218,19 @@ async fn agent(
             Event::MissionStarted { .. } => {
                 // A new mission's steps start from empty lanes.
                 put(&rec, "mission", &rerun::Clear::recursive());
+                continue;
+            }
+            Event::MissionPreview { steps, .. } => {
+                draw_preview(&rec, steps);
+                continue;
+            }
+            // A preview lasts while its plan is pending or running.
+            Event::MissionPlanned { .. }
+            | Event::MissionFinished { .. }
+            | Event::ApprovalResolved {
+                approved: false, ..
+            } => {
+                put(&rec, PLAN_PATH, &rerun::Clear::recursive());
                 continue;
             }
             Event::MissionProgress {

@@ -285,7 +285,7 @@ enum View {
     Overlay,
 }
 
-fn inside(region: &Instance, x: u32, y: u32) -> bool {
+pub(crate) fn inside(region: &Instance, x: u32, y: u32) -> bool {
     let (bx, by, bw, bh) = region.bbox;
     if x < bx || y < by || x >= bx + bw || y >= by + bh {
         return false;
@@ -448,6 +448,7 @@ impl SegmentTool {
             jpeg: Arc::new(jpeg),
             width: drawn.width(),
             height: drawn.height(),
+            marks: regions.iter().map(|r| r.label.clone()).collect(),
         };
         let listed: Vec<Value> = regions
             .iter()

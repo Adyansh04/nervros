@@ -5,16 +5,16 @@
 //! transport failure moves on without parking, and the answer names the model that gave it.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use futures::future::BoxFuture;
 use rig::agent::tool::ToolOutput;
 use rig::agent::{
-    AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent, HookContext,
-    InvalidToolCallAction, InvalidToolCallContext, ObservationAction, RequestPatch,
+    AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, InvalidToolCallAction,
+    InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, RequestPatch,
 };
 use rig::client::CompletionClient as _;
 use rig::completion::{Chat as _, Message, Prompt as _, PromptError};
@@ -416,6 +416,24 @@ fn is_user_text(m: &Message) -> bool {
     matches!(m, Message::User { content } if content.iter().all(|c| matches!(c, UserContent::Text(_))))
 }
 
+/// How a robot's report starts, as the model gets it.
+pub(crate) const REPORT_MARK: &str = "[Report from the robot, not the operator]";
+/// How a summary of the earlier conversation starts.
+const SUMMARY_MARK: &str = "[The earlier conversation, summarised]";
+/// How a tool result cut to save room starts.
+const CUT_MARK: &str = "[an earlier result, cut to save room]";
+
+/// The operator's own words: not a robot's report or a summary, which come as user text too.
+fn is_operator(m: &Message) -> bool {
+    let Message::User { content } = m else {
+        return false;
+    };
+    is_user_text(m)
+        && !content.iter().any(|c| {
+            matches!(c, UserContent::Text(t) if t.text.starts_with(REPORT_MARK) || t.text.starts_with(SUMMARY_MARK))
+        })
+}
+
 /// Characters per token: JSON-heavy text runs about three, so this errs high.
 const CHARS_PER_TOKEN: usize = 3;
 /// A camera frame, whatever its bytes: a model sizes an image by its tiles, not its base64.
@@ -481,14 +499,15 @@ fn result_text(parts: &[ToolResultContent]) -> String {
         .join(" ")
 }
 
-/// The messages with every tool result and image before the last `keep` cut to a line.
+/// The messages with every tool result and image before the last `keep` cut to a line; one cut
+/// before stays as it is.
 fn cut_old(messages: &[Message], keep: usize) -> Vec<Message> {
     let edge = messages.len().saturating_sub(keep);
     let cut = |c: &UserContent| match c {
-        UserContent::ToolResult(r) => {
+        UserContent::ToolResult(r) if !result_text(&r.content).starts_with(CUT_MARK) => {
             let mut r = r.clone();
             r.content = vec![ToolResultContent::text(format!(
-                "[an earlier result, cut to save room] {}",
+                "{CUT_MARK} {}",
                 crate::tools::clip(&result_text(&r.content), 160)
             ))];
             UserContent::ToolResult(r)
@@ -584,13 +603,35 @@ impl History {
         (split > 0).then(|| (split, transcript(&self.0[..split])))
     }
 
+    /// The part before the operator's last `keep` messages, as [`Self::older`] gives it: "condense
+    /// up to here". `None` when there is nothing before them.
+    #[must_use]
+    pub fn before_last(&self, keep: usize) -> Option<(usize, String)> {
+        let operator: Vec<usize> = (0..self.0.len())
+            .filter(|&i| is_operator(&self.0[i]))
+            .collect();
+        let split = match keep {
+            0 => self.0.len(),
+            k => operator[operator.len().checked_sub(k)?],
+        };
+        (split > 0).then(|| (split, transcript(&self.0[..split])))
+    }
+
+    /// Cuts every tool result and image before the operator's newest message to a line. What was
+    /// said and called stays word for word, which serves a later turn about as well as a summary
+    /// and costs no model call.
+    pub fn mask(&mut self) {
+        let newest = self.0.iter().rposition(is_operator).unwrap_or(0);
+        self.0 = cut_old(&self.0, self.0.len() - newest);
+    }
+
     /// Replaces the first `n` messages with a summary of them.
     pub fn summarised(&mut self, n: usize, summary: &str) {
         let kept = self.0.split_off(n.min(self.0.len()));
         self.0 = vec![
             Message::User {
                 content: vec![UserContent::text(format!(
-                    "[The earlier conversation, summarised]\n{}",
+                    "{SUMMARY_MARK}\n{}",
                     summary.trim()
                 ))],
             },
@@ -680,12 +721,16 @@ impl History {
     }
 }
 
-/// How the model is told to condense the conversation.
+/// How the model is told to condense the conversation: in sections, which a small model carries on
+/// from more reliably than from prose.
 const SUMMARY_PREAMBLE: &str = "You condense a conversation between a robot's operator and its \
-    assistant so the assistant can carry on from your summary alone. Keep what the operator asked \
-    for and still wants, decisions made, the ids of places and objects, what the robot did and how \
-    each mission ended, what it holds, and open problems. Drop greetings and raw tool output. \
-    Write at most 12 short lines.";
+    assistant so the assistant can carry on from your summary alone. Write four sections, each a \
+    heading line and then at most four lines that start with \"- \":\n\
+    Goal: what the operator wants now.\n\
+    Done: what the robot did, and how each mission ended.\n\
+    Open: what is unfinished, unanswered or went wrong.\n\
+    Facts: ids of places and objects, what each hand holds, and decisions made.\n\
+    Write \"- none\" under a section with nothing. Drop greetings and raw tool output.";
 
 /// A summary of a transcript from the first model of the `summarise` role that answers.
 pub async fn summarise(source: &Arc<dyn AgentSource>, transcript: &str) -> Option<String> {
@@ -745,6 +790,42 @@ impl crate::segment::Outliner for Llm {
         })
         .await
         .map(|a| (a.text, a.model))
+        .map_err(|e| e.to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::mission::advice::Advisor for Llm {
+    async fn advise(&self, prompt: &str) -> Option<String> {
+        let asked = self
+            .ask(Ask {
+                role: Role::Plan,
+                preamble: crate::mission::advice::ADVISOR_PREAMBLE,
+                prompt,
+                image: None,
+            })
+            .await;
+        match asked {
+            Ok(a) => Some(a.text),
+            Err(e) => {
+                tracing::info!(error = %e, "no advice");
+                None
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::mission::sanity::Critic for Llm {
+    async fn judge(&self, prompt: &str) -> Result<String, String> {
+        self.ask(Ask {
+            role: Role::PlanCheck,
+            preamble: crate::mission::sanity::CRITIC_PREAMBLE,
+            prompt,
+            image: None,
+        })
+        .await
+        .map(|a| a.text)
         .map_err(|e| e.to_string())
     }
 }
@@ -837,8 +918,9 @@ struct TurnHook {
     last: usize,
     /// Tokens left for the history and the prompt in the model's window, when it is known.
     room: Option<usize>,
-    /// The input tokens of the latest request, as the provider counted them.
-    used: Arc<AtomicU64>,
+    on_call: Option<OnCall>,
+    /// When the pending call was sent.
+    sent: Mutex<Option<Instant>>,
     /// The system prompt for the last call, which says no tool can be called.
     last_word: String,
 }
@@ -876,21 +958,33 @@ impl AgentHook for TurnHook {
                     .preamble(self.last_word.clone()),
             );
         }
+        if let Ok(mut sent) = self.sent.lock() {
+            *sent = Some(Instant::now());
+        }
         patch.map_or_else(
             CompletionCallAction::continue_run,
             CompletionCallAction::patch,
         )
     }
 
-    async fn on_completion_response(
+    /// Fired for every call, streamed or not, which a response hook is not.
+    async fn on_model_turn_finished(
         &self,
         _ctx: &HookContext,
-        event: CompletionResponseEvent<'_>,
-    ) -> ObservationAction {
-        if event.usage.input_tokens > 0 {
-            self.used.store(event.usage.input_tokens, Ordering::Relaxed);
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        if let Some(on_call) = &self.on_call {
+            let sent = self.sent.lock().ok().and_then(|mut s| s.take());
+            on_call(CallCost {
+                input_tokens: event.usage.input_tokens,
+                cached_tokens: event.usage.cached_input_tokens,
+                output_tokens: event.usage.output_tokens,
+                ms: sent.map_or(0, |t| {
+                    u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+                }),
+            });
         }
-        ObservationAction::continue_run()
+        ModelTurnAction::Continue
     }
 
     /// Small models invent tool names; the model gets the real ones back as the call's result
@@ -927,14 +1021,30 @@ pub struct TurnSetup<'a> {
     pub started: Arc<AtomicBool>,
     /// The model's context window in tokens, when known.
     pub window: Option<usize>,
-    /// Where the input tokens of the turn's latest request are written.
-    pub used: Arc<AtomicU64>,
+    /// Given what each model call cost.
+    pub on_call: Option<OnCall>,
     /// Given each piece of reply text as it arrives, when the model streams.
     pub delta: Option<OnDelta>,
 }
 
 /// What is given each piece of a streamed reply.
 pub type OnDelta = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// What one model call cost, as the provider reported it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallCost {
+    /// Prompt tokens.
+    pub input_tokens: u64,
+    /// Of those, read from the provider's prompt cache.
+    pub cached_tokens: u64,
+    /// Reply tokens.
+    pub output_tokens: u64,
+    /// From sending the request to the whole reply.
+    pub ms: u64,
+}
+
+/// What is given each model call's cost.
+pub type OnCall = Arc<dyn Fn(CallCost) + Send + Sync>;
 
 /// Added to the system prompt for a turn's last model call.
 const LAST_CALL: &str = "You cannot call a tool now: this request is out of steps. Answer the \
@@ -1016,7 +1126,8 @@ pub async fn chat(
             room: setup.window.map(|w| {
                 w.saturating_sub(fixed_cost(setup.preamble, setup.tools) + RESERVE_TOKENS)
             }),
-            used: setup.used,
+            on_call: setup.on_call,
+            sent: Mutex::new(None),
             last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
         });
     let agent = builder.build();
@@ -1126,6 +1237,57 @@ mod tests {
         let mut squeezed = history;
         squeezed.squeeze(2500);
         assert!(squeezed.size() <= 2500 && is_user_text(&squeezed.0[0]));
+    }
+
+    #[test]
+    fn old_results_are_cut_once_and_up_to_here_counts_the_operator_only() {
+        let said = |text: &str| Message::User {
+            content: vec![UserContent::text(text)],
+        };
+        let mut history = History(vec![
+            said("where is the mug?"),
+            Message::tool_result("c1", "find_objects", "y".repeat(2000)),
+            said(&format!("{REPORT_MARK}\nthe mission succeeded")),
+            said("and the basket?"),
+            Message::tool_result("c2", "find_objects", "z".repeat(2000)),
+        ]);
+        history.mask();
+        let results: Vec<String> = history
+            .0
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content } => content.iter().find_map(|c| match c {
+                    UserContent::ToolResult(r) => Some(result_text(&r.content)),
+                    _ => None,
+                }),
+                Message::Assistant { .. } | Message::System { .. } => None,
+            })
+            .collect();
+        assert!(
+            results[0].starts_with(CUT_MARK) && results[0].len() < 300,
+            "{results:?}"
+        );
+        assert_eq!(results[1].len(), 2000, "the newest request's result stays");
+        let once = history.clone();
+        history.mask();
+        assert_eq!(history.0, once.0, "a cut result is not cut again");
+
+        let (n, text) = history.before_last(1).unwrap();
+        assert_eq!(n, 3, "the report is not the operator's");
+        assert!(
+            text.contains("where is the mug?") && !text.contains("basket"),
+            "{text}"
+        );
+        assert_eq!(
+            history.before_last(0).unwrap().0,
+            5,
+            "keeping none condenses it all"
+        );
+        assert!(
+            history.before_last(2).is_none(),
+            "nothing is before the operator's first"
+        );
+        assert!(history.before_last(3).is_none());
     }
 
     #[tokio::test]

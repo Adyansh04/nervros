@@ -1,0 +1,15 @@
+# An observe tool runs without asking: the model looks the mug up and answers.
+say = ["Where is the red mug?"]
+
+[[model]]
+call = "find_objects"
+args = { query = "red mug" }
+
+[[model]]
+reply = "The red mug is in the kitchen."
+
+[expect]
+tools = ["find_objects"]
+mission = "none"
+approvals_max = 0
+reply_has = ["kitchen"]

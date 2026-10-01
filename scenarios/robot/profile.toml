@@ -1,0 +1,39 @@
+# The profile every scenario runs: a humanoid with a mission executor, a world model, one place
+# and one tool of its own. Disarmed at start; a scenario arms it unless it says `armed = false`.
+
+[robot]
+name = "A humanoid test robot in a two-room flat"
+
+[ros]
+interfaces = ["interfaces"]
+
+[policy]
+start_armed = false
+
+[world]
+rooms = { topic = "/canopy/rooms", type = "canopy_msgs/msg/RoomArray" }
+objects = { topic = "/canopy/objects", type = "canopy_msgs/msg/WorldObjectArray" }
+
+[mission]
+execute = "/x/execute_mission"
+validate = "/x/validate_mission"
+catalog = "/x/get_catalog"
+stop = "/x/stop_all"
+state = "/x/robot_state"
+
+[[place]]
+name = "dock"
+pose = { x = 0.5, y = 0.5 }
+
+[[tool]]
+name = "find_objects"
+kind = "service"
+ros_name = "/canopy/find_objects"
+type = "scenario_msgs/srv/FindObjects"
+risk = "observe"
+description = "Finds objects in the world model by what they are: ids, labels and rooms."
+schema = { type = "object", properties = { query = { type = "string" } }, required = ["query"] }
+world_text = ["labels"]
+
+[models]
+file = "models.toml"

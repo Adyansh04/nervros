@@ -1,0 +1,23 @@
+# The operator turns down three plans in a row: the third refusal tells the model to stop acting
+# and ask, and no mission runs. (The same plan sent a third time would be refused as a loop.)
+say = ["Walk forward."]
+approve = false
+
+[[model]]
+call = "run_mission"
+args = { intent = "walk forward", steps = [{ skill = "WalkStraight", args = [{ name = "direction", value = "forward" }, { name = "distance_m", value = "1" }] }] }
+
+[[model]]
+call = "run_mission"
+args = { intent = "walk forward", steps = [{ skill = "WalkStraight", args = [{ name = "direction", value = "forward" }, { name = "distance_m", value = "0.5" }] }] }
+
+[[model]]
+call = "run_mission"
+args = { intent = "walk forward", steps = [{ skill = "WalkStraight", args = [{ name = "direction", value = "forward" }, { name = "distance_m", value = "2" }] }] }
+
+[[model]]
+reply = "You turned the walk down three times. What should I do instead?"
+
+[expect]
+tool_said = ["3 times in a row"]
+mission = "none"

@@ -42,6 +42,14 @@ pub struct Agent {
     pub memory: Arc<crate::memory::Memory>,
     /// Missions run again and again, when the robot has an executor.
     pub schedules: Option<Arc<crate::schedule::Schedules>>,
+    /// Missions, when the robot has an executor: their ledger is the window's history.
+    pub missions: Option<Arc<Missions>>,
+    /// What the MCP servers brought, for the doctor.
+    pub mcp: Vec<crate::doctor::Check>,
+    /// What the operator should hear as the session starts, before anything subscribes to it.
+    pub notices: Vec<String>,
+    /// Requests the last session ended waiting on the operator for, to offer again.
+    pub unanswered: Vec<crate::session::Unanswered>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -145,20 +153,28 @@ fn orphan_notice(state: &serde_json::Value) -> Option<String> {
     ))
 }
 
-/// `look`, `segment` and the world editor's tools, as the profile has them; the editor client too,
-/// for the app.
+/// What seeing set up beyond its tools: the world editor's client, for the app, and the camera
+/// check of a mission's end, for the missions.
+struct Seeing {
+    editor: Option<Arc<crate::editor::EditorClient>>,
+    vision: Option<crate::mission::camera::Vision>,
+}
+
+/// `look`, `point`, `segment` and the world editor's tools, as the profile has them.
 fn seeing_tools(
     profile: &Profile,
     robot: &Arc<dyn RobotPort>,
     llm: &Arc<Llm>,
     snapshots: &Arc<SnapshotStore>,
     registry: &mut Registry,
-) -> Result<Option<Arc<crate::editor::EditorClient>>, StartError> {
+) -> Result<Seeing, StartError> {
     let robot = Arc::clone(robot);
     let snapshots = Arc::clone(snapshots);
     let llm = Arc::clone(llm);
+    let mut seen_by = None;
     if let Some(look) = profile.look.clone() {
         let cameras = Cameras::start(&look, &robot).map_err(StartError::Look)?;
+        seen_by = Some(Arc::clone(&cameras));
         let eyes: Arc<dyn crate::look::Eyes> = Arc::clone(&llm) as Arc<dyn crate::look::Eyes>;
         registry.add(Arc::new(LookTool::new(
             look,
@@ -167,6 +183,16 @@ fn seeing_tools(
             Arc::clone(&snapshots),
             Some(eyes),
         )))?;
+        // Pointing asks the models that outline, a skill few models have.
+        if !llm.router().config().roles.segment.is_empty() {
+            let pointer = Arc::clone(&llm) as Arc<dyn crate::segment::Outliner>;
+            registry.add(Arc::new(crate::point::PointTool::new(
+                Arc::clone(&cameras),
+                Arc::clone(&robot),
+                Arc::clone(&snapshots),
+                pointer,
+            )))?;
+        }
         if let Some(segment) = profile.segment.clone() {
             let outliner = Arc::clone(&llm) as Arc<dyn crate::segment::Outliner>;
             registry.add(Arc::new(SegmentTool::new(
@@ -190,7 +216,12 @@ fn seeing_tools(
             registry.add(tool)?;
         }
     }
-    Ok(editor)
+    let vision = seen_by.map(|cameras| crate::mission::camera::Vision {
+        eyes: Arc::clone(&llm) as Arc<dyn crate::look::Eyes>,
+        cameras,
+        snapshots: Arc::clone(&snapshots),
+    });
+    Ok(Seeing { editor, vision })
 }
 
 /// `list_places`, `tag_place` and `forget_place`, over the profile's places and the ones remembered
@@ -229,6 +260,22 @@ fn robot_file(profile: &Profile, ledger: &Path, kind: &str) -> Option<PathBuf> {
     })
 }
 
+/// Where a robot's mission ledger lives under the state folder `state`.
+#[must_use]
+pub fn mission_ledger_file(profile: &Profile, state: &Path) -> PathBuf {
+    robot_file(profile, &state.join("quota.json"), "missions")
+        .unwrap_or_else(|| state.join("missions").join("robot.json"))
+        .with_extension("sqlite3")
+}
+
+/// The robot's mission ledger, beside its memory. Missions still run without one, unrecorded.
+fn mission_ledger(profile: &Profile, ledger: &Path) -> Option<Arc<crate::mission::ledger::Ledger>> {
+    let path = mission_ledger_file(profile, ledger.parent()?);
+    crate::mission::ledger::Ledger::open(&path)
+        .map_err(|e| tracing::warn!(error = %e, path = %path.display(), "no mission ledger"))
+        .ok()
+}
+
 /// The watches and the health check: what a person runs before blaming the model.
 fn debug_tools(
     profile: &Profile,
@@ -246,13 +293,19 @@ fn debug_tools(
     Ok(watches)
 }
 
-/// Where a session keeps its conversation, and the conversation it carries on.
-#[derive(Debug, Default, Clone)]
-pub struct SessionFiles {
+/// How a session starts: where it keeps its conversation, the conversation it carries on, and
+/// the model it talks on.
+#[derive(Default, Clone)]
+pub struct StartOptions {
     /// Written after every turn, so the session can be resumed.
     pub history: Option<PathBuf>,
     /// An earlier conversation to carry on.
     pub resume: Option<crate::llm::History>,
+    /// The only model for the routine role, by its `models.toml` id: an eval's arm.
+    pub model: Option<String>,
+    /// What the session talks to in place of `models.toml`'s models, such as a scripted model
+    /// for a scenario; the profile's other roles (plan checks, vision) keep theirs.
+    pub source: Option<Arc<dyn crate::llm::AgentSource>>,
 }
 
 /// Starts an agent with a fresh conversation that is not saved. Must run inside a tokio runtime.
@@ -265,11 +318,133 @@ pub fn start(
     robot: Arc<dyn RobotPort>,
     ledger: &Path,
 ) -> Result<Agent, StartError> {
-    start_with(profile_path, robot, ledger, SessionFiles::default())
+    start_with(profile_path, robot, ledger, StartOptions::default())
 }
 
-/// Starts an agent whose conversation is saved to, or resumed from, `files`. Must run inside a
-/// tokio runtime.
+/// Missions, when the profile has a `[mission]` section: kept in the robot's ledger, checked by
+/// `critic` too when a model has the `plan_check` role, helped by `advisor` when the `plan` role
+/// has models of its own, and their ends seen through the camera with `vision`.
+fn missions(
+    profile: &Profile,
+    places: Arc<crate::places::Places>,
+    robot: &Arc<dyn RobotPort>,
+    ledger: &Path,
+    critic: Option<Arc<dyn crate::mission::sanity::Critic>>,
+    advisor: Option<Arc<dyn crate::mission::advice::Advisor>>,
+    vision: Option<crate::mission::camera::Vision>,
+) -> Option<Arc<Missions>> {
+    let mut m = Missions::new(profile, places, Arc::clone(robot))?;
+    if let Some(l) = mission_ledger(profile, ledger) {
+        m = m.with_ledger(l);
+    }
+    if let Some(c) = critic {
+        m = m.with_critic(c);
+    }
+    if let Some(a) = advisor {
+        m = m.with_advisor(a);
+    }
+    if let Some(v) = vision {
+        m = m.with_vision(v);
+    }
+    Some(m)
+}
+
+/// A mission started before this session runs on unwatched: says so, once, at start.
+fn say_orphan(
+    profile: &Profile,
+    robot: &Arc<dyn RobotPort>,
+    handle: crate::session::SessionHandle,
+) {
+    let Some(state) = profile.mission.as_ref().map(|m| m.state.clone()) else {
+        return;
+    };
+    let robot = Arc::clone(robot);
+    tokio::spawn(async move {
+        let latched = robot
+            .latest(&state, "nervros_interfaces/msg/RobotState", ORPHAN_WAIT)
+            .await;
+        if let Some(text) = latched.ok().as_ref().and_then(orphan_notice) {
+            handle.emit(crate::session::Event::Notice { text });
+        }
+    });
+}
+
+/// The model layer and the second opinions it gives on plans.
+struct ModelLayer {
+    llm: Arc<Llm>,
+    privacy: PrivacyMode,
+    critic: Option<Arc<dyn crate::mission::sanity::Critic>>,
+    advisor: Option<Arc<dyn crate::mission::advice::Advisor>>,
+}
+
+/// The profile's models behind one router, the routine role on `model` alone when one is given.
+fn model_layer(
+    profile: &Profile,
+    ledger: &Path,
+    model: Option<String>,
+) -> Result<ModelLayer, StartError> {
+    let mut models = ModelsConfig::load(&profile.resolve(&profile.models.file))?;
+    if let Some(id) = model {
+        if models.model(&id).is_none() {
+            return Err(crate::providers::ConfigError::Unknown {
+                from: "the model asked for".to_owned(),
+                kind: "model",
+                id,
+            }
+            .into());
+        }
+        models.roles.routine = vec![id];
+    }
+    let privacy = match profile.privacy.mode {
+        PrivacyModeConfig::Sim => PrivacyMode::Sim,
+        PrivacyModeConfig::Home => PrivacyMode::Home,
+    };
+    let checks_plans = !models.roles.plan_check.is_empty();
+    // An advisor that is the planner itself would only repeat it.
+    let advises = !models.roles.plan.is_empty() && models.roles.plan != models.roles.routine;
+    let router = Router::with_ledger_file(models, ledger, privacy).map_err(StartError::Ledger)?;
+    let llm = Arc::new(Llm::new(router));
+    Ok(ModelLayer {
+        critic: checks_plans.then(|| Arc::clone(&llm) as Arc<dyn crate::mission::sanity::Critic>),
+        advisor: advises.then(|| Arc::clone(&llm) as Arc<dyn crate::mission::advice::Advisor>),
+        llm,
+        privacy,
+    })
+}
+
+/// Where a session keeps the requests waiting on the operator: beside its conversation, so one
+/// that keeps a conversation keeps what it was asking too. And what the last session left there.
+fn waiting_requests(history: Option<&Path>) -> (Option<PathBuf>, Vec<crate::session::Unanswered>) {
+    let file = history.map(|h| h.with_file_name("pending.json"));
+    let left = file
+        .as_deref()
+        .map(crate::session::take_unanswered)
+        .unwrap_or_default();
+    (file, left)
+}
+
+/// The missions' tools, their history's and the schedules', and the schedules themselves.
+fn mission_tools(
+    missions: Option<&Arc<Missions>>,
+    guard: &Arc<Guard>,
+    registry: &mut Registry,
+) -> Result<Option<Arc<crate::schedule::Schedules>>, StartError> {
+    let Some(missions) = missions else {
+        return Ok(None);
+    };
+    let schedules = crate::schedule::Schedules::new(Arc::clone(missions), Arc::clone(guard));
+    for tool in missions
+        .tools()
+        .into_iter()
+        .chain(crate::mission::history::tools(missions))
+        .chain(schedules.tools())
+    {
+        registry.add(tool)?;
+    }
+    Ok(Some(schedules))
+}
+
+/// Starts an agent as `options` say. Must run inside a tokio runtime.
 ///
 /// # Errors
 ///
@@ -278,21 +453,17 @@ pub fn start_with(
     profile_path: &Path,
     robot: Arc<dyn RobotPort>,
     ledger: &Path,
-    files: SessionFiles,
+    options: StartOptions,
 ) -> Result<Agent, StartError> {
     let profile = Profile::load(profile_path)?;
-    let models = ModelsConfig::load(&profile.resolve(&profile.models.file))?;
-    let privacy = match profile.privacy.mode {
-        PrivacyModeConfig::Sim => PrivacyMode::Sim,
-        PrivacyModeConfig::Home => PrivacyMode::Home,
-    };
-    let router = Router::with_ledger_file(models, ledger, privacy).map_err(StartError::Ledger)?;
-    let llm = Arc::new(Llm::new(router));
+    let models = model_layer(&profile, ledger, options.model)?;
+    let (pending_file, unanswered) = waiting_requests(options.history.as_deref());
+    let llm = Arc::clone(&models.llm);
     let guard = Arc::new(Guard::new(profile.policy.clone()));
     let schemas: Arc<dyn SchemaSource> = Arc::new(RosidlSchemas::load(&profile)?);
     let mut registry = Registry::from_config(&profile.tools, &robot, &schemas, &guard)?;
     let snapshots = Arc::new(SnapshotStore::default());
-    let editor = seeing_tools(&profile, &robot, &llm, &snapshots, &mut registry)?;
+    let seeing = seeing_tools(&profile, &robot, &llm, &snapshots, &mut registry)?;
     let places = place_tools(&profile, &robot, ledger, &mut registry)?;
     registry.add(Arc::new(RobotState::new(
         &profile,
@@ -305,36 +476,44 @@ pub fn start_with(
         }
     }
     let watches = debug_tools(&profile, &robot, &mut registry)?;
+    let mcp = mcp_tools(&profile, models.privacy, &mut registry)?;
+    let skills = skill_tools(&profile, &mut registry)?;
     let memory = crate::memory::Memory::new(robot_file(&profile, ledger, "memory"));
     registry.add(Arc::new(crate::memory::MemoryTool::new(Arc::clone(
         &memory,
     ))))?;
     let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
     registry.add(Arc::clone(&stop))?;
-    let missions = Missions::new(&profile, places, Arc::clone(&robot));
-    let schedules = missions
-        .as_ref()
-        .map(|m| crate::schedule::Schedules::new(Arc::clone(m), Arc::clone(&guard)));
-    for tool in missions
-        .iter()
-        .flat_map(Missions::tools)
-        .chain(schedules.iter().flat_map(crate::schedule::Schedules::tools))
-    {
-        registry.add(tool)?;
-    }
+    let missions = missions(
+        &profile,
+        places,
+        &robot,
+        ledger,
+        models.critic,
+        models.advisor,
+        seeing.vision,
+    );
+    let schedules = mission_tools(missions.as_ref(), &guard, &mut registry)?;
     let tools = registry.iter().map(|t| t.spec().name.clone()).collect();
     let config = SessionConfig {
-        preamble: system_prompt(&profile),
+        preamble: system_prompt(&profile, &skills),
         max_model_calls: usize::try_from(profile.policy.budgets.model_calls).unwrap_or(6),
         approval_ttl: profile.policy.approval_ttl,
         turn_time: profile.policy.budgets.wall_time,
-        history_file: files.history,
-        resume: files.resume,
+        pending_file,
+        history_file: options.history,
+        resume: options.resume,
         notes: Some(Arc::clone(&memory) as Arc<dyn crate::memory::Notes>),
+        pulse: missions
+            .as_ref()
+            .map(|m| Arc::clone(m) as Arc<dyn crate::session::Pulse>),
         ..SessionConfig::default()
     };
+    let source = options
+        .source
+        .unwrap_or_else(|| Arc::clone(&llm) as Arc<dyn crate::llm::AgentSource>);
     let session = Session::start(
-        Arc::clone(&llm) as Arc<dyn crate::llm::AgentSource>,
+        source,
         Arc::new(registry),
         Arc::clone(&guard),
         Some(stop),
@@ -347,18 +526,7 @@ pub fn start_with(
         s.attach(session.handle());
     }
     watches.attach(session.handle());
-    if let Some(state) = profile.mission.as_ref().map(|m| m.state.clone()) {
-        // A mission started before this session runs on unwatched: say so, once, at start.
-        let (robot, handle) = (Arc::clone(&robot), session.handle());
-        tokio::spawn(async move {
-            let latched = robot
-                .latest(&state, "nervros_interfaces/msg/RobotState", ORPHAN_WAIT)
-                .await;
-            if let Some(text) = latched.ok().as_ref().and_then(orphan_notice) {
-                handle.emit(crate::session::Event::Notice { text });
-            }
-        });
-    }
+    say_orphan(&profile, &robot, session.handle());
     Ok(Agent {
         session,
         profile,
@@ -367,10 +535,58 @@ pub fn start_with(
         snapshots,
         llm,
         tools,
-        editor,
+        editor: seeing.editor,
         memory,
         schedules,
+        missions,
+        notices: mcp
+            .iter()
+            .filter(|c| !c.ok)
+            .map(|c| c.what.clone())
+            .collect(),
+        mcp,
+        unanswered,
     })
+}
+
+/// The profile's skills, and the `skill` tool to read them when there are any. A folder or file
+/// that cannot be read is logged and left out.
+fn skill_tools(
+    profile: &Profile,
+    registry: &mut Registry,
+) -> Result<Vec<crate::skills::Skill>, StartError> {
+    let dirs: Vec<PathBuf> = profile.skills.iter().map(|d| profile.resolve(d)).collect();
+    let (skills, problems) = crate::skills::load(&dirs);
+    for problem in problems {
+        tracing::warn!(%problem, "a skill was left out");
+    }
+    if !skills.is_empty() {
+        registry.add(Arc::new(crate::skills::SkillTool::new(skills.clone())))?;
+    }
+    Ok(skills)
+}
+
+/// The approved tools of the profile's MCP servers, connected once at start: the tool set stays
+/// fixed for the session, which keeps the model server's prompt cache whole.
+fn mcp_tools(
+    profile: &Profile,
+    privacy: PrivacyMode,
+    registry: &mut Registry,
+) -> Result<Vec<crate::doctor::Check>, StartError> {
+    if profile.mcp_servers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let home = privacy == PrivacyMode::Home;
+    // Start-up is not async; the runtime it runs in has threads to spare for this one wait.
+    let (servers, checks) = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(crate::mcp::connect_all(profile, home))
+    });
+    for server in &servers {
+        for tool in server.tools() {
+            registry.add(tool)?;
+        }
+    }
+    Ok(checks)
 }
 
 #[cfg(test)]

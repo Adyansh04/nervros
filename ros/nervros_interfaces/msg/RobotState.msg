@@ -18,3 +18,12 @@ string holding_right
 bool stopped
 # Short human-readable state, such as "holding posture; right hand keeps O17".
 string message
+# Whether the robot can move now. False while it is down, or the controller that keeps it
+# standing or drives it is not running; a mission that moves the robot is then refused.
+bool can_move
+# Why it cannot, for people and models, such as "fallen: tilted 104 degrees"; empty when it can.
+string cannot_move_reason
+# Tilt of the body from upright in degrees; NaN when the robot does not report one.
+float32 tilt_deg
+# True while the executor drives the base from Teleop commands.
+bool teleop

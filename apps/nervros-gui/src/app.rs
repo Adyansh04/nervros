@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nervros_core::app::Agent;
 use nervros_core::doctor::Check;
@@ -20,12 +20,17 @@ use rerun::external::egui::{
 };
 use rerun::external::re_log_channel::LogReceiver;
 use rerun::external::re_sdk_types::blueprint::components::PanelState;
-use rerun::external::re_ui::{ReButton, UiExt as _};
+use rerun::external::re_ui::{CommandPalette, ReButton, UiExt as _, icons};
+use rerun::external::re_viewer::SystemCommandSender as _;
+use rerun::external::re_viewer::external::re_log_types::{TimeReal, TimelineName};
+use rerun::external::re_viewer::external::re_viewer_context::TimeControlCommand;
 use rerun::external::{eframe, re_memory, re_viewer};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::chat::{Action, Chat};
+use crate::palette::{self, Cmd};
+use crate::toasts::{Kind, Toasts};
 
 const EVENT_LOG: usize = 300;
 const COMPOSER: &str = "nervros_composer";
@@ -33,7 +38,7 @@ const STOP_HINT: &str = "Halts the mission and cancels every goal; the hands kee
                          The e-stop on the robot's remote is the real emergency stop.";
 
 /// What the World tab's Explore button says to the agent.
-const EXPLORE_REQUEST: &str = "Explore the building to fill in the map.";
+pub(crate) const EXPLORE_REQUEST: &str = "Explore the building to fill in the map.";
 
 /// What background tasks learn about the robot.
 #[derive(Debug, Default)]
@@ -50,6 +55,12 @@ struct Live {
     pub objects: Option<usize>,
     /// Each object's name, or its label, by id.
     pub object_names: HashMap<String, String>,
+    /// Where the robot stands on the map.
+    pub pose: Option<crate::robot::Pose>,
+    /// The robot's battery, when the profile names its topic.
+    pub battery: Option<Value>,
+    /// Its motor diagnostics, when the profile names their topic.
+    pub motors: Option<Value>,
 }
 
 /// What the operator clicked in the viewer, when it is something the agent can act on.
@@ -81,7 +92,7 @@ impl Picked {
 type SharedLive = Arc<Mutex<Live>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
+pub(crate) enum Tab {
     Mission,
     World,
     Layers,
@@ -89,10 +100,11 @@ enum Tab {
     Events,
     Agent,
     Doctor,
+    Robot,
 }
 
 impl Tab {
-    const ALL: [(Self, &'static str); 7] = [
+    const ALL: [(Self, &'static str); 8] = [
         (Self::Mission, "Mission"),
         (Self::World, "World"),
         (Self::Layers, "Layers"),
@@ -100,6 +112,7 @@ impl Tab {
         (Self::Events, "Events"),
         (Self::Agent, "Agent"),
         (Self::Doctor, "Doctor"),
+        (Self::Robot, "Robot"),
     ];
 }
 
@@ -199,6 +212,20 @@ pub struct Gui {
     /// The world editor, when the profile names one; `editing` shows it in place of the viewer.
     editor: Option<crate::editor::WorldEditor>,
     editing: bool,
+    /// Ctrl+K, and the commands it lists.
+    palette: CommandPalette,
+    commands: Vec<palette::Entry>,
+    toasts: Toasts,
+    /// Moves the viewer's time cursor.
+    viewer_commands: re_viewer::CommandSender,
+    /// The earlier moment the 3D view is paused at, if it is not following the newest data.
+    viewing: Option<SystemTime>,
+    /// Driving by hand, when the profile names the executor's teleop.
+    drive: Option<crate::robot::Drive>,
+    /// The mission ledger's lists, for the Mission tab.
+    records: crate::history::History,
+    /// Images waiting to go with the next message.
+    attachments: crate::attach::Attachments,
 }
 
 impl Gui {
@@ -249,7 +276,10 @@ impl Gui {
             .editor
             .clone()
             .map(|client| crate::editor::WorldEditor::new(client, runtime.clone()));
-        let mut viewer = re_viewer::App::new(
+        let drive =
+            crate::robot::Drive::new(&agent.profile, Arc::clone(&agent.robot), runtime.clone());
+        let (viewer_commands, receiver) = re_viewer::command_channel();
+        let mut viewer = re_viewer::App::with_commands(
             main_thread,
             re_viewer::build_info(),
             if cfg!(test) {
@@ -261,12 +291,25 @@ impl Gui {
             cc,
             None,
             re_viewer::AsyncRuntimeHandle::new_native(runtime),
+            re_viewer::register_text_log_receiver(),
+            (viewer_commands.clone(), receiver),
         );
         viewer.app_options_mut().memory_limit = feed.memory_limit;
         viewer.add_log_receiver(feed.input);
         let live = Arc::new(Mutex::new(Live::default()));
         let recheck = watch(&agent, &live, &cc.egui_ctx);
         let events = agent.session.subscribe();
+        let mut chat = Chat::default();
+        chat.items
+            .extend(agent.notices.iter().cloned().map(crate::chat::Item::Notice));
+        chat.items.extend(
+            agent
+                .unanswered
+                .iter()
+                .cloned()
+                .map(|u| crate::chat::Item::Unanswered(u, std::cell::Cell::new(false))),
+        );
+        let agent_snapshots = Arc::clone(&agent.snapshots);
         Ok(Self {
             viewer,
             agent,
@@ -274,7 +317,7 @@ impl Gui {
             live,
             log_path,
             sessions: None,
-            chat: Chat::default(),
+            chat,
             event_log: VecDeque::new(),
             input: String::new(),
             history: Vec::new(),
@@ -287,6 +330,14 @@ impl Gui {
             bridge: feed.bridge,
             editor,
             editing: false,
+            palette: CommandPalette::default(),
+            commands: palette::entries(),
+            toasts: Toasts::default(),
+            viewer_commands,
+            viewing: None,
+            drive,
+            records: crate::history::History::default(),
+            attachments: crate::attach::Attachments::new(Arc::clone(&agent_snapshots)),
         })
     }
 
@@ -340,6 +391,7 @@ impl Gui {
             match self.events.try_recv() {
                 Ok(e) => {
                     self.chat.apply(&e);
+                    self.toast(&e);
                     if let (Closing::Stopping(_), Event::Notice { text }) = (self.closing, &e)
                         && (text.starts_with("robot stopped") || text.starts_with("stop failed"))
                     {
@@ -360,34 +412,134 @@ impl Gui {
         }
     }
 
-    /// The bubble appears when the session starts the turn, so a message it turns away shows
-    /// only as its notice.
-    fn say(&mut self, text: String) {
-        self.history.push(text.clone());
-        self.history_pos = None;
-        let command = if text.trim() == "/compact" {
-            Command::Compact
-        } else {
-            Command::User(text)
+    /// A finished mission gets a toast: the operator may be looking at the viewer or away.
+    fn toast(&mut self, e: &Event) {
+        let Event::MissionFinished {
+            id,
+            outcome,
+            failed_step,
+            reason,
+            elapsed_s,
+        } = e
+        else {
+            return;
         };
-        self.agent.session.send(command);
+        self.records.stale();
+        let what = self.chat.intent_of_mission(id).unwrap_or("the mission");
+        let (kind, text) = match outcome.as_str() {
+            "success" => (Kind::Success, format!("Done: {what} in {elapsed_s:.0} s")),
+            "canceled" => (Kind::Info, format!("Stopped: {what}")),
+            _ if failed_step.is_empty() => (Kind::Failure, format!("{outcome}: {what}: {reason}")),
+            _ => (
+                Kind::Failure,
+                format!("{outcome}: {what} at {failed_step}: {reason}"),
+            ),
+        };
+        self.toasts.add(kind, text);
+    }
+
+    /// The bubble appears when the session starts the turn, so a message it turns away shows
+    /// only as its notice. A `/name` runs that command instead.
+    fn say(&mut self, text: &str) {
+        self.history.push(text.to_owned());
+        self.history_pos = None;
+        if text.starts_with('/') {
+            match palette::slash(&self.commands, text).cloned() {
+                Some(cmd) => self.run(cmd),
+                None => self.chat.items.push(crate::chat::Item::Notice(format!(
+                    "No command {text}; Ctrl+K lists them"
+                ))),
+            }
+            return;
+        }
+        let (text, shown) = self.attachments.send(text);
+        let handle = self.agent.session.handle();
+        for image in shown {
+            handle.emit(image);
+        }
+        self.agent.session.send(Command::User(text));
+    }
+
+    /// Runs a palette or slash command.
+    fn run(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Say(text) => self.say(text),
+            Cmd::Send(c) => self.agent.session.send(c),
+            Cmd::Tab(tab) => {
+                self.tab = tab;
+                self.dock_open = true;
+            }
+            Cmd::Doctor => {
+                self.tab = Tab::Doctor;
+                self.dock_open = true;
+                self.live().checks = None;
+                let _ = self.recheck.send(());
+            }
+            Cmd::Dock => self.dock_open = !self.dock_open,
+            Cmd::ResetLayout => self.bridge.reset_layout(),
+            Cmd::EditWorld => {
+                if self.editor.is_some() {
+                    self.editing = !self.editing;
+                    self.tab = Tab::World;
+                    self.dock_open = true;
+                }
+            }
+            Cmd::Live => self.follow_live(),
+        }
+    }
+
+    /// Pauses the 3D view at `at`, where the robot was and what the world model held then.
+    fn show_at(&mut self, at: SystemTime) {
+        let ns = at
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+        self.time_commands(vec![
+            TimeControlCommand::SetActiveTimeline(TimelineName::log_time()),
+            TimeControlCommand::Pause,
+            TimeControlCommand::SetTime(TimeReal::from(ns)),
+        ]);
+        self.viewing = Some(at);
+    }
+
+    fn follow_live(&mut self) {
+        self.time_commands(vec![TimeControlCommand::MoveEndAndFollow]);
+        self.viewing = None;
+    }
+
+    fn time_commands(&self, time_commands: Vec<TimeControlCommand>) {
+        if let Some(store_id) = self.viewer.active_recording_id().cloned() {
+            self.viewer_commands
+                .send_system(re_viewer::SystemCommand::TimeControlCommands {
+                    store_id,
+                    time_commands,
+                });
+        }
     }
 
     fn act(&mut self, ctx: &egui::Context, actions: Vec<Action>) {
         for a in actions {
             match a {
-                Action::Send(c) => self.agent.session.send(c),
-                Action::Say(text) => self.say(text),
+                Action::Send(c) => {
+                    if let Command::Edit { id, .. } = &c {
+                        self.chat.edit_sent(*id);
+                    }
+                    self.agent.session.send(c);
+                }
+                Action::Say(text) => self.say(&text),
                 Action::Prefill(text) => {
                     self.input = text;
                     ctx.memory_mut(|m| m.request_focus(egui::Id::new(COMPOSER)));
                 }
+                Action::ShowAt(at) => self.show_at(at),
             }
         }
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
         let working = self.chat.turn.is_some();
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
+            self.palette.toggle();
+        }
         let (esc, stop, tab) = ctx.input_mut(|i| {
             let esc = working && i.consume_key(Modifiers::NONE, Key::Escape);
             let stop = i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::S);
@@ -399,6 +551,7 @@ impl Gui {
                 Key::Num5,
                 Key::Num6,
                 Key::Num7,
+                Key::Num8,
             ];
             let tab = keys.iter().position(|k| i.consume_key(Modifiers::CTRL, *k));
             (esc, stop, tab)
@@ -445,24 +598,7 @@ impl Gui {
             ui.label(RichText::new("NervROS").strong().size(15.0));
             ui.label(RichText::new(&self.agent.profile.robot.name).color(t.text_subdued));
             ui.add_space(8.0);
-            let (topics, executor) = {
-                let live = self.live();
-                (live.topics, live.executor.is_some())
-            };
-            match topics {
-                Some(n) if n > 2 => chip(ui, t.success_text_color, format!("ROS · {n} topics")),
-                Some(_) => chip(ui, t.error_fg_color, "ROS · empty graph"),
-                None => chip(ui, t.warn_fg_color, "ROS · connecting"),
-            }
-            if self.agent.profile.mission.is_some() {
-                if executor {
-                    chip(ui, t.success_text_color, "executor");
-                } else {
-                    chip(ui, t.warn_fg_color, "executor offline");
-                }
-            }
-            let (model, quota) = self.model_status();
-            chip(ui, t.info_text_color, format!("{model} · {quota}"));
+            self.status_chips(ui);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if window_chrome {
                     ui.native_window_buttons_ui();
@@ -527,6 +663,41 @@ impl Gui {
         });
     }
 
+    /// How the robot, the executor and the model are, and a way back to the live 3D view.
+    fn status_chips(&mut self, ui: &mut egui::Ui) {
+        let t = ui.tokens();
+        let (topics, executor) = {
+            let live = self.live();
+            (live.topics, live.executor.is_some())
+        };
+        match topics {
+            Some(n) if n > 2 => chip(ui, t.success_text_color, format!("ROS · {n} topics")),
+            Some(_) => chip(ui, t.error_fg_color, "ROS · empty graph"),
+            None => chip(ui, t.warn_fg_color, "ROS · connecting"),
+        }
+        if self.agent.profile.mission.is_some() {
+            if executor {
+                chip(ui, t.success_text_color, "executor");
+            } else {
+                chip(ui, t.warn_fg_color, "executor offline");
+            }
+        }
+        let (model, quota) = self.model_status();
+        chip(ui, t.info_text_color, format!("{model} · {quota}"));
+        if let Some(at) = self.viewing {
+            let secs = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let back = ReButton::new(format!(
+                "Viewing {} · back to live",
+                crate::sessions::ago(secs)
+            ))
+            .small()
+            .secondary();
+            if ui.add(back).clicked() {
+                self.follow_live();
+            }
+        }
+    }
+
     /// The model answering now, and its quota for today.
     fn model_status(&self) -> (String, String) {
         let router = self.agent.llm.router();
@@ -569,13 +740,13 @@ impl Gui {
         self.act(ui.ctx(), actions);
     }
 
-    /// What was clicked in the viewer, and messages about it to send, filled in for the operator
-    /// to read and send.
+    /// What was clicked in the viewer: a walk there to approve at once, and messages about it
+    /// filled in for the operator to read and send.
     fn picked_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let Some(picked) = self.picked.borrow().clone() else {
             return;
         };
-        let (what, prompts) = {
+        let (what, go, prompts) = {
             let live = self.live();
             match &picked {
                 Picked::Object(id) => {
@@ -584,11 +755,10 @@ impl Gui {
                         .get(id)
                         .map_or_else(|| id.clone(), |n| format!("{id} ({n})"));
                     let prompts = vec![
-                        ("Go there", format!("Walk to {what}.")),
                         ("What is it?", format!("Tell me about {what}.")),
                         ("Pick it up", format!("Pick up {what}.")),
                     ];
-                    (what, prompts)
+                    (what.clone(), walk_to_target(id, &what), prompts)
                 }
                 Picked::Room(id) => {
                     let name = live.rooms.as_ref().and_then(|m| {
@@ -606,15 +776,12 @@ impl Gui {
                             })
                     });
                     let what = name.map_or_else(|| id.clone(), |n| format!("{id} ({n})"));
-                    let prompts = vec![
-                        ("Go there", format!("Walk to {what}.")),
-                        ("What is in it?", format!("What objects are in {what}?")),
-                    ];
-                    (what, prompts)
+                    let prompts = vec![("What is in it?", format!("What objects are in {what}?"))];
+                    (what.clone(), walk_to_target(id, &what), prompts)
                 }
                 Picked::Point([x, y]) => {
                     let what = format!("x {x:.2}, y {y:.2} on the map");
-                    (what.clone(), vec![("Go there", format!("Walk to {what}."))])
+                    (what, walk_to_point(*x, *y, live.pose), Vec::new())
                 }
             }
         };
@@ -624,6 +791,16 @@ impl Gui {
                     .small()
                     .color(ui.tokens().text_subdued),
             );
+            if ui
+                .small_button("Go there")
+                .on_hover_text("Plan the walk now; you approve it before the robot moves")
+                .clicked()
+            {
+                actions.push(Action::Send(Command::Run {
+                    tool: "run_mission".to_owned(),
+                    args: go,
+                }));
+            }
             for (label, text) in prompts {
                 if ui.small_button(label).clicked() {
                     actions.push(Action::Prefill(text));
@@ -673,15 +850,36 @@ impl Gui {
             }
         }
         let working = self.chat.turn.is_some();
+        let sees = self.agent.tools.iter().any(|t| t == "look");
+        if sees {
+            self.attachments.show(ui);
+        }
         ui.horizontal(|ui| {
+            if sees
+                && ui
+                    .small_icon_button(&icons::ADD, "Paste an image")
+                    .on_hover_text(
+                        "Paste an image from the clipboard for the agent to look at; or drop \
+                         one on the window",
+                    )
+                    .clicked()
+            {
+                self.attachments.paste(ui.ctx());
+            }
+            let hint = if working {
+                "Say something while it works: it reads it at its next step · Esc stops it"
+            } else {
+                "Message the robot · Enter sends, Shift+Enter adds a line"
+            };
             let edit = egui::TextEdit::multiline(&mut self.input)
                 .id(id)
-                .hint_text("Message the robot · Enter sends, Shift+Enter adds a line")
+                .hint_text(hint)
                 .desired_rows(2)
                 .desired_width(ui.available_width() - 72.0)
                 .margin(Margin::symmetric(8, 6));
             ui.add(edit);
-            if working {
+            let has_text = !self.input.trim().is_empty();
+            if working && !has_text {
                 if ui
                     .add(ReButton::new("Stop").secondary())
                     .on_hover_text("Stops the reply (Esc)")
@@ -690,9 +888,8 @@ impl Gui {
                     actions.push(Action::Send(Command::StopGeneration));
                 }
             } else {
-                let can_send = !self.input.trim().is_empty();
-                let send = ui.add_enabled(can_send, ReButton::new("Send").primary());
-                if can_send && (enter || send.clicked()) {
+                let send = ui.add_enabled(has_text, ReButton::new("Send").primary());
+                if has_text && (enter || send.clicked()) {
                     actions.push(Action::Say(
                         std::mem::take(&mut self.input).trim().to_owned(),
                     ));
@@ -741,20 +938,26 @@ impl Gui {
                 Tab::Events => self.events_tab(ui),
                 Tab::Agent => self.agent_tab(ui),
                 Tab::Doctor => self.doctor_tab(ui),
+                Tab::Robot => self.robot_tab(ui),
             });
     }
 
     fn mission_tab(&mut self, ui: &mut egui::Ui) {
         let mut actions = Vec::new();
         match self.chat.latest_plan() {
-            Some(p) => crate::chat::plan_card(ui, p, &mut actions),
+            Some(p) => {
+                crate::chat::plan_card(ui, p, &mut actions);
+                crate::chat::tree_panel(ui, p);
+            }
             None => empty(
                 ui,
                 "No plan yet. Ask the robot to do something; its plan appears here.",
             ),
         }
-        self.act(ui.ctx(), actions);
         self.schedules_list(ui);
+        let ledger = self.agent.missions.as_ref().and_then(|m| m.ledger());
+        crate::history::show(ui, &mut self.records, ledger, &mut actions);
+        self.act(ui.ctx(), actions);
     }
 
     /// Missions that run again and again, each with a way to end it.
@@ -773,10 +976,14 @@ impl Gui {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&s.id).monospace().small());
                 ui.label(RichText::new(&s.intent).small());
-                let when = format!(
-                    "every {} min, {} of {} runs left",
-                    s.every_min, s.left, s.times
-                );
+                let when = if s.when.is_empty() {
+                    format!(
+                        "every {} min, {} of {} runs left",
+                        s.every_min, s.left, s.times
+                    )
+                } else {
+                    format!("when {}, {} of {} runs left", s.when, s.left, s.times)
+                };
                 ui.label(RichText::new(when).small().color(ui.tokens().text_subdued));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
@@ -822,15 +1029,30 @@ impl Gui {
         self.act(ui.ctx(), actions);
     }
 
+    fn robot_tab(&mut self, ui: &mut egui::Ui) {
+        let status = {
+            let l = self.live();
+            crate::robot::Status {
+                state: l.executor.clone(),
+                pose: l.pose,
+                rooms: l.rooms.clone(),
+                names: l.object_names.clone(),
+                battery: l.battery.clone(),
+                motors: l.motors.clone(),
+            }
+        };
+        crate::robot::tab(ui, &status, self.drive.as_mut());
+    }
+
     fn layers_tab(&self, ui: &mut egui::Ui) {
         layers_view(ui, &self.bridge.layers);
     }
 
     fn approvals_tab(&mut self, ui: &mut egui::Ui) {
-        let pending: Vec<(u64, String)> = self
+        let pending: Vec<(u64, String, String)> = self
             .chat
             .pending()
-            .map(|a| (a.id(), a.tool().to_owned()))
+            .map(|a| (a.id(), a.tool().to_owned(), a.reason().to_owned()))
             .collect();
         if pending.is_empty() {
             empty(
@@ -839,7 +1061,7 @@ impl Gui {
             );
             return;
         }
-        for (id, tool) in pending {
+        for (id, tool, reason) in pending {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(tool).monospace());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -851,6 +1073,16 @@ impl Gui {
                     }
                 });
             });
+            // What it would do, so the dock alone is enough to decide.
+            ui.add(
+                egui::Label::new(
+                    RichText::new(reason)
+                        .small()
+                        .color(ui.tokens().text_subdued),
+                )
+                .wrap(),
+            );
+            ui.add_space(6.0);
         }
     }
 
@@ -868,9 +1100,35 @@ impl Gui {
         }
     }
 
-    /// Earlier sessions to carry on, then the models and their quotas.
+    /// Saves a session as an eval case, and says where.
+    fn save_as_case(&mut self, log: &Path) {
+        match crate::sessions::save_as_case(log) {
+            Ok((id, suite)) => self.toasts.add(
+                Kind::Success,
+                format!("Saved as test case {id} in {}", suite.display()),
+            ),
+            Err(e) => self.toasts.add(Kind::Failure, format!("Not saved: {e}")),
+        }
+    }
+
+    /// Earlier sessions to carry on or keep as tests, then memory, then the models and quotas.
     fn agent_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Sessions").strong());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Sessions").strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(ReButton::new("Save this one as a test").small().secondary())
+                    .on_hover_text(
+                        "Keep this conversation as an eval case, expecting what happened; run \
+                         it with nervros-cli eval",
+                    )
+                    .clicked()
+                {
+                    let log = self.log_path.clone();
+                    self.save_as_case(&log);
+                }
+            });
+        });
         let fresh = self
             .sessions
             .as_ref()
@@ -883,7 +1141,7 @@ impl Gui {
                 .unwrap_or_default();
             self.sessions = Some((Instant::now(), crate::sessions::list(&logs, &self.log_path)));
         }
-        let mut resume = None;
+        let (mut resume, mut keep) = (None, None);
         let listed = self
             .sessions
             .as_ref()
@@ -908,8 +1166,18 @@ impl Gui {
                     {
                         resume = Some(s.path.clone());
                     }
+                    if ui
+                        .add(ReButton::new("Save as test").small().secondary())
+                        .on_hover_text("Keep it as an eval case, expecting what happened")
+                        .clicked()
+                    {
+                        keep = Some(crate::sessions::log_of(&s.path));
+                    }
                 });
             });
+        }
+        if let Some(log) = keep {
+            self.save_as_case(&log);
         }
         if let Some(path) = resume {
             match nervros_core::llm::History::load(&path) {
@@ -964,13 +1232,21 @@ impl Gui {
         let now = SystemTime::now();
         for (role, name) in [
             (Role::Routine, "Routine"),
-            (Role::Plan, "Plan"),
+            (Role::Plan, "Plan advice"),
             (Role::VisionCheck, "Vision check"),
             (Role::Summarise, "Summarise"),
             (Role::Segment, "Segment"),
+            (Role::PlanCheck, "Plan check"),
         ] {
             ui.label(RichText::new(name).strong());
             let (take, skipped) = router.candidates(role, Need::default(), now);
+            if take.is_empty() && skipped.is_empty() {
+                ui.label(
+                    RichText::new("off: models.toml lists no model for it")
+                        .small()
+                        .color(ui.tokens().text_subdued),
+                );
+            }
             for m in take {
                 ui.horizontal(|ui| {
                     ui.bullet(ui.tokens().success_text_color);
@@ -999,7 +1275,11 @@ impl Gui {
     }
 
     fn doctor_tab(&self, ui: &mut egui::Ui) {
-        let checks = self.live().checks.clone();
+        // What the MCP servers brought at start goes with what the robot answers now.
+        let checks = self.live().checks.clone().map(|mut c| {
+            c.extend(self.agent.mcp.iter().cloned());
+            c
+        });
         match checks {
             None => {
                 ui.horizontal(|ui| {
@@ -1067,6 +1347,19 @@ impl Gui {
                         "Tokens the latest request took; /compact condenses the conversation",
                     );
             }
+            let spent = self.chat.spent;
+            if spent.calls > 0 {
+                let cached = spent.cached_tokens * 100 / spent.input_tokens.max(1);
+                ui.label(subdued(format!("{} calls, {cached}% cached", spent.calls)))
+                    .on_hover_text(format!(
+                        "Model calls this session: {} tokens in, {} of them read from the model's \
+                         prompt cache, {} out, {:.0} s waiting",
+                        crate::chat::thousands(spent.input_tokens),
+                        crate::chat::thousands(spent.cached_tokens),
+                        crate::chat::thousands(spent.output_tokens),
+                        Duration::from_millis(spent.ms).as_secs_f64(),
+                    ));
+            }
             if let Some(bytes) = re_memory::MemoryUse::capture().counted {
                 #[expect(clippy::cast_precision_loss, reason = "shown to one decimal")]
                 let gb = bytes as f64 / 1e9;
@@ -1080,6 +1373,32 @@ impl Gui {
             });
         });
     }
+}
+
+/// A plan that walks to a room or an object of the world model.
+fn walk_to_target(id: &str, what: &str) -> Value {
+    serde_json::json!({
+        "intent": format!("walk to {what}"),
+        "steps": [{"skill": "GoToTarget", "args": [{"name": "target", "value": id}]}]
+    })
+}
+
+/// A plan that walks to a point on the map, facing the way it walked from where it stands.
+fn walk_to_point(x: f32, y: f32, from: Option<crate::robot::Pose>) -> Value {
+    let (x, y) = (f64::from(x), f64::from(y));
+    let yaw = from.map_or(0.0, |(fx, fy, heading)| {
+        if (x - fx).hypot(y - fy) < 0.05 {
+            heading
+        } else {
+            (y - fy).atan2(x - fx)
+        }
+    });
+    serde_json::json!({
+        "intent": format!("walk to x {x:.2}, y {y:.2}"),
+        "steps": [{"skill": "GoToPose", "args": [
+            {"name": "station", "value": format!("{x:.2};{y:.2};{yaw:.3}")}
+        ]}]
+    })
 }
 
 /// Today's use against the tightest daily limit: the shared pool's if the model is in one.
@@ -1238,6 +1557,9 @@ fn empty(ui: &mut egui::Ui, text: &str) {
 impl eframe::App for Gui {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.drain_events();
+        if self.agent.tools.iter().any(|t| t == "look") {
+            self.attachments.take_dropped(ui.ctx());
+        }
         self.keys(ui.ctx());
         self.guard_close(ui.ctx());
         let t = ui.tokens();
@@ -1281,6 +1603,20 @@ impl eframe::App for Gui {
             }
             _ => self.viewer.ui(ui, frame),
         }
+        let (editor, viewing) = (self.editor.is_some(), self.viewing.is_some());
+        let available = move |cmd: &Cmd| match cmd {
+            Cmd::EditWorld => editor,
+            Cmd::Live => viewing,
+            _ => true,
+        };
+        let mut provider = palette::Provider {
+            entries: &self.commands,
+            available: &available,
+        };
+        if let Some(cmd) = self.palette.show(ui.ctx(), &mut provider) {
+            self.run(cmd);
+        }
+        self.toasts.show(ui.ctx());
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -1290,6 +1626,45 @@ impl eframe::App for Gui {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.viewer.save(storage);
     }
+}
+
+/// The executor's state and the robot's pose, once a second: the Robot tab and the stop
+/// button's label follow them.
+fn watch_robot(agent: &Agent, live: &SharedLive, ctx: &egui::Context) {
+    let (robot, profile) = (Arc::clone(&agent.robot), agent.profile.clone());
+    let (live, wake) = (Arc::clone(live), ctx.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let state = profile.mission.as_ref().map(|m| m.state.clone());
+        let (map, base) = (
+            profile.ros.map_frame.clone(),
+            profile.ros.base_frame.clone(),
+        );
+        loop {
+            tick.tick().await;
+            let executor = match &state {
+                Some(topic) => robot
+                    .latest(
+                        topic,
+                        "nervros_interfaces/msg/RobotState",
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .ok(),
+                None => None,
+            };
+            let pose = robot
+                .transform(&map, &base)
+                .ok()
+                .map(|t| (t.translation[0], t.translation[1], t.yaw()));
+            {
+                let mut l = live.lock().unwrap_or_else(PoisonError::into_inner);
+                l.executor = executor;
+                l.pose = pose;
+            }
+            wake.request_repaint();
+        }
+    });
 }
 
 /// Keeps [`Live`] current and wakes the window when the agent or the robot changes.
@@ -1305,11 +1680,11 @@ fn watch(
             wake.request_repaint();
         }
     });
+    watch_robot(agent, live, ctx);
     let (robot, profile) = (Arc::clone(&agent.robot), agent.profile.clone());
     let (live_graph, wake) = (Arc::clone(live), ctx.clone());
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
-        let state = profile.mission.as_ref().map(|m| m.state.clone());
         let world = profile.world.clone();
         loop {
             tick.tick().await;
@@ -1345,24 +1720,33 @@ fn watch(
                         .collect()
                 })
                 .unwrap_or_default();
-            let executor = match &state {
-                Some(topic) => robot
-                    .latest(
-                        topic,
-                        "nervros_interfaces/msg/RobotState",
-                        Duration::from_secs(1),
-                    )
-                    .await
-                    .ok(),
-                None => None,
+            let read = |topic: Option<String>, msg_type: &'static str| {
+                let robot = Arc::clone(&robot);
+                async move {
+                    robot
+                        .latest(&topic?, msg_type, Duration::from_secs(1))
+                        .await
+                        .ok()
+                }
             };
+            let battery = read(
+                profile.robot.battery.clone(),
+                "sensor_msgs/msg/BatteryState",
+            )
+            .await;
+            let motors = read(
+                profile.robot.diagnostics.clone(),
+                "diagnostic_msgs/msg/DiagnosticArray",
+            )
+            .await;
             {
                 let mut l = live_graph.lock().unwrap_or_else(PoisonError::into_inner);
                 l.topics = topics;
-                l.executor = executor;
                 l.rooms = rooms;
                 l.objects = objects;
                 l.object_names = object_names;
+                l.battery = battery;
+                l.motors = motors;
             }
             wake.request_repaint();
         }
@@ -1389,6 +1773,10 @@ fn watch(
 }
 
 #[cfg(test)]
+#[path = "live_eval.rs"]
+mod live_eval;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable as _;
@@ -1406,6 +1794,9 @@ mod tests {
         objects = { topic = "/objects", type = "canopy_msgs/msg/WorldObjectArray" }
         [models]
         file = "models.toml"
+        # Long, so the approval's countdown reads the same however slowly the test runs.
+        [policy]
+        approval_ttl = 600
     "#;
 
     fn robot() -> FakeRobot {
@@ -1487,6 +1878,19 @@ mod tests {
         );
         assert_eq!(Picked::from_click("/world/map", None), None);
         assert_eq!(Picked::from_click("/camera", at), None);
+    }
+
+    #[test]
+    fn a_click_on_the_floor_walks_there_facing_the_way_it_walked() {
+        let plan = walk_to_point(2.0, 1.0, Some((0.0, 1.0, 1.0)));
+        assert_eq!(plan["steps"][0]["skill"], "GoToPose");
+        assert_eq!(plan["steps"][0]["args"][0]["value"], "2.00;1.00;0.000");
+        let here = walk_to_point(0.0, 1.0, Some((0.0, 1.0, 1.0)));
+        assert_eq!(here["steps"][0]["args"][0]["value"], "0.00;1.00;1.000");
+        assert_eq!(
+            walk_to_target("O17", "O17 (red mug)")["steps"][0]["args"][0]["value"],
+            "O17"
+        );
     }
 
     #[test]

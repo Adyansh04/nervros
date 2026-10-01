@@ -1,4 +1,4 @@
-//! Headless NervROS: chat, doctor, scenarios and replay.
+//! Headless NervROS: chat, doctor, evals and replay.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -11,8 +11,10 @@ use nervros_core::providers::router::{PrivacyMode, Router};
 use nervros_core::providers::{ModelsConfig, Role, free_only, openrouter};
 
 #[cfg(feature = "ros")]
-#[cfg(feature = "ros")]
 mod eval;
+mod mcp;
+mod records;
+#[cfg(feature = "ros")]
 mod robot;
 
 #[derive(Parser)]
@@ -46,7 +48,9 @@ enum Command {
         image: Option<PathBuf>,
     },
     /// Chat with the robot. Lines starting with `/` are commands: `/arm`, `/disarm`, `/stop`,
-    /// `/yes N`, `/no N`, `/compact`, `/quit`; a line that is exactly `stop` also stops the robot.
+    /// `/yes N`, `/allow N` (yes, and no more asking for that tool this session unless it moves
+    /// the robot), `/no N`, `/again N` (a request the last session left waiting), `/compact`,
+    /// `/quit`; a line that is exactly `stop` also stops the robot.
     #[cfg(feature = "ros")]
     Chat {
         /// Send these messages in order and exit, instead of reading stdin.
@@ -71,10 +75,61 @@ enum Command {
         /// Only the cases whose ids hold this.
         #[arg(long)]
         only: Option<String>,
+        /// Trials per case and model; the report gives pass^k for k = this.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+        repeat: u16,
+        /// Run the routine role on each of these `models.toml` ids in turn, instead of the
+        /// profile's chain, and compare them.
+        #[arg(long, value_delimiter = ',')]
+        models: Vec<String>,
         /// Where the report goes (default: the state directory's `evals/`).
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Print a session log as it happened: a `.ndjson` path, or `last`.
+    Replay {
+        /// The log.
+        #[arg(default_value = "last")]
+        log: String,
+    },
+    /// The missions the robot ran, newest first, from its ledger; with an id, that one in full.
+    Missions {
+        /// A mission id, or its start.
+        id: Option<String>,
+        /// How many.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// The requests no skill could do, newest first.
+    Gaps {
+        /// How many.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// A session as an eval case, with what happened as its expectations, to trim and keep.
+    Case {
+        /// The session log: a `.ndjson` path, or `last`.
+        #[arg(default_value = "last")]
+        log: String,
+        /// The case's id.
+        #[arg(long, default_value = "from-session")]
+        id: String,
+        /// Append it to this suite instead of printing it.
+        #[arg(long)]
+        append: Option<PathBuf>,
+    },
+    /// The profile's MCP servers: each tool it names, and whether its definition is approved.
+    /// With `pin`, approve a server's tools as they are now, after reading them.
+    Mcp {
+        /// `pin` to approve.
+        action: Option<String>,
+        /// For pin: the server's id.
+        server: Option<String>,
+        /// For pin: its tools to approve; all it names when none.
+        tools: Vec<String>,
+    },
+    /// The profile's skills, as the agent's index lists them, and any that could not be read.
+    Skills,
     /// Check the profile's tools, topics and mission services against the live graph.
     #[cfg(feature = "ros")]
     Doctor,
@@ -155,10 +210,7 @@ fn router(models: &Path) -> Result<Router> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+    let _telemetry = nervros_core::telemetry::init();
     let cli = Cli::parse();
     match cli.command {
         Command::Models { check } => models(&models_file(&cli.profile)?, check).await,
@@ -201,19 +253,54 @@ async fn main() -> Result<()> {
             .await
         }
         #[cfg(feature = "ros")]
-        Command::Eval { suite, only, out } => {
+        Command::Eval {
+            suite,
+            only,
+            repeat,
+            models,
+            out,
+        } => {
             let out = out.unwrap_or_else(eval::default_out);
-            let failed = eval::run(&cli.profile, &suite, only.as_deref(), &out).await?;
+            let options = eval::Options {
+                only,
+                repeat: usize::from(repeat),
+                models,
+            };
+            let failed = eval::run(&cli.profile, &suite, &options, &out).await?;
             if failed > 0 {
-                anyhow::bail!("{failed} case(s) failed");
+                anyhow::bail!("{failed} trial(s) failed");
             }
             Ok(())
         }
+        Command::Replay { log } => records::replay(&log),
+        Command::Missions { id, limit } => records::missions(&cli.profile, id.as_deref(), limit),
+        Command::Gaps { limit } => records::gaps(&cli.profile, limit),
+        Command::Case { log, id, append } => records::case(&log, &id, append.as_deref()),
+        Command::Mcp {
+            action,
+            server,
+            tools,
+        } => mcp::run(&cli.profile, action.as_deref(), server.as_deref(), &tools).await,
+        Command::Skills => skills(&cli.profile),
         #[cfg(feature = "ros")]
         Command::Doctor => robot::doctor(&cli.profile).await,
         #[cfg(feature = "ros")]
         Command::Ros { tool, args } => robot::ros(&cli.profile, &tool, &args).await,
     }
+}
+
+fn skills(profile: &Path) -> Result<()> {
+    let profile = nervros_core::profile::Profile::load(profile).context("loading the profile")?;
+    let dirs: Vec<PathBuf> = profile.skills.iter().map(|d| profile.resolve(d)).collect();
+    let (skills, problems) = nervros_core::skills::load(&dirs);
+    match nervros_core::skills::index(&skills) {
+        Some(index) => println!("{index}"),
+        None => println!("no skills"),
+    }
+    for problem in problems {
+        println!("left out: {problem}");
+    }
+    Ok(())
 }
 
 async fn models(path: &Path, check: bool) -> Result<()> {
@@ -226,6 +313,7 @@ async fn models(path: &Path, check: bool) -> Result<()> {
         ("vision_check", Role::VisionCheck),
         ("summarise", Role::Summarise),
         ("segment", Role::Segment),
+        ("plan_check", Role::PlanCheck),
     ] {
         println!("{name}: {}", config.roles.chain(role).join(" > "));
     }

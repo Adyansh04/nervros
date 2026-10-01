@@ -1,0 +1,23 @@
+# The model turns right when asked to turn left: the plan goes back to it once with the concern,
+# and its corrected plan runs.
+say = ["Turn left 90 degrees."]
+
+[[model]]
+call = "run_mission"
+args = { intent = "turn left 90 degrees", steps = [{ skill = "TurnInPlace", args = [{ name = "degrees", value = "-90" }] }] }
+
+[[model]]
+call = "run_mission"
+args = { intent = "turn left 90 degrees", steps = [{ skill = "TurnInPlace", args = [{ name = "degrees", value = "90" }] }] }
+
+[[model]]
+reply = "Turning left."
+
+[[model]]
+reply = "I turned 90 degrees to the left."
+
+[expect]
+tool_said = ["may not do what the operator asked"]
+skills = ["TurnInPlace"]
+mission = "success"
+approvals_max = 1

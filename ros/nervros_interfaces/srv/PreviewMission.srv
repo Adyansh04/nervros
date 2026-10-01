@@ -1,0 +1,10 @@
+# Predict where a mission would take the robot without moving anything: each step's end pose and
+# the path Nav2's planner finds to it, chained from the robot's pose now. Only the planner runs.
+
+# A complete BehaviorTree.CPP v4 document, as for ValidateMission.
+string tree_xml
+---
+bool ok
+# Why not, when not ok.
+string message
+StepPreview[] steps

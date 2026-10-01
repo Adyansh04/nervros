@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use nervros_ros::RobotPort;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 
 use crate::session::{Command, Event, SessionHandle};
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
@@ -28,7 +29,7 @@ const MAX_PLOT_S: u64 = 1800;
 
 /// What a watch waits for.
 #[derive(Debug, Clone, PartialEq)]
-enum Condition {
+pub(crate) enum Condition {
     /// The topic's rate under this many hertz, silence included.
     RateBelow(f64),
     /// A field of the newest message compared with a value.
@@ -42,7 +43,7 @@ enum Condition {
 }
 
 impl Condition {
-    fn parse(args: &Value) -> Result<Self, String> {
+    pub(crate) fn parse(args: &Value) -> Result<Self, String> {
         match args["condition"].as_str().unwrap_or_default() {
             "rate_below" => args["hz"]
                 .as_f64()
@@ -78,7 +79,7 @@ impl Condition {
         }
     }
 
-    fn describe(&self, topic: &str) -> String {
+    pub(crate) fn describe(&self, topic: &str) -> String {
         match self {
             Self::RateBelow(hz) => format!("{topic} under {hz} Hz"),
             Self::Value { field, op, value } => format!("{topic} {field} {op} {value}"),
@@ -140,7 +141,7 @@ fn compare(found: &Value, op: &str, wanted: &Value) -> bool {
 }
 
 /// One look: `Some(what was seen)` when the condition holds.
-async fn holds(
+pub(crate) async fn holds(
     robot: &dyn RobotPort,
     topic: &str,
     ty: &str,
@@ -180,6 +181,34 @@ async fn holds(
                 })
         }
     }
+}
+
+/// The topic the arguments name, and its type from the graph.
+pub(crate) async fn topic_of(
+    robot: &dyn RobotPort,
+    args: &Value,
+) -> Result<(String, String), String> {
+    let topic = args["topic"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| t.starts_with('/'))
+        .ok_or("`topic` is an absolute topic name, such as /scan")?
+        .to_owned();
+    let graph = robot.graph().await.map_err(|e| e.to_string())?;
+    let ty = graph
+        .topics
+        .iter()
+        .find(|(name, _)| *name == topic)
+        .map(|(_, types)| types.first().cloned().unwrap_or_default())
+        // The local model took a one-off reading instead of setting the watch again.
+        .ok_or_else(|| {
+            let names = graph.topics.iter().map(|(n, _)| n.as_str());
+            format!(
+                "{}; call this tool again with the right one",
+                crate::ros_tools::missing("topic", &topic, names)
+            )
+        })?;
+    Ok((topic, ty))
 }
 
 struct Entry {
@@ -237,29 +266,8 @@ impl Watches {
         ]
     }
 
-    /// The topic the arguments name, and its type from the graph.
     async fn topic(&self, args: &Value) -> Result<(String, String), String> {
-        let topic = args["topic"]
-            .as_str()
-            .map(str::trim)
-            .filter(|t| t.starts_with('/'))
-            .ok_or("`topic` is an absolute topic name, such as /scan")?
-            .to_owned();
-        let graph = self.robot.graph().await.map_err(|e| e.to_string())?;
-        let ty = graph
-            .topics
-            .iter()
-            .find(|(name, _)| *name == topic)
-            .map(|(_, types)| types.first().cloned().unwrap_or_default())
-            // The local model took a one-off reading instead of setting the watch again.
-            .ok_or_else(|| {
-                let names = graph.topics.iter().map(|(n, _)| n.as_str());
-                format!(
-                    "{}; call this tool again with the right one",
-                    crate::ros_tools::missing("topic", &topic, names)
-                )
-            })?;
-        Ok((topic, ty))
+        topic_of(self.robot.as_ref(), args).await
     }
 
     async fn start(self: &Arc<Self>, args: &Value) -> Result<ToolOutcome, String> {
@@ -282,33 +290,37 @@ impl Watches {
         let what = condition.describe(&topic);
         let (robot, session) = (Arc::clone(&self.robot), self.session.get().cloned());
         let (task_id, task_what) = (id.clone(), what.clone());
-        let task = tokio::spawn(async move {
-            let deadline = Instant::now() + Duration::from_secs(for_s);
-            let mut was = false;
-            while Instant::now() < deadline {
-                let looked = Instant::now();
-                let seen = holds(robot.as_ref(), &topic, &ty, &condition).await;
-                if let Some(seen) = &seen
-                    && !was
-                {
-                    let note = if say.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {say}")
-                    };
-                    let report = format!("Watch {task_id} ({task_what}) fired: {seen}.{note}");
-                    if let Some(s) = &session {
-                        s.send(Command::Report(report));
+        let span = crate::telemetry::job("watch", &id, &what);
+        let task = tokio::spawn(
+            async move {
+                let deadline = Instant::now() + Duration::from_secs(for_s);
+                let mut was = false;
+                while Instant::now() < deadline {
+                    let looked = Instant::now();
+                    let seen = holds(robot.as_ref(), &topic, &ty, &condition).await;
+                    if let Some(seen) = &seen
+                        && !was
+                    {
+                        let note = if say.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {say}")
+                        };
+                        let report = format!("Watch {task_id} ({task_what}) fired: {seen}.{note}");
+                        if let Some(s) = &session {
+                            s.send(Command::Report(report));
+                        }
+                        if !repeat {
+                            return;
+                        }
                     }
-                    if !repeat {
-                        return;
-                    }
+                    was = seen.is_some();
+                    // Rate and text looks span a window already; a value look, or a failed one, waits.
+                    tokio::time::sleep(PERIOD.saturating_sub(looked.elapsed())).await;
                 }
-                was = seen.is_some();
-                // Rate and text looks span a window already; a value look, or a failed one, waits.
-                tokio::time::sleep(PERIOD.saturating_sub(looked.elapsed())).await;
             }
-        });
+            .instrument(span),
+        );
         running.push(Entry {
             id: id.clone(),
             what: what.clone(),

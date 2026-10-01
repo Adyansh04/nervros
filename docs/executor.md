@@ -37,7 +37,10 @@ it, and turns it away when:
 | `validate` | `ValidateMission` service | Everything `execute` checks, without running: diagnostics written for a model to act on, the tree's hash and its worst-case duration. |
 | `catalog` | `GetCatalog` service | The skill catalog as JSON (below), the TreeNodesModel XML of the leaves and the macros, and the BehaviorTree.CPP version. |
 | `stop` | `StopAll` service | Halts the tree, cancels every goal on every action server the skills use, whoever sent it, and holds posture while the hands keep their grip. The reference executor also cancels the arm trajectory controller's goal, which holds the arm where it is, and leaves the hand controllers alone. Safe to call at any time, with or without a mission. |
-| `state` | `RobotState` topic | Transient local, on change and at 1 Hz: the running mission and step, the resources held, what each hand holds, and whether a stop is in force. |
+| `state` | `RobotState` topic | Transient local, on change and at 1 Hz: the running mission and step, the resources held, what each hand holds, whether a stop is in force, and whether the robot can walk (its tilt, and why not when it cannot). |
+| `preview` | `PreviewMission` service | Optional. Where each step of a tree would end the robot and the path Nav2's planner finds there, chained from the robot's pose now, with a note when there is none; only the planner runs. The app draws it beside the plan's approval card. |
+| `heartbeat` | `Heartbeat` topic | Optional. The agent's heartbeats while a mission runs; see the deadman below. |
+| `teleop` | `Teleop` service | Optional. Hands the base to the operator: while on, the executor refuses missions and forwards each `geometry_msgs/Twist` on its `~/teleop_cmd` within its speed limits, stops the base when they pause, and `StopAll` ends it. |
 
 ## Running a mission
 
@@ -60,6 +63,18 @@ diagnostics in `diagnostics_json`.
 The watchdog is the goal's `max_duration_s`, or the tree's worst case times 1.2, and never more
 than the executor's cap. Feedback carries the running nodes and the transitions since the last
 message, for the mission's steps and the skills' leaves.
+
+## Deadman and health
+
+A goal may carry `heartbeat_timeout_s` and `heartbeat_client`: the executor then stops the mission,
+as `StopAll` would, when no `Heartbeat` from that client has arrived for that long. It clamps the
+timeout to its own limit, and counts only that client's beats, so another agent cannot keep a
+mission alive. NervROS beats from its session's own loop, the one that serves Stop, so an agent
+that crashed or hung stops beating too.
+
+The executor refuses to start a mission that moves the base when the robot cannot walk, and stops
+one that is running when that changes: the reference executor reads the body's tilt from the IMU
+and whether the balance controller is active, with some hysteresis, and says why in `RobotState`.
 
 ## Arms and hands
 
