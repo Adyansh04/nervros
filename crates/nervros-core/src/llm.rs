@@ -1061,8 +1061,13 @@ async fn streamed(
         }
     }
     let response = done.ok_or("the reply stream ended without a reply")?;
+    // The run's transcript: the new messages only, or the history it was given with them.
     if let Some(messages) = response.messages {
-        history.0 = messages;
+        if messages.starts_with(&history.0) {
+            history.0 = messages;
+        } else {
+            history.0.extend(messages);
+        }
     }
     Ok(response.output)
 }
@@ -1121,6 +1126,25 @@ mod tests {
         let mut squeezed = history;
         squeezed.squeeze(2500);
         assert!(squeezed.size() <= 2500 && is_user_text(&squeezed.0[0]));
+    }
+
+    #[tokio::test]
+    async fn a_streamed_turn_adds_to_the_history_it_was_given() {
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let model = MockCompletionModel::from_stream_turns([vec![
+            MockStreamEvent::text("Noted."),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+        let mut history = History::sample(2, 10);
+        let reply = streamed(&agent, "and one more", &mut history, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(reply, "Noted.");
+        let exchanges = history.exchanges();
+        assert_eq!(exchanges.len(), 6, "{exchanges:?}");
+        assert_eq!(exchanges[0].1, "request 0");
+        assert_eq!(exchanges[4].1, "and one more");
     }
 
     #[test]
