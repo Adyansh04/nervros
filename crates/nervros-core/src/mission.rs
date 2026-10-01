@@ -84,6 +84,9 @@ pub struct Missions {
     running: Mutex<Option<Running>>,
     plan_failures: AtomicU32,
     run_failures: AtomicU32,
+    /// The plan that ran last in this request, and how it ended: run again unchanged on the
+    /// model's own, it repeats a done task or fails the same way.
+    last: Mutex<Option<(String, String)>>,
     session: OnceLock<SessionHandle>,
 }
 
@@ -114,6 +117,7 @@ impl Missions {
             running: Mutex::default(),
             plan_failures: AtomicU32::new(0),
             run_failures: AtomicU32::new(0),
+            last: Mutex::default(),
             session: OnceLock::new(),
         }))
     }
@@ -142,6 +146,7 @@ impl Missions {
                     Ok(Event::User { .. }) => {
                         me.plan_failures.store(0, Ordering::SeqCst);
                         me.run_failures.store(0, Ordering::SeqCst);
+                        *lock(&me.last) = None;
                     }
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -255,8 +260,6 @@ impl Missions {
                 "hash": {"type": "string", "description": "Instead of steps: a plan checked before"},
                 "check_only": {"type": "boolean", "description": "Only check the plan; do not run it"},
                 "intent": {"type": "string", "description": "What the operator asked for, in a few words"},
-                "goal": {"type": "array", "items": {"type": "string"},
-                         "description": "What should hold at the end: at(place), holding(arm, object_id), inside(object_id, container_id), on(object_id, surface_id)"},
                 "steps": {"type": "array", "minItems": 1, "maxItems": plan::MAX_STEPS, "items": {
                     "type": "object",
                     "properties": {
@@ -405,6 +408,14 @@ impl Missions {
                 r.id
             ));
         }
+        if let Some((hash, how)) = lock(&self.last).as_ref()
+            && *hash == compiled.sha256
+        {
+            return ToolOutcome::refused(format!(
+                "this exact plan just ran and {how}; running it unchanged would repeat that. Change \
+                 the plan to deal with what the report said, or tell the operator"
+            ));
+        }
         let id = uuid::Uuid::now_v7().to_string();
         let goal = json!({
             "mission_id": id,
@@ -459,6 +470,12 @@ impl Missions {
                 .and_then(|r| r),
         );
         *lock(&self.running) = None;
+        let how = if outcome == "success" {
+            "succeeded".to_owned()
+        } else {
+            format!("failed at {step}: {reason}")
+        };
+        *lock(&self.last) = Some((compiled.sha256.clone(), how));
         self.emit(Event::MissionFinished {
             id: id.clone(),
             outcome: outcome.clone(),
@@ -473,7 +490,7 @@ impl Missions {
         );
         if outcome == "success" {
             self.run_failures.store(0, Ordering::SeqCst);
-            let verdicts = check::check(&compiled.plan.goal, &seen);
+            let verdicts = check::check(&compiled.goal, &seen);
             if !verdicts.is_empty() {
                 let lines: Vec<String> = verdicts
                     .iter()
@@ -769,9 +786,21 @@ mod tests {
             panic!("not a report")
         };
         assert!(text.contains("ended: success"), "{text}");
+        // The checks come from the steps, not the model's goal list: the pick moves the base, so
+        // no at(dock), and the fake's hands never change.
         assert!(
-            text.contains("at(dock) holds") && text.contains("holding(right, O17) holds"),
+            text.contains("holding(right, O17) holds")
+                && text.contains("holding(left, O18) DOES NOT hold")
+                && !text.contains("at(dock)"),
             "{text}"
+        );
+        // Unchanged, the same plan is not run again on the model's own.
+        let again = missions.run(&json!({"hash": hash})).await;
+        assert_eq!(again.status, Status::Refused);
+        assert!(
+            again.message.contains("just ran and succeeded"),
+            "{}",
+            again.message
         );
         let mut seen = Vec::new();
         while let Ok(e) = rx.try_recv() {
