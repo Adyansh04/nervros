@@ -268,7 +268,7 @@ impl Tool for ScheduleTool {
             Some("list") => ToolOutcome::ok(json!({"schedules": self.schedules.list()})),
             Some("cancel") => {
                 let id = args["id"].as_str().unwrap_or("all");
-                if self.schedules.cancel(id) {
+                if self.schedules.cancel(id) || id == "all" {
                     ToolOutcome::ok(json!({"cancelled": id}))
                 } else {
                     ToolOutcome::failed(format!("no schedule {id}; list them first"))

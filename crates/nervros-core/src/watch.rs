@@ -251,11 +251,12 @@ impl Watches {
             .iter()
             .find(|(name, _)| *name == topic)
             .map(|(_, types)| types.first().cloned().unwrap_or_default())
+            // The local model took a one-off reading instead of setting the watch again.
             .ok_or_else(|| {
-                crate::ros_tools::missing(
-                    "topic",
-                    &topic,
-                    graph.topics.iter().map(|(n, _)| n.as_str()),
+                let names = graph.topics.iter().map(|(n, _)| n.as_str());
+                format!(
+                    "{}; call this tool again with the right one",
+                    crate::ros_tools::missing("topic", &topic, names)
                 )
             })?;
         Ok((topic, ty))
@@ -504,7 +505,8 @@ impl Tool for WatchesTool {
             Some("list") => ToolOutcome::ok(json!({"watches": self.watches.list()})),
             Some("cancel") => {
                 let id = args["watch"].as_str().unwrap_or_default();
-                if self.watches.cancel(id) {
+                // Cancelling all of none is done, not a mistake.
+                if self.watches.cancel(id) || id == "all" {
                     ToolOutcome::ok(json!({"cancelled": id}))
                 } else {
                     ToolOutcome::failed(format!("no watch `{id}`; watches lists them"))
