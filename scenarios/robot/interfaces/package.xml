@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<!-- The test robot's own interface, read from source: scenarios run where no ROS is installed. -->
+<package format="3">
+  <name>scenario_msgs</name>
+  <version>0.0.0</version>
+  <description>Interfaces of the scenarios' test robot.</description>
+  <maintainer email="gupta.adyansh@gmail.com">Adyansh Gupta</maintainer>
+  <license>Apache-2.0</license>
+</package>

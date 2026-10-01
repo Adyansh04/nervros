@@ -1,4 +1,4 @@
-//! Headless NervROS: chat, doctor, scenarios and replay.
+//! Headless NervROS: chat, doctor, evals and replay.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;

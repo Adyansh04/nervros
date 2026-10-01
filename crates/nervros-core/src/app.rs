@@ -291,7 +291,7 @@ fn debug_tools(
 
 /// How a session starts: where it keeps its conversation, the conversation it carries on, and
 /// the model it talks on.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct StartOptions {
     /// Written after every turn, so the session can be resumed.
     pub history: Option<PathBuf>,
@@ -299,6 +299,9 @@ pub struct StartOptions {
     pub resume: Option<crate::llm::History>,
     /// The only model for the routine role, by its `models.toml` id: an eval's arm.
     pub model: Option<String>,
+    /// What the session talks to in place of `models.toml`'s models, such as a scripted model
+    /// for a scenario; the profile's other roles (plan checks, vision) keep theirs.
+    pub source: Option<Arc<dyn crate::llm::AgentSource>>,
 }
 
 /// Starts an agent with a fresh conversation that is not saved. Must run inside a tokio runtime.
@@ -358,17 +361,21 @@ fn say_orphan(
     });
 }
 
-/// Runs the routine role on `id` alone.
-fn pin_routine(models: &mut ModelsConfig, id: String) -> Result<(), crate::providers::ConfigError> {
-    if models.model(&id).is_none() {
-        return Err(crate::providers::ConfigError::Unknown {
-            from: "the model asked for".to_owned(),
-            kind: "model",
-            id,
-        });
+/// The profile's models, with the routine role on `model` alone when one is given.
+fn load_models(profile: &Profile, model: Option<String>) -> Result<ModelsConfig, StartError> {
+    let mut models = ModelsConfig::load(&profile.resolve(&profile.models.file))?;
+    if let Some(id) = model {
+        if models.model(&id).is_none() {
+            return Err(crate::providers::ConfigError::Unknown {
+                from: "the model asked for".to_owned(),
+                kind: "model",
+                id,
+            }
+            .into());
+        }
+        models.roles.routine = vec![id];
     }
-    models.roles.routine = vec![id];
-    Ok(())
+    Ok(models)
 }
 
 /// Starts an agent as `options` say. Must run inside a tokio runtime.
@@ -383,10 +390,7 @@ pub fn start_with(
     options: StartOptions,
 ) -> Result<Agent, StartError> {
     let profile = Profile::load(profile_path)?;
-    let mut models = ModelsConfig::load(&profile.resolve(&profile.models.file))?;
-    if let Some(id) = options.model {
-        pin_routine(&mut models, id)?;
-    }
+    let models = load_models(&profile, options.model)?;
     let privacy = match profile.privacy.mode {
         PrivacyModeConfig::Sim => PrivacyMode::Sim,
         PrivacyModeConfig::Home => PrivacyMode::Home,
@@ -446,8 +450,11 @@ pub fn start_with(
             .map(|m| Arc::clone(m) as Arc<dyn crate::session::Pulse>),
         ..SessionConfig::default()
     };
+    let source = options
+        .source
+        .unwrap_or_else(|| Arc::clone(&llm) as Arc<dyn crate::llm::AgentSource>);
     let session = Session::start(
-        Arc::clone(&llm) as Arc<dyn crate::llm::AgentSource>,
+        source,
         Arc::new(registry),
         Arc::clone(&guard),
         Some(stop),

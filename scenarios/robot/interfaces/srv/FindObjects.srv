@@ -1,0 +1,6 @@
+# The objects in the world model whose label holds `query`.
+string query
+---
+string[] ids
+string[] labels
+string[] rooms

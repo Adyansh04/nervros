@@ -1,6 +1,6 @@
 [package]
 name = "nervros-cli"
-description = "Headless NervROS: chat, doctor, scenarios and replay."
+description = "Headless NervROS: chat, doctor, evals and replay."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

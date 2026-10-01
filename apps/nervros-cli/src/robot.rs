@@ -359,7 +359,7 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
     let files = nervros_core::app::StartOptions {
         history: Some(logs_dir.join(format!("session-{stamp}.history.json"))),
         resume,
-        model: None,
+        ..Default::default()
     };
     let agent =
         nervros_core::app::start_with(profile_path, robot, &state.join("quota.json"), files)

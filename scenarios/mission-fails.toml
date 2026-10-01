@@ -1,0 +1,20 @@
+# The robot gives up on a step: the mission fails, and the model tells the operator why.
+say = ["Walk forward one metre."]
+
+[[model]]
+call = "run_mission"
+args = { intent = "walk forward 1 m", steps = [{ skill = "WalkStraight", args = [{ name = "direction", value = "forward" }, { name = "distance_m", value = "1" }] }] }
+
+[[model]]
+reply = "Walking one metre forward."
+
+[[model]]
+reply = "I could not finish: the way ahead was blocked."
+
+[robot.actions."/x/execute_mission"]
+status = "aborted"
+result = { outcome = 1, failed_step_id = "s1", failure_reason = "something is in the way" }
+
+[expect]
+mission = "failure"
+reply_has = ["blocked"]

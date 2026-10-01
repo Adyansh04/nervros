@@ -13,25 +13,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use nervros_core::evalcase::{Case, Expect, Suite, Truth};
+use nervros_core::evalcase::{Case, Seen, Suite, Truth, judge, say};
 use nervros_core::profile::Profile;
 use nervros_core::providers::{ModelsConfig, ProviderKind};
-use nervros_core::session::{Command, Event};
+use nervros_core::session::Command;
 use nervros_ros::RobotPort;
 use nervros_ros::tf::Transform;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use tokio::sync::broadcast;
-
-/// Words a reply should not use to ask for what the approval card asks.
-const ASKS_FIRST: [&str; 5] = [
-    "would you like me to",
-    "shall i ",
-    "do you want me to",
-    "should i proceed",
-    "want me to execute",
-];
 
 /// The robot's estimate and the simulator's truth further apart than this are worth a note.
 const DRIFT_M: f64 = 0.25;
@@ -46,32 +36,6 @@ pub(crate) struct Options {
     /// The models the routine role runs on, one after another, by `models.toml` id; none for the
     /// profile's chain.
     pub models: Vec<String>,
-}
-
-/// What happened in one trial.
-#[derive(Debug, Default, Serialize)]
-struct Seen {
-    tools: Vec<(String, String)>,
-    skills: Vec<String>,
-    missions: Vec<String>,
-    approvals: usize,
-    replies: Vec<String>,
-    errors: Vec<String>,
-    notices: Vec<String>,
-    compactions: usize,
-    /// By the robot's own estimate of its pose on the map.
-    moved_m: Option<f64>,
-    turned_deg: Option<f64>,
-    /// By the simulator, when the suite names its truth.
-    truth_moved_m: Option<f64>,
-    truth_turned_deg: Option<f64>,
-    seconds: f64,
-    timed_out: bool,
-    calls: u64,
-    input_tokens: u64,
-    cached_tokens: u64,
-    output_tokens: u64,
-    model_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -352,7 +316,15 @@ async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize)
     let deadline = Instant::now() + Duration::from_secs(case.max_s);
     for text in &case.setup {
         let mut ignored = Seen::default();
-        say(&agent.session, &mut events, text, deadline, &mut ignored).await;
+        say(
+            &agent.session,
+            &mut events,
+            text,
+            deadline,
+            true,
+            &mut ignored,
+        )
+        .await;
     }
     let start = pose(run.robot, run.profile);
     let truth_start = match run.truth {
@@ -361,7 +333,7 @@ async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize)
     };
     let began = Instant::now();
     for text in &case.say {
-        if say(&agent.session, &mut events, text, deadline, &mut seen).await {
+        if say(&agent.session, &mut events, text, deadline, true, &mut seen).await {
             seen.timed_out = true;
             // A case over its time stops the robot rather than leave it running into the next.
             agent.session.send(Command::StopMission);
@@ -381,170 +353,6 @@ async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize)
         (seen.truth_moved_m, seen.truth_turned_deg) = (Some(moved), Some(turned));
     }
     Ok(seen)
-}
-
-/// Sends one message and waits for its turn, the missions it starts and their reports;
-/// `true` when the deadline passed first.
-async fn say(
-    session: &nervros_core::session::Session,
-    events: &mut broadcast::Receiver<Event>,
-    text: &str,
-    deadline: Instant,
-    seen: &mut Seen,
-) -> bool {
-    session.send(Command::User(text.to_owned()));
-    let (mut mine, mut open, mut awaiting_report) = (None, 0u32, false);
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let e = match tokio::time::timeout(left, events.recv()).await {
-            Err(_) => return true,
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Closed)) => return false,
-            Ok(Ok(e)) => e,
-        };
-        match e {
-            Event::ApprovalRequested { id, .. } => {
-                seen.approvals += 1;
-                session.send(Command::Approve(id));
-            }
-            Event::ToolFinished { tool, status, .. } => seen.tools.push((tool, status.to_owned())),
-            Event::MissionPlanned { steps, .. } => {
-                seen.skills.extend(steps.into_iter().map(|s| s.summary));
-            }
-            Event::MissionStarted { .. } => open += 1,
-            Event::MissionFinished { outcome, .. } => {
-                seen.missions.push(outcome);
-                open = open.saturating_sub(1);
-                awaiting_report = true;
-            }
-            Event::Report { .. } => awaiting_report = false,
-            Event::Reply { text, .. } => seen.replies.push(text),
-            Event::Error { text, .. } => seen.errors.push(text),
-            Event::Notice { text } => seen.notices.push(text),
-            Event::Compacted { .. } => seen.compactions += 1,
-            Event::ModelCall {
-                input_tokens,
-                cached_tokens,
-                output_tokens,
-                ms,
-                ..
-            } => {
-                seen.calls += 1;
-                seen.input_tokens += input_tokens;
-                seen.cached_tokens += cached_tokens;
-                seen.output_tokens += output_tokens;
-                seen.model_ms += ms;
-            }
-            Event::User { turn, text: sent } if sent == text => mine = Some(turn),
-            Event::TurnFinished { turn }
-                if mine.is_some_and(|m| turn >= m) && open == 0 && !awaiting_report =>
-            {
-                return false;
-            }
-            _ => {}
-        }
-    }
-}
-
-fn judge(expect: &Expect, seen: &Seen) -> Vec<String> {
-    let mut problems = Vec::new();
-    if seen.timed_out {
-        problems.push("timed out".to_owned());
-    }
-    for e in &seen.errors {
-        problems.push(format!("error: {e}"));
-    }
-    let ok = |t: &str| {
-        seen.tools
-            .iter()
-            .any(|(n, s)| n == t && (s == "succeeded" || s == "accepted"))
-    };
-    for t in expect.tools.iter().filter(|t| !ok(t)) {
-        problems.push(format!("{t} not called successfully"));
-    }
-    for t in &expect.not_tools {
-        if seen.tools.iter().any(|(n, _)| n == t) {
-            problems.push(format!("{t} called"));
-        }
-    }
-    for s in &expect.skills {
-        if !seen.skills.iter().any(|k| k.starts_with(s.as_str())) {
-            problems.push(format!(
-                "no {s} in any plan (plans: {})",
-                seen.skills.join(", ")
-            ));
-        }
-    }
-    match (expect.mission.as_deref(), seen.missions.last()) {
-        (Some("none"), Some(m)) => problems.push(format!("a mission ran ({m})")),
-        (Some(want), None) if want != "none" => {
-            problems.push(format!("no mission ({want} wanted)"));
-        }
-        (Some(want), Some(got)) if want != "none" && want != got => {
-            problems.push(format!("mission {got}, {want} wanted"));
-        }
-        _ => {}
-    }
-    if let Some(max) = expect.approvals_max
-        && seen.approvals > max
-    {
-        problems.push(format!(
-            "{} approvals, at most {max} wanted",
-            seen.approvals
-        ));
-    }
-    let last = seen
-        .replies
-        .last()
-        .map(|r| r.to_lowercase())
-        .unwrap_or_default();
-    if !expect.reply_has.is_empty()
-        && !expect
-            .reply_has
-            .iter()
-            .any(|w| last.contains(&w.to_lowercase()))
-    {
-        problems.push(format!("the reply has none of {:?}", expect.reply_has));
-    }
-    // Offering a follow-up is fine; asking leave for a plan the approval card asks about is not.
-    let planned = !seen.skills.is_empty() || !seen.missions.is_empty();
-    let asks = ASKS_FIRST.iter().copied().filter(|_| planned);
-    for w in expect.reply_lacks.iter().map(String::as_str).chain(asks) {
-        if last.contains(&w.to_lowercase()) {
-            problems.push(format!("the reply says \"{w}\""));
-        }
-    }
-    let within =
-        |v: Option<f64>, [lo, hi]: [f64; 2], what: &str, problems: &mut Vec<String>| match v {
-            Some(v) if v < lo || v > hi => {
-                problems.push(format!("{what} {v:.2}, wanted {lo}..{hi}"));
-            }
-            None => problems.push(format!("{what} unknown")),
-            _ => {}
-        };
-    // The simulator's truth when there is one: the robot's estimate is what may be wrong.
-    if let Some(range) = expect.moved_m {
-        within(
-            seen.truth_moved_m.or(seen.moved_m),
-            range,
-            "moved m",
-            &mut problems,
-        );
-    }
-    if let Some(want) = expect.compacted
-        && want != (seen.compactions > 0)
-    {
-        problems.push(format!("compacted {} times", seen.compactions));
-    }
-    if let Some(range) = expect.turned_deg {
-        within(
-            seen.truth_turned_deg.or(seen.turned_deg),
-            range,
-            "turned deg",
-            &mut problems,
-        );
-    }
-    problems
 }
 
 /// Where the robot's estimate of its travel disagrees with the simulator's.
@@ -739,41 +547,7 @@ pub(crate) fn default_out() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_case_is_judged_on_what_happened() {
-        let expect: Expect = toml::from_str(
-            "tools = [\"run_mission\"]\nskills = [\"WalkStraight\"]\nmission = \"success\"\n\
-             approvals_max = 1\nmoved_m = [0.7, 1.3]\n",
-        )
-        .unwrap();
-        let mut seen = Seen {
-            tools: vec![("run_mission".into(), "accepted".into())],
-            skills: vec!["WalkStraight(direction=forward, distance_m=1)".into()],
-            missions: vec!["success".into()],
-            approvals: 1,
-            replies: vec!["It walked 1 m forward.".into()],
-            moved_m: Some(0.95),
-            turned_deg: Some(2.0),
-            ..Seen::default()
-        };
-        assert!(
-            judge(&expect, &seen).is_empty(),
-            "{:?}",
-            judge(&expect, &seen)
-        );
-        seen.replies
-            .push("I planned it. Would you like me to run it?".into());
-        seen.moved_m = Some(0.0);
-        seen.approvals = 2;
-        let problems = judge(&expect, &seen).join("; ");
-        assert!(
-            problems.contains("would you like me to")
-                && problems.contains("moved m 0.00")
-                && problems.contains("2 approvals"),
-            "{problems}"
-        );
-    }
+    use nervros_core::evalcase::Expect;
 
     #[test]
     fn the_simulator_judges_travel_and_a_drifting_estimate_is_noted() {
