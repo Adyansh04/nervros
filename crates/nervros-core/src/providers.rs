@@ -153,6 +153,9 @@ pub struct ModelConfig {
     /// Request fields passed to the provider as they are, such as Gemini's
     /// `{ generation_config = { thinking_level = "low" } }`.
     pub params: Option<serde_json::Value>,
+    /// Its context window in tokens; the conversation is compacted to stay inside it. Unset,
+    /// nothing is cut.
+    pub context: Option<usize>,
 }
 
 /// A shared daily budget.

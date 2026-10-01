@@ -4,10 +4,10 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use nervros_core::app::Agent;
 use nervros_core::doctor::Check;
@@ -87,7 +87,7 @@ enum Tab {
     Layers,
     Approvals,
     Events,
-    Models,
+    Agent,
     Doctor,
 }
 
@@ -98,7 +98,7 @@ impl Tab {
         (Self::Layers, "Layers"),
         (Self::Approvals, "Approvals"),
         (Self::Events, "Events"),
-        (Self::Models, "Models"),
+        (Self::Agent, "Agent"),
         (Self::Doctor, "Doctor"),
     ];
 }
@@ -182,6 +182,8 @@ pub struct Gui {
     events: broadcast::Receiver<Event>,
     live: SharedLive,
     log_path: PathBuf,
+    /// Earlier sessions for the Agent tab, and when they were listed.
+    sessions: Option<(Instant, Vec<crate::sessions::SessionInfo>)>,
     chat: Chat,
     event_log: VecDeque<String>,
     input: String,
@@ -271,6 +273,7 @@ impl Gui {
             events,
             live,
             log_path,
+            sessions: None,
             chat: Chat::default(),
             event_log: VecDeque::new(),
             input: String::new(),
@@ -362,7 +365,12 @@ impl Gui {
     fn say(&mut self, text: String) {
         self.history.push(text.clone());
         self.history_pos = None;
-        self.agent.session.send(Command::User(text));
+        let command = if text.trim() == "/compact" {
+            Command::Compact
+        } else {
+            Command::User(text)
+        };
+        self.agent.session.send(command);
     }
 
     fn act(&mut self, ctx: &egui::Context, actions: Vec<Action>) {
@@ -731,7 +739,7 @@ impl Gui {
                 Tab::Layers => self.layers_tab(ui),
                 Tab::Approvals => self.approvals_tab(ui),
                 Tab::Events => self.events_tab(ui),
-                Tab::Models => self.models_tab(ui),
+                Tab::Agent => self.agent_tab(ui),
                 Tab::Doctor => self.doctor_tab(ui),
             });
     }
@@ -823,7 +831,63 @@ impl Gui {
         }
     }
 
-    fn models_tab(&self, ui: &mut egui::Ui) {
+    /// Earlier sessions to carry on, then the models and their quotas.
+    fn agent_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Sessions").strong());
+        let fresh = self
+            .sessions
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(5));
+        if !fresh {
+            let logs = self
+                .log_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            self.sessions = Some((Instant::now(), crate::sessions::list(&logs, &self.log_path)));
+        }
+        let mut resume = None;
+        let listed = self
+            .sessions
+            .as_ref()
+            .map_or(&[][..], |(_, l)| l.as_slice());
+        if listed.is_empty() {
+            ui.label(
+                RichText::new("No earlier session saved its conversation yet.")
+                    .small()
+                    .color(ui.tokens().text_subdued),
+            );
+        }
+        for s in listed {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&s.when).monospace().small());
+                ui.label(RichText::new(&s.first).small())
+                    .on_hover_text(format!("{} messages", s.messages));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(ReButton::new("Resume").small().secondary())
+                        .on_hover_text("Carry on this conversation")
+                        .clicked()
+                    {
+                        resume = Some(s.path.clone());
+                    }
+                });
+            });
+        }
+        if let Some(path) = resume {
+            match nervros_core::llm::History::load(&path) {
+                Ok(history) => self.agent.session.send(Command::Restore(history)),
+                Err(e) => self
+                    .chat
+                    .items
+                    .push(crate::chat::Item::Error(format!("{}: {e}", path.display()))),
+            }
+        }
+        ui.add_space(12.0);
+        self.models_list(ui);
+    }
+
+    fn models_list(&self, ui: &mut egui::Ui) {
         let router = self.agent.llm.router();
         let now = SystemTime::now();
         for (role, name) in [
@@ -913,6 +977,24 @@ impl Gui {
             );
             ui.label(subdued(state));
             ui.label(subdued(format!("{} tools", self.agent.tools.len())));
+            if let Some((used, window)) = self.chat.context {
+                let text = format!(
+                    "context {} / {}",
+                    crate::chat::thousands(used),
+                    crate::chat::thousands(window)
+                );
+                // Past three quarters a compaction is near; past the window, a request fails.
+                let full = used.saturating_mul(4) >= window.saturating_mul(3);
+                let colour = if full {
+                    t.warn_fg_color
+                } else {
+                    t.text_subdued
+                };
+                ui.label(RichText::new(text).small().color(colour))
+                    .on_hover_text(
+                        "Tokens the latest request took; /compact condenses the conversation",
+                    );
+            }
             if let Some(bytes) = re_memory::MemoryUse::capture().counted {
                 #[expect(clippy::cast_precision_loss, reason = "shown to one decimal")]
                 let gb = bytes as f64 / 1e9;

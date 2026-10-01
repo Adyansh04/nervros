@@ -46,7 +46,7 @@ enum Command {
         image: Option<PathBuf>,
     },
     /// Chat with the robot. Lines starting with `/` are commands: `/arm`, `/disarm`, `/stop`,
-    /// `/yes N`, `/no N`, `/quit`; a line that is exactly `stop` also stops the robot.
+    /// `/yes N`, `/no N`, `/compact`, `/quit`; a line that is exactly `stop` also stops the robot.
     #[cfg(feature = "ros")]
     Chat {
         /// Send these messages in order and exit, instead of reading stdin.
@@ -58,6 +58,9 @@ enum Command {
         /// Approve every request; for scripted runs only.
         #[arg(long)]
         approve: bool,
+        /// Carry on a saved conversation: a `.history.json` path, or `last`.
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// Run a suite of requests against the live robot, each in a fresh session approving every
     /// request, and report which cases did what they expect.
@@ -179,11 +182,21 @@ async fn main() -> Result<()> {
             robot::segment(&cli.profile, args, &out).await
         }
         #[cfg(feature = "ros")]
-        Command::Chat { say, arm, approve } => {
+        Command::Chat {
+            say,
+            arm,
+            approve,
+            resume,
+        } => {
             robot::chat(
                 &cli.profile,
                 &nervros_core::app::state_dir(),
-                robot::ChatOptions { say, arm, approve },
+                robot::ChatOptions {
+                    say,
+                    arm,
+                    approve,
+                    resume,
+                },
             )
             .await
         }

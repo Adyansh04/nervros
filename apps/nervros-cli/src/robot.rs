@@ -149,6 +149,8 @@ pub(crate) struct ChatOptions {
     pub(crate) arm: bool,
     /// Approve every request (scripted runs only).
     pub(crate) approve: bool,
+    /// A saved conversation to carry on: a path, or `last`.
+    pub(crate) resume: Option<String>,
 }
 
 fn print_event(e: &Event, logs: &Path) {
@@ -233,8 +235,33 @@ fn print_event(e: &Event, logs: &Path) {
         Event::User { .. }
         | Event::TurnStarted { .. }
         | Event::TurnFinished { .. }
-        | Event::Plot { .. } => {}
+        | Event::Plot { .. }
+        | Event::Context { .. } => {}
+        Event::Restored { exchanges } => {
+            println!(
+                "  [carrying on an earlier conversation: {} messages]",
+                exchanges.len()
+            );
+        }
+        Event::Compacted {
+            before,
+            after,
+            summarised,
+        } => {
+            let how = if *summarised { "summarised" } else { "cut" };
+            println!("  [conversation {how}: {before} -> {after} tokens]");
+        }
     }
+}
+
+/// The newest conversation a session saved under `logs`.
+fn newest_history(logs: &Path) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(logs)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".history.json"))
+        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
 fn parse_line(line: &str) -> Option<SessionCommand> {
@@ -247,6 +274,7 @@ fn parse_line(line: &str) -> Option<SessionCommand> {
         "" => None,
         "/arm" => Some(SessionCommand::Arm),
         "/disarm" => Some(SessionCommand::Disarm),
+        "/compact" => Some(SessionCommand::Compact),
         // An exact stop word stops the robot without asking the model.
         "/stop" | "stop" | "halt" | "freeze" => Some(SessionCommand::StopMission),
         _ => {
@@ -264,12 +292,32 @@ fn parse_line(line: &str) -> Option<SessionCommand> {
 pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions) -> Result<()> {
     let profile = Profile::load(profile_path).context("loading the profile")?;
     let robot = nervros_core::app::connect(&profile)?;
-    let agent = nervros_core::app::start(profile_path, robot, &state.join("quota.json"))
-        .context("starting the agent")?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let logs_dir = state.join("logs");
+    let resume = match options.resume.as_deref() {
+        None => None,
+        Some(which) => {
+            let path = if which == "last" {
+                newest_history(&logs_dir).context("no saved conversation to resume")?
+            } else {
+                std::path::PathBuf::from(which)
+            };
+            eprintln!("resuming {}", path.display());
+            Some(
+                nervros_core::llm::History::load(&path)
+                    .with_context(|| format!("reading {}", path.display()))?,
+            )
+        }
+    };
+    let files = nervros_core::app::SessionFiles {
+        history: Some(logs_dir.join(format!("session-{stamp}.history.json"))),
+        resume,
+    };
+    let agent =
+        nervros_core::app::start_with(profile_path, robot, &state.join("quota.json"), files)
+            .context("starting the agent")?;
     let (log_path, _log) = nervros_core::log::spawn(
         &logs_dir,
         &format!("session-{stamp}"),

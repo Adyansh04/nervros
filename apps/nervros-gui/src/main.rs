@@ -3,6 +3,7 @@
 mod app;
 mod chat;
 mod editor;
+mod sessions;
 
 use std::path::PathBuf;
 
@@ -42,11 +43,20 @@ fn main() -> Result<()> {
     let profile = Profile::load(&args.profile).context("loading the profile")?;
     let robot = nervros_core::app::connect(&profile)?;
     let state = nervros_core::app::state_dir();
-    let agent = nervros_core::app::start(&args.profile, robot, &state.join("quota.json"))
-        .context("starting the agent")?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    let files = nervros_core::app::SessionFiles {
+        history: Some(
+            state
+                .join("logs")
+                .join(format!("session-{stamp}.history.json")),
+        ),
+        resume: None,
+    };
+    let agent =
+        nervros_core::app::start_with(&args.profile, robot, &state.join("quota.json"), files)
+            .context("starting the agent")?;
     let (log_path, _log) = nervros_core::log::spawn(
         &state.join("logs"),
         &format!("session-{stamp}"),

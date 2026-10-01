@@ -25,7 +25,7 @@ use crate::providers::router::Need;
 use crate::tools::{Lane, Registry, Resource, Status, Tool, ToolOutcome};
 
 /// What a UI or the CLI asks the session to do.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// A message from the operator.
     User(String),
@@ -44,6 +44,11 @@ pub enum Command {
     /// Something the robot reports, such as a finished mission; the model answers it in a turn
     /// of its own, after any running turn.
     Report(String),
+    /// Condense the conversation now, as it is condensed when it grows past half the model's
+    /// window.
+    Compact,
+    /// Carry on an earlier conversation instead of this one.
+    Restore(History),
 }
 
 /// What the session reports.
@@ -128,6 +133,27 @@ pub enum Event {
         field: String,
         /// How long to draw it, in seconds.
         for_s: u64,
+    },
+    /// How full the model's context was on the turn's latest request.
+    Context {
+        /// Tokens the request took, as the provider counted them, or as estimated.
+        used: u64,
+        /// The model's window.
+        window: u64,
+    },
+    /// An earlier conversation was taken up: its exchanges, oldest first, the operator's marked.
+    Restored {
+        /// Each message's text, and whether the operator wrote it.
+        exchanges: Vec<(bool, String)>,
+    },
+    /// The conversation was condensed to stay inside the model's context.
+    Compacted {
+        /// Its estimated size before, in tokens.
+        before: u64,
+        /// And after.
+        after: u64,
+        /// A model summarised the older part, rather than its old results only being cut.
+        summarised: bool,
     },
     /// The operator must approve a call.
     ApprovalRequested {
@@ -235,6 +261,10 @@ pub struct SessionConfig {
     pub approval_ttl: Duration,
     /// How long a turn may take, not counting the operator's time on approvals.
     pub turn_time: Duration,
+    /// Where the conversation is written after every turn, so it can be resumed.
+    pub history_file: Option<std::path::PathBuf>,
+    /// A conversation to carry on.
+    pub resume: Option<History>,
 }
 
 impl Default for SessionConfig {
@@ -246,6 +276,8 @@ impl Default for SessionConfig {
             result_chars: 6000,
             approval_ttl: Duration::from_mins(1),
             turn_time: Duration::from_secs(90),
+            history_file: None,
+            resume: None,
         }
     }
 }
@@ -496,6 +528,10 @@ impl Session {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per command, each a few lines"
+)]
 async fn actor(
     mut rx: mpsc::UnboundedReceiver<Command>,
     shared: Arc<Shared>,
@@ -503,7 +539,7 @@ async fn actor(
     registry: Arc<Registry>,
     stop: Option<Arc<dyn Tool>>,
 ) {
-    let mut history = History::default();
+    let mut history = shared.config.resume.clone().unwrap_or_default();
     let mut turns = 0u64;
     let mut running: Option<(u64, JoinHandle<Option<History>>)> = None;
     let mut reports: Vec<String> = Vec::new();
@@ -566,6 +602,23 @@ async fn actor(
                         }
                         halt(&shared, stop.as_ref().filter(|_| mission));
                     }
+                    Command::Compact => {
+                        if running.is_some() {
+                            shared.emit(Event::Notice { text: "still working on the last message; compact after it".into() });
+                            continue;
+                        }
+                        turns += 1;
+                        running = Some((turns, compaction(turns, &shared, &source, &registry, history.clone())));
+                        answering_report = false;
+                    }
+                    Command::Restore(earlier) => {
+                        if running.is_some() {
+                            shared.emit(Event::Notice { text: "still working on the last message; resume after it".into() });
+                            continue;
+                        }
+                        shared.emit(Event::Restored { exchanges: earlier.exchanges() });
+                        history = earlier;
+                    }
                     Command::Approve(id) => shared.resolve(id, true),
                     Command::Deny(id) => shared.resolve(id, false),
                     Command::Arm | Command::Disarm => {
@@ -579,6 +632,7 @@ async fn actor(
                 if let Some((turn, _)) = running.take() {
                     if let Ok(Some(updated)) = done {
                         history = updated;
+                        save(&shared, &history);
                     }
                     shared.emit(Event::TurnFinished { turn });
                 }
@@ -594,6 +648,69 @@ async fn actor(
             }
         }
     }
+}
+
+/// Condenses the conversation as a turn of its own, so a stop is never held up by a summary.
+fn compaction(
+    turn: u64,
+    shared: &Arc<Shared>,
+    source: &Arc<dyn AgentSource>,
+    registry: &Arc<Registry>,
+    mut history: History,
+) -> JoinHandle<Option<History>> {
+    let (shared, source, registry) = (Arc::clone(shared), Arc::clone(source), Arc::clone(registry));
+    tokio::spawn(async move {
+        shared.emit(Event::TurnStarted { turn });
+        let room = room_for(&shared, &source, &registry).unwrap_or(COMPACT_ROOM);
+        compact(&shared, &source, &mut history, room).await;
+        Some(history)
+    })
+}
+
+/// Writes the conversation where the session keeps it, if it keeps it anywhere.
+fn save(shared: &Shared, history: &History) {
+    if let Some(file) = &shared.config.history_file
+        && let Err(e) = history.save(file)
+    {
+        tracing::warn!(error = %e, "the conversation was not saved");
+    }
+}
+
+/// Before a turn, condenses a history past half the first candidate's window.
+async fn fit_window(
+    shared: &Shared,
+    source: &Arc<dyn AgentSource>,
+    candidates: &[String],
+    tools: &[LoopTool],
+    history: &mut History,
+) {
+    let Some(window) = candidates.first().and_then(|m| source.context(m)) else {
+        return;
+    };
+    let room = window
+        .saturating_sub(llm::fixed_cost(&shared.config.preamble, tools) + llm::RESERVE_TOKENS);
+    if history.size() > room / 2 {
+        compact(shared, source, history, room).await;
+    }
+}
+
+/// Tells the UI how full the model's window was: as the provider counted, or as estimated.
+fn report_context(
+    shared: &Shared,
+    tools: &[LoopTool],
+    history: &History,
+    counted: u64,
+    window: usize,
+) {
+    let estimated = llm::fixed_cost(&shared.config.preamble, tools) + history.size();
+    shared.emit(Event::Context {
+        used: if counted > 0 {
+            counted
+        } else {
+            u64::try_from(estimated).unwrap_or(u64::MAX)
+        },
+        window: u64::try_from(window).unwrap_or(u64::MAX),
+    });
 }
 
 /// Denies what waits for approval and, given the stop tool, stops the robot too.
@@ -657,6 +774,56 @@ async fn limited(
             }
         }
     }
+}
+
+/// Room for the history when the model's window is unknown, for an operator's compaction.
+const COMPACT_ROOM: usize = 12_000;
+
+/// Room left for the history in the first routine model's window, if the models file gives it.
+fn room_for(shared: &Shared, source: &Arc<dyn AgentSource>, registry: &Registry) -> Option<usize> {
+    let need = Need {
+        tools: true,
+        ..Need::default()
+    };
+    let window = source
+        .candidates(Role::Routine, need)
+        .first()
+        .and_then(|m| source.context(m))?;
+    let schemas: usize = registry
+        .iter()
+        .map(|t| {
+            let spec = t.spec();
+            spec.name.len() + spec.description.len() + spec.parameters.to_string().len()
+        })
+        .sum();
+    let fixed = llm::tokens_of(shared.config.preamble.len() + schemas);
+    Some(window.saturating_sub(fixed + llm::RESERVE_TOKENS))
+}
+
+/// Condenses the history to about a quarter of `room`: the older part summarised by a model,
+/// or, when none answers, old results cut and the oldest exchanges dropped.
+async fn compact(
+    shared: &Shared,
+    source: &Arc<dyn AgentSource>,
+    history: &mut History,
+    room: usize,
+) {
+    let before = history.size();
+    let mut summarised = false;
+    if let Some((n, text)) = history.older(room / 4)
+        && let Some(summary) = llm::summarise(source, &text).await
+    {
+        history.summarised(n, &summary);
+        summarised = true;
+    }
+    if history.size() > room / 2 {
+        history.squeeze(room / 2);
+    }
+    shared.emit(Event::Compacted {
+        before: u64::try_from(before).unwrap_or(u64::MAX),
+        after: u64::try_from(history.size()).unwrap_or(u64::MAX),
+        summarised,
+    });
 }
 
 /// Who started a turn.
@@ -733,14 +900,20 @@ async fn run_turn(
         ..Need::default()
     };
     let candidates = source.candidates(Role::Routine, need);
+    let mut history = history;
+    fit_window(&shared, &source, &candidates, &tools, &mut history).await;
     let mut failures = Vec::new();
     for model in candidates {
         let mut updated = history.clone();
+        let used = Arc::new(AtomicU64::new(0));
+        let window = source.context(&model);
         let setup = llm::TurnSetup {
             preamble: &shared.config.preamble,
             max_turns: shared.config.max_model_calls,
             tools: &tools,
             started: Arc::clone(&flags.started),
+            window,
+            used: Arc::clone(&used),
         };
         let result = llm::chat(&model, Arc::clone(&source), setup, &mut updated, &text).await;
         match result {
@@ -750,6 +923,15 @@ async fn run_turn(
                     text: reply,
                     model,
                 });
+                if let Some(window) = window {
+                    report_context(
+                        &shared,
+                        &tools,
+                        &updated,
+                        used.load(Ordering::Relaxed),
+                        window,
+                    );
+                }
                 updated.trim(shared.config.history_max);
                 return Some(updated);
             }
@@ -1063,6 +1245,36 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::Reply { text, .. } if text.contains("kitchen")))
         );
+    }
+
+    #[tokio::test]
+    async fn the_operator_compacts_and_resumes_a_conversation() {
+        let model = MockCompletionModel::new([MockTurn::text("They asked for ten things.")]);
+        let config = SessionConfig {
+            resume: Some(History::sample(10, 3000)),
+            ..SessionConfig::default()
+        };
+        let guard = Arc::new(Guard::new(Policy::default()));
+        let session = Session::start(
+            Arc::new(Scripted(model)),
+            registry(Risk::Observe),
+            guard,
+            None,
+            config,
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::Compact);
+        let events = collect_until_finished(&mut rx, |_| None, &session).await;
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Compacted { summarised: true, before, after } if after < before)),
+            "{events:?}"
+        );
+        session.send(Command::Restore(History::sample(2, 10)));
+        let restored = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(restored, Event::Restored { exchanges } if exchanges.len() == 4));
     }
 
     struct Slow(ToolSpec, Duration);

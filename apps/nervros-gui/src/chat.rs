@@ -21,7 +21,7 @@ const SUGGESTIONS: [&str; 3] = [
 ];
 
 /// What a click in the chat asks the app to do.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Send a command to the session.
     Send(Command),
@@ -124,6 +124,8 @@ pub struct Chat {
     pub turn: Option<Instant>,
     /// The model of the last reply.
     pub model: Option<String>,
+    /// Tokens the latest request took of the model's window, when the window is known.
+    pub context: Option<(u64, u64)>,
     last_user: Option<String>,
 }
 
@@ -239,6 +241,37 @@ impl Chat {
             | Event::MissionFinished { .. } => self.apply_mission(event),
             // The viewer draws it; the tool's card already says what.
             Event::Plot { .. } => {}
+            Event::Context { .. } | Event::Restored { .. } | Event::Compacted { .. } => {
+                self.apply_conversation(event);
+            }
+        }
+    }
+
+    /// How full the model's context is, and the conversation condensed or taken up again.
+    fn apply_conversation(&mut self, event: &Event) {
+        match event {
+            Event::Context { used, window } => self.context = Some((*used, *window)),
+            Event::Restored { exchanges } => {
+                self.items.push(Item::Notice(
+                    "Carrying on an earlier conversation".to_owned(),
+                ));
+                for (operator, text) in exchanges {
+                    if *operator {
+                        self.push_user(text.clone());
+                    } else {
+                        self.items.push(Item::Reply {
+                            text: text.clone(),
+                            model: "earlier".to_owned(),
+                        });
+                    }
+                }
+            }
+            Event::Compacted { before, after, .. } => self.items.push(Item::Notice(format!(
+                "Condensed the conversation to stay inside the model's context: {} to {} tokens",
+                thousands(*before),
+                thousands(*after)
+            ))),
+            _ => {}
         }
     }
 
@@ -373,6 +406,18 @@ impl Chat {
             // Only while a turn runs, so an idle app does not redraw.
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
+    }
+}
+
+/// A token count as people read it: 812, 9.8k.
+#[must_use]
+pub fn thousands(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        #[expect(clippy::cast_precision_loss, reason = "shown to one decimal")]
+        let k = n as f64 / 1000.0;
+        format!("{k:.1}k")
     }
 }
 

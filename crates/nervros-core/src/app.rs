@@ -220,7 +220,33 @@ fn place_tools(
     Ok(places)
 }
 
-/// Starts an agent. Must run inside a tokio runtime.
+/// The watches and the health check: what a person runs before blaming the model.
+fn debug_tools(
+    profile: &Profile,
+    robot: &Arc<dyn RobotPort>,
+    registry: &mut Registry,
+) -> Result<Arc<crate::watch::Watches>, StartError> {
+    let watches = crate::watch::Watches::new(Arc::clone(robot));
+    for tool in watches.tools() {
+        registry.add(tool)?;
+    }
+    registry.add(Arc::new(crate::doctor::HealthCheck::new(
+        profile,
+        Arc::clone(robot),
+    )))?;
+    Ok(watches)
+}
+
+/// Where a session keeps its conversation, and the conversation it carries on.
+#[derive(Debug, Default, Clone)]
+pub struct SessionFiles {
+    /// Written after every turn, so the session can be resumed.
+    pub history: Option<PathBuf>,
+    /// An earlier conversation to carry on.
+    pub resume: Option<crate::llm::History>,
+}
+
+/// Starts an agent with a fresh conversation that is not saved. Must run inside a tokio runtime.
 ///
 /// # Errors
 ///
@@ -229,6 +255,21 @@ pub fn start(
     profile_path: &Path,
     robot: Arc<dyn RobotPort>,
     ledger: &Path,
+) -> Result<Agent, StartError> {
+    start_with(profile_path, robot, ledger, SessionFiles::default())
+}
+
+/// Starts an agent whose conversation is saved to, or resumed from, `files`. Must run inside a
+/// tokio runtime.
+///
+/// # Errors
+///
+/// Anything in [`StartError`].
+pub fn start_with(
+    profile_path: &Path,
+    robot: Arc<dyn RobotPort>,
+    ledger: &Path,
+    files: SessionFiles,
 ) -> Result<Agent, StartError> {
     let profile = Profile::load(profile_path)?;
     let models = ModelsConfig::load(&profile.resolve(&profile.models.file))?;
@@ -254,14 +295,7 @@ pub fn start(
             registry.add(tool)?;
         }
     }
-    let watches = crate::watch::Watches::new(Arc::clone(&robot));
-    for tool in watches.tools() {
-        registry.add(tool)?;
-    }
-    registry.add(Arc::new(crate::doctor::HealthCheck::new(
-        &profile,
-        Arc::clone(&robot),
-    )))?;
+    let watches = debug_tools(&profile, &robot, &mut registry)?;
     let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
     registry.add(Arc::clone(&stop))?;
     let missions = Missions::new(&profile, places, Arc::clone(&robot));
@@ -276,6 +310,8 @@ pub fn start(
         max_model_calls: usize::try_from(profile.policy.budgets.model_calls).unwrap_or(6),
         approval_ttl: profile.policy.approval_ttl,
         turn_time: profile.policy.budgets.wall_time,
+        history_file: files.history,
+        resume: files.resume,
         ..SessionConfig::default()
     };
     let session = Session::start(
