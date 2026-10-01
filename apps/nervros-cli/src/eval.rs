@@ -192,9 +192,6 @@ async fn run_case(
             .context("opening the case log")?;
     let mut events = agent.session.subscribe();
     agent.session.send(Command::Arm);
-    // A fresh agent fetches the robot's skill catalog first; asked at once, the model would see
-    // no skills, as no operator types that fast in the window.
-    tokio::time::sleep(Duration::from_secs(2)).await;
     let mut seen = Seen::default();
     let deadline = Instant::now() + Duration::from_secs(case.max_s);
     for text in &case.setup {

@@ -926,6 +926,9 @@ async fn run_turn(
         }
     };
     let flags = Arc::new(TurnFlags::default());
+    for tool in registry.iter() {
+        tool.ready().await;
+    }
     let tools = loop_tools(&registry, &shared, turn, &flags);
     let need = Need {
         tools: !tools.is_empty(),

@@ -242,6 +242,10 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Waits until the spec is complete, as a mission tool's skill list once the robot has
+    /// answered; the session asks before each turn. Most specs are complete from the start.
+    async fn ready(&self) {}
+
     /// Runs it. Errors are outcomes, never panics.
     async fn call(&self, args: Value) -> ToolOutcome;
 }

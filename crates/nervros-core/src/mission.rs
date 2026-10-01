@@ -722,6 +722,11 @@ impl Tool for RunMission {
         }))
     }
 
+    /// The skill list loads when the session starts; a first message sent at once would see none.
+    async fn ready(&self) {
+        let _ = tokio::time::timeout(SERVICE_TIMEOUT / 2, self.0.catalog()).await;
+    }
+
     async fn call(&self, args: Value) -> ToolOutcome {
         // Steps reach here only to be checked: a run's were replaced by their hash.
         if args.get("steps").is_some() {
