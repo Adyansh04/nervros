@@ -124,6 +124,8 @@ pub struct ImageArtifact {
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
+    /// What each numbered mark on it is, mark 1 first.
+    pub marks: Vec<String>,
 }
 
 /// What a call returned.

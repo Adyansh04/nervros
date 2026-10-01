@@ -4,7 +4,7 @@
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::fmt::Write as _;
 
@@ -35,6 +35,8 @@ pub enum Action {
     Say(String),
     /// Put text in the composer.
     Prefill(String),
+    /// Show the 3D view as it was at this time.
+    ShowAt(SystemTime),
 }
 
 /// One tool call, from its start to its end.
@@ -97,6 +99,10 @@ pub enum Item {
         /// Decoded once, uploaded on first draw.
         pixels: Arc<egui::ColorImage>,
         texture: OnceCell<egui::TextureHandle>,
+        /// What each numbered mark is, mark 1 first.
+        marks: Vec<String>,
+        /// When it arrived, for showing the 3D view as it was then.
+        at: SystemTime,
     },
     /// An approval request.
     Approval(Approval),
@@ -129,6 +135,8 @@ pub struct PlanCard {
     concerns: Vec<Concern>,
     /// An edit replaced it before it ran.
     replaced: bool,
+    /// Each tree node seen so far, by path, with its latest status, in the order they started.
+    nodes: Vec<(String, String)>,
 }
 
 /// The conversation.
@@ -180,11 +188,14 @@ impl Chat {
                 jpeg,
                 width,
                 height,
+                marks,
             } => match decode(jpeg) {
                 Some(pixels) => self.items.push(Item::Image {
                     id: id.clone(),
                     pixels: Arc::new(pixels),
                     texture: OnceCell::new(),
+                    marks: marks.clone(),
+                    at: SystemTime::now(),
                 }),
                 None => self.items.push(Item::Notice(format!(
                     "Snapshot {id} ({width}×{height}) could not be decoded"
@@ -394,6 +405,7 @@ impl Chat {
                 preview: Vec::new(),
                 concerns: concerns.clone(),
                 replaced: false,
+                nodes: Vec::new(),
             })),
             Event::MissionPreview { hash, steps } => {
                 if let Some(p) = self.plan_mut(|p| p.hash == *hash) {
@@ -410,10 +422,17 @@ impl Chat {
                 id,
                 step,
                 node,
+                path,
                 status,
                 ..
             } => {
                 if let Some(p) = self.plan_mut(|p| p.mission.as_ref() == Some(id)) {
+                    if !path.is_empty() {
+                        match p.nodes.iter_mut().find(|(n, _)| n == path) {
+                            Some((_, s)) => s.clone_from(status),
+                            None => p.nodes.push((path.clone(), status.clone())),
+                        }
+                    }
                     let entry = p.progress.entry(step.clone()).or_default();
                     if node.is_empty() {
                         entry.0.clone_from(status);
@@ -459,6 +478,14 @@ impl Chat {
         })
     }
 
+    /// What a mission was for, by its id.
+    pub fn intent_of_mission(&self, id: &str) -> Option<&str> {
+        self.items.iter().rev().find_map(|i| match i {
+            Item::Plan(p) if p.mission.as_deref() == Some(id) => Some(p.intent.as_str()),
+            _ => None,
+        })
+    }
+
     /// The newest plan, for the dock.
     pub fn latest_plan(&self) -> Option<&PlanCard> {
         self.items.iter().rev().find_map(|i| match i {
@@ -486,12 +513,14 @@ impl Chat {
                         id,
                         pixels,
                         texture,
+                        marks,
+                        at,
                     } => {
                         let texture = texture.get_or_init(|| {
                             let options = egui::TextureOptions::LINEAR;
                             ui.ctx().load_texture(id, Arc::clone(pixels), options)
                         });
-                        image_card(ui, id, texture, actions);
+                        image_card(ui, id, texture, marks, *at, actions);
                     }
                     Item::Approval(a) => {
                         approval_card(ui, a, self.plan_for(a), approval_ttl, actions);
@@ -643,10 +672,14 @@ fn tool_chip(ui: &mut egui::Ui, t: &ToolCall) {
         });
 }
 
+/// A marked image: its marks as a legend to ask about one by one, when it was taken, and the
+/// 3D view as it was then.
 fn image_card(
     ui: &mut egui::Ui,
     id: &str,
     texture: &egui::TextureHandle,
+    marks: &[String],
+    at: SystemTime,
     actions: &mut Vec<Action>,
 ) {
     let stroke = ui.tokens().widget_noninteractive_bg_stroke;
@@ -657,8 +690,27 @@ fn image_card(
                 .max_width(ui.available_width())
                 .corner_radius(CornerRadius::same(6)),
         );
+        if !marks.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (i, label) in marks.iter().enumerate() {
+                    let n = i + 1;
+                    if ui
+                        .add(ReButton::new(format!("{n} {label}")).small().secondary())
+                        .on_hover_text(format!("Ask about mark {n}"))
+                        .clicked()
+                    {
+                        actions.push(Action::Prefill(format!(
+                            "In snapshot {id}, mark {n} ({label}): "
+                        )));
+                    }
+                }
+            });
+        }
         ui.horizontal(|ui| {
-            let caption = RichText::new(format!("Snapshot {id} · {w}×{h}"));
+            let taken = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let caption = format!("Snapshot {id} · {} · {w}×{h}", crate::sessions::ago(taken));
+            let caption = RichText::new(caption);
             ui.label(caption.small().color(ui.tokens().text_subdued));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
@@ -666,6 +718,13 @@ fn image_card(
                     .clicked()
                 {
                     actions.push(Action::Prefill(format!("In snapshot {id}, ")));
+                }
+                if ui
+                    .add(ReButton::new("Show in 3D").small().secondary())
+                    .on_hover_text("Pause the 3D view at the moment this was taken")
+                    .clicked()
+                {
+                    actions.push(Action::ShowAt(at));
                 }
             });
         });
@@ -840,12 +899,10 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
             for s in &p.steps {
                 let (status, node) = p.progress.get(&s.id).cloned().unwrap_or_default();
                 let failed = p.finished.as_ref().is_some_and(|f| f.1 == s.id);
-                let (color, mark) = match (status.as_str(), failed) {
-                    (_, true) | ("failure", _) => (t.error_fg_color, "✗"),
-                    ("success", _) => (t.success_text_color, "✓"),
-                    ("running", _) => (t.info_text_color, "●"),
-                    ("skipped", _) => (t.text_subdued, "–"),
-                    _ => (t.text_subdued, "○"),
+                let (color, mark) = if failed {
+                    (t.error_fg_color, "✗")
+                } else {
+                    node_look(ui, &status)
                 };
                 ui.label(RichText::new(mark).color(color));
                 ui.label(
@@ -890,6 +947,45 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
                     ui.add(egui::Label::new(text).wrap());
                     ui.end_row();
                 }
+            }
+        });
+}
+
+/// A step's or node's status as a coloured mark.
+fn node_look(ui: &egui::Ui, status: &str) -> (Color32, &'static str) {
+    let t = ui.tokens();
+    match status {
+        "failure" => (t.error_fg_color, "✗"),
+        "success" => (t.success_text_color, "✓"),
+        "running" => (t.info_text_color, "●"),
+        "skipped" => (t.text_subdued, "–"),
+        _ => (t.text_subdued, "○"),
+    }
+}
+
+/// The mission's behaviour tree as it has run so far, as the executor reports its nodes: each
+/// under the subtrees it is in, marked with its latest status.
+pub fn tree_panel(ui: &mut egui::Ui, p: &PlanCard) {
+    if p.nodes.is_empty() {
+        return;
+    }
+    ui.add_space(8.0);
+    egui::CollapsingHeader::new(RichText::new("Behaviour tree").strong())
+        .id_salt(("tree", &p.hash))
+        .default_open(true)
+        .show(ui, |ui| {
+            for (path, status) in &p.nodes {
+                let depth = u16::try_from(path.matches('/').count()).unwrap_or(u16::MAX);
+                let name = path.rsplit('/').next().unwrap_or(path);
+                // BehaviorTree.CPP names an unnamed node by its type and uid, as "Sequence::3".
+                let name = name.split_once("::").map_or(name, |(n, _)| n);
+                let (colour, mark) = node_look(ui, status);
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0 * f32::from(depth));
+                    ui.label(RichText::new(mark).color(colour));
+                    ui.label(RichText::new(name).monospace().size(12.0))
+                        .on_hover_text(format!("{path}: {status}"));
+                });
             }
         });
 }
@@ -1260,6 +1356,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn snapshot_tree_panel() {
+        let mut chat = doubtful_plan();
+        chat.apply(&Event::MissionStarted {
+            id: "m2".to_owned(),
+            hash: "5be0c1d9f2a4".to_owned(),
+        });
+        for (step, node, path, status) in [
+            ("s1", "", "s1_TurnInPlace::2", "running"),
+            ("s1", "Turn", "s1_TurnInPlace::2/Turn", "running"),
+            ("s1", "Turn", "s1_TurnInPlace::2/Turn", "success"),
+            ("s1", "", "s1_TurnInPlace::2", "success"),
+            ("s2", "", "s2_WalkStraight::5", "running"),
+            (
+                "s2",
+                "Sequence",
+                "s2_WalkStraight::5/Sequence::6",
+                "running",
+            ),
+            (
+                "s2",
+                "CheckClear",
+                "s2_WalkStraight::5/Sequence::6/CheckClear",
+                "success",
+            ),
+            (
+                "s2",
+                "Walk",
+                "s2_WalkStraight::5/Sequence::6/Walk",
+                "running",
+            ),
+        ] {
+            chat.apply(&Event::MissionProgress {
+                id: "m2".to_owned(),
+                step: step.to_owned(),
+                node: node.to_owned(),
+                path: path.to_owned(),
+                status: status.to_owned(),
+                elapsed_s: 3.0,
+            });
+        }
+        let plan = chat.latest_plan().cloned().unwrap();
+        let mut harness = Harness::builder()
+            .wgpu()
+            .with_size(egui::vec2(440.0, 600.0))
+            .build_ui(move |ui| {
+                Frame::new()
+                    .fill(ui.tokens().panel_bg_color)
+                    .inner_margin(Margin::same(16))
+                    .show(ui, |ui| tree_panel(ui, &plan));
+            });
+        style_for_tests(&harness.ctx);
+        harness.run();
+        harness.fit_contents();
+        compare(&mut harness, "tree_panel", &SnapshotOptions::new());
+    }
+
+    #[test]
     fn a_passed_edit_moves_the_approval_below_its_new_plan() {
         let mut chat = doubtful_plan();
         chat.edit_sent(9);
@@ -1371,6 +1524,7 @@ pub(crate) mod tests {
                 id: "m1".to_owned(),
                 step: step.to_owned(),
                 node: node.to_owned(),
+                path: String::new(),
                 status: status.to_owned(),
                 elapsed_s: 0.0,
             });
@@ -1474,6 +1628,7 @@ pub(crate) mod tests {
             jpeg: Arc::new(jpeg),
             width: 96,
             height: 54,
+            marks: vec!["red mug".to_owned(), "fruit bowl".to_owned()],
         });
         chat.apply(&Event::Notice {
             text: "The robot is running mission m7, at s2_GoToPlace, started before this session. \

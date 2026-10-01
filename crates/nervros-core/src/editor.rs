@@ -395,6 +395,7 @@ impl InspectObject {
                     jpeg: Arc::new(jpeg.clone()),
                     width,
                     height,
+                    marks: Vec::new(),
                 };
                 self.snapshots.put(Snapshot {
                     id: artifact.snapshot.clone(),

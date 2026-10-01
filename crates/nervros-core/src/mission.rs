@@ -1028,6 +1028,7 @@ impl Missions {
                 id: id.to_owned(),
                 step,
                 node,
+                path: path.to_owned(),
                 status: status.to_owned(),
                 elapsed_s: elapsed,
             });

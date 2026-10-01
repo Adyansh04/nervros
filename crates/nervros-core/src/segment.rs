@@ -448,6 +448,7 @@ impl SegmentTool {
             jpeg: Arc::new(jpeg),
             width: drawn.width(),
             height: drawn.height(),
+            marks: regions.iter().map(|r| r.label.clone()).collect(),
         };
         let listed: Vec<Value> = regions
             .iter()

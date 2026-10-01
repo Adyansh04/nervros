@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nervros_core::app::Agent;
 use nervros_core::doctor::Check;
@@ -20,12 +20,17 @@ use rerun::external::egui::{
 };
 use rerun::external::re_log_channel::LogReceiver;
 use rerun::external::re_sdk_types::blueprint::components::PanelState;
-use rerun::external::re_ui::{ReButton, UiExt as _};
+use rerun::external::re_ui::{CommandPalette, ReButton, UiExt as _};
+use rerun::external::re_viewer::SystemCommandSender as _;
+use rerun::external::re_viewer::external::re_log_types::{TimeReal, TimelineName};
+use rerun::external::re_viewer::external::re_viewer_context::TimeControlCommand;
 use rerun::external::{eframe, re_memory, re_viewer};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::chat::{Action, Chat};
+use crate::palette::{self, Cmd};
+use crate::toasts::{Kind, Toasts};
 
 const EVENT_LOG: usize = 300;
 const COMPOSER: &str = "nervros_composer";
@@ -33,7 +38,7 @@ const STOP_HINT: &str = "Halts the mission and cancels every goal; the hands kee
                          The e-stop on the robot's remote is the real emergency stop.";
 
 /// What the World tab's Explore button says to the agent.
-const EXPLORE_REQUEST: &str = "Explore the building to fill in the map.";
+pub(crate) const EXPLORE_REQUEST: &str = "Explore the building to fill in the map.";
 
 /// What background tasks learn about the robot.
 #[derive(Debug, Default)]
@@ -81,7 +86,7 @@ impl Picked {
 type SharedLive = Arc<Mutex<Live>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
+pub(crate) enum Tab {
     Mission,
     World,
     Layers,
@@ -199,6 +204,14 @@ pub struct Gui {
     /// The world editor, when the profile names one; `editing` shows it in place of the viewer.
     editor: Option<crate::editor::WorldEditor>,
     editing: bool,
+    /// Ctrl+K, and the commands it lists.
+    palette: CommandPalette,
+    commands: Vec<palette::Entry>,
+    toasts: Toasts,
+    /// Moves the viewer's time cursor.
+    viewer_commands: re_viewer::CommandSender,
+    /// The earlier moment the 3D view is paused at, if it is not following the newest data.
+    viewing: Option<SystemTime>,
 }
 
 impl Gui {
@@ -249,7 +262,8 @@ impl Gui {
             .editor
             .clone()
             .map(|client| crate::editor::WorldEditor::new(client, runtime.clone()));
-        let mut viewer = re_viewer::App::new(
+        let (viewer_commands, receiver) = re_viewer::command_channel();
+        let mut viewer = re_viewer::App::with_commands(
             main_thread,
             re_viewer::build_info(),
             if cfg!(test) {
@@ -261,6 +275,8 @@ impl Gui {
             cc,
             None,
             re_viewer::AsyncRuntimeHandle::new_native(runtime),
+            re_viewer::register_text_log_receiver(),
+            (viewer_commands.clone(), receiver),
         );
         viewer.app_options_mut().memory_limit = feed.memory_limit;
         viewer.add_log_receiver(feed.input);
@@ -287,6 +303,11 @@ impl Gui {
             bridge: feed.bridge,
             editor,
             editing: false,
+            palette: CommandPalette::default(),
+            commands: palette::entries(),
+            toasts: Toasts::default(),
+            viewer_commands,
+            viewing: None,
         })
     }
 
@@ -340,6 +361,7 @@ impl Gui {
             match self.events.try_recv() {
                 Ok(e) => {
                     self.chat.apply(&e);
+                    self.toast(&e);
                     if let (Closing::Stopping(_), Event::Notice { text }) = (self.closing, &e)
                         && (text.starts_with("robot stopped") || text.starts_with("stop failed"))
                     {
@@ -360,17 +382,102 @@ impl Gui {
         }
     }
 
+    /// A finished mission gets a toast: the operator may be looking at the viewer or away.
+    fn toast(&mut self, e: &Event) {
+        let Event::MissionFinished {
+            id,
+            outcome,
+            failed_step,
+            reason,
+            elapsed_s,
+        } = e
+        else {
+            return;
+        };
+        let what = self.chat.intent_of_mission(id).unwrap_or("the mission");
+        let (kind, text) = match outcome.as_str() {
+            "success" => (Kind::Success, format!("Done: {what} in {elapsed_s:.0} s")),
+            "canceled" => (Kind::Info, format!("Stopped: {what}")),
+            _ if failed_step.is_empty() => (Kind::Failure, format!("{outcome}: {what}: {reason}")),
+            _ => (
+                Kind::Failure,
+                format!("{outcome}: {what} at {failed_step}: {reason}"),
+            ),
+        };
+        self.toasts.add(kind, text);
+    }
+
     /// The bubble appears when the session starts the turn, so a message it turns away shows
-    /// only as its notice.
+    /// only as its notice. A `/name` runs that command instead.
     fn say(&mut self, text: String) {
         self.history.push(text.clone());
         self.history_pos = None;
-        let command = if text.trim() == "/compact" {
-            Command::Compact
-        } else {
-            Command::User(text)
-        };
-        self.agent.session.send(command);
+        if text.starts_with('/') {
+            match palette::slash(&self.commands, &text).cloned() {
+                Some(cmd) => self.run(cmd),
+                None => self.chat.items.push(crate::chat::Item::Notice(format!(
+                    "No command {text}; Ctrl+K lists them"
+                ))),
+            }
+            return;
+        }
+        self.agent.session.send(Command::User(text));
+    }
+
+    /// Runs a palette or slash command.
+    fn run(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Say(text) => self.say(text.to_owned()),
+            Cmd::Send(c) => self.agent.session.send(c),
+            Cmd::Tab(tab) => {
+                self.tab = tab;
+                self.dock_open = true;
+            }
+            Cmd::Doctor => {
+                self.tab = Tab::Doctor;
+                self.dock_open = true;
+                self.live().checks = None;
+                let _ = self.recheck.send(());
+            }
+            Cmd::Dock => self.dock_open = !self.dock_open,
+            Cmd::ResetLayout => self.bridge.reset_layout(),
+            Cmd::EditWorld => {
+                if self.editor.is_some() {
+                    self.editing = !self.editing;
+                    self.tab = Tab::World;
+                    self.dock_open = true;
+                }
+            }
+            Cmd::Live => self.follow_live(),
+        }
+    }
+
+    /// Pauses the 3D view at `at`, where the robot was and what the world model held then.
+    fn show_at(&mut self, at: SystemTime) {
+        let ns = at
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+        self.time_commands(vec![
+            TimeControlCommand::SetActiveTimeline(TimelineName::log_time()),
+            TimeControlCommand::Pause,
+            TimeControlCommand::SetTime(TimeReal::from(ns)),
+        ]);
+        self.viewing = Some(at);
+    }
+
+    fn follow_live(&mut self) {
+        self.time_commands(vec![TimeControlCommand::MoveEndAndFollow]);
+        self.viewing = None;
+    }
+
+    fn time_commands(&self, time_commands: Vec<TimeControlCommand>) {
+        if let Some(store_id) = self.viewer.active_recording_id().cloned() {
+            self.viewer_commands
+                .send_system(re_viewer::SystemCommand::TimeControlCommands {
+                    store_id,
+                    time_commands,
+                });
+        }
     }
 
     fn act(&mut self, ctx: &egui::Context, actions: Vec<Action>) {
@@ -387,12 +494,16 @@ impl Gui {
                     self.input = text;
                     ctx.memory_mut(|m| m.request_focus(egui::Id::new(COMPOSER)));
                 }
+                Action::ShowAt(at) => self.show_at(at),
             }
         }
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
         let working = self.chat.turn.is_some();
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
+            self.palette.toggle();
+        }
         let (esc, stop, tab) = ctx.input_mut(|i| {
             let esc = working && i.consume_key(Modifiers::NONE, Key::Escape);
             let stop = i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::S);
@@ -450,24 +561,7 @@ impl Gui {
             ui.label(RichText::new("NervROS").strong().size(15.0));
             ui.label(RichText::new(&self.agent.profile.robot.name).color(t.text_subdued));
             ui.add_space(8.0);
-            let (topics, executor) = {
-                let live = self.live();
-                (live.topics, live.executor.is_some())
-            };
-            match topics {
-                Some(n) if n > 2 => chip(ui, t.success_text_color, format!("ROS · {n} topics")),
-                Some(_) => chip(ui, t.error_fg_color, "ROS · empty graph"),
-                None => chip(ui, t.warn_fg_color, "ROS · connecting"),
-            }
-            if self.agent.profile.mission.is_some() {
-                if executor {
-                    chip(ui, t.success_text_color, "executor");
-                } else {
-                    chip(ui, t.warn_fg_color, "executor offline");
-                }
-            }
-            let (model, quota) = self.model_status();
-            chip(ui, t.info_text_color, format!("{model} · {quota}"));
+            self.status_chips(ui);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if window_chrome {
                     ui.native_window_buttons_ui();
@@ -530,6 +624,41 @@ impl Gui {
                 }
             });
         });
+    }
+
+    /// How the robot, the executor and the model are, and a way back to the live 3D view.
+    fn status_chips(&mut self, ui: &mut egui::Ui) {
+        let t = ui.tokens();
+        let (topics, executor) = {
+            let live = self.live();
+            (live.topics, live.executor.is_some())
+        };
+        match topics {
+            Some(n) if n > 2 => chip(ui, t.success_text_color, format!("ROS · {n} topics")),
+            Some(_) => chip(ui, t.error_fg_color, "ROS · empty graph"),
+            None => chip(ui, t.warn_fg_color, "ROS · connecting"),
+        }
+        if self.agent.profile.mission.is_some() {
+            if executor {
+                chip(ui, t.success_text_color, "executor");
+            } else {
+                chip(ui, t.warn_fg_color, "executor offline");
+            }
+        }
+        let (model, quota) = self.model_status();
+        chip(ui, t.info_text_color, format!("{model} · {quota}"));
+        if let Some(at) = self.viewing {
+            let secs = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let back = ReButton::new(format!(
+                "Viewing {} · back to live",
+                crate::sessions::ago(secs)
+            ))
+            .small()
+            .secondary();
+            if ui.add(back).clicked() {
+                self.follow_live();
+            }
+        }
     }
 
     /// The model answering now, and its quota for today.
@@ -752,7 +881,10 @@ impl Gui {
     fn mission_tab(&mut self, ui: &mut egui::Ui) {
         let mut actions = Vec::new();
         match self.chat.latest_plan() {
-            Some(p) => crate::chat::plan_card(ui, p, &mut actions),
+            Some(p) => {
+                crate::chat::plan_card(ui, p, &mut actions);
+                crate::chat::tree_panel(ui, p);
+            }
             None => empty(
                 ui,
                 "No plan yet. Ask the robot to do something; its plan appears here.",
@@ -1287,6 +1419,20 @@ impl eframe::App for Gui {
             }
             _ => self.viewer.ui(ui, frame),
         }
+        let (editor, viewing) = (self.editor.is_some(), self.viewing.is_some());
+        let available = move |cmd: &Cmd| match cmd {
+            Cmd::EditWorld => editor,
+            Cmd::Live => viewing,
+            _ => true,
+        };
+        let mut provider = palette::Provider {
+            entries: &self.commands,
+            available: &available,
+        };
+        if let Some(cmd) = self.palette.show(ui.ctx(), &mut provider) {
+            self.run(cmd);
+        }
+        self.toasts.show(ui.ctx());
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {

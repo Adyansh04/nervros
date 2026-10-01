@@ -585,6 +585,7 @@ impl LookTool {
             jpeg: Arc::new(jpeg),
             width: img.width(),
             height: img.height(),
+            marks: dets.instances.iter().map(|i| i.label.clone()).collect(),
         };
         let marks: Vec<Value> = dets
             .instances

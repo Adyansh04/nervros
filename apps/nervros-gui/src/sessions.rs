@@ -67,8 +67,8 @@ fn shorten(text: &str, max: usize) -> String {
     }
 }
 
-/// "5 min ago", "3 h ago", "2 days ago".
-fn ago(stamp: u64) -> String {
+/// "5 min ago", "3 h ago", "2 days ago", from seconds since the Unix epoch.
+pub fn ago(stamp: u64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)

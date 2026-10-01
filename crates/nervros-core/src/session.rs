@@ -129,6 +129,9 @@ pub enum Event {
         width: u32,
         /// Height.
         height: u32,
+        /// What each numbered mark on it is, mark 1 first.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        marks: Vec<String>,
     },
     /// A number in a topic's messages to draw over time, in the viewer's Plots tab.
     Plot {
@@ -268,6 +271,9 @@ pub enum Event {
         step: String,
         /// The node inside the step, or empty for the step itself.
         node: String,
+        /// The node's path in the tree, `/` between the subtrees it is in.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        path: String,
         /// `running`, `success`, `failure` or `skipped`.
         status: String,
         /// Since the mission started.
@@ -551,6 +557,7 @@ impl Shared {
                 jpeg: Arc::clone(&image.jpeg),
                 width: image.width,
                 height: image.height,
+                marks: image.marks.clone(),
             });
         }
         let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);

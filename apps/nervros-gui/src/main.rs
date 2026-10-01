@@ -3,8 +3,10 @@
 mod app;
 mod chat;
 mod editor;
+mod palette;
 mod plan_edit;
 mod sessions;
+mod toasts;
 
 use std::path::PathBuf;
 
