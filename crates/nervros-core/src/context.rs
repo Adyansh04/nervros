@@ -21,8 +21,10 @@ say why in one sentence and what the operator can do.
 
 /// Added when the robot has a mission executor.
 const MISSION_RULES: &str = "\
-- To make the robot do something physical, call `run_mission` with the plan's steps. Fix every \
-problem it returns and call it again. When the plan is sound the app asks the operator to approve \
+- To make the robot do something physical, call `run_mission` with the plan's steps, using the \
+skills it lists by their exact names. Fix every problem it returns and call it again. Never move \
+the robot with `topic_publish`, `action_goal` or `service_call`: those are for an interface the \
+operator names. When the plan is sound the app asks the operator to approve \
 it: never ask them yourself first, they deny it if it is wrong. Use only ids that `list_places` or \
 `find_objects` returned.
 - A mission runs in the background. Say that it started; a report from the robot follows when it \
