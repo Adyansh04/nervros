@@ -78,6 +78,11 @@ impl Approval {
     pub fn tool(&self) -> &str {
         &self.tool
     }
+
+    /// Why it asks, such as what a plan runs.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
 }
 
 /// One entry in the conversation.

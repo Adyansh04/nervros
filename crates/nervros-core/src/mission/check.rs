@@ -278,11 +278,19 @@ pub fn describe_seen(found: &Value, seen: &Observed, now_s: f64) -> String {
     }
     let room_id = text(found, "room_id");
     if !room_id.is_empty() {
+        // A room's type says more than its name, which is often a letter ("room C").
         let room = seen.rooms["rooms"]
             .as_array()
-            .and_then(|rooms| rooms.iter().find(|r| text(r, "id") == room_id))
-            .map_or(room_id, |r| text(r, "name"));
-        let _ = write!(line, " in the {room}");
+            .and_then(|rooms| rooms.iter().find(|r| text(r, "id") == room_id));
+        let place = room.map_or_else(
+            || format!("in {room_id}"),
+            |r| match (text(r, "type"), text(r, "name")) {
+                ("", name) if name.starts_with("room ") => format!("in {name}"),
+                ("", name) => format!("in the {name}"),
+                (kind, _) => format!("in the {} ({room_id})", kind.replace('_', " ")),
+            },
+        );
+        let _ = write!(line, " {place}");
     }
     let support_id = text(found, "support_id");
     let support = seen.objects["objects"].as_array().and_then(|objects| {
@@ -319,7 +327,7 @@ pub(crate) fn named(o: &Value, words: &str) -> bool {
 }
 
 /// The words of a name such as `mug_4` or `small_white_mug`, without its number.
-fn words_of(name: &str) -> String {
+pub(crate) fn words_of(name: &str) -> String {
     name.split(['_', ' '])
         .filter(|p| !p.is_empty() && !p.chars().all(|c| c.is_ascii_digit()))
         .collect::<Vec<_>>()
@@ -446,6 +454,9 @@ mod tests {
             last_seen(&step, &seen, 1000.0).as_deref(),
             Some("small white mug O244: last seen 2 min ago in the office, on wooden tray O31")
         );
+        seen.rooms = json!({"rooms": [{"id": "R3", "name": "room A", "type": "living_room"}]});
+        let typed = last_seen(&step, &seen, 1000.0).unwrap_or_default();
+        assert!(typed.contains(" in the living room (R3),"), "{typed}");
 
         let by_id = PlannedStep {
             args: vec![StepArg {

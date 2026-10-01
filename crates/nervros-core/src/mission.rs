@@ -678,19 +678,19 @@ impl Missions {
     }
 
     async fn rejected(&self, problems: &Value, plan: &Value, by: By) -> ToolOutcome {
-        if by == By::Operator {
-            let lines: Vec<String> = problems
-                .as_array()
-                .map_or(&[][..], Vec::as_slice)
-                .iter()
-                .filter_map(|p| {
-                    let message = p["message"].as_str()?;
-                    Some(match p["step"].as_str().filter(|s| !s.is_empty()) {
-                        Some(step) => format!("{step}: {message}"),
-                        None => message.to_owned(),
-                    })
+        let lines: Vec<String> = problems
+            .as_array()
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .filter_map(|p| {
+                let message = p["message"].as_str()?;
+                Some(match p["step"].as_str().filter(|s| !s.is_empty()) {
+                    Some(step) => format!("{step}: {message}"),
+                    None => message.to_owned(),
                 })
-                .collect();
+            })
+            .collect();
+        if by == By::Operator {
             return ToolOutcome::failed(if lines.is_empty() {
                 "the edited plan failed its checks".to_owned()
             } else {
@@ -713,9 +713,19 @@ impl Missions {
                 "",
             );
         }
-        let mut message = format!(
-            "the plan has {count} problem(s); fix them all and call run_mission again (attempt {n} of {MAX_PLAN_ATTEMPTS})"
-        );
+        // The problems first: what a reader of the first line most needs.
+        let mut message = if lines.is_empty() {
+            format!(
+                "the plan has {count} problem(s); fix them all and call run_mission again \
+                 (attempt {n} of {MAX_PLAN_ATTEMPTS})"
+            )
+        } else {
+            format!(
+                "{}. Fix all {count} problem(s) and call run_mission again (attempt {n} of \
+                 {MAX_PLAN_ATTEMPTS})",
+                lines.iter().take(2).cloned().collect::<Vec<_>>().join("; ")
+            )
+        };
         if n == advice::ADVISE_AFTER
             && let Some(advice) = self.advice(plan, problems).await
         {

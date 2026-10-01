@@ -154,13 +154,20 @@ fn question(goal: &str, seen: &Observed) -> Option<String> {
     let [thing, host] = args.as_slice() else {
         return None;
     };
+    // A detector's own name, such as `mug_4`, reads as its words when the world model lacks it;
+    // a bare world-model id would mean nothing to the vision model.
     let named = |id: &str| {
-        let o = object(&seen.objects, id)?;
-        [o["name"].as_str(), o["label"].as_str()]
-            .into_iter()
-            .flatten()
-            .find(|n| !n.is_empty())
-            .map(str::to_owned)
+        object(&seen.objects, id)
+            .and_then(|o| {
+                [o["name"].as_str(), o["label"].as_str()]
+                    .into_iter()
+                    .flatten()
+                    .find(|n| !n.is_empty())
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                Some(super::check::words_of(id)).filter(|w| id.contains('_') && !w.is_empty())
+            })
     };
     let (thing, host) = (named(thing)?, named(host)?);
     match name {
@@ -329,6 +336,11 @@ mod tests {
         );
         assert_eq!(question("holding(left, O18)", &seen), None);
         assert_eq!(question("inside(O18, O99)", &seen), None, "unknown host");
+        assert_eq!(
+            question("inside(mug_4, tray_1)", &seen).as_deref(),
+            Some("Is the mug now inside the tray?"),
+            "a detector's names, which the world model lacks"
+        );
     }
 
     #[test]

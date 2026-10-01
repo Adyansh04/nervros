@@ -1049,10 +1049,10 @@ impl Gui {
     }
 
     fn approvals_tab(&mut self, ui: &mut egui::Ui) {
-        let pending: Vec<(u64, String)> = self
+        let pending: Vec<(u64, String, String)> = self
             .chat
             .pending()
-            .map(|a| (a.id(), a.tool().to_owned()))
+            .map(|a| (a.id(), a.tool().to_owned(), a.reason().to_owned()))
             .collect();
         if pending.is_empty() {
             empty(
@@ -1061,7 +1061,7 @@ impl Gui {
             );
             return;
         }
-        for (id, tool) in pending {
+        for (id, tool, reason) in pending {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(tool).monospace());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1073,6 +1073,16 @@ impl Gui {
                     }
                 });
             });
+            // What it would do, so the dock alone is enough to decide.
+            ui.add(
+                egui::Label::new(
+                    RichText::new(reason)
+                        .small()
+                        .color(ui.tokens().text_subdued),
+                )
+                .wrap(),
+            );
+            ui.add_space(6.0);
         }
     }
 
