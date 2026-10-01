@@ -24,13 +24,14 @@ const SLACK: f64 = 1.2;
 /// skills ask for about half a metre.
 const NEAR_M: f64 = 0.6;
 
-/// What the model sends to `plan_mission`.
+/// What the model sends to `run_mission`.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plan {
-    /// What the operator asked for, in a few words.
+    /// What the operator asked for, in a few words; the first step's `why` when left out.
+    #[serde(default)]
     pub intent: String,
-    /// Predicates that should hold at the end, such as `at(kitchen)`.
+    /// A model's own end state, accepted and ignored: [`Compiled::goal`] comes from the steps.
     #[serde(default)]
     pub goal: Vec<String>,
     /// In order.
@@ -134,11 +135,21 @@ struct Sim {
     at: Option<String>,
     xy: Option<(f64, f64)>,
     holding: BTreeMap<String, String>,
+    /// What went into what, object first.
+    inside: Vec<(String, String)>,
 }
 
 impl Sim {
     fn near(&self, target: &str, world: &World) -> bool {
         if self.at.as_deref() == Some(target) {
+            return true;
+        }
+        if let Some(at) = &self.at
+            && world
+                .places
+                .iter()
+                .any(|p| p.name == *at && p.near.iter().any(|n| n == target))
+        {
             return true;
         }
         let thing = world.objects.iter().find(|o| o.id == target);
@@ -212,6 +223,25 @@ impl Sim {
                 _ => {}
             }
         }
+        problems.append(&mut self.apply(id, step, skill));
+        // A skill that takes the base may move it, as a pick backs off the surface afterwards, so
+        // the robot's position is unknown until the next walk.
+        if skill.resources.iter().any(|r| r == "base") {
+            self.at = None;
+            self.xy = None;
+        }
+        problems
+    }
+
+    /// Applies what a skill does, as `run` checked it may.
+    fn apply(&mut self, id: &str, step: &Step, skill: &Skill) -> Vec<Problem> {
+        let value = |name: &str| {
+            step.args
+                .iter()
+                .find(|a| a.name == name)
+                .map(|a| a.value.trim().to_owned())
+        };
+        let mut problems = Vec::new();
         for effect in &skill.effects {
             let Some((name, args)) = predicate(effect) else {
                 continue;
@@ -219,6 +249,7 @@ impl Sim {
             match (name, args.as_slice()) {
                 ("holding", [a, x]) => {
                     if let (Some(arm), Some(obj)) = (value(a), value(x)) {
+                        self.inside.retain(|(o, _)| *o != obj);
                         // A replan after a failed place tends to pick the object up again.
                         if let Some((hand, _)) = self.holding.iter().find(|(_, held)| **held == obj)
                         {
@@ -238,20 +269,50 @@ impl Sim {
                         self.holding.insert(arm, String::new());
                     }
                 }
+                // `X`, a capital, is what the hand the skill needs holding holds: its effects
+                // come before `hand_empty` empties it.
+                ("inside", [x, c]) => {
+                    let obj = if x.starts_with(char::is_uppercase) {
+                        skill
+                            .requires
+                            .iter()
+                            .find_map(|need| match predicate(need) {
+                                Some(("holding", r)) if r.len() == 2 && r[1] == *x => {
+                                    value(r[0]).map(|arm| self.held(&arm))
+                                }
+                                _ => None,
+                            })
+                            .filter(|o| !o.is_empty())
+                    } else {
+                        value(x)
+                    };
+                    if let (Some(obj), Some(container)) = (obj, value(c)) {
+                        self.inside.retain(|(o, _)| *o != obj);
+                        self.inside.push((obj, container));
+                    }
+                }
                 _ => {}
             }
-        }
-        // A skill that takes the base may move it, as a pick backs off the surface afterwards, so
-        // the robot's position is unknown until the next walk.
-        if skill.resources.iter().any(|r| r == "base") {
-            self.at = None;
-            self.xy = None;
         }
         problems
     }
 
     fn held(&self, arm: &str) -> String {
         self.holding.get(arm).cloned().unwrap_or_default()
+    }
+
+    /// What holds once every step has run: where the last walk leaves the robot, what each hand
+    /// still holds and what went into what.
+    fn end_state(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.at.iter().map(|p| format!("at({p})")).collect();
+        out.extend(
+            self.holding
+                .iter()
+                .filter(|(_, held)| !held.is_empty())
+                .map(|(arm, held)| format!("holding({arm}, {held})")),
+        );
+        out.extend(self.inside.iter().map(|(o, c)| format!("inside({o}, {c})")));
+        out
     }
 
     /// The walk a step needs first: a `GoToPlace` up to the object or room, known to the world
@@ -271,11 +332,25 @@ impl Sim {
                 .value
                 .trim()
                 .to_owned();
-            (world.knows(&target) && !self.near(&target, world)).then(|| Step {
+            if self.near(&target, world) {
+                return None;
+            }
+            // A thing only the detector knows is reached from the place the profile says.
+            let place = if world.knows(&target) {
+                target
+            } else {
+                world
+                    .places
+                    .iter()
+                    .find(|p| p.near.contains(&target))?
+                    .name
+                    .clone()
+            };
+            Some(Step {
                 skill: GO_TO_PLACE.to_owned(),
                 args: vec![StepArg {
                     name: "place".to_owned(),
-                    value: target,
+                    value: place,
                 }],
                 retries: 0,
                 timeout_s: None,
@@ -321,6 +396,9 @@ pub struct Compiled {
     pub worst_case_s: f64,
     /// The catalog it was checked against.
     pub catalog_version: String,
+    /// What should hold at the end, from the steps' effects: a model's own goals once
+    /// contradicted its steps, and their failed checks sent it to repeat a mission that worked.
+    pub goal: Vec<String>,
 }
 
 /// Something wrong with a plan, for the model to fix.
@@ -368,6 +446,7 @@ pub fn compile(plan: &Plan, catalog: &Catalog, world: &World) -> Result<Compiled
         at: None,
         xy: world.robot,
         holding: world.holding.clone(),
+        inside: Vec::new(),
     };
     let mut n = 0;
     for planned in &plan.steps {
@@ -418,6 +497,7 @@ pub fn compile(plan: &Plan, catalog: &Catalog, world: &World) -> Result<Compiled
         steps,
         worst_case_s: worst,
         catalog_version: catalog.catalog_version.clone(),
+        goal: sim.end_state(),
     })
 }
 
@@ -641,11 +721,31 @@ fn go_to_place<'c>(
         };
         return Ok((skill, vec![(port(skill, "station"), station)], spot));
     }
-    let target = world
+    let mut target = world
         .rooms
         .iter()
         .find(|r| r.id == place || same(&r.name))
         .or_else(|| world.objects.iter().find(|o| o.id == place));
+    // "the sofa": an object by what it is, when only one object is that.
+    if target.is_none() {
+        let named: Vec<&Thing> = world.objects.iter().filter(|o| same(&o.name)).collect();
+        match named.as_slice() {
+            [] => {}
+            [one] => target = Some(one),
+            many => {
+                let ids: Vec<&str> = many.iter().take(8).map(|o| o.id.as_str()).collect();
+                return Err(Problem::new(
+                    id,
+                    "place",
+                    format!(
+                        "`{place}` could be {} objects ({}); use one id, as find_objects gives it",
+                        many.len(),
+                        ids.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
     if let (Some(t), Some(skill)) = (target, catalog.skill(GO_TO_TARGET)) {
         let spot = Spot {
             id: t.id.clone(),
@@ -726,6 +826,7 @@ mod tests {
     fn world() -> World {
         World {
             places: vec![PlaceConfig {
+                near: Vec::new(),
                 name: "dock".to_owned(),
                 aliases: vec!["charging dock".to_owned()],
                 frame: "map".to_owned(),
@@ -751,6 +852,61 @@ mod tests {
 
     fn catalog() -> Catalog {
         Catalog::parse(CATALOG).unwrap()
+    }
+
+    #[test]
+    fn an_object_is_walked_to_by_what_it_is_and_the_end_state_follows_the_steps() {
+        let p = plan(&json!([
+            {"skill": "GoToPlace", "args": {"place": "Basket"}},
+            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}},
+            {"skill": "PlaceInto", "args": {"container_id": "O31", "phrase": "basket", "arm": "right"}}
+        ]));
+        let c = compile(&p, &catalog(), &world()).unwrap();
+        assert!(c.xml.contains(r#"target="O31""#), "{}", c.xml);
+        // The mug ends in the basket and the hand empty; the pick and place moved the base.
+        assert_eq!(c.goal, ["inside(O17, O31)"]);
+        let mut two = world();
+        two.objects.push(thing("O32", "basket", 1.0, 1.0));
+        let problems = compile(&p, &catalog(), &two).unwrap_err();
+        assert!(
+            problems[0]
+                .message
+                .contains("could be 2 objects (O31, O32)"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_thing_only_the_detector_knows_is_walked_to_from_its_place() {
+        let mut w = world();
+        for (name, thing, x) in [("table_side", "cup_9", 2.0), ("shelf", "bin_2", 4.0)] {
+            w.places.push(PlaceConfig {
+                near: vec![thing.to_owned()],
+                name: name.to_owned(),
+                aliases: Vec::new(),
+                frame: "map".to_owned(),
+                pose: PlacePose {
+                    x,
+                    y: 0.0,
+                    yaw: 0.0,
+                },
+            });
+        }
+        let p = plan(&json!([
+            {"skill": "PickObject", "args": {"object_id": "cup_9", "phrase": "cup", "arm": "right"}},
+            {"skill": "PlaceInto", "args": {"container_id": "bin_2", "phrase": "bin", "arm": "right"}}
+        ]));
+        let c = compile(&p, &catalog(), &w).unwrap();
+        let summaries: Vec<&str> = c.steps.iter().map(|s| s.summary.as_str()).collect();
+        assert_eq!(
+            summaries[0], "GoToPlace(place=table_side) (added)",
+            "{summaries:?}"
+        );
+        assert_eq!(
+            summaries[2], "GoToPlace(place=shelf) (added)",
+            "{summaries:?}"
+        );
+        assert_eq!(c.goal, ["inside(cup_9, bin_2)"]);
     }
 
     #[test]

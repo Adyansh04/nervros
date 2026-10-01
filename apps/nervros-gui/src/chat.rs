@@ -21,7 +21,7 @@ const SUGGESTIONS: [&str; 3] = [
 ];
 
 /// What a click in the chat asks the app to do.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Send a command to the session.
     Send(Command),
@@ -100,7 +100,7 @@ pub enum Item {
     Plan(PlanCard),
 }
 
-/// A plan from `plan_mission`, updated as its mission runs.
+/// A plan `run_mission` checked, updated as its mission runs.
 #[derive(Clone)]
 pub struct PlanCard {
     hash: String,
@@ -124,6 +124,10 @@ pub struct Chat {
     pub turn: Option<Instant>,
     /// The model of the last reply.
     pub model: Option<String>,
+    /// Tokens the latest request took of the model's window, when the window is known.
+    pub context: Option<(u64, u64)>,
+    /// The reply as it streams in, until it arrives whole or a tool call takes over.
+    pub draft: Option<String>,
     last_user: Option<String>,
 }
 
@@ -144,6 +148,7 @@ impl Chat {
 
     /// Folds a session event into the conversation.
     pub fn apply(&mut self, event: &Event) {
+        self.settle_draft(event);
         match event {
             Event::TurnStarted { .. } => self.turn = Some(Instant::now()),
             Event::TurnFinished { .. } => self.turn = None,
@@ -239,6 +244,53 @@ impl Chat {
             | Event::MissionFinished { .. } => self.apply_mission(event),
             // The viewer draws it; the tool's card already says what.
             Event::Plot { .. } => {}
+            Event::Context { .. }
+            | Event::Restored { .. }
+            | Event::Compacted { .. }
+            | Event::ReplyDelta { .. } => self.apply_conversation(event),
+        }
+    }
+
+    /// A streamed reply ends whole, or gives way to a tool call.
+    fn settle_draft(&mut self, event: &Event) {
+        if matches!(
+            event,
+            Event::Reply { .. }
+                | Event::ToolStarted { .. }
+                | Event::TurnFinished { .. }
+                | Event::Error { .. }
+        ) {
+            self.draft = None;
+        }
+    }
+
+    /// The reply as it streams, how full the model's context is, and the conversation condensed
+    /// or taken up again.
+    fn apply_conversation(&mut self, event: &Event) {
+        match event {
+            Event::ReplyDelta { text, .. } => self.draft.get_or_insert_default().push_str(text),
+            Event::Context { used, window } => self.context = Some((*used, *window)),
+            Event::Restored { exchanges } => {
+                self.items.push(Item::Notice(
+                    "Carrying on an earlier conversation".to_owned(),
+                ));
+                for (operator, text) in exchanges {
+                    if *operator {
+                        self.push_user(text.clone());
+                    } else {
+                        self.items.push(Item::Reply {
+                            text: text.clone(),
+                            model: "earlier".to_owned(),
+                        });
+                    }
+                }
+            }
+            Event::Compacted { before, after, .. } => self.items.push(Item::Notice(format!(
+                "Condensed the conversation to stay inside the model's context: {} to {} tokens",
+                thousands(*before),
+                thousands(*after)
+            ))),
+            _ => {}
         }
     }
 
@@ -362,6 +414,9 @@ impl Chat {
                 }
             });
         }
+        if let Some(draft) = self.draft.as_deref().filter(|d| !d.trim().is_empty()) {
+            reply(ui, draft, "…");
+        }
         if let Some(since) = self.turn {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -373,6 +428,18 @@ impl Chat {
             // Only while a turn runs, so an idle app does not redraw.
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
+    }
+}
+
+/// A token count as people read it: 812, 9.8k.
+#[must_use]
+pub fn thousands(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        #[expect(clippy::cast_precision_loss, reason = "shown to one decimal")]
+        let k = n as f64 / 1000.0;
+        format!("{k:.1}k")
     }
 }
 
@@ -855,6 +922,27 @@ pub(crate) mod tests {
     #[test]
     fn snapshot_chat() {
         render(sample(), "chat");
+    }
+
+    #[test]
+    fn snapshot_draft_and_compaction() {
+        let mut chat = Chat::default();
+        chat.apply(&Event::Compacted {
+            before: 9800,
+            after: 2100,
+            summarised: true,
+        });
+        chat.apply(&Event::User {
+            turn: 3,
+            text: "Where is the mug?".to_owned(),
+        });
+        for piece in ["The small white mug ", "is on the dining table, "] {
+            chat.apply(&Event::ReplyDelta {
+                turn: 3,
+                text: piece.to_owned(),
+            });
+        }
+        render(chat, "chat_draft");
     }
 
     #[test]

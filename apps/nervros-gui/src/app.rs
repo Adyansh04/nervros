@@ -4,10 +4,10 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use nervros_core::app::Agent;
 use nervros_core::doctor::Check;
@@ -21,9 +21,6 @@ use rerun::external::egui::{
 use rerun::external::re_log_channel::LogReceiver;
 use rerun::external::re_sdk_types::blueprint::components::PanelState;
 use rerun::external::re_ui::{ReButton, UiExt as _};
-use rerun::external::re_viewer::external::re_viewer_context::{
-    SystemCommand, SystemCommandSender as _,
-};
 use rerun::external::{eframe, re_memory, re_viewer};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -90,7 +87,7 @@ enum Tab {
     Layers,
     Approvals,
     Events,
-    Models,
+    Agent,
     Doctor,
 }
 
@@ -101,7 +98,7 @@ impl Tab {
         (Self::Layers, "Layers"),
         (Self::Approvals, "Approvals"),
         (Self::Events, "Events"),
-        (Self::Models, "Models"),
+        (Self::Agent, "Agent"),
         (Self::Doctor, "Doctor"),
     ];
 }
@@ -185,6 +182,8 @@ pub struct Gui {
     events: broadcast::Receiver<Event>,
     live: SharedLive,
     log_path: PathBuf,
+    /// Earlier sessions for the Agent tab, and when they were listed.
+    sessions: Option<(Instant, Vec<crate::sessions::SessionInfo>)>,
     chat: Chat,
     event_log: VecDeque<String>,
     input: String,
@@ -274,6 +273,7 @@ impl Gui {
             events,
             live,
             log_path,
+            sessions: None,
             chat: Chat::default(),
             event_log: VecDeque::new(),
             input: String::new(),
@@ -365,7 +365,12 @@ impl Gui {
     fn say(&mut self, text: String) {
         self.history.push(text.clone());
         self.history_pos = None;
-        self.agent.session.send(Command::User(text));
+        let command = if text.trim() == "/compact" {
+            Command::Compact
+        } else {
+            Command::User(text)
+        };
+        self.agent.session.send(command);
     }
 
     fn act(&mut self, ctx: &egui::Context, actions: Vec<Action>) {
@@ -504,9 +509,7 @@ impl Gui {
                     .on_hover_text("Put the viewer's panes back the way NervROS lays them out")
                     .clicked()
                 {
-                    self.viewer
-                        .command_sender
-                        .send_system(SystemCommand::ClearActiveBlueprint);
+                    self.bridge.reset_layout();
                 }
                 let mut armed = self.agent.guard.armed();
                 let label = if armed { "Armed" } else { "Observe only" };
@@ -736,7 +739,7 @@ impl Gui {
                 Tab::Layers => self.layers_tab(ui),
                 Tab::Approvals => self.approvals_tab(ui),
                 Tab::Events => self.events_tab(ui),
-                Tab::Models => self.models_tab(ui),
+                Tab::Agent => self.agent_tab(ui),
                 Tab::Doctor => self.doctor_tab(ui),
             });
     }
@@ -751,6 +754,43 @@ impl Gui {
             ),
         }
         self.act(ui.ctx(), actions);
+        self.schedules_list(ui);
+    }
+
+    /// Missions that run again and again, each with a way to end it.
+    fn schedules_list(&self, ui: &mut egui::Ui) {
+        let Some(schedules) = &self.agent.schedules else {
+            return;
+        };
+        let list = schedules.list();
+        if list.is_empty() {
+            return;
+        }
+        ui.add_space(12.0);
+        ui.label(RichText::new("Schedules").strong());
+        let mut cancel = None;
+        for s in &list {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&s.id).monospace().small());
+                ui.label(RichText::new(&s.intent).small());
+                let when = format!(
+                    "every {} min, {} of {} runs left",
+                    s.every_min, s.left, s.times
+                );
+                ui.label(RichText::new(when).small().color(ui.tokens().text_subdued));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(ReButton::new("Cancel").small().secondary())
+                        .clicked()
+                    {
+                        cancel = Some(s.id.clone());
+                    }
+                });
+            });
+        }
+        if let Some(id) = cancel {
+            schedules.cancel(&id);
+        }
     }
 
     fn world_tab(&mut self, ui: &mut egui::Ui) {
@@ -828,7 +868,98 @@ impl Gui {
         }
     }
 
-    fn models_tab(&self, ui: &mut egui::Ui) {
+    /// Earlier sessions to carry on, then the models and their quotas.
+    fn agent_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Sessions").strong());
+        let fresh = self
+            .sessions
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(5));
+        if !fresh {
+            let logs = self
+                .log_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            self.sessions = Some((Instant::now(), crate::sessions::list(&logs, &self.log_path)));
+        }
+        let mut resume = None;
+        let listed = self
+            .sessions
+            .as_ref()
+            .map_or(&[][..], |(_, l)| l.as_slice());
+        if listed.is_empty() {
+            ui.label(
+                RichText::new("No earlier session saved its conversation yet.")
+                    .small()
+                    .color(ui.tokens().text_subdued),
+            );
+        }
+        for s in listed {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&s.when).monospace().small());
+                ui.label(RichText::new(&s.first).small())
+                    .on_hover_text(format!("{} messages", s.messages));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(ReButton::new("Resume").small().secondary())
+                        .on_hover_text("Carry on this conversation")
+                        .clicked()
+                    {
+                        resume = Some(s.path.clone());
+                    }
+                });
+            });
+        }
+        if let Some(path) = resume {
+            match nervros_core::llm::History::load(&path) {
+                Ok(history) => self.agent.session.send(Command::Restore(history)),
+                Err(e) => self
+                    .chat
+                    .items
+                    .push(crate::chat::Item::Error(format!("{}: {e}", path.display()))),
+            }
+        }
+        ui.add_space(12.0);
+        self.memory_list(ui);
+        ui.add_space(12.0);
+        self.models_list(ui);
+    }
+
+    /// What the operator asked the agent to remember, each with a way to forget it.
+    fn memory_list(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Memory").strong());
+        let notes = self.agent.memory.all();
+        if notes.is_empty() {
+            ui.label(
+                RichText::new("Nothing yet: say \"remember that…\" in the chat.")
+                    .small()
+                    .color(ui.tokens().text_subdued),
+            );
+        }
+        let mut forget = None;
+        for n in &notes {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(n.id.to_string()).monospace().small());
+                ui.label(RichText::new(&n.text).small());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(ReButton::new("Forget").small().secondary())
+                        .clicked()
+                    {
+                        forget = Some(n.id);
+                    }
+                });
+            });
+        }
+        if let Some(id) = forget
+            && let Err(e) = self.agent.memory.forget(id)
+        {
+            self.chat.items.push(crate::chat::Item::Error(e));
+        }
+    }
+
+    fn models_list(&self, ui: &mut egui::Ui) {
         let router = self.agent.llm.router();
         let now = SystemTime::now();
         for (role, name) in [
@@ -918,6 +1049,24 @@ impl Gui {
             );
             ui.label(subdued(state));
             ui.label(subdued(format!("{} tools", self.agent.tools.len())));
+            if let Some((used, window)) = self.chat.context {
+                let text = format!(
+                    "context {} / {}",
+                    crate::chat::thousands(used),
+                    crate::chat::thousands(window)
+                );
+                // Past three quarters a compaction is near; past the window, a request fails.
+                let full = used.saturating_mul(4) >= window.saturating_mul(3);
+                let colour = if full {
+                    t.warn_fg_color
+                } else {
+                    t.text_subdued
+                };
+                ui.label(RichText::new(text).small().color(colour))
+                    .on_hover_text(
+                        "Tokens the latest request took; /compact condenses the conversation",
+                    );
+            }
             if let Some(bytes) = re_memory::MemoryUse::capture().counted {
                 #[expect(clippy::cast_precision_loss, reason = "shown to one decimal")]
                 let gb = bytes as f64 / 1e9;
@@ -1242,6 +1391,7 @@ fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::kittest::Queryable as _;
     use egui_kittest::{Harness, SnapshotOptions};
     use nervros_ros::fake::FakeRobot;
 
@@ -1412,6 +1562,7 @@ mod tests {
         let profile = dir.path().join("nervros.toml");
         let agent =
             nervros_core::app::start(&profile, robot, &dir.path().join("quota.json")).unwrap();
+        agent.memory.remember("The kitchen door sticks.").unwrap();
         let (rec, input) = nervros_viz::in_process().unwrap();
         let bridge = nervros_viz::spawn(
             &rec,
@@ -1442,5 +1593,15 @@ mod tests {
         // The status bar's memory and frame-time figures differ on every run.
         let options = SnapshotOptions::new().max_failed_pixels(1500);
         crate::chat::compare(&mut harness, "window", &options);
+        // Reset layout lays the panes out the same way again.
+        harness.get_by_label("Reset layout").click();
+        harness.run_steps(2);
+        harness.input_mut().events.push(egui::Event::PointerGone);
+        harness.run_steps(8);
+        crate::chat::compare(&mut harness, "window", &options);
+        // The Agent tab: sessions to resume, what it remembers, the models.
+        harness.state_mut().tab = Tab::Agent;
+        harness.run_steps(4);
+        crate::chat::compare(&mut harness, "window_agent", &options);
     }
 }

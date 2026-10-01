@@ -146,8 +146,13 @@ fn at(target: &str, seen: &Observed, out: impl Fn(Option<bool>, String) -> Verdi
     }
     if let Some(o) = object(&seen.objects, target) {
         let (ox, oy) = xy(&o["pose"]["position"]);
-        let d = (ox - x).hypot(oy - y);
-        return out(Some(d <= AT_OBJECT_M), format!("{d:.2} m from {target}"));
+        // From its edge: a walk up to a sofa stops beside it, two metres from its middle.
+        let (sx, sy) = xy(&o["size"]);
+        let d = ((ox - x).hypot(oy - y) - sx.max(sy) / 2.0).max(0.0);
+        return out(
+            Some(d <= AT_OBJECT_M),
+            format!("{d:.2} m from {target}'s edge"),
+        );
     }
     out(
         None,
@@ -165,6 +170,7 @@ mod tests {
         Observed {
             pose: Some((1.0, 1.0)),
             places: vec![PlaceConfig {
+                near: Vec::new(),
                 name: "dock".to_owned(),
                 aliases: vec![],
                 frame: "map".to_owned(),

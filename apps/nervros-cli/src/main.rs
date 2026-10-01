@@ -11,6 +11,8 @@ use nervros_core::providers::router::{PrivacyMode, Router};
 use nervros_core::providers::{ModelsConfig, Role, free_only, openrouter};
 
 #[cfg(feature = "ros")]
+#[cfg(feature = "ros")]
+mod eval;
 mod robot;
 
 #[derive(Parser)]
@@ -44,7 +46,7 @@ enum Command {
         image: Option<PathBuf>,
     },
     /// Chat with the robot. Lines starting with `/` are commands: `/arm`, `/disarm`, `/stop`,
-    /// `/yes N`, `/no N`, `/quit`; a line that is exactly `stop` also stops the robot.
+    /// `/yes N`, `/no N`, `/compact`, `/quit`; a line that is exactly `stop` also stops the robot.
     #[cfg(feature = "ros")]
     Chat {
         /// Send these messages in order and exit, instead of reading stdin.
@@ -56,6 +58,22 @@ enum Command {
         /// Approve every request; for scripted runs only.
         #[arg(long)]
         approve: bool,
+        /// Carry on a saved conversation: a `.history.json` path, or `last`.
+        #[arg(long)]
+        resume: Option<String>,
+    },
+    /// Run a suite of requests against the live robot, each in a fresh session approving every
+    /// request, and report which cases did what they expect.
+    #[cfg(feature = "ros")]
+    Eval {
+        /// The suite, a TOML file of `[[case]]`s.
+        suite: PathBuf,
+        /// Only the cases whose ids hold this.
+        #[arg(long)]
+        only: Option<String>,
+        /// Where the report goes (default: the state directory's `evals/`).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Check the profile's tools, topics and mission services against the live graph.
     #[cfg(feature = "ros")]
@@ -164,13 +182,32 @@ async fn main() -> Result<()> {
             robot::segment(&cli.profile, args, &out).await
         }
         #[cfg(feature = "ros")]
-        Command::Chat { say, arm, approve } => {
+        Command::Chat {
+            say,
+            arm,
+            approve,
+            resume,
+        } => {
             robot::chat(
                 &cli.profile,
                 &nervros_core::app::state_dir(),
-                robot::ChatOptions { say, arm, approve },
+                robot::ChatOptions {
+                    say,
+                    arm,
+                    approve,
+                    resume,
+                },
             )
             .await
+        }
+        #[cfg(feature = "ros")]
+        Command::Eval { suite, only, out } => {
+            let out = out.unwrap_or_else(eval::default_out);
+            let failed = eval::run(&cli.profile, &suite, only.as_deref(), &out).await?;
+            if failed > 0 {
+                anyhow::bail!("{failed} case(s) failed");
+            }
+            Ok(())
         }
         #[cfg(feature = "ros")]
         Command::Doctor => robot::doctor(&cli.profile).await,

@@ -6,19 +6,19 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use futures::future::BoxFuture;
 use rig::agent::tool::ToolOutput;
 use rig::agent::{
-    AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, InvalidToolCallAction,
-    InvalidToolCallContext, RequestPatch,
+    AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent, HookContext,
+    InvalidToolCallAction, InvalidToolCallContext, ObservationAction, RequestPatch,
 };
 use rig::client::CompletionClient as _;
 use rig::completion::{Chat as _, Message, Prompt as _, PromptError};
-use rig::message::{ImageMediaType, UserContent};
+use rig::message::{AssistantContent, ImageMediaType, ToolResultContent, UserContent};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::providers::router::{Need, Router, Skip};
@@ -382,7 +382,7 @@ impl std::fmt::Debug for LoopTool {
 }
 
 /// The conversation so far, tool calls and results included, in rig's message form.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct History(Vec<Message>);
 
 impl History {
@@ -414,6 +414,300 @@ impl History {
 
 fn is_user_text(m: &Message) -> bool {
     matches!(m, Message::User { content } if content.iter().all(|c| matches!(c, UserContent::Text(_))))
+}
+
+/// Characters per token: JSON-heavy text runs about three, so this errs high.
+const CHARS_PER_TOKEN: usize = 3;
+/// A camera frame, whatever its bytes: a model sizes an image by its tiles, not its base64.
+const IMAGE_TOKENS: usize = 800;
+/// What a reply, and the next tool call with its arguments, need on top of the request.
+pub const RESERVE_TOKENS: usize = 2048;
+
+/// Roughly how many tokens text of `chars` characters takes.
+#[must_use]
+pub fn tokens_of(chars: usize) -> usize {
+    chars.div_ceil(CHARS_PER_TOKEN)
+}
+
+fn json_len<T: serde::Serialize>(value: &T) -> usize {
+    serde_json::to_string(value).map_or(0, |s| s.len())
+}
+
+/// Roughly how many tokens messages take on the wire.
+fn size(messages: &[Message]) -> usize {
+    let (mut chars, mut images) = (0, 0);
+    for m in messages {
+        match m {
+            Message::System { content } => chars += content.len(),
+            Message::User { content } => {
+                for c in content {
+                    match c {
+                        UserContent::Image(_) => images += 1,
+                        UserContent::ToolResult(r) => {
+                            for part in &r.content {
+                                match part {
+                                    ToolResultContent::Image(_) => images += 1,
+                                    other => chars += json_len(other),
+                                }
+                            }
+                        }
+                        other => chars += json_len(other),
+                    }
+                }
+            }
+            Message::Assistant { content, .. } => {
+                for c in content {
+                    match c {
+                        AssistantContent::Image(_) => images += 1,
+                        other => chars += json_len(other),
+                    }
+                }
+            }
+        }
+    }
+    tokens_of(chars) + images * IMAGE_TOKENS
+}
+
+/// A tool result's text, its JSON as JSON and its images as a word.
+fn result_text(parts: &[ToolResultContent]) -> String {
+    parts
+        .iter()
+        .map(|p| match p {
+            ToolResultContent::Text(t) => t.text.clone(),
+            ToolResultContent::Json { value } => value.to_string(),
+            ToolResultContent::Image(_) => "[an image]".to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The messages with every tool result and image before the last `keep` cut to a line.
+fn cut_old(messages: &[Message], keep: usize) -> Vec<Message> {
+    let edge = messages.len().saturating_sub(keep);
+    let cut = |c: &UserContent| match c {
+        UserContent::ToolResult(r) => {
+            let mut r = r.clone();
+            r.content = vec![ToolResultContent::text(format!(
+                "[an earlier result, cut to save room] {}",
+                crate::tools::clip(&result_text(&r.content), 160)
+            ))];
+            UserContent::ToolResult(r)
+        }
+        UserContent::Image(_) => UserContent::text("[an earlier image]"),
+        other => other.clone(),
+    };
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| match m {
+            Message::User { content } if i < edge => Message::User {
+                content: content.iter().map(cut).collect(),
+            },
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// The newest messages that fit `budget`, from an operator's message on so that no tool result
+/// is left without its call; the last exchange stays whatever its size.
+fn fit(mut messages: Vec<Message>, budget: usize) -> Vec<Message> {
+    while size(&messages) > budget {
+        let Some(next) = messages.iter().skip(1).position(is_user_text) else {
+            break;
+        };
+        messages.drain(..=next);
+    }
+    messages
+}
+
+/// Messages as plain text, for a summary.
+fn transcript(messages: &[Message]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for m in messages {
+        match m {
+            Message::User { content } => {
+                for c in content {
+                    match c {
+                        UserContent::Text(t) => {
+                            let _ = writeln!(out, "Operator: {}", t.text);
+                        }
+                        UserContent::ToolResult(r) => {
+                            let text = crate::tools::clip(&result_text(&r.content), 300);
+                            let _ = writeln!(out, "  {} returned: {text}", r.name);
+                        }
+                        UserContent::Image(_) => out.push_str("  (an image)\n"),
+                        _ => {}
+                    }
+                }
+            }
+            Message::Assistant { content, .. } => {
+                for c in content {
+                    match c {
+                        AssistantContent::Text(t) => {
+                            let _ = writeln!(out, "Assistant: {}", t.text);
+                        }
+                        AssistantContent::ToolCall(call) => {
+                            let args =
+                                crate::tools::clip(&call.function.arguments.to_string(), 200);
+                            let _ = writeln!(out, "  called {} {args}", call.function.name);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Message::System { .. } => {}
+        }
+    }
+    out
+}
+
+impl History {
+    /// Roughly how many tokens it takes.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        size(&self.0)
+    }
+
+    /// The part a summary would replace, as text, and how many messages it is: everything
+    /// before the newest exchanges that fit `keep` tokens. `None` when that is nothing.
+    #[must_use]
+    pub fn older(&self, keep: usize) -> Option<(usize, String)> {
+        let starts: Vec<usize> = (0..self.0.len())
+            .filter(|&i| is_user_text(&self.0[i]))
+            .collect();
+        let split = starts
+            .iter()
+            .copied()
+            .find(|&i| size(&self.0[i..]) <= keep)
+            .unwrap_or_else(|| starts.last().copied().unwrap_or(0));
+        (split > 0).then(|| (split, transcript(&self.0[..split])))
+    }
+
+    /// Replaces the first `n` messages with a summary of them.
+    pub fn summarised(&mut self, n: usize, summary: &str) {
+        let kept = self.0.split_off(n.min(self.0.len()));
+        self.0 = vec![
+            Message::User {
+                content: vec![UserContent::text(format!(
+                    "[The earlier conversation, summarised]\n{}",
+                    summary.trim()
+                ))],
+            },
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::text("Noted.")],
+            },
+        ];
+        self.0.extend(kept);
+    }
+
+    /// Cuts old results and images and drops the oldest exchanges until it fits `budget`.
+    pub fn squeeze(&mut self, budget: usize) {
+        self.0 = fit(cut_old(&self.0, 4), budget);
+    }
+
+    /// Writes it as JSON, for a later session to resume.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be written.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, serde_json::to_vec(&self.0)?)
+    }
+
+    /// Reads one [`Self::save`] wrote.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read or is not a saved history.
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self(serde_json::from_slice(&std::fs::read(path)?)?))
+    }
+
+    /// The operator's messages and the replies, in order, for showing a resumed conversation.
+    #[must_use]
+    pub fn exchanges(&self) -> Vec<(bool, String)> {
+        self.0
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content } if is_user_text(m) => Some((
+                    true,
+                    content
+                        .iter()
+                        .filter_map(|c| match c {
+                            UserContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )),
+                Message::Assistant { content, .. } => {
+                    let text: Vec<&str> = content
+                        .iter()
+                        .filter_map(|c| match c {
+                            AssistantContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    (!text.is_empty()).then(|| (false, text.join(" ")))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl History {
+    /// `n` exchanges whose replies are `chars` long.
+    pub(crate) fn sample(n: usize, chars: usize) -> Self {
+        Self(
+            (0..n)
+                .flat_map(|i| {
+                    [
+                        Message::User {
+                            content: vec![UserContent::text(format!("request {i}"))],
+                        },
+                        Message::Assistant {
+                            id: None,
+                            content: vec![AssistantContent::text("x".repeat(chars))],
+                        },
+                    ]
+                })
+                .collect(),
+        )
+    }
+}
+
+/// How the model is told to condense the conversation.
+const SUMMARY_PREAMBLE: &str = "You condense a conversation between a robot's operator and its \
+    assistant so the assistant can carry on from your summary alone. Keep what the operator asked \
+    for and still wants, decisions made, the ids of places and objects, what the robot did and how \
+    each mission ended, what it holds, and open problems. Drop greetings and raw tool output. \
+    Write at most 12 short lines.";
+
+/// A summary of a transcript from the first model of the `summarise` role that answers.
+pub async fn summarise(source: &Arc<dyn AgentSource>, transcript: &str) -> Option<String> {
+    for model in source.candidates(Role::Summarise, Need::default()) {
+        if source.take_request(&model).is_err() {
+            continue;
+        }
+        let Ok(builder) = source.builder(&model) else {
+            continue;
+        };
+        match builder
+            .preamble(SUMMARY_PREAMBLE)
+            .build()
+            .prompt(transcript)
+            .await
+        {
+            Ok(text) if !text.trim().is_empty() => return Some(text),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(model = %model, error = %e, "the summary failed"),
+        }
+    }
+    None
 }
 
 /// How `look`'s vision model is told to answer.
@@ -476,6 +770,16 @@ pub trait AgentSource: Send + Sync {
 
     /// Sets a model aside after a 429.
     fn park(&self, model_id: &str);
+
+    /// The model's context window in tokens, when the models file gives it.
+    fn context(&self, _model_id: &str) -> Option<usize> {
+        None
+    }
+
+    /// Whether the model's replies stream.
+    fn streams(&self, _model_id: &str) -> bool {
+        false
+    }
 }
 
 impl AgentSource for Llm {
@@ -511,6 +815,17 @@ impl AgentSource for Llm {
             tracing::warn!(model = %model_id, error = %e, "could not save the quota ledger");
         }
     }
+
+    fn context(&self, model_id: &str) -> Option<usize> {
+        self.router.config().model(model_id).and_then(|m| m.context)
+    }
+
+    fn streams(&self, model_id: &str) -> bool {
+        self.router
+            .config()
+            .model(model_id)
+            .is_some_and(|m| m.stream)
+    }
 }
 
 /// Steers one turn's agent loop.
@@ -518,26 +833,64 @@ struct TurnHook {
     source: Arc<dyn AgentSource>,
     model: String,
     started: Arc<AtomicBool>,
+    /// The turn's last model call, which must answer: a tool called then ends the turn without one.
+    last: usize,
+    /// Tokens left for the history and the prompt in the model's window, when it is known.
+    room: Option<usize>,
+    /// The input tokens of the latest request, as the provider counted them.
+    used: Arc<AtomicU64>,
+    /// The system prompt for the last call, which says no tool can be called.
+    last_word: String,
 }
 
 impl AgentHook for TurnHook {
     /// Takes each request from the model's quota before it is sent (a turn is up to `max_turns`
-    /// requests, not one), and once a mission has started offers no more tools, so the model
-    /// answers instead of spending the turn on checks the mission's report will answer anyway.
+    /// requests, not one). Once a mission has started, and on the turn's last call, it offers no
+    /// more tools, so the model answers instead of spending the turn on checks the mission's report
+    /// will answer anyway, or being cut off mid-plan.
     async fn on_completion_call(
         &self,
-        _ctx: &HookContext,
-        _event: CompletionCallEvent<'_>,
+        ctx: &HookContext,
+        event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
         if let Err(why) = self.source.take_request(&self.model) {
             return CompletionCallAction::stop(format!("{}: {why}", self.model));
         }
+        let mut patch = None;
+        if let Some(room) = self.room {
+            // Within a turn the results pile up: what the model sees is cut to fit, while the
+            // session keeps every message for its own compaction between turns.
+            let room = room.saturating_sub(size(std::slice::from_ref(event.prompt)));
+            if size(event.history) > room {
+                patch = Some(RequestPatch::new().history(fit(cut_old(event.history, 2), room)));
+            }
+        }
         if self.started.load(Ordering::SeqCst) {
-            return CompletionCallAction::patch(
-                RequestPatch::new().active_tools(Vec::<String>::new()),
+            patch = Some(patch.unwrap_or_default().active_tools(Vec::<String>::new()));
+        } else if ctx.turn() >= self.last {
+            // Told nothing, a small model writes its next tool call as text.
+            patch = Some(
+                patch
+                    .unwrap_or_default()
+                    .active_tools(Vec::<String>::new())
+                    .preamble(self.last_word.clone()),
             );
         }
-        CompletionCallAction::continue_run()
+        patch.map_or_else(
+            CompletionCallAction::continue_run,
+            CompletionCallAction::patch,
+        )
+    }
+
+    async fn on_completion_response(
+        &self,
+        _ctx: &HookContext,
+        event: CompletionResponseEvent<'_>,
+    ) -> ObservationAction {
+        if event.usage.input_tokens > 0 {
+            self.used.store(event.usage.input_tokens, Ordering::Relaxed);
+        }
+        ObservationAction::continue_run()
     }
 
     /// Small models invent tool names; the model gets the real ones back as the call's result
@@ -572,6 +925,50 @@ pub struct TurnSetup<'a> {
     /// Set once a tool has started something that reports back, such as a mission; the rest of
     /// the turn is the answer.
     pub started: Arc<AtomicBool>,
+    /// The model's context window in tokens, when known.
+    pub window: Option<usize>,
+    /// Where the input tokens of the turn's latest request are written.
+    pub used: Arc<AtomicU64>,
+    /// Given each piece of reply text as it arrives, when the model streams.
+    pub delta: Option<OnDelta>,
+}
+
+/// What is given each piece of a streamed reply.
+pub type OnDelta = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Added to the system prompt for a turn's last model call.
+const LAST_CALL: &str = "You cannot call a tool now: this request is out of steps. Answer the \
+    operator in plain words with what you found, and what is left to do.";
+
+/// A reply without the tool calls a small model sometimes writes as text: what is before them,
+/// or a plain word that the request ran out of steps.
+fn plain(reply: String) -> String {
+    let cut = ["<tool_call>", "<function=", "<|tool_call"]
+        .iter()
+        .filter_map(|m| reply.find(m))
+        .min();
+    match cut {
+        None => reply,
+        Some(at) => {
+            let before = reply[..at].trim();
+            if before.is_empty() {
+                "I ran out of steps for this request before finishing; ask me to carry on."
+                    .to_owned()
+            } else {
+                before.to_owned()
+            }
+        }
+    }
+}
+
+/// What the system prompt and the tools' schemas take of every request.
+#[must_use]
+pub fn fixed_cost(preamble: &str, tools: &[LoopTool]) -> usize {
+    let schemas: usize = tools
+        .iter()
+        .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
+        .sum();
+    tokens_of(preamble.len() + schemas)
 }
 
 /// Runs one user turn on a model from `source`: the model may call the tools up to
@@ -605,6 +1002,7 @@ pub async fn chat(
             )
         })
         .collect();
+    let delta = setup.delta.clone().filter(|_| source.streams(model_id));
     let builder = source
         .builder(model_id)?
         .preamble(setup.preamble)
@@ -614,16 +1012,64 @@ pub async fn chat(
             source,
             model: model_id.to_owned(),
             started: setup.started,
+            last: setup.max_turns,
+            room: setup.window.map(|w| {
+                w.saturating_sub(fixed_cost(setup.preamble, setup.tools) + RESERVE_TOKENS)
+            }),
+            used: setup.used,
+            last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
         });
     let agent = builder.build();
+    let turn_error = |message: String, rate_limited: bool| LlmError::Turn {
+        model: model_id.to_owned(),
+        message: without_provider_body(&message),
+        rate_limited,
+    };
+    if let Some(delta) = delta {
+        return streamed(&agent, text, history, delta.as_ref())
+            .await
+            .map(plain)
+            .map_err(|e| turn_error(e.clone(), e.contains("429")));
+    }
     agent
         .chat(text, &mut history.0)
         .await
-        .map_err(|e| LlmError::Turn {
-            model: model_id.to_owned(),
-            message: without_provider_body(&e.to_string()),
-            rate_limited: is_rate_limited(&e),
-        })
+        .map(plain)
+        .map_err(|e| turn_error(e.to_string(), is_rate_limited(&e)))
+}
+
+/// One turn with the reply streamed: each text delta to `delta`, and the run's transcript into
+/// `history` at the end, as `chat` appends it.
+async fn streamed(
+    agent: &rig::Agent,
+    text: &str,
+    history: &mut History,
+    delta: &(dyn Fn(&str) + Send + Sync),
+) -> Result<String, String> {
+    use futures::StreamExt as _;
+    use rig::agent::MultiTurnStreamItem;
+    use rig::streaming::{StreamedAssistantContent, StreamingChat as _};
+    let mut stream = agent.stream_chat(text, history.0.clone()).await;
+    let mut done = None;
+    while let Some(item) = stream.next().await {
+        match item.map_err(|e| e.to_string())? {
+            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
+                delta(&t.text);
+            }
+            MultiTurnStreamItem::FinalResponse(response) => done = Some(response),
+            _ => {}
+        }
+    }
+    let response = done.ok_or("the reply stream ended without a reply")?;
+    // The run's transcript: the new messages only, or the history it was given with them.
+    if let Some(messages) = response.messages {
+        if messages.starts_with(&history.0) {
+            history.0 = messages;
+        } else {
+            history.0.extend(messages);
+        }
+    }
+    Ok(response.output)
 }
 
 /// A provider error with its JSON body replaced by the provider's own message: the body can
@@ -652,6 +1098,64 @@ fn without_provider_body(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exchange(n: usize, chars: usize) -> Vec<Message> {
+        vec![
+            Message::User {
+                content: vec![UserContent::text(format!("request {n}"))],
+            },
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::text("x".repeat(chars))],
+            },
+        ]
+    }
+
+    #[test]
+    fn a_long_history_is_cut_from_the_oldest_exchange_and_summarised() {
+        let history = History((0..10).flat_map(|n| exchange(n, 3000)).collect());
+        assert!(history.size() > 9000, "{}", history.size());
+        let (n, text) = history.older(2500).unwrap();
+        assert_eq!(n % 2, 0, "a cut starts at an operator's message");
+        assert!(text.starts_with("Operator: request 0"), "{text}");
+        let mut summarised = history.clone();
+        summarised.summarised(n, "the operator asked for ten things");
+        let first = summarised.exchanges();
+        assert!(first[0].0 && first[0].1.contains("ten things"), "{first:?}");
+        assert!(summarised.size() <= 2600, "{}", summarised.size());
+        let mut squeezed = history;
+        squeezed.squeeze(2500);
+        assert!(squeezed.size() <= 2500 && is_user_text(&squeezed.0[0]));
+    }
+
+    #[tokio::test]
+    async fn a_streamed_turn_adds_to_the_history_it_was_given() {
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let model = MockCompletionModel::from_stream_turns([vec![
+            MockStreamEvent::text("Noted."),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+        let mut history = History::sample(2, 10);
+        let reply = streamed(&agent, "and one more", &mut history, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(reply, "Noted.");
+        let exchanges = history.exchanges();
+        assert_eq!(exchanges.len(), 6, "{exchanges:?}");
+        assert_eq!(exchanges[0].1, "request 0");
+        assert_eq!(exchanges[4].1, "and one more");
+    }
+
+    #[test]
+    fn a_tool_call_written_as_text_is_not_shown() {
+        assert_eq!(plain("Done.".into()), "Done.");
+        assert_eq!(
+            plain("I checked it. <tool_call> <function=ros_graph> </function>".into()),
+            "I checked it."
+        );
+        assert!(plain("<tool_call>x".into()).contains("ran out of steps"));
+    }
 
     #[tokio::test]
     async fn a_provider_without_its_key_is_passed_over_with_the_reason() {

@@ -59,6 +59,8 @@ privacy = { trains = false }
 | `privacy.local` | `false` | Runs on this machine; see the profile's `[privacy]`. |
 | `privacy.trains` | `false` | The provider may train on what it is sent. |
 | `params` | none | Request fields passed to the provider as they are, such as Gemini's `{ generation_config = { thinking_level = "low" } }`. |
+| `context` | none | Its context window in tokens. Past half of it, the conversation is condensed before a turn: a `summarise` model sums up the older part, or old tool results are cut. Within a turn each request is cut to fit. The window shows how full it is, and `/compact` condenses it at once. Unset, nothing is cut. |
+| `stream` | `false` | Its replies appear word by word in the window. |
 
 ```toml
 [pools]

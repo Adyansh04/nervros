@@ -185,10 +185,25 @@ impl ToolOutcome {
         let data = cap(&self.data, max_chars);
         let mut out = json!({ "status": status, "data": data });
         if !self.message.is_empty() {
-            out["message"] = Value::String(self.message.clone());
+            out["message"] = Value::String(clip(&self.message, MESSAGE_CHARS));
         }
         out
     }
+}
+
+/// A message longer than this is cut: one line for the model, not a payload. A value quoted
+/// whole into an error once filled a 16k context by itself.
+const MESSAGE_CHARS: usize = 600;
+
+/// `text`, cut to `max` characters with a note of how much was left out.
+#[must_use]
+pub fn clip(text: &str, max: usize) -> String {
+    let len = text.chars().count();
+    if len <= max {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(max).collect();
+    format!("{head}… ({} more characters)", len - max)
 }
 
 /// Replaces data that serialises longer than `max_chars` with a truncated string and a note.
@@ -210,6 +225,8 @@ pub struct Assessment {
     pub resources: Vec<Resource>,
     /// What the operator is asked to approve, such as "calls /x (pkg/srv/T)".
     pub reason: String,
+    /// The arguments the call runs with, when checking settled them: a plan becomes its hash.
+    pub args: Option<Value>,
 }
 
 /// A callable tool.
@@ -224,6 +241,10 @@ pub trait Tool: Send + Sync {
     async fn assess(&self, _args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
         None
     }
+
+    /// Waits until the spec is complete, as a mission tool's skill list once the robot has
+    /// answered; the session asks before each turn. Most specs are complete from the start.
+    async fn ready(&self) {}
 
     /// Runs it. Errors are outcomes, never panics.
     async fn call(&self, args: Value) -> ToolOutcome;

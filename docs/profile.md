@@ -243,8 +243,9 @@ buries the map in them; hovering a box names it either way.
 ### `[mission]`
 
 The robot's mission executor, which runs behaviour trees; see
-[the executor contract](executor.md). With this section the agent gets `plan_mission` and
-`run_mission`.
+[the executor contract](executor.md). With this section the agent gets `run_mission`: it checks
+a plan, shows it, and runs it once the operator approves, so the operator approves once, in the
+app, and the agent never asks first in the chat. `check_only` only checks a plan.
 
 | Key | Default | |
 |---|---|---|
@@ -267,7 +268,12 @@ place cannot take a name the profile already uses.
 name = "dock"
 aliases = ["the charging dock"]
 pose = { x = 0.0, y = 0.0, yaw = 0.0 }   # in frame, default "map"
+near = ["charger_1"]                     # reached from here; see below
 ```
+
+`near` lists what the robot reaches from the place that the world model may not know, such as a
+detector's name for an object. A plan step that needs the robot near one of them walks to the
+place first, as it walks to any object the world model knows.
 
 ### `[models]`
 
@@ -277,7 +283,7 @@ pose = { x = 0.0, y = 0.0, yaw = 0.0 }   # in frame, default "map"
 
 Every robot gets `list_places`, `robot_state` and `stop`. `stop` is always allowed, armed or not,
 because it only makes the robot do less. `look` comes with `[look]`, `segment` with `[segment]`,
-and `plan_mission` and `run_mission` with `[mission]`.
+and `run_mission` with `[mission]`.
 
 The rest are the checks you would run yourself before blaming the model:
 
@@ -287,4 +293,6 @@ The rest are the checks you would run yourself before blaming the model:
 | `watch` | Watches a topic in the background and posts to the chat when a condition holds: its rate drops below a floor, a field crosses a value, or a text field matches. Once, or each time it comes back; at most 8 at a time, all ended with the session. |
 | `watches` | Lists the running watches, or cancels one or all. |
 | `plot` | Draws a number from a topic's messages over time in the app's Plots tab, as `rqt_plot` does, for two minutes unless told longer. |
+| `memory` | Keeps what the operator asks it to remember across sessions ("the kitchen door sticks"), in the state directory, one file per robot; lists and forgets notes. The notes join the system prompt on every turn, and the Agent tab lists them. Remembering and forgetting are approved like an edit. |
+| `schedule` | With `[mission]`: runs a plan again and again, such as a patrol every 30 minutes, a set number of times. The operator approves it once for all its runs; a run is skipped while the robot is disarmed or busy, and stopping the robot cancels every schedule. The Mission tab lists them. |
 | `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each asks for approval when supervised, like a world edit. |

@@ -122,6 +122,10 @@ pub struct Privacy {
 /// One model on one provider.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is a capability the models file states"
+)]
 pub struct ModelConfig {
     /// Referenced by roles.
     pub id: String,
@@ -153,6 +157,12 @@ pub struct ModelConfig {
     /// Request fields passed to the provider as they are, such as Gemini's
     /// `{ generation_config = { thinking_level = "low" } }`.
     pub params: Option<serde_json::Value>,
+    /// Its context window in tokens; the conversation is compacted to stay inside it. Unset,
+    /// nothing is cut.
+    pub context: Option<usize>,
+    /// Its replies stream to the window word by word.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 /// A shared daily budget.

@@ -21,7 +21,9 @@ anyhow.workspace = true
 clap.workspace = true
 nervros-core = { path = "../../crates/nervros-core" }
 nervros-ros = { path = "../../crates/nervros-ros", default-features = false }
+serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

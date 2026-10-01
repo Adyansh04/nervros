@@ -168,12 +168,6 @@ async fn walks_to_a_room() {
     assert!(
         calls
             .iter()
-            .any(|(t, s)| t == "plan_mission" && *s == "succeeded"),
-        "{calls:?}"
-    );
-    assert!(
-        calls
-            .iter()
             .any(|(t, s)| t == "run_mission" && *s == "accepted"),
         "{calls:?}"
     );

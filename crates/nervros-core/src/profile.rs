@@ -379,6 +379,10 @@ pub struct PlaceConfig {
     pub frame: String,
     /// Where the robot stands.
     pub pose: PlacePose,
+    /// What the robot reaches from here that the world model may not know, such as a detector's
+    /// name for an object: a step that needs the robot near one walks here first.
+    #[serde(default)]
+    pub near: Vec<String>,
 }
 
 fn default_frame() -> String {

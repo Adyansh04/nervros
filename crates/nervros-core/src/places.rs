@@ -184,6 +184,7 @@ impl Tool for TagPlace {
             .unwrap_or_default();
         let round = |v: f64| (v * 1000.0).round() / 1000.0;
         let place = PlaceConfig {
+            near: Vec::new(),
             name: name.clone(),
             aliases,
             frame: map.clone(),
