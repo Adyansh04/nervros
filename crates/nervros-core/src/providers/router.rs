@@ -148,9 +148,9 @@ impl Router {
         now: SystemTime,
     ) -> (Vec<&ModelConfig>, Vec<(String, Skip)>) {
         let chain = self.config.roles.chain(role);
-        // Outlining is a skill few models have, and the plan check is asked for: these roles ask
-        // only the models listed for them.
-        let opt_in = matches!(role, Role::Segment | Role::PlanCheck);
+        // Outlining is a skill few models have, and a second opinion or advice from the model that
+        // planned is neither: these roles ask only the models listed for them.
+        let opt_in = matches!(role, Role::Segment | Role::PlanCheck | Role::Plan);
         let local_tail = self
             .config
             .models
@@ -336,7 +336,11 @@ mod tests {
             ..Need::default()
         };
         let (take, skipped) = r.candidates(Role::Plan, need, SystemTime::now());
-        assert_eq!(ids(&take), ["big", "local9b"]);
+        assert_eq!(
+            ids(&take),
+            ["big"],
+            "the plan role asks only its own models"
+        );
         assert_eq!(skipped, [("text".to_owned(), Skip::NoVision)]);
     }
 

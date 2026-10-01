@@ -178,7 +178,7 @@ pub struct PoolConfig {
 pub enum Role {
     /// Conversation and tool calls.
     Routine,
-    /// Writing a mission plan.
+    /// Advice when the routine model's plans keep failing their checks; only the models listed.
     Plan,
     /// Spatial checks and pointing.
     VisionCheck,
