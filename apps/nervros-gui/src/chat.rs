@@ -528,11 +528,19 @@ impl Chat {
         }
         let width = ui.available_width().min(MAX_TEXT_WIDTH);
         ui.spacing_mut().item_spacing.y = 8.0;
+        let mut later = self
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::User(_)))
+            .count();
         for item in &self.items {
             ui.scope(|ui| {
                 ui.set_max_width(width);
                 match item {
-                    Item::User(text) => user_bubble(ui, text),
+                    Item::User(text) => {
+                        later -= 1;
+                        user_bubble(ui, text, later, actions);
+                    }
                     Item::Reply { text, model } => reply(ui, text, model),
                     Item::Tool(t) => tool_chip(ui, t),
                     Item::Image {
@@ -629,16 +637,32 @@ fn empty_state(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     });
 }
 
-fn user_bubble(ui: &mut egui::Ui, text: &str) {
+/// The operator's message, with "condense up to here" on a right click; `later` is how many of
+/// their messages came after it.
+fn user_bubble(ui: &mut egui::Ui, text: &str, later: usize, actions: &mut Vec<Action>) {
     ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-        Frame::new()
+        let bubble = Frame::new()
             .fill(ui.tokens().selection_bg_fill)
             .corner_radius(CornerRadius::same(12))
             .inner_margin(Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width() * 0.8);
                 ui.label(RichText::new(text).color(ui.tokens().text_strong));
-            });
+            })
+            .response
+            .interact(egui::Sense::click());
+        bubble.context_menu(|ui| {
+            if ui
+                .button("Condense up to here")
+                .on_hover_text(
+                    "Summarise the conversation up to this message; what came after stays as it is",
+                )
+                .clicked()
+            {
+                actions.push(Action::Send(Command::CompactUpTo { keep: later }));
+                ui.close();
+            }
+        });
     });
 }
 
@@ -1215,8 +1239,11 @@ pub fn compare<S>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use egui_kittest::kittest::Queryable as _;
     use egui_kittest::{Harness, SnapshotOptions};
     use nervros_core::mission::plan::StepArg;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     pub(crate) fn sample() -> Chat {
         let mut chat = Chat::default();
@@ -1279,6 +1306,38 @@ pub(crate) mod tests {
             approved: false,
         });
         assert_eq!(chat.pending().count(), 0);
+    }
+
+    #[test]
+    fn condensing_up_to_a_message_keeps_the_ones_after_it() {
+        let mut chat = Chat::default();
+        for (turn, text) in [(1, "Where is the mug?"), (2, "Bring it here.")] {
+            chat.apply(&Event::User {
+                turn,
+                text: text.to_owned(),
+            });
+        }
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&sent);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(440.0, 400.0))
+            .build_ui(move |ui| {
+                let mut actions = Vec::new();
+                chat.show(ui, Duration::from_mins(10), &mut actions);
+                seen.borrow_mut().extend(actions);
+            });
+        harness.run();
+        harness.get_by_label("Where is the mug?").click_secondary();
+        harness.run();
+        harness.get_by_label("Condense up to here").click();
+        harness.run();
+        assert!(
+            sent.borrow()
+                .iter()
+                .any(|a| matches!(a, Action::Send(Command::CompactUpTo { keep: 1 }))),
+            "{:?}",
+            sent.borrow().len()
+        );
     }
 
     /// A harness drawing `chat` on the panel background, cropped to what it draws.

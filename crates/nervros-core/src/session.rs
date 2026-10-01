@@ -67,6 +67,12 @@ pub enum Command {
     /// Condense the conversation now, as it is condensed when it grows past half the model's
     /// window.
     Compact,
+    /// Condense the conversation up to one of the operator's messages: everything before their
+    /// last `keep` messages is summarised, and those stay as they are.
+    CompactUpTo {
+        /// The operator's newest messages to keep.
+        keep: usize,
+    },
     /// Carry on an earlier conversation instead of this one.
     Restore(History),
 }
@@ -953,13 +959,17 @@ async fn actor(
                             answering_report = false;
                         }
                     }
-                    Command::Compact => {
+                    Command::Compact | Command::CompactUpTo { .. } => {
                         if running.is_some() {
                             shared.emit(Event::Notice { text: "still working on the last message; compact after it".into() });
                             continue;
                         }
+                        let how = match cmd {
+                            Command::CompactUpTo { keep } => Condense::UpTo(keep),
+                            _ => Condense::Now,
+                        };
                         turns += 1;
-                        running = Some((turns, compaction(turns, &shared, &source, &registry, history.clone())));
+                        running = Some((turns, compaction(turns, &shared, &source, &registry, history.clone(), how)));
                         answering_report = false;
                     }
                     Command::Restore(earlier) => {
@@ -1021,12 +1031,13 @@ fn compaction(
     source: &Arc<dyn AgentSource>,
     registry: &Arc<Registry>,
     mut history: History,
+    how: Condense,
 ) -> JoinHandle<Option<History>> {
     let (shared, source, registry) = (Arc::clone(shared), Arc::clone(source), Arc::clone(registry));
     tokio::spawn(async move {
         shared.emit(Event::TurnStarted { turn });
         let room = room_for(&shared, &source, &registry).unwrap_or(COMPACT_ROOM);
-        compact(&shared, &source, &mut history, room).await;
+        compact(&shared, &source, &mut history, room, how).await;
         Some(history)
     })
 }
@@ -1054,11 +1065,10 @@ async fn fit_window(
     let room =
         window.saturating_sub(llm::fixed_cost(&preamble(shared), tools) + llm::RESERVE_TOKENS);
     if history.size() > room / 2 {
-        compact(shared, source, history, room).await;
+        compact(shared, source, history, room, Condense::ToFit).await;
     }
 }
 
-/// Passes a streamed reply's pieces to the UI.
 /// Each model call's cost, to the log and to `used`, the context gauge's count.
 fn costs(shared: &Arc<Shared>, turn: u64, model: &str, used: &Arc<AtomicU64>) -> llm::OnCall {
     let (shared, model, used) = (Arc::clone(shared), model.to_owned(), Arc::clone(used));
@@ -1077,6 +1087,7 @@ fn costs(shared: &Arc<Shared>, turn: u64, model: &str, used: &Arc<AtomicU64>) ->
     })
 }
 
+/// Passes a streamed reply's pieces to the UI.
 fn deltas(shared: &Arc<Shared>, turn: u64) -> llm::OnDelta {
     let shared = Arc::clone(shared);
     Arc::new(move |text: &str| {
@@ -1231,15 +1242,33 @@ fn room_for(shared: &Shared, source: &Arc<dyn AgentSource>, registry: &Registry)
 
 /// Condenses the history to about a quarter of `room`: the older part summarised by a model,
 /// or, when none answers, old results cut and the oldest exchanges dropped.
+/// How far a compaction goes.
+#[derive(Debug, Clone, Copy)]
+enum Condense {
+    /// Past half the window: old results cut first, and a summary only when that is not enough.
+    ToFit,
+    /// The operator's `/compact`: old results cut, and the older part summarised.
+    Now,
+    /// "Condense up to here": all but the operator's last `n` messages summarised.
+    UpTo(usize),
+}
+
 async fn compact(
     shared: &Shared,
     source: &Arc<dyn AgentSource>,
     history: &mut History,
     room: usize,
+    how: Condense,
 ) {
     let before = history.size();
+    history.mask();
+    let older = match how {
+        Condense::ToFit if history.size() <= room / 2 => None,
+        Condense::ToFit | Condense::Now => history.older(room / 4),
+        Condense::UpTo(keep) => history.before_last(keep),
+    };
     let mut summarised = false;
-    if let Some((n, text)) = history.older(room / 4)
+    if let Some((n, text)) = older
         && let Some(summary) = llm::summarise(source, &text).await
     {
         history.summarised(n, &summary);
@@ -1323,7 +1352,7 @@ async fn run_turn(
                 turn,
                 text: text.clone(),
             });
-            format!("[Report from the robot, not the operator]\n{text}")
+            format!("{}\n{text}", llm::REPORT_MARK)
         }
     };
     let flags = Arc::new(TurnFlags::default());
@@ -1762,6 +1791,18 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(e, Event::Compacted { summarised: true, before, after } if after < before)),
             "{events:?}"
+        );
+        session.send(Command::CompactUpTo { keep: 1 });
+        let events = collect_until_finished(&mut rx, |_| None, &session).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::Compacted {
+                    summarised: false,
+                    ..
+                }
+            )),
+            "a second summary needs a model turn the script lacks, so it only cuts: {events:?}"
         );
         session.send(Command::Restore(History::sample(2, 10)));
         let restored = tokio::time::timeout(Duration::from_secs(5), rx.recv())

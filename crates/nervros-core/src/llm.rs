@@ -416,6 +416,24 @@ fn is_user_text(m: &Message) -> bool {
     matches!(m, Message::User { content } if content.iter().all(|c| matches!(c, UserContent::Text(_))))
 }
 
+/// How a robot's report starts, as the model gets it.
+pub(crate) const REPORT_MARK: &str = "[Report from the robot, not the operator]";
+/// How a summary of the earlier conversation starts.
+const SUMMARY_MARK: &str = "[The earlier conversation, summarised]";
+/// How a tool result cut to save room starts.
+const CUT_MARK: &str = "[an earlier result, cut to save room]";
+
+/// The operator's own words: not a robot's report or a summary, which come as user text too.
+fn is_operator(m: &Message) -> bool {
+    let Message::User { content } = m else {
+        return false;
+    };
+    is_user_text(m)
+        && !content.iter().any(|c| {
+            matches!(c, UserContent::Text(t) if t.text.starts_with(REPORT_MARK) || t.text.starts_with(SUMMARY_MARK))
+        })
+}
+
 /// Characters per token: JSON-heavy text runs about three, so this errs high.
 const CHARS_PER_TOKEN: usize = 3;
 /// A camera frame, whatever its bytes: a model sizes an image by its tiles, not its base64.
@@ -481,14 +499,15 @@ fn result_text(parts: &[ToolResultContent]) -> String {
         .join(" ")
 }
 
-/// The messages with every tool result and image before the last `keep` cut to a line.
+/// The messages with every tool result and image before the last `keep` cut to a line; one cut
+/// before stays as it is.
 fn cut_old(messages: &[Message], keep: usize) -> Vec<Message> {
     let edge = messages.len().saturating_sub(keep);
     let cut = |c: &UserContent| match c {
-        UserContent::ToolResult(r) => {
+        UserContent::ToolResult(r) if !result_text(&r.content).starts_with(CUT_MARK) => {
             let mut r = r.clone();
             r.content = vec![ToolResultContent::text(format!(
-                "[an earlier result, cut to save room] {}",
+                "{CUT_MARK} {}",
                 crate::tools::clip(&result_text(&r.content), 160)
             ))];
             UserContent::ToolResult(r)
@@ -584,13 +603,35 @@ impl History {
         (split > 0).then(|| (split, transcript(&self.0[..split])))
     }
 
+    /// The part before the operator's last `keep` messages, as [`Self::older`] gives it: "condense
+    /// up to here". `None` when there is nothing before them.
+    #[must_use]
+    pub fn before_last(&self, keep: usize) -> Option<(usize, String)> {
+        let operator: Vec<usize> = (0..self.0.len())
+            .filter(|&i| is_operator(&self.0[i]))
+            .collect();
+        let split = match keep {
+            0 => self.0.len(),
+            k => operator[operator.len().checked_sub(k)?],
+        };
+        (split > 0).then(|| (split, transcript(&self.0[..split])))
+    }
+
+    /// Cuts every tool result and image before the operator's newest message to a line. What was
+    /// said and called stays word for word, which serves a later turn about as well as a summary
+    /// and costs no model call.
+    pub fn mask(&mut self) {
+        let newest = self.0.iter().rposition(is_operator).unwrap_or(0);
+        self.0 = cut_old(&self.0, self.0.len() - newest);
+    }
+
     /// Replaces the first `n` messages with a summary of them.
     pub fn summarised(&mut self, n: usize, summary: &str) {
         let kept = self.0.split_off(n.min(self.0.len()));
         self.0 = vec![
             Message::User {
                 content: vec![UserContent::text(format!(
-                    "[The earlier conversation, summarised]\n{}",
+                    "{SUMMARY_MARK}\n{}",
                     summary.trim()
                 ))],
             },
@@ -680,12 +721,16 @@ impl History {
     }
 }
 
-/// How the model is told to condense the conversation.
+/// How the model is told to condense the conversation: in sections, which a small model carries on
+/// from more reliably than from prose.
 const SUMMARY_PREAMBLE: &str = "You condense a conversation between a robot's operator and its \
-    assistant so the assistant can carry on from your summary alone. Keep what the operator asked \
-    for and still wants, decisions made, the ids of places and objects, what the robot did and how \
-    each mission ended, what it holds, and open problems. Drop greetings and raw tool output. \
-    Write at most 12 short lines.";
+    assistant so the assistant can carry on from your summary alone. Write four sections, each a \
+    heading line and then at most four lines that start with \"- \":\n\
+    Goal: what the operator wants now.\n\
+    Done: what the robot did, and how each mission ended.\n\
+    Open: what is unfinished, unanswered or went wrong.\n\
+    Facts: ids of places and objects, what each hand holds, and decisions made.\n\
+    Write \"- none\" under a section with nothing. Drop greetings and raw tool output.";
 
 /// A summary of a transcript from the first model of the `summarise` role that answers.
 pub async fn summarise(source: &Arc<dyn AgentSource>, transcript: &str) -> Option<String> {
@@ -1171,6 +1216,57 @@ mod tests {
         let mut squeezed = history;
         squeezed.squeeze(2500);
         assert!(squeezed.size() <= 2500 && is_user_text(&squeezed.0[0]));
+    }
+
+    #[test]
+    fn old_results_are_cut_once_and_up_to_here_counts_the_operator_only() {
+        let said = |text: &str| Message::User {
+            content: vec![UserContent::text(text)],
+        };
+        let mut history = History(vec![
+            said("where is the mug?"),
+            Message::tool_result("c1", "find_objects", "y".repeat(2000)),
+            said(&format!("{REPORT_MARK}\nthe mission succeeded")),
+            said("and the basket?"),
+            Message::tool_result("c2", "find_objects", "z".repeat(2000)),
+        ]);
+        history.mask();
+        let results: Vec<String> = history
+            .0
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content } => content.iter().find_map(|c| match c {
+                    UserContent::ToolResult(r) => Some(result_text(&r.content)),
+                    _ => None,
+                }),
+                Message::Assistant { .. } | Message::System { .. } => None,
+            })
+            .collect();
+        assert!(
+            results[0].starts_with(CUT_MARK) && results[0].len() < 300,
+            "{results:?}"
+        );
+        assert_eq!(results[1].len(), 2000, "the newest request's result stays");
+        let once = history.clone();
+        history.mask();
+        assert_eq!(history.0, once.0, "a cut result is not cut again");
+
+        let (n, text) = history.before_last(1).unwrap();
+        assert_eq!(n, 3, "the report is not the operator's");
+        assert!(
+            text.contains("where is the mug?") && !text.contains("basket"),
+            "{text}"
+        );
+        assert_eq!(
+            history.before_last(0).unwrap().0,
+            5,
+            "keeping none condenses it all"
+        );
+        assert!(
+            history.before_last(2).is_none(),
+            "nothing is before the operator's first"
+        );
+        assert!(history.before_last(3).is_none());
     }
 
     #[tokio::test]
