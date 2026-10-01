@@ -153,6 +153,21 @@ pub(crate) struct ChatOptions {
     pub(crate) resume: Option<String>,
 }
 
+/// A checked plan, each step with how it has gone before.
+fn print_plan(hash: &str, steps: &[nervros_core::mission::plan::PlannedStep], worst_case_s: f64) {
+    let short = hash.get(..8).unwrap_or(hash);
+    println!("  plan {short} ({worst_case_s:.0} s at most):");
+    for s in steps {
+        let record = s.track.as_ref().map_or_else(String::new, |t| {
+            let typical = t
+                .typical_s
+                .map_or_else(String::new, |s| format!(", ~{s:.0} s"));
+            format!("  ({} of {} ok{typical})", t.succeeded, t.runs)
+        });
+        println!("    {} {}{record}", s.id, s.summary);
+    }
+}
+
 fn print_event(e: &Event, logs: &Path) {
     match e {
         Event::Reply { text, model, .. } => println!("robot> {text}\n        [{model}]"),
@@ -200,11 +215,10 @@ fn print_event(e: &Event, logs: &Path) {
             steps,
             worst_case_s,
             ..
-        } => {
-            let short = hash.get(..8).unwrap_or(hash);
-            println!("  plan {short} ({worst_case_s:.0} s at most):");
-            for s in steps {
-                println!("    {} {}", s.id, s.summary);
+        } => print_plan(hash, steps, *worst_case_s),
+        Event::MissionPreview { steps, .. } => {
+            for s in steps.iter().filter(|s| !s.note.is_empty()) {
+                println!("    {} {}", s.id, s.note);
             }
         }
         Event::MissionStarted { id, .. } => println!("  [mission {id} started]"),

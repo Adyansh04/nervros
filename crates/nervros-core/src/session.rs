@@ -218,6 +218,13 @@ pub enum Event {
         /// The longest it can take.
         worst_case_s: f64,
     },
+    /// Where a checked plan would take the robot, for the viewer; follows its `MissionPlanned`.
+    MissionPreview {
+        /// The plan's hash.
+        hash: String,
+        /// Each step's predicted end and path.
+        steps: Vec<crate::mission::preview::PreviewStep>,
+    },
     /// The executor started a mission.
     MissionStarted {
         /// Mission id.
@@ -274,6 +281,18 @@ pub struct SessionConfig {
     pub resume: Option<History>,
     /// Added to the system prompt on every turn, such as what the operator asked to remember.
     pub notes: Option<Arc<dyn crate::memory::Notes>>,
+    /// Called from the session's own loop, the one that serves Stop, every [`PULSE_PERIOD`]:
+    /// a heartbeat fed from it stops when that loop does.
+    pub pulse: Option<Arc<dyn Pulse>>,
+}
+
+/// How often the session's loop calls [`SessionConfig::pulse`].
+pub const PULSE_PERIOD: Duration = Duration::from_millis(200);
+
+/// Something the session's loop proves alive by calling it.
+pub trait Pulse: Send + Sync + std::fmt::Debug {
+    /// One beat.
+    fn pulse(&self);
 }
 
 impl Default for SessionConfig {
@@ -288,6 +307,7 @@ impl Default for SessionConfig {
             history_file: None,
             resume: None,
             notes: None,
+            pulse: None,
         }
     }
 }
@@ -551,6 +571,8 @@ async fn actor(
 ) {
     let mut history = shared.config.resume.clone().unwrap_or_default();
     let mut turns = 0u64;
+    let mut pulse = tokio::time::interval(PULSE_PERIOD);
+    pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut running: Option<(u64, JoinHandle<Option<History>>)> = None;
     let mut reports: Vec<String> = Vec::new();
     // Nobody asked for a report's reply, so a message sent during one waits for it, not refused.
@@ -575,6 +597,11 @@ async fn actor(
         };
         tokio::select! {
             biased;
+            _ = pulse.tick(), if shared.config.pulse.is_some() => {
+                if let Some(p) = &shared.config.pulse {
+                    p.pulse();
+                }
+            }
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {

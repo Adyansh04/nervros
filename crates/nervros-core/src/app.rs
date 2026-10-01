@@ -229,6 +229,14 @@ fn robot_file(profile: &Profile, ledger: &Path, kind: &str) -> Option<PathBuf> {
     })
 }
 
+/// The robot's mission ledger, beside its memory. Missions still run without one, unrecorded.
+fn mission_ledger(profile: &Profile, ledger: &Path) -> Option<Arc<crate::mission::ledger::Ledger>> {
+    let path = robot_file(profile, ledger, "missions")?.with_extension("sqlite3");
+    crate::mission::ledger::Ledger::open(&path)
+        .map_err(|e| tracing::warn!(error = %e, path = %path.display(), "no mission ledger"))
+        .ok()
+}
+
 /// The watches and the health check: what a person runs before blaming the model.
 fn debug_tools(
     profile: &Profile,
@@ -311,7 +319,13 @@ pub fn start_with(
     ))))?;
     let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
     registry.add(Arc::clone(&stop))?;
-    let missions = Missions::new(&profile, places, Arc::clone(&robot));
+    let missions =
+        Missions::new(&profile, places, Arc::clone(&robot)).map(|m| {
+            match mission_ledger(&profile, ledger) {
+                Some(l) => m.with_ledger(l),
+                None => m,
+            }
+        });
     let schedules = missions
         .as_ref()
         .map(|m| crate::schedule::Schedules::new(Arc::clone(m), Arc::clone(&guard)));
@@ -331,6 +345,9 @@ pub fn start_with(
         history_file: files.history,
         resume: files.resume,
         notes: Some(Arc::clone(&memory) as Arc<dyn crate::memory::Notes>),
+        pulse: missions
+            .as_ref()
+            .map(|m| Arc::clone(m) as Arc<dyn crate::session::Pulse>),
         ..SessionConfig::default()
     };
     let session = Session::start(

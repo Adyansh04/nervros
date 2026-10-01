@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::fmt::Write as _;
+
 use nervros_core::mission::plan::PlannedStep;
+use nervros_core::mission::preview::PreviewStep;
 use nervros_core::session::{Command, Event};
 use rerun::external::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _, icons};
@@ -113,6 +116,8 @@ pub struct PlanCard {
     progress: HashMap<String, (String, String)>,
     /// `(outcome, failed step, reason, seconds)` once it ended.
     finished: Option<(String, String, String, f64)>,
+    /// Where each step would take the robot, once the executor has said.
+    preview: Vec<PreviewStep>,
 }
 
 /// The conversation.
@@ -159,6 +164,52 @@ impl Chat {
                     model: model.clone(),
                 });
             }
+            Event::Snapshot {
+                id,
+                jpeg,
+                width,
+                height,
+            } => match decode(jpeg) {
+                Some(pixels) => self.items.push(Item::Image {
+                    id: id.clone(),
+                    pixels: Arc::new(pixels),
+                    texture: OnceCell::new(),
+                }),
+                None => self.items.push(Item::Notice(format!(
+                    "Snapshot {id} ({width}×{height}) could not be decoded"
+                ))),
+            },
+            Event::Armed { armed } => self.items.push(Item::Notice(if *armed {
+                "Armed: the agent may now act".to_owned()
+            } else {
+                "Observe only: the agent cannot act".to_owned()
+            })),
+            Event::Halted { reason } => self.items.push(Item::Notice(format!("Stopped: {reason}"))),
+            Event::Notice { text } => self.items.push(Item::Notice(text.clone())),
+            Event::Error { text, .. } => self.items.push(Item::Error(text.clone())),
+            Event::User { text, .. } => self.push_user(text.clone()),
+            Event::Report { text, .. } => self.items.push(Item::Report(text.clone())),
+            Event::ToolStarted { .. }
+            | Event::ToolFinished { .. }
+            | Event::ApprovalRequested { .. }
+            | Event::ApprovalResolved { .. } => self.apply_tool(event),
+            Event::MissionPlanned { .. }
+            | Event::MissionPreview { .. }
+            | Event::MissionStarted { .. }
+            | Event::MissionProgress { .. }
+            | Event::MissionFinished { .. } => self.apply_mission(event),
+            // The viewer draws it; the tool's card already says what.
+            Event::Plot { .. } => {}
+            Event::Context { .. }
+            | Event::Restored { .. }
+            | Event::Compacted { .. }
+            | Event::ReplyDelta { .. } => self.apply_conversation(event),
+        }
+    }
+
+    /// Tool calls as they start and end, and the approvals they ask for.
+    fn apply_tool(&mut self, event: &Event) {
+        match event {
             Event::ToolStarted {
                 turn,
                 call,
@@ -191,21 +242,6 @@ impl Chat {
                     t.ms = *ms;
                 }
             }
-            Event::Snapshot {
-                id,
-                jpeg,
-                width,
-                height,
-            } => match decode(jpeg) {
-                Some(pixels) => self.items.push(Item::Image {
-                    id: id.clone(),
-                    pixels: Arc::new(pixels),
-                    texture: OnceCell::new(),
-                }),
-                None => self.items.push(Item::Notice(format!(
-                    "Snapshot {id} ({width}×{height}) could not be decoded"
-                ))),
-            },
             Event::ApprovalRequested {
                 id,
                 tool,
@@ -228,26 +264,7 @@ impl Chat {
                     }
                 }
             }
-            Event::Armed { armed } => self.items.push(Item::Notice(if *armed {
-                "Armed: the agent may now act".to_owned()
-            } else {
-                "Observe only: the agent cannot act".to_owned()
-            })),
-            Event::Halted { reason } => self.items.push(Item::Notice(format!("Stopped: {reason}"))),
-            Event::Notice { text } => self.items.push(Item::Notice(text.clone())),
-            Event::Error { text, .. } => self.items.push(Item::Error(text.clone())),
-            Event::User { text, .. } => self.push_user(text.clone()),
-            Event::Report { text, .. } => self.items.push(Item::Report(text.clone())),
-            Event::MissionPlanned { .. }
-            | Event::MissionStarted { .. }
-            | Event::MissionProgress { .. }
-            | Event::MissionFinished { .. } => self.apply_mission(event),
-            // The viewer draws it; the tool's card already says what.
-            Event::Plot { .. } => {}
-            Event::Context { .. }
-            | Event::Restored { .. }
-            | Event::Compacted { .. }
-            | Event::ReplyDelta { .. } => self.apply_conversation(event),
+            _ => {}
         }
     }
 
@@ -310,7 +327,13 @@ impl Chat {
                 started: None,
                 progress: HashMap::new(),
                 finished: None,
+                preview: Vec::new(),
             })),
+            Event::MissionPreview { hash, steps } => {
+                if let Some(p) = self.plan_mut(|p| p.hash == *hash) {
+                    p.preview.clone_from(steps);
+                }
+            }
             Event::MissionStarted { id, hash } => {
                 if let Some(p) = self.plan_mut(|p| p.hash == *hash) {
                     p.mission = Some(id.clone());
@@ -659,7 +682,7 @@ fn approval_card(
     });
 }
 
-/// The plan's steps with each one's state.
+/// The plan's steps with each one's state, how it has gone before, and what the preview warns of.
 fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
     let t = ui.tokens();
     egui::Grid::new(("plan_steps", &p.hash))
@@ -688,10 +711,56 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
                 } else {
                     s.summary.clone()
                 };
-                ui.label(RichText::new(text).monospace().size(12.0));
+                let preview_note = p
+                    .preview
+                    .iter()
+                    .find(|v| v.id == s.id)
+                    .map(|v| v.note.as_str())
+                    .filter(|n| !n.is_empty());
+                ui.horizontal(|ui| {
+                    let summary = ui.label(RichText::new(text).monospace().size(12.0));
+                    if let Some(note) = preview_note {
+                        summary.on_hover_text(note);
+                    }
+                    track_label(ui, s);
+                });
                 ui.end_row();
+                // Only a warning earns a line of its own; the rest is in the hover.
+                if let Some(warning) = preview_note.filter(|n| n.starts_with("no path")) {
+                    ui.label("");
+                    ui.label("");
+                    ui.label(RichText::new(warning).small().color(t.warn_fg_color));
+                    ui.end_row();
+                }
             }
         });
+}
+
+/// How a step has gone before, small and quiet, with the details in its hover.
+fn track_label(ui: &mut egui::Ui, s: &PlannedStep) {
+    let Some(track) = &s.track else {
+        return;
+    };
+    let t = ui.tokens();
+    let mut text = format!("{} of {}", track.succeeded, track.runs);
+    if let Some(typical) = track.typical_s {
+        let _ = write!(text, " · {}", minutes(typical));
+    }
+    // Under three in four is worth a second look before approving.
+    let color = if track.succeeded * 4 < track.runs * 3 {
+        t.warn_fg_color
+    } else {
+        t.text_subdued
+    };
+    let mut hover = format!(
+        "{} succeeded {} of its last {} runs",
+        s.summary, track.succeeded, track.runs
+    );
+    if let Some(why) = &track.last_failure {
+        let _ = write!(hover, "; it last failed because {why}");
+    }
+    ui.label(RichText::new(text).small().color(color))
+        .on_hover_text(hover);
 }
 
 fn minutes(seconds: f64) -> String {
@@ -961,7 +1030,9 @@ pub(crate) mod tests {
             id: id.to_owned(),
             skill: summary.split('(').next().unwrap_or_default().to_owned(),
             summary: summary.to_owned(),
+            args: Vec::new(),
             timeout_s: 300.0,
+            track: None,
         };
         chat.apply(&Event::MissionPlanned {
             hash: "a91f3c2e77d04b1e".to_owned(),
@@ -1018,6 +1089,75 @@ pub(crate) mod tests {
                 .to_owned(),
         });
         render(chat, "chat_mission");
+    }
+
+    #[test]
+    fn snapshot_plan_with_records_and_a_preview_warning() {
+        use nervros_core::mission::ledger::Track;
+        let mut chat = Chat::default();
+        chat.apply(&Event::User {
+            turn: 1,
+            text: "Bring the small white mug to the tray".to_owned(),
+        });
+        let step = |id: &str, summary: &str, track: Option<Track>| PlannedStep {
+            id: id.to_owned(),
+            skill: summary.split('(').next().unwrap_or_default().to_owned(),
+            summary: summary.to_owned(),
+            args: Vec::new(),
+            timeout_s: 300.0,
+            track,
+        };
+        let track = |succeeded, runs, typical_s, last: Option<&str>| Track {
+            runs,
+            succeeded,
+            typical_s,
+            last_failure: last.map(str::to_owned),
+        };
+        chat.apply(&Event::MissionPlanned {
+            hash: "7c01d2aa9e3b".to_owned(),
+            intent: "bring the mug to the tray".to_owned(),
+            steps: vec![
+                step(
+                    "s1",
+                    "GoToPlace(place=dining_table_side)",
+                    Some(track(8, 8, Some(21.0), None)),
+                ),
+                step(
+                    "s2",
+                    "PickObject(object_id=mug_4, arm=left)",
+                    Some(track(
+                        1,
+                        3,
+                        Some(44.0),
+                        Some("nothing called mug_4 on /objects"),
+                    )),
+                ),
+                step("s3", "GoToPlace(place=office_desk_tray)", None),
+                step("s4", "PlaceInto(container_id=tray_1, arm=left)", None),
+            ],
+            worst_case_s: 1500.0,
+        });
+        let preview = |id: &str, note: &str| PreviewStep {
+            id: id.to_owned(),
+            goal: None,
+            path: Vec::new(),
+            note: note.to_owned(),
+        };
+        chat.apply(&Event::MissionPreview {
+            hash: "7c01d2aa9e3b".to_owned(),
+            steps: vec![
+                preview("s1", "walks there along Nav2's path"),
+                preview("s2", "closes in on what it sees; ends within reach of it"),
+                preview("s3", "no path: the goal is inside an obstacle"),
+            ],
+        });
+        chat.apply(&Event::ApprovalRequested {
+            id: 4,
+            tool: "run_mission".to_owned(),
+            args: serde_json::json!({"hash": "7c01d2aa9e3b"}),
+            reason: "`run_mission` acts on the robot".to_owned(),
+        });
+        render(chat, "chat_plan_records");
     }
 
     #[test]

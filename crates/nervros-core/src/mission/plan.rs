@@ -377,8 +377,13 @@ pub struct PlannedStep {
     pub skill: String,
     /// One line, such as `PickObject(object_id=O17, arm=right)`.
     pub summary: String,
+    /// Its arguments, as planned.
+    pub args: Vec<StepArg>,
     /// Its timeout.
     pub timeout_s: f64,
+    /// How it has gone before, from the ledger; none before its first run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track: Option<super::ledger::Track>,
 }
 
 /// A plan that compiled.
@@ -473,7 +478,9 @@ pub fn compile(plan: &Plan, catalog: &Catalog, world: &World) -> Result<Compiled
                         id,
                         skill: step.skill.clone(),
                         summary: text,
+                        args: step.args.clone(),
                         timeout_s,
+                        track: None,
                     });
                 }
                 Err(mut p) => problems.append(&mut p),

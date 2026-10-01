@@ -240,6 +240,10 @@ impl Tool for RobotState {
                 "holding_right": held_by(&state, "right"),
                 "resources_held": field("resources_held"),
                 "stopped": field("stopped"),
+                "can_move": field("can_move"),
+                "cannot_move_reason": field("cannot_move_reason"),
+                "tilt_deg": field("tilt_deg"),
+                "teleop": field("teleop"),
             });
         }
         ToolOutcome::ok(out)

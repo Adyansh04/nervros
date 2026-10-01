@@ -294,15 +294,27 @@ pub struct MissionConfig {
     pub catalog: String,
     /// `StopAll` service.
     pub stop: String,
+    /// `PreviewMission` service, for the picture of a plan beside its approval card.
+    pub preview: Option<String>,
     /// `RobotState` topic.
     pub state: String,
     /// Replans allowed after a failed mission.
     #[serde(default = "default_replans")]
     pub max_replans: u32,
+    /// Where the agent's `nervros_interfaces/msg/Heartbeat` goes, for the executor's deadman.
+    /// Without it a mission keeps running when the agent stops.
+    pub heartbeat: Option<String>,
+    /// How long a mission may go without a heartbeat before the executor stops it.
+    #[serde(default = "default_heartbeat_timeout")]
+    pub heartbeat_timeout_s: f64,
 }
 
 fn default_replans() -> u32 {
     2
+}
+
+fn default_heartbeat_timeout() -> f64 {
+    2.0
 }
 
 /// The world model's topics.

@@ -25,6 +25,7 @@ futures.workspace = true
 image.workspace = true
 reqwest.workspace = true
 rig.workspace = true
+rusqlite.workspace = true
 schemars.workspace = true
 secrecy.workspace = true
 serde.workspace = true

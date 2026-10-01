@@ -9,22 +9,25 @@
 
 pub mod catalog;
 pub mod check;
+pub mod ledger;
 pub mod plan;
+pub mod preview;
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use nervros_ros::{Goal, GoalResult, RobotPort, RosError};
+use nervros_ros::{Goal, GoalResult, Publisher, RobotPort, RosError};
 use serde_json::{Value, json};
 
 use self::catalog::Catalog;
 use self::check::Observed;
-use self::plan::{Compiled, Plan, Thing, World};
+use self::ledger::{Ledger, MissionRecord, StepRecord};
+use self::plan::{Compiled, Plan, PlannedStep, Thing, World};
 use crate::profile::{MissionConfig, Profile};
 use crate::session::{Command, Event, SessionHandle};
 use crate::tools::{Assessment, Risk, Status, Tool, ToolOutcome, ToolSpec};
@@ -40,6 +43,7 @@ const MAX_PLAN_ATTEMPTS: u32 = 4;
 const MIN_HASH_PREFIX: usize = 8;
 const EXECUTE: &str = "nervros_interfaces/action/ExecuteMission";
 const STATE: &str = "nervros_interfaces/msg/RobotState";
+const HEARTBEAT: &str = "nervros_interfaces/msg/Heartbeat";
 const OUTCOMES: [&str; 6] = [
     "success", "failure", "canceled", "timeout", "rejected", "error",
 ];
@@ -88,6 +92,31 @@ pub struct Missions {
     /// model's own, it repeats a done task or fails the same way.
     last: Mutex<Option<(String, String)>>,
     session: OnceLock<SessionHandle>,
+    /// Where the session's pulse goes: the executor's deadman, fed while the loop that serves
+    /// Stop runs.
+    heartbeat: Mutex<Option<Publisher>>,
+    /// Whether it does: a mission that asked for a deadman without one would be stopped at once.
+    heartbeat_live: AtomicBool,
+    /// Who this agent is in its heartbeats, so the executor counts only its own.
+    client: String,
+    /// Where finished missions are kept, for track records, recall and replay.
+    ledger: OnceLock<Arc<Ledger>>,
+    /// What the operator said last: the request a mission is for.
+    request: Mutex<String>,
+}
+
+impl crate::session::Pulse for Missions {
+    fn pulse(&self) {
+        if let Some(publisher) = lock(&self.heartbeat).as_ref() {
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            publisher.send(json!({
+                "stamp": {"sec": since.as_secs(), "nanosec": since.subsec_nanos()},
+                "client": self.client,
+            }));
+        }
+    }
 }
 
 impl std::fmt::Debug for Missions {
@@ -119,7 +148,26 @@ impl Missions {
             run_failures: AtomicU32::new(0),
             last: Mutex::default(),
             session: OnceLock::new(),
+            heartbeat: Mutex::default(),
+            heartbeat_live: AtomicBool::new(false),
+            client: format!("nervros {}", std::process::id()),
+            ledger: OnceLock::new(),
+            request: Mutex::default(),
         }))
+    }
+
+    /// Keeps finished missions in `ledger` from now on.
+    #[must_use]
+    pub fn with_ledger(self: Arc<Self>, ledger: Arc<Ledger>) -> Arc<Self> {
+        // Set once, at start-up.
+        let _ = self.ledger.set(ledger);
+        self
+    }
+
+    /// Where finished missions are kept, if anywhere.
+    #[must_use]
+    pub fn ledger(&self) -> Option<&Arc<Ledger>> {
+        self.ledger.get()
     }
 
     /// `run_mission`, the one tool: it checks a plan, and runs it once the operator approves.
@@ -137,13 +185,15 @@ impl Missions {
         }
         let me = Arc::clone(self);
         tokio::spawn(async move {
+            me.start_heartbeat().await;
             if let Err(e) = me.catalog().await {
                 tracing::info!(error = %e, "no mission catalog yet");
             }
             // The operator speaking resets the retry limits: it is a new request.
             loop {
                 match events.recv().await {
-                    Ok(Event::User { .. }) => {
+                    Ok(Event::User { text, .. }) => {
+                        *lock(&me.request) = text;
                         me.plan_failures.store(0, Ordering::SeqCst);
                         me.run_failures.store(0, Ordering::SeqCst);
                         *lock(&me.last) = None;
@@ -153,6 +203,83 @@ impl Missions {
                 }
             }
         });
+    }
+
+    /// Keeps a publisher for the heartbeat, if the profile names where; the session's pulse
+    /// sends the beats.
+    async fn start_heartbeat(&self) {
+        let Some(topic) = &self.config.heartbeat else {
+            return;
+        };
+        match self.robot.publisher(topic, HEARTBEAT).await {
+            Ok(publisher) => {
+                *lock(&self.heartbeat) = Some(publisher);
+                self.heartbeat_live.store(true, Ordering::SeqCst);
+            }
+            Err(e) => self.emit(Event::Notice {
+                text: format!(
+                    "no heartbeat on {topic} ({e}): a mission will not stop by itself if NervROS stops"
+                ),
+            }),
+        }
+    }
+
+    /// Asks the executor where a checked plan would take the robot, and tells the window: the
+    /// approval card shows at once, and the picture follows when the planner has answered.
+    async fn preview(&self, hash: &str) {
+        let Some(service) = &self.config.preview else {
+            return;
+        };
+        let Ok(compiled) = self.find(hash) else {
+            return;
+        };
+        let reply = self
+            .robot
+            .call(
+                service,
+                "nervros_interfaces/srv/PreviewMission",
+                json!({"tree_xml": compiled.xml}),
+                SERVICE_TIMEOUT,
+            )
+            .await;
+        match reply
+            .map_err(|e| e.to_string())
+            .and_then(|r| preview::parse(&r))
+        {
+            Ok(steps) => self.emit(Event::MissionPreview {
+                hash: compiled.sha256,
+                steps,
+            }),
+            Err(why) => tracing::info!(%why, "no preview of the plan"),
+        }
+    }
+
+    /// Why the robot cannot run a plan that walks now, from the executor's own state.
+    async fn cannot_walk(&self, compiled: &Compiled, catalog: &Catalog) -> Option<String> {
+        let walks = compiled.steps.iter().any(|s| {
+            s.skill == "GoToPlace"
+                || catalog
+                    .skill(&s.skill)
+                    .is_some_and(|k| k.resources.iter().any(|r| r == "base"))
+        });
+        if !walks {
+            return None;
+        }
+        let state = self
+            .robot
+            .latest(&self.config.state, STATE, Duration::from_secs(1))
+            .await
+            .ok()?;
+        if state["can_move"].as_bool() != Some(false) {
+            return None;
+        }
+        let reason = state["cannot_move_reason"]
+            .as_str()
+            .filter(|r| !r.is_empty())
+            .unwrap_or("the robot says so");
+        Some(format!(
+            "the robot cannot walk now: {reason}. Tell the operator; plan no walk until they say it is fixed"
+        ))
     }
 
     fn emit(&self, event: Event) {
@@ -325,7 +452,7 @@ impl Missions {
             Err(e) => return ToolOutcome::failed(e),
         };
         let world = self.world_of(&self.observe().await);
-        let compiled = match plan::compile(&plan, &catalog, &world) {
+        let mut compiled = match plan::compile(&plan, &catalog, &world) {
             Ok(c) => c,
             Err(problems) => return self.rejected(&json!(problems)),
         };
@@ -352,22 +479,56 @@ impl Missions {
             return self.rejected(&diagnostics);
         }
         self.plan_failures.store(0, Ordering::SeqCst);
+        // Not the model's fault, so not counted against its attempts.
+        if let Some(why) = self.cannot_walk(&compiled, &catalog).await {
+            return ToolOutcome::refused(why);
+        }
+        self.add_tracks(&mut compiled.steps).await;
         let worst = reply["worst_case_duration_s"]
             .as_f64()
             .filter(|w| *w > 0.0)
             .unwrap_or(compiled.worst_case_s);
+        self.checked(compiled, worst)
+    }
+
+    /// A plan that passed every check: shown to the window, kept by its hash, and described to
+    /// the model with what went wrong before with its steps.
+    fn checked(&self, compiled: Compiled, worst: f64) -> ToolOutcome {
         self.emit(Event::MissionPlanned {
             hash: compiled.sha256.clone(),
-            intent: plan.intent.clone(),
+            intent: compiled.plan.intent.clone(),
             steps: compiled.steps.clone(),
             worst_case_s: worst,
         });
-        let out = json!({
+        let mut out = json!({
             "hash": compiled.sha256,
             "steps": compiled.steps.iter().map(|s| format!("{} {}", s.id, s.summary)).collect::<Vec<_>>(),
             "worst_case_s": worst.round(),
             "next": "only checked: to run it, call run_mission with this hash; the operator approves it then"
         });
+        let history: Vec<String> = compiled
+            .steps
+            .iter()
+            .filter_map(|s| {
+                let track = s.track.as_ref()?;
+                let failed = track.runs - track.succeeded;
+                (failed > 0).then(|| {
+                    format!(
+                        "{} {}: failed {failed} of its last {} runs, last because {}",
+                        s.id,
+                        s.summary,
+                        track.runs,
+                        track
+                            .last_failure
+                            .as_deref()
+                            .unwrap_or("of something unknown")
+                    )
+                })
+            })
+            .collect();
+        if !history.is_empty() {
+            out["history"] = json!(history);
+        }
         let mut planned = lock(&self.planned);
         // The same plan compiles to the same tree: keep one copy, or its hash reads as ambiguous.
         planned.retain(|c| c.sha256 != compiled.sha256);
@@ -446,6 +607,12 @@ impl Missions {
             "tree_xml": compiled.xml,
             "tree_sha256": compiled.sha256,
             "max_duration_s": 0.0,
+            "heartbeat_timeout_s": if self.heartbeat_live.load(Ordering::SeqCst) {
+                self.config.heartbeat_timeout_s
+            } else {
+                0.0
+            },
+            "heartbeat_client": self.client,
             "mode": 0
         });
         let goal = self
@@ -509,6 +676,8 @@ impl Missions {
 
     async fn watch(self: Arc<Self>, id: String, compiled: Compiled, goal: Goal) {
         let started = Instant::now();
+        let started_s = ledger::now_s();
+        let mut times = StepTimes::default();
         let Goal {
             mut feedback,
             result,
@@ -517,7 +686,7 @@ impl Missions {
         tokio::pin!(result);
         let result = loop {
             tokio::select! {
-                Some(fb) = feedback.recv() => self.progress(&id, &fb),
+                Some(fb) = feedback.recv() => self.progress(&id, &fb, &mut times),
                 r = &mut result => break r,
             }
         };
@@ -541,14 +710,46 @@ impl Missions {
             reason: reason.clone(),
             elapsed_s: elapsed,
         });
+        self.keep(MissionRecord {
+            id: id.clone(),
+            hash: compiled.sha256.clone(),
+            intent: compiled.plan.intent.clone(),
+            request: lock(&self.request).clone(),
+            started: started_s,
+            ended: ledger::now_s(),
+            outcome: outcome.clone(),
+            failed_step: step.clone(),
+            reason: reason.clone(),
+            steps: compiled
+                .steps
+                .iter()
+                .map(|s| times.record(s, &step, &reason))
+                .collect(),
+        });
         let seen = self.observe().await;
+        let report = self.report(&id, &compiled, (&outcome, &step, &reason), elapsed, &seen);
+        if let Some(s) = self.session.get() {
+            s.send(Command::Report(report));
+        }
+    }
+
+    /// What the model reads when a mission ends: how it went, the goal checks or why it failed
+    /// and where its object was last seen, and what the hands hold now.
+    fn report(
+        &self,
+        id: &str,
+        compiled: &Compiled,
+        (outcome, step, reason): (&str, &str, &str),
+        elapsed: f64,
+        seen: &Observed,
+    ) -> String {
         let mut report = format!(
             "Mission {id} ({}) ended: {outcome} after {elapsed:.0} s.",
             compiled.plan.intent
         );
         if outcome == "success" {
             self.run_failures.store(0, Ordering::SeqCst);
-            let verdicts = check::check(&compiled.goal, &seen);
+            let verdicts = check::check(&compiled.goal, seen);
             if !verdicts.is_empty() {
                 let lines: Vec<String> = verdicts
                     .iter()
@@ -565,24 +766,20 @@ impl Missions {
             }
         } else {
             let n = self.run_failures.fetch_add(1, Ordering::SeqCst) + 1;
-            let what = compiled
-                .steps
-                .iter()
-                .find(|s| s.id == step)
-                .map_or_else(String::new, |s| format!(" {}", s.summary));
+            let failed = compiled.steps.iter().find(|s| s.id == step);
+            let what = failed.map_or_else(String::new, |s| format!(" {}", s.summary));
             let _ = write!(report, " Failed at {step}{what}: {reason}.");
-            if n > self.config.max_replans {
-                report.push_str(
-                    " This request has failed too often: do not retry. Tell the operator what went \
-                     wrong and what would help.",
-                );
-            } else {
-                report.push_str(
-                    " Find out why (robot_state, look, log_tail) and say it in one sentence. If a \
-                     changed plan can work, run it now: the operator approves it. If not, say what is \
-                     needed.",
-                );
+            if let Some(line) = failed.and_then(|s| check::last_seen(s, seen, ledger::now_s())) {
+                let _ = write!(report, " The world model: {line}.");
             }
+            report.push_str(if n > self.config.max_replans {
+                " This request has failed too often: do not retry. Tell the operator what went \
+                 wrong and what would help."
+            } else {
+                " Find out why (robot_state, look, log_tail) and say it in one sentence. If a \
+                 changed plan can work, run it now: the operator approves it. If not, say what is \
+                 needed."
+            });
         }
         if !seen.state.is_null() {
             let hands: Vec<String> = ["left", "right"]
@@ -596,13 +793,43 @@ impl Missions {
                 let _ = write!(report, " Now {}.", hands.join(" and "));
             }
         }
-        if let Some(s) = self.session.get() {
-            s.send(Command::Report(report));
+        report
+    }
+
+    /// Each step's track record from the ledger, read off the async threads.
+    async fn add_tracks(&self, steps: &mut [PlannedStep]) {
+        let Some(ledger) = self.ledger.get().cloned() else {
+            return;
+        };
+        let keys: Vec<(String, String)> = steps
+            .iter()
+            .map(|s| (s.skill.clone(), ledger::target_of(&s.args)))
+            .collect();
+        let tracks = tokio::task::spawn_blocking(move || {
+            keys.iter()
+                .map(|(skill, target)| ledger.track(skill, target).ok().flatten())
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        for (step, track) in steps.iter_mut().zip(tracks) {
+            step.track = track;
+        }
+    }
+
+    /// Writes a finished mission to the ledger, off the async threads.
+    fn keep(&self, record: MissionRecord) {
+        if let Some(ledger) = self.ledger.get().cloned() {
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = ledger.record(&record) {
+                    tracing::warn!(error = %e, mission = %record.id, "the mission was not recorded");
+                }
+            });
         }
     }
 
     /// Maps one feedback message's node events onto steps.
-    fn progress(&self, id: &str, feedback: &Value) {
+    fn progress(&self, id: &str, feedback: &Value, times: &mut StepTimes) {
         let elapsed = feedback["elapsed_s"].as_f64().unwrap_or(0.0);
         for e in feedback["events"].as_array().map_or(&[][..], Vec::as_slice) {
             let name = e["name"].as_str().unwrap_or_default();
@@ -620,6 +847,7 @@ impl Missions {
                 continue;
             }
             let node = if step_of(name).is_some() {
+                times.note(&step, status, elapsed);
                 String::new()
             } else {
                 name.to_owned()
@@ -683,6 +911,59 @@ fn summarise(result: Result<GoalResult, RosError>) -> (String, String, String) {
 }
 
 /// The `s<N>` a node name or path belongs to: the step subtrees are named `s<N>_<Skill>`.
+/// When a step began, in seconds into the mission, and when and how it ended.
+#[derive(Debug, Clone, Copy)]
+struct StepTime {
+    start: f64,
+    end: Option<(f64, &'static str)>,
+}
+
+/// Each step's [`StepTime`], from the executor's events, for the ledger.
+#[derive(Debug, Default)]
+struct StepTimes(std::collections::BTreeMap<String, StepTime>);
+
+impl StepTimes {
+    fn note(&mut self, step: &str, status: &'static str, elapsed: f64) {
+        let time = self.0.entry(step.to_owned()).or_insert(StepTime {
+            start: elapsed,
+            end: None,
+        });
+        if matches!(status, "success" | "failure") {
+            time.end = Some((elapsed, status));
+        }
+    }
+
+    /// A planned step as it went; `failed` is the step the mission failed at, with `reason`.
+    fn record(&self, step: &PlannedStep, failed: &str, reason: &str) -> StepRecord {
+        let (seconds, outcome) = match self.0.get(&step.id) {
+            Some(&StepTime {
+                start,
+                end: Some((end, status)),
+            }) => (Some(end - start), status),
+            _ if step.id == failed => (None, "failure"),
+            _ => (None, "skipped"),
+        };
+        StepRecord {
+            id: step.id.clone(),
+            skill: step.skill.clone(),
+            target: ledger::target_of(&step.args),
+            args: Value::Object(
+                step.args
+                    .iter()
+                    .map(|a| (a.name.clone(), Value::String(a.value.clone())))
+                    .collect(),
+            ),
+            seconds,
+            outcome: outcome.to_owned(),
+            reason: if outcome == "failure" {
+                reason.to_owned()
+            } else {
+                String::new()
+            },
+        }
+    }
+}
+
 fn step_of(text: &str) -> Option<String> {
     text.split(['/', ':'])
         .filter_map(|seg| {
@@ -721,6 +1002,10 @@ impl Tool for RunMission {
         }
         let steps = out.data["steps"].as_array().map_or(0, Vec::len);
         let minutes = (out.data["worst_case_s"].as_f64().unwrap_or(0.0) / 60.0).ceil();
+        if let Some(hash) = out.data["hash"].as_str().map(str::to_owned) {
+            let missions = Arc::clone(&self.0);
+            tokio::spawn(async move { missions.preview(&hash).await });
+        }
         Some(Ok(Assessment {
             risk: Risk::Manipulation,
             resources: Vec::new(),
@@ -756,6 +1041,11 @@ mod tests {
     use std::path::Path;
 
     fn profile() -> Profile {
+        profile_with("")
+    }
+
+    /// The test profile with `mission` lines added to its `[mission]` section.
+    fn profile_with(mission: &str) -> Profile {
         let text = r#"
             [robot]
             name = "t"
@@ -768,6 +1058,7 @@ mod tests {
             stop = "/x/stop"
             state = "/x/state"
             max_replans = 1
+            MISSION_EXTRA
             [[place]]
             name = "dock"
             pose = { x = 1.0, y = 2.0 }
@@ -776,7 +1067,7 @@ mod tests {
         "#;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nervros.toml");
-        std::fs::write(&path, text).unwrap();
+        std::fs::write(&path, text.replace("MISSION_EXTRA", mission)).unwrap();
         Profile::load(Path::new(&path)).unwrap()
     }
 
@@ -880,6 +1171,90 @@ mod tests {
                 |e| matches!(e, Event::MissionFinished { outcome, .. } if outcome == "success")
             )
         );
+    }
+
+    #[tokio::test]
+    async fn a_walk_is_refused_while_the_robot_cannot_move_and_not_counted_as_the_models() {
+        let robot = robot(ScriptedRun::default()).with_topic(
+            "/x/state",
+            json!({"holding_left": "", "holding_right": "", "can_move": false,
+                   "cannot_move_reason": "fallen: tilted 104 degrees"}),
+        );
+        let robot: Arc<dyn RobotPort> = Arc::new(robot);
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+
+        let out = missions.plan(steps()).await;
+
+        assert_eq!(out.status, Status::Refused, "{}", out.message);
+        assert!(
+            out.message.contains("fallen: tilted 104 degrees"),
+            "{}",
+            out.message
+        );
+        assert_eq!(missions.plan_failures.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_live_heartbeat_feeds_the_deadman_and_each_mission_asks_for_it() {
+        let profile = profile_with("heartbeat = \"/x/heartbeat\"\nheartbeat_timeout_s = 1.0");
+        let sent = Arc::new(Mutex::new(None));
+        let goals = Arc::clone(&sent);
+        let fake = Arc::new(
+            robot(ScriptedRun::default()).with_action("/x/execute", move |goal| {
+                *lock(&goals) = Some(goal.clone());
+                ScriptedRun::default()
+            }),
+        );
+        let robot: Arc<dyn RobotPort> = fake.clone();
+        let missions = Missions::new(&profile, Places::new(&profile, None), robot).unwrap();
+        let (tx, _commands) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        missions.attach(SessionHandle::for_tests(&tx, events));
+
+        // The session's loop pulses; here the test does.
+        let beating = async {
+            while !fake.published().iter().any(|(t, _)| t == "/x/heartbeat") {
+                crate::session::Pulse::pulse(missions.as_ref());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), beating)
+            .await
+            .expect("no heartbeat was published");
+        let hash = missions.plan(steps()).await.data["hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let out = missions.run(&json!({"hash": hash})).await;
+        assert_eq!(out.status, Status::Accepted, "{}", out.message);
+        let goal = lock(&sent).clone().expect("no goal was sent");
+        assert_eq!(goal["heartbeat_timeout_s"], json!(1.0));
+        assert_eq!(goal["heartbeat_client"], json!(missions.client));
+        let (_, beat) = fake
+            .published()
+            .into_iter()
+            .find(|(t, _)| t == "/x/heartbeat")
+            .unwrap();
+        assert_eq!(beat["client"], json!(missions.client));
+    }
+
+    #[tokio::test]
+    async fn without_a_heartbeat_a_mission_asks_for_no_deadman() {
+        let sent = Arc::new(Mutex::new(None));
+        let goals = Arc::clone(&sent);
+        let robot = robot(ScriptedRun::default()).with_action("/x/execute", move |goal| {
+            *lock(&goals) = Some(goal.clone());
+            ScriptedRun::default()
+        });
+        let robot: Arc<dyn RobotPort> = Arc::new(robot);
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+        let hash = missions.plan(steps()).await.data["hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        missions.run(&json!({"hash": hash})).await;
+        let goal = lock(&sent).clone().expect("no goal was sent");
+        assert_eq!(goal["heartbeat_timeout_s"], json!(0.0));
     }
 
     #[tokio::test]

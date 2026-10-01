@@ -1,10 +1,12 @@
 //! Goal checks after a mission reports success: the executor says the tree finished, these say
 //! whether the world agrees.
 
+use std::fmt::Write as _;
+
 use serde::Serialize;
 use serde_json::Value;
 
-use super::plan::predicate as predicate_of;
+use super::plan::{PlannedStep, predicate as predicate_of};
 use crate::builtins::inside;
 use crate::profile::PlaceConfig;
 
@@ -160,9 +162,114 @@ fn at(target: &str, seen: &Observed, out: impl Fn(Option<bool>, String) -> Verdi
     )
 }
 
+/// Where and when the world model last saw what a failed step was about, such as "small white
+/// mug O244: last seen 3 min ago in the office, on wooden tray O31". The model reads it before
+/// it replans: a pick that found nothing is often a pick of something already moved.
+#[must_use]
+pub fn last_seen(step: &PlannedStep, seen: &Observed, now_s: f64) -> Option<String> {
+    let arg = |name: &str| {
+        step.args
+            .iter()
+            .find(|a| a.name == name)
+            .map(|a| a.value.as_str())
+    };
+    let keys: Vec<&str> = ["object_id", "container_id", "target", "place"]
+        .iter()
+        .filter_map(|k| arg(k))
+        .collect();
+    let objects = seen.objects["objects"].as_array()?;
+    let found = keys
+        .iter()
+        .find_map(|k| {
+            objects
+                .iter()
+                .find(|o| text(o, "id").eq_ignore_ascii_case(k))
+        })
+        .or_else(|| {
+            // The operator's words, then a detector's name ("mug_4" is a mug): the newest wins.
+            arg("phrase")
+                .map(str::to_owned)
+                .into_iter()
+                .chain(keys.iter().map(|k| words_of(k)))
+                .filter(|w| !w.is_empty())
+                .find_map(|w| {
+                    objects
+                        .iter()
+                        .filter(|o| named(o, &w))
+                        .max_by(|a, b| seen_at(a).total_cmp(&seen_at(b)))
+                })
+        })?;
+
+    let label = [text(found, "name"), text(found, "label")]
+        .into_iter()
+        .find(|n| !n.is_empty())
+        .unwrap_or("object");
+    let mut line = format!("{label} {}: last seen", text(found, "id"));
+    let age = now_s - seen_at(found);
+    if seen_at(found) > 0.0 && (0.0..86_400.0).contains(&age) {
+        let _ = write!(line, " {} ago", how_long(age));
+    }
+    let room_id = text(found, "room_id");
+    if !room_id.is_empty() {
+        let room = seen.rooms["rooms"]
+            .as_array()
+            .and_then(|rooms| rooms.iter().find(|r| text(r, "id") == room_id))
+            .map_or(room_id, |r| text(r, "name"));
+        let _ = write!(line, " in the {room}");
+    }
+    let support_id = text(found, "support_id");
+    if let Some(support) = objects
+        .iter()
+        .find(|o| !support_id.is_empty() && text(o, "id") == support_id)
+    {
+        let _ = write!(line, ", on {} {support_id}", text(support, "label"));
+    }
+    match found["state"].as_u64() {
+        Some(1) => line.push_str("; looked for there since and not found"),
+        Some(2) => line.push_str("; no longer there"),
+        _ => {}
+    }
+    Some(line)
+}
+
+fn text<'a>(v: &'a Value, key: &str) -> &'a str {
+    v[key].as_str().unwrap_or_default()
+}
+
+/// When an object was last seen, in seconds since the epoch; 0 when it never was.
+fn seen_at(o: &Value) -> f64 {
+    let t = &o["last_seen"];
+    t["sec"].as_f64().unwrap_or(0.0) + t["nanosec"].as_f64().unwrap_or(0.0) * 1e-9
+}
+
+/// Whether an object's label or name is, or holds, `words`.
+fn named(o: &Value, words: &str) -> bool {
+    let words = words.to_lowercase();
+    [text(o, "label"), text(o, "name")]
+        .iter()
+        .any(|n| !n.is_empty() && n.to_lowercase().contains(&words))
+}
+
+/// The words of a name such as `mug_4` or `small_white_mug`, without its number.
+fn words_of(name: &str) -> String {
+    name.split(['_', ' '])
+        .filter(|p| !p.is_empty() && !p.chars().all(|c| c.is_ascii_digit()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn how_long(seconds: f64) -> String {
+    match seconds {
+        s if s < 90.0 => format!("{s:.0} s"),
+        s if s < 90.0 * 60.0 => format!("{:.0} min", s / 60.0),
+        s => format!("{:.0} h", s / 3600.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mission::plan::StepArg;
     use crate::profile::PlacePose;
     use serde_json::json;
 
@@ -218,5 +325,59 @@ mod tests {
                 None
             ]
         );
+    }
+
+    #[test]
+    fn a_failed_pick_says_where_the_object_was_last_seen_and_on_what() {
+        let mut seen = seen();
+        seen.rooms = json!({"rooms": [{"id": "R3", "name": "office"}]});
+        seen.objects = json!({"objects": [
+            {"id": "O31", "label": "wooden tray", "room_id": "R3", "last_seen": {"sec": 1000, "nanosec": 0}},
+            {"id": "O244", "label": "small white mug", "room_id": "R3", "support_id": "O31",
+             "state": 0, "last_seen": {"sec": 880, "nanosec": 0}},
+            {"id": "O9", "label": "mug", "last_seen": {"sec": 100, "nanosec": 0}}]});
+        let step = PlannedStep {
+            id: "s2".to_owned(),
+            skill: "PickObject".to_owned(),
+            summary: String::new(),
+            args: vec![
+                StepArg {
+                    name: "object_id".to_owned(),
+                    value: "mug_4".to_owned(),
+                },
+                StepArg {
+                    name: "phrase".to_owned(),
+                    value: "small white mug".to_owned(),
+                },
+            ],
+            timeout_s: 0.0,
+            track: None,
+        };
+        assert_eq!(
+            last_seen(&step, &seen, 1000.0).as_deref(),
+            Some("small white mug O244: last seen 2 min ago in the office, on wooden tray O31")
+        );
+
+        let by_id = PlannedStep {
+            args: vec![StepArg {
+                name: "container_id".to_owned(),
+                value: "o31".to_owned(),
+            }],
+            ..step.clone()
+        };
+        assert!(
+            last_seen(&by_id, &seen, 1000.0)
+                .unwrap()
+                .starts_with("wooden tray O31")
+        );
+
+        let unknown = PlannedStep {
+            args: vec![StepArg {
+                name: "object_id".to_owned(),
+                value: "kettle_2".to_owned(),
+            }],
+            ..step
+        };
+        assert_eq!(last_seen(&unknown, &seen, 1000.0), None);
     }
 }
