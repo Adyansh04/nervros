@@ -20,7 +20,7 @@ use rerun::external::egui::{
 };
 use rerun::external::re_log_channel::LogReceiver;
 use rerun::external::re_sdk_types::blueprint::components::PanelState;
-use rerun::external::re_ui::{CommandPalette, ReButton, UiExt as _};
+use rerun::external::re_ui::{CommandPalette, ReButton, UiExt as _, icons};
 use rerun::external::re_viewer::SystemCommandSender as _;
 use rerun::external::re_viewer::external::re_log_types::{TimeReal, TimelineName};
 use rerun::external::re_viewer::external::re_viewer_context::TimeControlCommand;
@@ -222,6 +222,10 @@ pub struct Gui {
     viewing: Option<SystemTime>,
     /// Driving by hand, when the profile names the executor's teleop.
     drive: Option<crate::robot::Drive>,
+    /// The mission ledger's lists, for the Mission tab.
+    records: crate::history::History,
+    /// Images waiting to go with the next message.
+    attachments: crate::attach::Attachments,
 }
 
 impl Gui {
@@ -295,6 +299,7 @@ impl Gui {
         let live = Arc::new(Mutex::new(Live::default()));
         let recheck = watch(&agent, &live, &cc.egui_ctx);
         let events = agent.session.subscribe();
+        let agent_snapshots = Arc::clone(&agent.snapshots);
         Ok(Self {
             viewer,
             agent,
@@ -321,6 +326,8 @@ impl Gui {
             viewer_commands,
             viewing: None,
             drive,
+            records: crate::history::History::default(),
+            attachments: crate::attach::Attachments::new(Arc::clone(&agent_snapshots)),
         })
     }
 
@@ -407,6 +414,7 @@ impl Gui {
         else {
             return;
         };
+        self.records.stale();
         let what = self.chat.intent_of_mission(id).unwrap_or("the mission");
         let (kind, text) = match outcome.as_str() {
             "success" => (Kind::Success, format!("Done: {what} in {elapsed_s:.0} s")),
@@ -422,11 +430,11 @@ impl Gui {
 
     /// The bubble appears when the session starts the turn, so a message it turns away shows
     /// only as its notice. A `/name` runs that command instead.
-    fn say(&mut self, text: String) {
-        self.history.push(text.clone());
+    fn say(&mut self, text: &str) {
+        self.history.push(text.to_owned());
         self.history_pos = None;
         if text.starts_with('/') {
-            match palette::slash(&self.commands, &text).cloned() {
+            match palette::slash(&self.commands, text).cloned() {
                 Some(cmd) => self.run(cmd),
                 None => self.chat.items.push(crate::chat::Item::Notice(format!(
                     "No command {text}; Ctrl+K lists them"
@@ -434,13 +442,18 @@ impl Gui {
             }
             return;
         }
+        let (text, shown) = self.attachments.send(text);
+        let handle = self.agent.session.handle();
+        for image in shown {
+            handle.emit(image);
+        }
         self.agent.session.send(Command::User(text));
     }
 
     /// Runs a palette or slash command.
     fn run(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Say(text) => self.say(text.to_owned()),
+            Cmd::Say(text) => self.say(text),
             Cmd::Send(c) => self.agent.session.send(c),
             Cmd::Tab(tab) => {
                 self.tab = tab;
@@ -502,7 +515,7 @@ impl Gui {
                     }
                     self.agent.session.send(c);
                 }
-                Action::Say(text) => self.say(text),
+                Action::Say(text) => self.say(&text),
                 Action::Prefill(text) => {
                     self.input = text;
                     ctx.memory_mut(|m| m.request_focus(egui::Id::new(COMPOSER)));
@@ -827,7 +840,22 @@ impl Gui {
             }
         }
         let working = self.chat.turn.is_some();
+        let sees = self.agent.tools.iter().any(|t| t == "look");
+        if sees {
+            self.attachments.show(ui);
+        }
         ui.horizontal(|ui| {
+            if sees
+                && ui
+                    .small_icon_button(&icons::ADD, "Paste an image")
+                    .on_hover_text(
+                        "Paste an image from the clipboard for the agent to look at; or drop \
+                         one on the window",
+                    )
+                    .clicked()
+            {
+                self.attachments.paste(ui.ctx());
+            }
             let edit = egui::TextEdit::multiline(&mut self.input)
                 .id(id)
                 .hint_text("Message the robot · Enter sends, Shift+Enter adds a line")
@@ -911,8 +939,10 @@ impl Gui {
                 "No plan yet. Ask the robot to do something; its plan appears here.",
             ),
         }
-        self.act(ui.ctx(), actions);
         self.schedules_list(ui);
+        let ledger = self.agent.missions.as_ref().and_then(|m| m.ledger());
+        crate::history::show(ui, &mut self.records, ledger, &mut actions);
+        self.act(ui.ctx(), actions);
     }
 
     /// Missions that run again and again, each with a way to end it.
@@ -1041,9 +1071,35 @@ impl Gui {
         }
     }
 
-    /// Earlier sessions to carry on, then the models and their quotas.
+    /// Saves a session as an eval case, and says where.
+    fn save_as_case(&mut self, log: &Path) {
+        match crate::sessions::save_as_case(log) {
+            Ok((id, suite)) => self.toasts.add(
+                Kind::Success,
+                format!("Saved as test case {id} in {}", suite.display()),
+            ),
+            Err(e) => self.toasts.add(Kind::Failure, format!("Not saved: {e}")),
+        }
+    }
+
+    /// Earlier sessions to carry on or keep as tests, then memory, then the models and quotas.
     fn agent_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Sessions").strong());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Sessions").strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(ReButton::new("Save this one as a test").small().secondary())
+                    .on_hover_text(
+                        "Keep this conversation as an eval case, expecting what happened; run \
+                         it with nervros-cli eval",
+                    )
+                    .clicked()
+                {
+                    let log = self.log_path.clone();
+                    self.save_as_case(&log);
+                }
+            });
+        });
         let fresh = self
             .sessions
             .as_ref()
@@ -1056,7 +1112,7 @@ impl Gui {
                 .unwrap_or_default();
             self.sessions = Some((Instant::now(), crate::sessions::list(&logs, &self.log_path)));
         }
-        let mut resume = None;
+        let (mut resume, mut keep) = (None, None);
         let listed = self
             .sessions
             .as_ref()
@@ -1081,8 +1137,18 @@ impl Gui {
                     {
                         resume = Some(s.path.clone());
                     }
+                    if ui
+                        .add(ReButton::new("Save as test").small().secondary())
+                        .on_hover_text("Keep it as an eval case, expecting what happened")
+                        .clicked()
+                    {
+                        keep = Some(crate::sessions::log_of(&s.path));
+                    }
                 });
             });
+        }
+        if let Some(log) = keep {
+            self.save_as_case(&log);
         }
         if let Some(path) = resume {
             match nervros_core::llm::History::load(&path) {
@@ -1145,6 +1211,13 @@ impl Gui {
         ] {
             ui.label(RichText::new(name).strong());
             let (take, skipped) = router.candidates(role, Need::default(), now);
+            if take.is_empty() && skipped.is_empty() {
+                ui.label(
+                    RichText::new("off: models.toml lists no model for it")
+                        .small()
+                        .color(ui.tokens().text_subdued),
+                );
+            }
             for m in take {
                 ui.horizontal(|ui| {
                     ui.bullet(ui.tokens().success_text_color);
@@ -1438,6 +1511,9 @@ fn empty(ui: &mut egui::Ui, text: &str) {
 impl eframe::App for Gui {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.drain_events();
+        if self.agent.tools.iter().any(|t| t == "look") {
+            self.attachments.take_dropped(ui.ctx());
+        }
         self.keys(ui.ctx());
         self.guard_close(ui.ctx());
         let t = ui.tokens();
@@ -1668,6 +1744,9 @@ mod tests {
         objects = { topic = "/objects", type = "canopy_msgs/msg/WorldObjectArray" }
         [models]
         file = "models.toml"
+        # Long, so the approval's countdown reads the same however slowly the test runs.
+        [policy]
+        approval_ttl = 600
     "#;
 
     fn robot() -> FakeRobot {

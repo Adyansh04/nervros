@@ -59,7 +59,7 @@ const SCHEMA: &str = "
 ";
 
 /// One mission as it ended.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct MissionRecord {
     /// The mission id.
     pub id: String,
@@ -84,7 +84,7 @@ pub struct MissionRecord {
 }
 
 /// One step of a mission as it ended.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct StepRecord {
     /// `s1`, `s2`, ...
     pub id: String,

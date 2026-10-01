@@ -42,6 +42,8 @@ pub struct Agent {
     pub memory: Arc<crate::memory::Memory>,
     /// Missions run again and again, when the robot has an executor.
     pub schedules: Option<Arc<crate::schedule::Schedules>>,
+    /// Missions, when the robot has an executor: their ledger is the window's history.
+    pub missions: Option<Arc<Missions>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -412,6 +414,7 @@ pub fn start_with(
         editor,
         memory,
         schedules,
+        missions,
     })
 }
 

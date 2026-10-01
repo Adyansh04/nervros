@@ -308,6 +308,19 @@ pub fn draw_marks(img: &mut RgbImage, instances: &[Instance]) {
     }
 }
 
+/// Marks as the model reads them: number, label, score and box.
+fn marks_json(instances: &[Instance]) -> Vec<Value> {
+    instances
+        .iter()
+        .enumerate()
+        .map(|(i, inst)| {
+            let (x, y, w, h) = inst.bbox;
+            let score = (f64::from(inst.score) * 100.0).round() / 100.0;
+            json!({"mark": i + 1, "label": inst.label, "score": score, "box": [x, y, w, h]})
+        })
+        .collect()
+}
+
 /// A stored look: what was seen, as marks.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -523,7 +536,8 @@ impl LookTool {
         eyes: Option<Arc<dyn Eyes>>,
     ) -> Self {
         let mut parameters = json!({"type": "object", "properties": {
-            "question": {"type": "string", "description": "What to find out from the frame, such as \"is there a red mug on the table?\". Leave it out for a short description."}
+            "question": {"type": "string", "description": "What to find out from the frame, such as \"is there a red mug on the table?\". Leave it out for a short description."},
+            "snapshot": {"type": "string", "description": "Instead of looking now: an earlier snapshot, or an image the operator attached, such as s7."}
         }, "additionalProperties": false});
         cameras.add_argument(&mut parameters);
         let spec = ToolSpec::new(
@@ -531,7 +545,8 @@ impl LookTool {
             "Looks through the robot's camera now. The detector's finds are drawn on the frame as \
              numbered marks (label, score, box), a vision model looks at that frame and answers \
              `question`, and the operator sees it too. Refer to things as `mark N` of the returned \
-             snapshot.",
+             snapshot. With `snapshot`, it answers about that image instead: an earlier snapshot, \
+             or one the operator attached, which their message names as [image sN].",
             parameters,
             Risk::Observe,
         );
@@ -587,15 +602,7 @@ impl LookTool {
             height: img.height(),
             marks: dets.instances.iter().map(|i| i.label.clone()).collect(),
         };
-        let marks: Vec<Value> = dets
-            .instances
-            .iter()
-            .enumerate()
-            .map(|(i, inst)| {
-                let (x, y, w, h) = inst.bbox;
-                json!({"mark": i + 1, "label": inst.label, "score": (f64::from(inst.score) * 100.0).round() / 100.0, "box": [x, y, w, h]})
-            })
-            .collect();
+        let marks = marks_json(&dets.instances);
         let seen = self
             .see(
                 question,
@@ -623,6 +630,29 @@ impl LookTool {
         let mut out = ToolOutcome::ok(data);
         out.message = format!("{} marks; the user sees the marked image", marks.len());
         out.images.push(image);
+        Ok(out)
+    }
+
+    /// The vision model's answer about a kept snapshot or an image the operator attached; the
+    /// operator already sees it, so it is not shown again.
+    async fn again(&self, id: &str, question: Option<&str>) -> Result<ToolOutcome, String> {
+        let snapshot = self.snapshots.get(id).ok_or_else(|| {
+            format!("no image {id} is kept any more; look again, or ask for it again")
+        })?;
+        let img = image::load_from_memory(&snapshot.image.jpeg)
+            .map_err(|e| e.to_string())?
+            .to_rgb8();
+        let mut data = json!({"snapshot": id, "marks": marks_json(&snapshot.marks)});
+        match self.see(question, &img, &snapshot.marks, None).await {
+            Some(Ok((answer, model))) => {
+                data["answer"] = Value::String(answer);
+                data["seen_by"] = Value::String(model);
+            }
+            Some(Err(why)) => data["not_seen"] = Value::String(why),
+            None => return Err("no vision model is set up to look at images".to_owned()),
+        }
+        let mut out = ToolOutcome::ok(data);
+        out.message = format!("looked at {id} again");
         Ok(out)
     }
 
@@ -676,9 +706,12 @@ impl Tool for LookTool {
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
-        self.run(args["question"].as_str(), args["camera"].as_str())
-            .await
-            .unwrap_or_else(ToolOutcome::failed)
+        let question = args["question"].as_str();
+        let done = match args["snapshot"].as_str().map(str::trim) {
+            Some(id) if !id.is_empty() => self.again(id, question).await,
+            _ => self.run(question, args["camera"].as_str()).await,
+        };
+        done.unwrap_or_else(ToolOutcome::failed)
     }
 }
 
@@ -881,6 +914,45 @@ mod tests {
             asked[0].0
         );
         assert!(!asked[0].0.contains("About this camera"), "{}", asked[0].0);
+    }
+
+    #[tokio::test]
+    async fn an_earlier_snapshot_is_asked_about_again_without_a_new_frame() {
+        let eyes = Arc::new(FakeEyes {
+            answer: Ok("Mark 2 is a white cup.".into()),
+            asked: Mutex::new(Vec::new()),
+        });
+        let robot: Arc<dyn RobotPort> = Arc::new(
+            FakeRobot::new()
+                .with_frame("/camera", frame(12.0))
+                .with_topic("/masks", masks(12.0)),
+        );
+        let config: LookConfig = toml::from_str(
+            "image = \"/camera\"\ndetections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n",
+        )
+        .unwrap();
+        let look = start(
+            config,
+            robot,
+            Arc::new(SnapshotStore::default()),
+            Some(Arc::clone(&eyes) as Arc<dyn Eyes>),
+        );
+        tokio::task::yield_now().await;
+        let first = look.call(json!({})).await;
+        let id = first.data["snapshot"].as_str().unwrap().to_owned();
+
+        let again = look
+            .call(json!({"snapshot": id, "question": "What is mark 2?"}))
+            .await;
+
+        assert_eq!(again.data["answer"], "Mark 2 is a white cup.");
+        assert_eq!(again.data["marks"][1]["label"], "cup");
+        assert!(again.images.is_empty(), "the operator already sees it");
+        let second = guard(&eyes.asked)[1].0.clone();
+        assert!(second.starts_with("What is mark 2?"), "{second}");
+        let gone = look.call(json!({"snapshot": "s99"})).await;
+        assert_eq!(gone.status, crate::tools::Status::Failed);
+        assert!(gone.message.contains("no image s99"), "{}", gone.message);
     }
 
     #[tokio::test]

@@ -1,8 +1,10 @@
 //! The NervROS desktop app: chat beside an embedded Rerun viewer, in one process with the agent.
 
 mod app;
+mod attach;
 mod chat;
 mod editor;
+mod history;
 mod palette;
 mod plan_edit;
 mod robot;

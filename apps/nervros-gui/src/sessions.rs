@@ -67,6 +67,57 @@ fn shorten(text: &str, max: usize) -> String {
     }
 }
 
+/// A session's event log, beside its saved conversation.
+pub fn log_of(history: &Path) -> PathBuf {
+    let name = history
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    history.with_file_name(name.replace(".history.json", ".ndjson"))
+}
+
+/// A session as an eval case, appended to the suite of saved cases in the state folder: its id
+/// and the suite's path. The case expects what happened, to trim before relying on it.
+///
+/// # Errors
+///
+/// The log cannot be read, holds no operator message, or the suite cannot be written.
+pub fn save_as_case(log: &Path) -> Result<(String, PathBuf), String> {
+    use std::io::Write as _;
+    let text = std::fs::read_to_string(log).map_err(|e| format!("{}: {e}", log.display()))?;
+    let mut case = nervros_core::evalcase::from_log(&text, "");
+    let first = case
+        .say
+        .first()
+        .ok_or("the session has no operator message")?;
+    case.id = slug(first);
+    let toml = nervros_core::evalcase::to_toml(&case).map_err(|e| e.to_string())?;
+    let suite = nervros_core::app::state_dir()
+        .join("evals")
+        .join("saved.toml");
+    if let Some(dir) = suite.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&suite)
+        .map_err(|e| format!("{}: {e}", suite.display()))?;
+    write!(file, "\n# From {}\n{toml}", log.display()).map_err(|e| e.to_string())?;
+    Ok((case.id, suite))
+}
+
+/// A case id from the operator's words: "turn-left-90-degrees".
+fn slug(text: &str) -> String {
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .take(6)
+        .map(str::to_lowercase)
+        .collect();
+    words.join("-")
+}
+
 /// "5 min ago", "3 h ago", "2 days ago", from seconds since the Unix epoch.
 pub fn ago(stamp: u64) -> String {
     let now = SystemTime::now()
@@ -99,5 +150,17 @@ mod tests {
             .as_secs();
         assert_eq!(ago(now - 7200), "2 h ago");
         assert_eq!(ago(now), "just now");
+    }
+
+    #[test]
+    fn a_case_is_named_by_the_operators_words_and_found_beside_its_conversation() {
+        assert_eq!(
+            slug("Turn left 90 degrees, then stop."),
+            "turn-left-90-degrees-then-stop"
+        );
+        assert_eq!(
+            log_of(Path::new("/l/session-17.history.json")),
+            Path::new("/l/session-17.ndjson")
+        );
     }
 }

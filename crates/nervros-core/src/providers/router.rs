@@ -148,12 +148,14 @@ impl Router {
         now: SystemTime,
     ) -> (Vec<&ModelConfig>, Vec<(String, Skip)>) {
         let chain = self.config.roles.chain(role);
-        // Outlining is a skill few models have: `segment` asks only the models listed for it.
+        // Outlining is a skill few models have, and the plan check is asked for: these roles ask
+        // only the models listed for them.
+        let opt_in = matches!(role, Role::Segment | Role::PlanCheck);
         let local_tail = self
             .config
             .models
             .iter()
-            .filter(|m| role != Role::Segment && m.privacy.local && !chain.contains(&m.id))
+            .filter(|m| !opt_in && m.privacy.local && !chain.contains(&m.id))
             .map(|m| m.id.as_str());
         let mut take = Vec::new();
         let mut skipped = Vec::new();
