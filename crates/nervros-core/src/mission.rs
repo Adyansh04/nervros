@@ -381,7 +381,7 @@ impl Missions {
         }
     }
 
-    fn find(&self, hash: &str) -> Result<Compiled, String> {
+    pub(crate) fn find(&self, hash: &str) -> Result<Compiled, String> {
         let hash = hash.trim().to_ascii_lowercase();
         let planned = lock(&self.planned);
         let hits: Vec<&Compiled> = planned
@@ -416,6 +416,20 @@ impl Missions {
                  the plan to deal with what the report said, or tell the operator"
             ));
         }
+        match self.launch(compiled).await {
+            Ok(id) => ToolOutcome {
+                status: Status::Accepted,
+                data: json!({"mission_id": id}),
+                message: "the mission is running; a report follows when it ends. Tell the operator it started."
+                    .to_owned(),
+                images: Vec::new(),
+            },
+            Err(e) => ToolOutcome::failed(e),
+        }
+    }
+
+    /// Sends a checked plan to the executor and watches it; its id.
+    async fn launch(self: &Arc<Self>, compiled: Compiled) -> Result<String, String> {
         let id = uuid::Uuid::now_v7().to_string();
         let goal = json!({
             "mission_id": id,
@@ -424,29 +438,63 @@ impl Missions {
             "max_duration_s": 0.0,
             "mode": 0
         });
-        let goal = match self
+        let goal = self
             .robot
             .send_goal(&self.config.execute, EXECUTE, goal, SERVICE_TIMEOUT)
             .await
-        {
-            Ok(g) => g,
-            Err(e) => {
-                return ToolOutcome::failed(format!("the executor did not start the mission: {e}"));
-            }
-        };
+            .map_err(|e| format!("the executor did not start the mission: {e}"))?;
         *lock(&self.running) = Some(Running { id: id.clone() });
         self.emit(Event::MissionStarted {
             id: id.clone(),
             hash: compiled.sha256.clone(),
         });
         tokio::spawn(Arc::clone(self).watch(id.clone(), compiled, goal));
-        ToolOutcome {
-            status: Status::Accepted,
-            data: json!({"mission_id": id}),
-            message: "the mission is running; a report follows when it ends. Tell the operator it started."
-                .to_owned(),
-            images: Vec::new(),
+        Ok(id)
+    }
+
+    /// Runs a plan a schedule's approval covers: it repeats on purpose, so the guard against an
+    /// unchanged rerun does not apply; `label` names the run in its report.
+    ///
+    /// # Errors
+    ///
+    /// A mission is running, or the executor did not start it.
+    pub async fn run_scheduled(
+        self: &Arc<Self>,
+        mut compiled: Compiled,
+        label: &str,
+    ) -> Result<String, String> {
+        if let Some(r) = lock(&self.running).as_ref() {
+            return Err(format!("mission {} was still running", r.id));
         }
+        compiled.plan.intent = label.to_owned();
+        self.launch(compiled).await
+    }
+
+    /// Whether a mission is running now.
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        lock(&self.running).is_some()
+    }
+
+    /// Checks a plan for a schedule: its hash, and its steps as the operator reads them.
+    ///
+    /// # Errors
+    ///
+    /// The plan's problems, as the tool's outcome.
+    pub async fn check(
+        &self,
+        intent: &str,
+        steps: &Value,
+    ) -> Result<(String, usize, f64), ToolOutcome> {
+        let out = self.plan(json!({"intent": intent, "steps": steps})).await;
+        if out.status != Status::Succeeded {
+            return Err(out);
+        }
+        Ok((
+            out.data["hash"].as_str().unwrap_or_default().to_owned(),
+            out.data["steps"].as_array().map_or(0, Vec::len),
+            out.data["worst_case_s"].as_f64().unwrap_or(0.0),
+        ))
     }
 
     async fn watch(self: Arc<Self>, id: String, compiled: Compiled, goal: Goal) {

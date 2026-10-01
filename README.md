@@ -58,12 +58,21 @@ regions. With [`[editor]`](docs/profile.md#editor) it reviews and fixes the save
 you ask ("the chair by the window is a stool", "merge the two halves of the sofa"), and Edit world
 opens the same world on its floor plan to fix by hand. It also runs the checks you would: "check
 the robot's health", "tell me if the chest camera drops below 5 Hz", "plot the robot's speed",
-"remember this spot as the reading corner".
+"remember this spot as the reading corner". It remembers what you ask it to across sessions
+("remember that the kitchen door sticks"), and runs patrols you approve once ("every 30 minutes,
+walk through the rooms, 6 times").
+
+To act, the agent writes a plan and the app asks you to approve it, once: the agent never asks you
+first in the chat, and you deny what is wrong. A failed mission comes back with what went wrong, and
+the agent proposes a changed plan for you to approve.
 
 In the window, Enter sends, Esc stops the reply and Ctrl+Shift+S stops the mission. Ctrl+1 to
 Ctrl+7 switch the dock between the mission, the world model, the viewer's layers, approvals, events,
-models and the connection check. Closing the window while a mission runs asks first whether to stop
-the robot, and a new session tells you when the robot is already running one.
+the agent (earlier sessions to resume, what it remembers, the models) and the connection check. The
+status bar shows how full the model's context is; the conversation is condensed before it fills,
+and `/compact` condenses it at once. Every conversation is saved, so Resume in the Agent tab, or
+`nervros-cli chat --resume last`, carries one on. Closing the window while a mission runs asks first
+whether to stop the robot, and a new session tells you when the robot is already running one.
 The embedded viewer is [Rerun](https://rerun.io), which keeps the cameras, map, rooms, objects and
 mission steps on a timeline. [`[[viz.layer]]`](docs/profile.md#viz) adds what RViz would draw:
 occupancy grids, marker arrays and laser scans, each with a switch in the Layers tab. Clicking an

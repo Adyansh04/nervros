@@ -754,6 +754,43 @@ impl Gui {
             ),
         }
         self.act(ui.ctx(), actions);
+        self.schedules_list(ui);
+    }
+
+    /// Missions that run again and again, each with a way to end it.
+    fn schedules_list(&self, ui: &mut egui::Ui) {
+        let Some(schedules) = &self.agent.schedules else {
+            return;
+        };
+        let list = schedules.list();
+        if list.is_empty() {
+            return;
+        }
+        ui.add_space(12.0);
+        ui.label(RichText::new("Schedules").strong());
+        let mut cancel = None;
+        for s in &list {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&s.id).monospace().small());
+                ui.label(RichText::new(&s.intent).small());
+                let when = format!(
+                    "every {} min, {} of {} runs left",
+                    s.every_min, s.left, s.times
+                );
+                ui.label(RichText::new(when).small().color(ui.tokens().text_subdued));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(ReButton::new("Cancel").small().secondary())
+                        .clicked()
+                    {
+                        cancel = Some(s.id.clone());
+                    }
+                });
+            });
+        }
+        if let Some(id) = cancel {
+            schedules.cancel(&id);
+        }
     }
 
     fn world_tab(&mut self, ui: &mut egui::Ui) {
@@ -884,7 +921,42 @@ impl Gui {
             }
         }
         ui.add_space(12.0);
+        self.memory_list(ui);
+        ui.add_space(12.0);
         self.models_list(ui);
+    }
+
+    /// What the operator asked the agent to remember, each with a way to forget it.
+    fn memory_list(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Memory").strong());
+        let notes = self.agent.memory.all();
+        if notes.is_empty() {
+            ui.label(
+                RichText::new("Nothing yet: say \"remember that…\" in the chat.")
+                    .small()
+                    .color(ui.tokens().text_subdued),
+            );
+        }
+        let mut forget = None;
+        for n in &notes {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(n.id.to_string()).monospace().small());
+                ui.label(RichText::new(&n.text).small());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(ReButton::new("Forget").small().secondary())
+                        .clicked()
+                    {
+                        forget = Some(n.id);
+                    }
+                });
+            });
+        }
+        if let Some(id) = forget
+            && let Err(e) = self.agent.memory.forget(id)
+        {
+            self.chat.items.push(crate::chat::Item::Error(e));
+        }
     }
 
     fn models_list(&self, ui: &mut egui::Ui) {
@@ -1490,6 +1562,7 @@ mod tests {
         let profile = dir.path().join("nervros.toml");
         let agent =
             nervros_core::app::start(&profile, robot, &dir.path().join("quota.json")).unwrap();
+        agent.memory.remember("The kitchen door sticks.").unwrap();
         let (rec, input) = nervros_viz::in_process().unwrap();
         let bridge = nervros_viz::spawn(
             &rec,
@@ -1526,5 +1599,9 @@ mod tests {
         harness.input_mut().events.push(egui::Event::PointerGone);
         harness.run_steps(8);
         crate::chat::compare(&mut harness, "window", &options);
+        // The Agent tab: sessions to resume, what it remembers, the models.
+        harness.state_mut().tab = Tab::Agent;
+        harness.run_steps(4);
+        crate::chat::compare(&mut harness, "window_agent", &options);
     }
 }

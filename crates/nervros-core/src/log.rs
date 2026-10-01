@@ -41,6 +41,10 @@ pub fn spawn(
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             };
+            // The reply arrives whole after its pieces.
+            if matches!(event, Event::ReplyDelta { .. }) {
+                continue;
+            }
             seq += 1;
             if let Event::Snapshot { id, jpeg, .. } = &event
                 && let Err(e) = std::fs::write(blobs.join(format!("{id}.jpg")), jpeg.as_slice())

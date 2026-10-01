@@ -38,6 +38,10 @@ pub struct Agent {
     pub tools: Vec<String>,
     /// The world editor, when the profile names one.
     pub editor: Option<Arc<crate::editor::EditorClient>>,
+    /// What the operator asked to remember.
+    pub memory: Arc<crate::memory::Memory>,
+    /// Missions run again and again, when the robot has an executor.
+    pub schedules: Option<Arc<crate::schedule::Schedules>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -197,12 +201,7 @@ fn place_tools(
     ledger: &Path,
     registry: &mut Registry,
 ) -> Result<Arc<crate::places::Places>, StartError> {
-    let file = ledger.parent().map(|dir| {
-        let name = Some(crate::places::slug(&profile.robot.name))
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| "robot".into());
-        dir.join("places").join(format!("{name}.json"))
-    });
+    let file = robot_file(profile, ledger, "places");
     let places = crate::places::Places::new(profile, file);
     registry.add(Arc::new(ListPlaces::new(
         profile,
@@ -218,6 +217,16 @@ fn place_tools(
         &places,
     ))))?;
     Ok(places)
+}
+
+/// `<kind>/<robot>.json` beside the quota ledger: what this robot keeps across sessions.
+fn robot_file(profile: &Profile, ledger: &Path, kind: &str) -> Option<PathBuf> {
+    ledger.parent().map(|dir| {
+        let name = Some(crate::places::slug(&profile.robot.name))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "robot".into());
+        dir.join(kind).join(format!("{name}.json"))
+    })
 }
 
 /// The watches and the health check: what a person runs before blaming the model.
@@ -296,13 +305,22 @@ pub fn start_with(
         }
     }
     let watches = debug_tools(&profile, &robot, &mut registry)?;
+    let memory = crate::memory::Memory::new(robot_file(&profile, ledger, "memory"));
+    registry.add(Arc::new(crate::memory::MemoryTool::new(Arc::clone(
+        &memory,
+    ))))?;
     let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
     registry.add(Arc::clone(&stop))?;
     let missions = Missions::new(&profile, places, Arc::clone(&robot));
-    if let Some(m) = &missions {
-        for tool in m.tools() {
-            registry.add(tool)?;
-        }
+    let schedules = missions
+        .as_ref()
+        .map(|m| crate::schedule::Schedules::new(Arc::clone(m), Arc::clone(&guard)));
+    for tool in missions
+        .iter()
+        .flat_map(Missions::tools)
+        .chain(schedules.iter().flat_map(crate::schedule::Schedules::tools))
+    {
+        registry.add(tool)?;
     }
     let tools = registry.iter().map(|t| t.spec().name.clone()).collect();
     let config = SessionConfig {
@@ -312,6 +330,7 @@ pub fn start_with(
         turn_time: profile.policy.budgets.wall_time,
         history_file: files.history,
         resume: files.resume,
+        notes: Some(Arc::clone(&memory) as Arc<dyn crate::memory::Notes>),
         ..SessionConfig::default()
     };
     let session = Session::start(
@@ -323,6 +342,9 @@ pub fn start_with(
     );
     if let Some(m) = &missions {
         m.attach(session.handle());
+    }
+    if let Some(s) = &schedules {
+        s.attach(session.handle());
     }
     watches.attach(session.handle());
     if let Some(state) = profile.mission.as_ref().map(|m| m.state.clone()) {
@@ -346,6 +368,8 @@ pub fn start_with(
         llm,
         tools,
         editor,
+        memory,
+        schedules,
     })
 }
 

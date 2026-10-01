@@ -288,4 +288,6 @@ The rest are the checks you would run yourself before blaming the model:
 | `watch` | Watches a topic in the background and posts to the chat when a condition holds: its rate drops below a floor, a field crosses a value, or a text field matches. Once, or each time it comes back; at most 8 at a time, all ended with the session. |
 | `watches` | Lists the running watches, or cancels one or all. |
 | `plot` | Draws a number from a topic's messages over time in the app's Plots tab, as `rqt_plot` does, for two minutes unless told longer. |
+| `memory` | Keeps what the operator asks it to remember across sessions ("the kitchen door sticks"), in the state directory, one file per robot; lists and forgets notes. The notes join the system prompt on every turn, and the Agent tab lists them. Remembering and forgetting are approved like an edit. |
+| `schedule` | With `[mission]`: runs a plan again and again, such as a patrol every 30 minutes, a set number of times. The operator approves it once for all its runs; a run is skipped while the robot is disarmed or busy, and stopping the robot cancels every schedule. The Mission tab lists them. |
 | `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each asks for approval when supervised, like a world edit. |

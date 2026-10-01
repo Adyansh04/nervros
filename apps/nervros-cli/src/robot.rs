@@ -236,7 +236,8 @@ fn print_event(e: &Event, logs: &Path) {
         | Event::TurnStarted { .. }
         | Event::TurnFinished { .. }
         | Event::Plot { .. }
-        | Event::Context { .. } => {}
+        | Event::Context { .. }
+        | Event::ReplyDelta { .. } => {}
         Event::Restored { exchanges } => {
             println!(
                 "  [carrying on an earlier conversation: {} messages]",

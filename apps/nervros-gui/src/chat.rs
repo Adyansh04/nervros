@@ -126,6 +126,8 @@ pub struct Chat {
     pub model: Option<String>,
     /// Tokens the latest request took of the model's window, when the window is known.
     pub context: Option<(u64, u64)>,
+    /// The reply as it streams in, until it arrives whole or a tool call takes over.
+    pub draft: Option<String>,
     last_user: Option<String>,
 }
 
@@ -146,6 +148,7 @@ impl Chat {
 
     /// Folds a session event into the conversation.
     pub fn apply(&mut self, event: &Event) {
+        self.settle_draft(event);
         match event {
             Event::TurnStarted { .. } => self.turn = Some(Instant::now()),
             Event::TurnFinished { .. } => self.turn = None,
@@ -241,15 +244,31 @@ impl Chat {
             | Event::MissionFinished { .. } => self.apply_mission(event),
             // The viewer draws it; the tool's card already says what.
             Event::Plot { .. } => {}
-            Event::Context { .. } | Event::Restored { .. } | Event::Compacted { .. } => {
-                self.apply_conversation(event);
-            }
+            Event::Context { .. }
+            | Event::Restored { .. }
+            | Event::Compacted { .. }
+            | Event::ReplyDelta { .. } => self.apply_conversation(event),
         }
     }
 
-    /// How full the model's context is, and the conversation condensed or taken up again.
+    /// A streamed reply ends whole, or gives way to a tool call.
+    fn settle_draft(&mut self, event: &Event) {
+        if matches!(
+            event,
+            Event::Reply { .. }
+                | Event::ToolStarted { .. }
+                | Event::TurnFinished { .. }
+                | Event::Error { .. }
+        ) {
+            self.draft = None;
+        }
+    }
+
+    /// The reply as it streams, how full the model's context is, and the conversation condensed
+    /// or taken up again.
     fn apply_conversation(&mut self, event: &Event) {
         match event {
+            Event::ReplyDelta { text, .. } => self.draft.get_or_insert_default().push_str(text),
             Event::Context { used, window } => self.context = Some((*used, *window)),
             Event::Restored { exchanges } => {
                 self.items.push(Item::Notice(
@@ -394,6 +413,9 @@ impl Chat {
                     Item::Plan(p) => plan_card(ui, p, actions),
                 }
             });
+        }
+        if let Some(draft) = self.draft.as_deref().filter(|d| !d.trim().is_empty()) {
+            reply(ui, draft, "…");
         }
         if let Some(since) = self.turn {
             ui.horizontal(|ui| {

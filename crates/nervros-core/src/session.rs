@@ -134,6 +134,13 @@ pub enum Event {
         /// How long to draw it, in seconds.
         for_s: u64,
     },
+    /// A piece of the reply as the model writes it; the `Reply` that follows replaces them.
+    ReplyDelta {
+        /// Turn number.
+        turn: u64,
+        /// The new text.
+        text: String,
+    },
     /// How full the model's context was on the turn's latest request.
     Context {
         /// Tokens the request took, as the provider counted them, or as estimated.
@@ -265,6 +272,8 @@ pub struct SessionConfig {
     pub history_file: Option<std::path::PathBuf>,
     /// A conversation to carry on.
     pub resume: Option<History>,
+    /// Added to the system prompt on every turn, such as what the operator asked to remember.
+    pub notes: Option<Arc<dyn crate::memory::Notes>>,
 }
 
 impl Default for SessionConfig {
@@ -278,6 +287,7 @@ impl Default for SessionConfig {
             turn_time: Duration::from_secs(90),
             history_file: None,
             resume: None,
+            notes: None,
         }
     }
 }
@@ -687,11 +697,22 @@ async fn fit_window(
     let Some(window) = candidates.first().and_then(|m| source.context(m)) else {
         return;
     };
-    let room = window
-        .saturating_sub(llm::fixed_cost(&shared.config.preamble, tools) + llm::RESERVE_TOKENS);
+    let room =
+        window.saturating_sub(llm::fixed_cost(&preamble(shared), tools) + llm::RESERVE_TOKENS);
     if history.size() > room / 2 {
         compact(shared, source, history, room).await;
     }
+}
+
+/// Passes a streamed reply's pieces to the UI.
+fn deltas(shared: &Arc<Shared>, turn: u64) -> llm::OnDelta {
+    let shared = Arc::clone(shared);
+    Arc::new(move |text: &str| {
+        shared.emit(Event::ReplyDelta {
+            turn,
+            text: text.to_owned(),
+        });
+    })
 }
 
 /// Tells the UI how full the model's window was: as the provider counted, or as estimated.
@@ -702,7 +723,7 @@ fn report_context(
     counted: u64,
     window: usize,
 ) {
-    let estimated = llm::fixed_cost(&shared.config.preamble, tools) + history.size();
+    let estimated = llm::fixed_cost(&preamble(shared), tools) + history.size();
     shared.emit(Event::Context {
         used: if counted > 0 {
             counted
@@ -776,6 +797,17 @@ async fn limited(
     }
 }
 
+/// The system prompt for this turn: the fixed one and the notes as they are now.
+fn preamble(shared: &Shared) -> String {
+    let notes = shared
+        .config
+        .notes
+        .as_ref()
+        .map(|n| n.text())
+        .unwrap_or_default();
+    format!("{}{notes}", shared.config.preamble)
+}
+
 /// Room for the history when the model's window is unknown, for an operator's compaction.
 const COMPACT_ROOM: usize = 12_000;
 
@@ -796,7 +828,7 @@ fn room_for(shared: &Shared, source: &Arc<dyn AgentSource>, registry: &Registry)
             spec.name.len() + spec.description.len() + spec.parameters.to_string().len()
         })
         .sum();
-    let fixed = llm::tokens_of(shared.config.preamble.len() + schemas);
+    let fixed = llm::tokens_of(preamble(shared).len() + schemas);
     Some(window.saturating_sub(fixed + llm::RESERVE_TOKENS))
 }
 
@@ -907,13 +939,15 @@ async fn run_turn(
         let mut updated = history.clone();
         let used = Arc::new(AtomicU64::new(0));
         let window = source.context(&model);
+        let system = preamble(&shared);
         let setup = llm::TurnSetup {
-            preamble: &shared.config.preamble,
+            preamble: &system,
             max_turns: shared.config.max_model_calls,
             tools: &tools,
             started: Arc::clone(&flags.started),
             window,
             used: Arc::clone(&used),
+            delta: Some(deltas(&shared, turn)),
         };
         let result = llm::chat(&model, Arc::clone(&source), setup, &mut updated, &text).await;
         match result {
@@ -1245,6 +1279,57 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::Reply { text, .. } if text.contains("kitchen")))
         );
+    }
+
+    /// A source whose model streams.
+    struct Streaming(MockCompletionModel);
+
+    impl AgentSource for Streaming {
+        fn candidates(&self, _role: Role, _need: Need) -> Vec<String> {
+            vec!["mock".into()]
+        }
+        fn builder(&self, _id: &str) -> Result<AgentBuilder, LlmError> {
+            Ok(AgentBuilder::new(self.0.clone()))
+        }
+        fn take_request(&self, _id: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn park(&self, _id: &str) {}
+        fn streams(&self, _id: &str) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streamed_reply_arrives_in_pieces_then_whole() {
+        use rig::test_utils::MockStreamEvent;
+        let model = MockCompletionModel::from_stream_turns([vec![
+            MockStreamEvent::text("The cup "),
+            MockStreamEvent::text("is in the kitchen."),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let guard = Arc::new(Guard::new(Policy::default()));
+        let session = Session::start(
+            Arc::new(Streaming(model)),
+            registry(Risk::Observe),
+            guard,
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("Where is the cup?".into()));
+        let events = collect_until_finished(&mut rx, |_| None, &session).await;
+        let pieces: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ReplyDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pieces, ["The cup ", "is in the kitchen."]);
+        assert!(events.iter().any(
+            |e| matches!(e, Event::Reply { text, .. } if text == "The cup is in the kitchen.")
+        ));
     }
 
     #[tokio::test]

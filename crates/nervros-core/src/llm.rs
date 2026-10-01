@@ -775,6 +775,11 @@ pub trait AgentSource: Send + Sync {
     fn context(&self, _model_id: &str) -> Option<usize> {
         None
     }
+
+    /// Whether the model's replies stream.
+    fn streams(&self, _model_id: &str) -> bool {
+        false
+    }
 }
 
 impl AgentSource for Llm {
@@ -813,6 +818,13 @@ impl AgentSource for Llm {
 
     fn context(&self, model_id: &str) -> Option<usize> {
         self.router.config().model(model_id).and_then(|m| m.context)
+    }
+
+    fn streams(&self, model_id: &str) -> bool {
+        self.router
+            .config()
+            .model(model_id)
+            .is_some_and(|m| m.stream)
     }
 }
 
@@ -917,7 +929,12 @@ pub struct TurnSetup<'a> {
     pub window: Option<usize>,
     /// Where the input tokens of the turn's latest request are written.
     pub used: Arc<AtomicU64>,
+    /// Given each piece of reply text as it arrives, when the model streams.
+    pub delta: Option<OnDelta>,
 }
+
+/// What is given each piece of a streamed reply.
+pub type OnDelta = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Added to the system prompt for a turn's last model call.
 const LAST_CALL: &str = "You cannot call a tool now: this request is out of steps. Answer the \
@@ -985,6 +1002,7 @@ pub async fn chat(
             )
         })
         .collect();
+    let delta = setup.delta.clone().filter(|_| source.streams(model_id));
     let builder = source
         .builder(model_id)?
         .preamble(setup.preamble)
@@ -1002,15 +1020,51 @@ pub async fn chat(
             last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
         });
     let agent = builder.build();
+    let turn_error = |message: String, rate_limited: bool| LlmError::Turn {
+        model: model_id.to_owned(),
+        message: without_provider_body(&message),
+        rate_limited,
+    };
+    if let Some(delta) = delta {
+        return streamed(&agent, text, history, delta.as_ref())
+            .await
+            .map(plain)
+            .map_err(|e| turn_error(e.clone(), e.contains("429")));
+    }
     agent
         .chat(text, &mut history.0)
         .await
         .map(plain)
-        .map_err(|e| LlmError::Turn {
-            model: model_id.to_owned(),
-            message: without_provider_body(&e.to_string()),
-            rate_limited: is_rate_limited(&e),
-        })
+        .map_err(|e| turn_error(e.to_string(), is_rate_limited(&e)))
+}
+
+/// One turn with the reply streamed: each text delta to `delta`, and the run's transcript into
+/// `history` at the end, as `chat` appends it.
+async fn streamed(
+    agent: &rig::Agent,
+    text: &str,
+    history: &mut History,
+    delta: &(dyn Fn(&str) + Send + Sync),
+) -> Result<String, String> {
+    use futures::StreamExt as _;
+    use rig::agent::MultiTurnStreamItem;
+    use rig::streaming::{StreamedAssistantContent, StreamingChat as _};
+    let mut stream = agent.stream_chat(text, history.0.clone()).await;
+    let mut done = None;
+    while let Some(item) = stream.next().await {
+        match item.map_err(|e| e.to_string())? {
+            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
+                delta(&t.text);
+            }
+            MultiTurnStreamItem::FinalResponse(response) => done = Some(response),
+            _ => {}
+        }
+    }
+    let response = done.ok_or("the reply stream ended without a reply")?;
+    if let Some(messages) = response.messages {
+        history.0 = messages;
+    }
+    Ok(response.output)
 }
 
 /// A provider error with its JSON body replaced by the provider's own message: the body can
