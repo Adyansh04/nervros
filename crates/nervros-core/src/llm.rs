@@ -518,21 +518,24 @@ struct TurnHook {
     source: Arc<dyn AgentSource>,
     model: String,
     started: Arc<AtomicBool>,
+    /// The turn's last model call, which must answer: a tool called then ends the turn without one.
+    last: usize,
 }
 
 impl AgentHook for TurnHook {
     /// Takes each request from the model's quota before it is sent (a turn is up to `max_turns`
-    /// requests, not one), and once a mission has started offers no more tools, so the model
-    /// answers instead of spending the turn on checks the mission's report will answer anyway.
+    /// requests, not one). Once a mission has started, and on the turn's last call, it offers no
+    /// more tools, so the model answers instead of spending the turn on checks the mission's report
+    /// will answer anyway, or being cut off mid-plan.
     async fn on_completion_call(
         &self,
-        _ctx: &HookContext,
+        ctx: &HookContext,
         _event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
         if let Err(why) = self.source.take_request(&self.model) {
             return CompletionCallAction::stop(format!("{}: {why}", self.model));
         }
-        if self.started.load(Ordering::SeqCst) {
+        if self.started.load(Ordering::SeqCst) || ctx.turn() >= self.last {
             return CompletionCallAction::patch(
                 RequestPatch::new().active_tools(Vec::<String>::new()),
             );
@@ -614,6 +617,7 @@ pub async fn chat(
             source,
             model: model_id.to_owned(),
             started: setup.started,
+            last: setup.max_turns,
         });
     let agent = builder.build();
     agent
