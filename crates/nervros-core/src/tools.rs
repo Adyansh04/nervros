@@ -242,6 +242,13 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// For a tool whose request the operator may change while approving it, such as a plan:
+    /// checks `edited` as [`Tool::assess`] would, for the approval to wait on instead. `None`
+    /// means it cannot be edited.
+    async fn edit(&self, _edited: Value) -> Option<Result<Assessment, ToolOutcome>> {
+        None
+    }
+
     /// Waits until the spec is complete, as a mission tool's skill list once the robot has
     /// answered; the session asks before each turn. Most specs are complete from the start.
     async fn ready(&self) {}

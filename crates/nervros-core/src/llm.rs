@@ -749,6 +749,21 @@ impl crate::segment::Outliner for Llm {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::mission::sanity::Critic for Llm {
+    async fn judge(&self, prompt: &str) -> Result<String, String> {
+        self.ask(Ask {
+            role: Role::PlanCheck,
+            preamble: crate::mission::sanity::CRITIC_PREAMBLE,
+            prompt,
+            image: None,
+        })
+        .await
+        .map(|a| a.text)
+        .map_err(|e| e.to_string())
+    }
+}
+
 /// What the session asks of its model layer; [`Llm`] implements it, tests use a scripted model.
 pub trait AgentSource: Send + Sync {
     /// Model ids to try for a role, in order.

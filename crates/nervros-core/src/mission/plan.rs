@@ -368,8 +368,8 @@ pub(crate) fn predicate(text: &str) -> Option<(&str, Vec<&str>)> {
     Some((name.trim(), args.split(',').map(str::trim).collect()))
 }
 
-/// A step as the operator sees it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// A step as the operator sees it, with what it takes to plan it again after an edit.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct PlannedStep {
     /// `s1`, `s2`, ...: the executor's events carry it.
     pub id: String,
@@ -381,9 +381,27 @@ pub struct PlannedStep {
     pub args: Vec<StepArg>,
     /// Its timeout.
     pub timeout_s: f64,
+    /// Extra attempts after a failure.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retries: u8,
+    /// A failure here does not fail the mission.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+    /// The planner added it, as a walk up to what the next step must be near; planned again
+    /// after an edit rather than kept.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub added: bool,
     /// How it has gone before, from the ledger; none before its first run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track: Option<super::ledger::Track>,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 /// A plan that compiled.
@@ -480,6 +498,9 @@ pub fn compile(plan: &Plan, catalog: &Catalog, world: &World) -> Result<Compiled
                         summary: text,
                         args: step.args.clone(),
                         timeout_s,
+                        retries: step.retries,
+                        optional: step.optional,
+                        added,
                         track: None,
                     });
                 }

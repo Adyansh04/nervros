@@ -13,6 +13,7 @@ pub mod history;
 pub mod ledger;
 pub mod plan;
 pub mod preview;
+pub mod sanity;
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -29,6 +30,7 @@ use self::catalog::Catalog;
 use self::check::Observed;
 use self::ledger::{Ledger, MissionRecord, StepRecord};
 use self::plan::{Compiled, Plan, PlannedStep, Thing, World};
+use self::sanity::{Concern, Critic, Verdict};
 use crate::profile::{MissionConfig, Profile};
 use crate::session::{Command, Event, SessionHandle};
 use crate::tools::{Assessment, Risk, Status, Tool, ToolOutcome, ToolSpec};
@@ -40,6 +42,8 @@ const KEPT_PLANS: usize = 8;
 /// Failed `plan_mission` calls before the model must ask the operator instead. Small local models
 /// need about three to fix a plan from its problem list.
 const MAX_PLAN_ATTEMPTS: u32 = 4;
+/// How long the critic may think before a plan goes on without its opinion.
+const CRITIC_TIMEOUT: Duration = Duration::from_secs(30);
 /// A hash may be shortened to this many characters when it stays unique.
 const MIN_HASH_PREFIX: usize = 8;
 const EXECUTE: &str = "nervros_interfaces/action/ExecuteMission";
@@ -104,6 +108,20 @@ pub struct Missions {
     ledger: OnceLock<Arc<Ledger>>,
     /// What the operator said last: the request a mission is for.
     request: Mutex<String>,
+    /// A second opinion on the model's plans, when a model has the role.
+    critic: OnceLock<Arc<dyn Critic>>,
+    /// Whether a plan for this request already went back for not matching the operator's words:
+    /// once is a hint, twice would argue with a model that may be right.
+    questioned: AtomicBool,
+}
+
+/// Who a plan is from. The model's go back once when they may not match the operator's words,
+/// and its failed checks count against its attempts; the operator's own edits only show
+/// their concerns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum By {
+    Model,
+    Operator,
 }
 
 impl crate::session::Pulse for Missions {
@@ -154,6 +172,8 @@ impl Missions {
             client: format!("nervros {}", std::process::id()),
             ledger: OnceLock::new(),
             request: Mutex::default(),
+            critic: OnceLock::new(),
+            questioned: AtomicBool::new(false),
         }))
     }
 
@@ -162,6 +182,14 @@ impl Missions {
     pub fn with_ledger(self: Arc<Self>, ledger: Arc<Ledger>) -> Arc<Self> {
         // Set once, at start-up.
         let _ = self.ledger.set(ledger);
+        self
+    }
+
+    /// Asks `critic` about each plan the model makes, before the operator sees it.
+    #[must_use]
+    pub fn with_critic(self: Arc<Self>, critic: Arc<dyn Critic>) -> Arc<Self> {
+        // Set once, at start-up.
+        let _ = self.critic.set(critic);
         self
     }
 
@@ -197,6 +225,7 @@ impl Missions {
                         *lock(&me.request) = text;
                         me.plan_failures.store(0, Ordering::SeqCst);
                         me.run_failures.store(0, Ordering::SeqCst);
+                        me.questioned.store(false, Ordering::SeqCst);
                         *lock(&me.last) = None;
                     }
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -413,18 +442,19 @@ impl Missions {
         }
     }
 
-    async fn plan(&self, args: Value) -> ToolOutcome {
-        if self.plan_failures.load(Ordering::SeqCst) >= MAX_PLAN_ATTEMPTS {
-            return ToolOutcome::refused(format!(
-                "{MAX_PLAN_ATTEMPTS} plans in a row failed their checks; tell the operator what is missing instead"
-            ));
-        }
-        let max_replans = self.config.max_replans;
-        let failed = self.run_failures.load(Ordering::SeqCst);
-        if failed > max_replans {
-            return ToolOutcome::refused(format!(
-                "this request already failed {failed} times; tell the operator what went wrong instead of retrying"
-            ));
+    async fn plan(&self, args: Value, by: By) -> ToolOutcome {
+        if by == By::Model {
+            if self.plan_failures.load(Ordering::SeqCst) >= MAX_PLAN_ATTEMPTS {
+                return ToolOutcome::refused(format!(
+                    "{MAX_PLAN_ATTEMPTS} plans in a row failed their checks; tell the operator what is missing instead"
+                ));
+            }
+            let failed = self.run_failures.load(Ordering::SeqCst);
+            if failed > self.config.max_replans {
+                return ToolOutcome::refused(format!(
+                    "this request already failed {failed} times; tell the operator what went wrong instead of retrying"
+                ));
+            }
         }
         let mut args = args;
         // A plan saved by name runs as its steps.
@@ -442,8 +472,10 @@ impl Missions {
         let mut plan: Plan = match serde_json::from_value(args) {
             Ok(p) => p,
             Err(e) => {
-                return self
-                    .rejected(&json!([{"step": "", "field": "", "message": e.to_string()}]));
+                return self.rejected(
+                    &json!([{"step": "", "field": "", "message": e.to_string()}]),
+                    by,
+                );
             }
         };
         // The local model leaves the label out, and once resent an unchanged plan until refused.
@@ -463,7 +495,7 @@ impl Missions {
         let world = self.world_of(&self.observe().await);
         let mut compiled = match plan::compile(&plan, &catalog, &world) {
             Ok(c) => c,
-            Err(problems) => return self.rejected(&json!(problems)),
+            Err(problems) => return self.rejected(&json!(problems), by),
         };
         let reply = match self
             .robot
@@ -485,29 +517,91 @@ impl Missions {
                 .as_str()
                 .and_then(|d| serde_json::from_str::<Value>(d).ok())
                 .unwrap_or_else(|| json!([{"message": "the executor rejected the plan"}]));
-            return self.rejected(&diagnostics);
+            return self.rejected(&diagnostics, by);
         }
-        self.plan_failures.store(0, Ordering::SeqCst);
+        if by == By::Model {
+            self.plan_failures.store(0, Ordering::SeqCst);
+        }
         // Not the model's fault, so not counted against its attempts.
         if let Some(why) = self.cannot_walk(&compiled, &catalog).await {
             return ToolOutcome::refused(why);
+        }
+        let (blocking, concerns) = self.concerns(&compiled, &catalog, by).await;
+        if blocking && by == By::Model && !self.questioned.swap(true, Ordering::SeqCst) {
+            return questioned(&concerns);
         }
         self.add_tracks(&mut compiled.steps).await;
         let worst = reply["worst_case_duration_s"]
             .as_f64()
             .filter(|w| *w > 0.0)
             .unwrap_or(compiled.worst_case_s);
-        self.checked(compiled, worst)
+        self.checked(compiled, worst, concerns)
+    }
+
+    /// Ways a plan may not do what the operator asked, and whether any is plain enough to send
+    /// the plan back: the rules first, then the critic on what they let through.
+    async fn concerns(
+        &self,
+        compiled: &Compiled,
+        catalog: &Catalog,
+        by: By,
+    ) -> (bool, Vec<Concern>) {
+        let request = self.request();
+        let found = sanity::check(&request, &compiled.steps);
+        if !found.is_empty() {
+            return (true, found);
+        }
+        let none = (false, Vec::new());
+        // The operator's own edit needs no second opinion.
+        let Some(critic) = self
+            .critic
+            .get()
+            .filter(|_| by == By::Model && !request.is_empty())
+        else {
+            return none;
+        };
+        let prompt = sanity::critic_prompt(&request, &compiled.steps, catalog);
+        let reply = match tokio::time::timeout(CRITIC_TIMEOUT, critic.judge(&prompt)).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => {
+                tracing::info!(error = %e, "no critic for this plan");
+                return none;
+            }
+            Err(_) => {
+                tracing::info!("the critic took too long");
+                return none;
+            }
+        };
+        let whole = |message: String| Concern {
+            step: String::new(),
+            message: if message.is_empty() {
+                "the plan checker has doubts".to_owned()
+            } else {
+                message
+            },
+            fix: None,
+        };
+        match sanity::verdict(&reply) {
+            Some(Verdict::Reject(why)) => (true, vec![whole(why)]),
+            Some(Verdict::Ask(why)) => (false, vec![whole(why)]),
+            Some(Verdict::Ok) => none,
+            None => {
+                tracing::info!(%reply, "the critic gave no verdict");
+                none
+            }
+        }
     }
 
     /// A plan that passed every check: shown to the window, kept by its hash, and described to
     /// the model with what went wrong before with its steps.
-    fn checked(&self, compiled: Compiled, worst: f64) -> ToolOutcome {
+    fn checked(&self, compiled: Compiled, worst: f64, concerns: Vec<Concern>) -> ToolOutcome {
+        let noted: Vec<String> = concerns.iter().map(concern_line).collect();
         self.emit(Event::MissionPlanned {
             hash: compiled.sha256.clone(),
             intent: compiled.plan.intent.clone(),
             steps: compiled.steps.clone(),
             worst_case_s: worst,
+            concerns,
         });
         let mut out = json!({
             "hash": compiled.sha256,
@@ -538,6 +632,9 @@ impl Missions {
         if !history.is_empty() {
             out["history"] = json!(history);
         }
+        if !noted.is_empty() {
+            out["concerns"] = json!(noted);
+        }
         let mut planned = lock(&self.planned);
         // The same plan compiles to the same tree: keep one copy, or its hash reads as ambiguous.
         planned.retain(|c| c.sha256 != compiled.sha256);
@@ -548,7 +645,26 @@ impl Missions {
         ToolOutcome::ok(out)
     }
 
-    fn rejected(&self, problems: &Value) -> ToolOutcome {
+    fn rejected(&self, problems: &Value, by: By) -> ToolOutcome {
+        if by == By::Operator {
+            let lines: Vec<String> = problems
+                .as_array()
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter_map(|p| {
+                    let message = p["message"].as_str()?;
+                    Some(match p["step"].as_str().filter(|s| !s.is_empty()) {
+                        Some(step) => format!("{step}: {message}"),
+                        None => message.to_owned(),
+                    })
+                })
+                .collect();
+            return ToolOutcome::failed(if lines.is_empty() {
+                "the edited plan failed its checks".to_owned()
+            } else {
+                lines.join("; ")
+            });
+        }
         let n = self.plan_failures.fetch_add(1, Ordering::SeqCst) + 1;
         let count = problems.as_array().map_or(1, Vec::len);
         if n == MAX_PLAN_ATTEMPTS {
@@ -686,7 +802,9 @@ impl Missions {
         intent: &str,
         steps: &Value,
     ) -> Result<(String, usize, f64), ToolOutcome> {
-        let out = self.plan(json!({"intent": intent, "steps": steps})).await;
+        let out = self
+            .plan(json!({"intent": intent, "steps": steps}), By::Model)
+            .await;
         if out.status != Status::Succeeded {
             return Err(out);
         }
@@ -1052,25 +1170,12 @@ impl Tool for RunMission {
                 args: None,
             }));
         }
-        let out = self.0.plan(args.clone()).await;
-        if out.status != Status::Succeeded {
-            return Some(Err(out));
-        }
-        let steps = out.data["steps"].as_array().map_or(0, Vec::len);
-        let minutes = (out.data["worst_case_s"].as_f64().unwrap_or(0.0) / 60.0).ceil();
-        if let Some(hash) = out.data["hash"].as_str().map(str::to_owned) {
-            let missions = Arc::clone(&self.0);
-            tokio::spawn(async move { missions.preview(&hash).await });
-        }
-        Some(Ok(Assessment {
-            risk: Risk::Manipulation,
-            resources: Vec::new(),
-            reason: format!(
-                "runs \"{}\": {steps} step(s), at most {minutes} min",
-                args["intent"].as_str().unwrap_or("the plan")
-            ),
-            args: Some(json!({"hash": out.data["hash"]})),
-        }))
+        Some(self.approvable(args.clone(), By::Model).await)
+    }
+
+    /// The operator's edit of a plan waiting for approval, checked as the model's would be.
+    async fn edit(&self, edited: Value) -> Option<Result<Assessment, ToolOutcome>> {
+        Some(self.approvable(edited, By::Operator).await)
     }
 
     /// The skill list loads when the session starts; a first message sent at once would see none.
@@ -1081,9 +1186,64 @@ impl Tool for RunMission {
     async fn call(&self, args: Value) -> ToolOutcome {
         // Steps reach here only to be checked: a run's were replaced by their hash.
         if args.get("steps").is_some() || args.get("template").is_some() {
-            return self.0.plan(args).await;
+            return self.0.plan(args, By::Model).await;
         }
         self.0.run(&args).await
+    }
+}
+
+impl RunMission {
+    /// A plan checked and ready for the operator: run by its hash once approved, with its
+    /// preview on the way.
+    async fn approvable(&self, args: Value, by: By) -> Result<Assessment, ToolOutcome> {
+        let out = self.0.plan(args, by).await;
+        if out.status != Status::Succeeded {
+            return Err(out);
+        }
+        let hash = out.data["hash"].as_str().unwrap_or_default().to_owned();
+        let steps = out.data["steps"].as_array().map_or(0, Vec::len);
+        let minutes = (out.data["worst_case_s"].as_f64().unwrap_or(0.0) / 60.0).ceil();
+        let intent = self
+            .0
+            .find(&hash)
+            .map_or_else(|_| "the plan".to_owned(), |c| c.plan.intent);
+        let mut reason = format!("runs \"{intent}\": {steps} step(s), at most {minutes} min");
+        if let Some(concerns) = out.data["concerns"].as_array() {
+            for c in concerns.iter().filter_map(Value::as_str) {
+                let _ = write!(reason, "; check: {c}");
+            }
+        }
+        let missions = Arc::clone(&self.0);
+        let previewed = hash.clone();
+        tokio::spawn(async move { missions.preview(&previewed).await });
+        Ok(Assessment {
+            risk: Risk::Manipulation,
+            resources: Vec::new(),
+            reason,
+            args: Some(json!({"hash": hash})),
+        })
+    }
+}
+
+/// A concern as one line, its step first.
+fn concern_line(c: &Concern) -> String {
+    if c.step.is_empty() {
+        c.message.clone()
+    } else {
+        format!("{}: {}", c.step, c.message)
+    }
+}
+
+/// The model's plan back to it once, for words it may not match; not a failed attempt.
+fn questioned(concerns: &[Concern]) -> ToolOutcome {
+    let lines: Vec<String> = concerns.iter().map(concern_line).collect();
+    ToolOutcome {
+        status: Status::Failed,
+        data: json!({"ok": false, "concerns": lines}),
+        message: "the plan may not do what the operator asked; fix it, or if it is right, send it \
+                  again unchanged and the operator sees these concerns when approving"
+            .to_owned(),
+        images: Vec::new(),
     }
 }
 
@@ -1198,7 +1358,7 @@ mod tests {
         });
         eventually(|| missions.request().contains("mug")).await;
 
-        let hash = missions.plan(steps()).await.data["hash"]
+        let hash = missions.plan(steps(), By::Model).await.data["hash"]
             .as_str()
             .unwrap()
             .to_owned();
@@ -1237,7 +1397,9 @@ mod tests {
             .call(json!({"action": "save", "name": "mug run", "hash": hash}))
             .await;
         assert_eq!(saved.status, Status::Succeeded, "{}", saved.message);
-        let again = missions.plan(json!({"template": "mug run"})).await;
+        let again = missions
+            .plan(json!({"template": "mug run"}), By::Model)
+            .await;
         assert_eq!(again.status, Status::Succeeded, "{}", again.message);
         assert_eq!(
             again.data["hash"],
@@ -1271,7 +1433,7 @@ mod tests {
         let (events, mut rx) = tokio::sync::broadcast::channel(64);
         missions.attach(SessionHandle::for_tests(&tx, events));
 
-        let planned = missions.plan(steps()).await;
+        let planned = missions.plan(steps(), By::Model).await;
         assert_eq!(planned.status, Status::Succeeded, "{}", planned.message);
         let hash = planned.data["hash"].as_str().unwrap().to_owned();
         let started = missions.run(&json!({"hash": &hash[..10]})).await;
@@ -1328,7 +1490,7 @@ mod tests {
         let robot: Arc<dyn RobotPort> = Arc::new(robot);
         let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
 
-        let out = missions.plan(steps()).await;
+        let out = missions.plan(steps(), By::Model).await;
 
         assert_eq!(out.status, Status::Refused, "{}", out.message);
         assert!(
@@ -1366,7 +1528,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), beating)
             .await
             .expect("no heartbeat was published");
-        let hash = missions.plan(steps()).await.data["hash"]
+        let hash = missions.plan(steps(), By::Model).await.data["hash"]
             .as_str()
             .unwrap()
             .to_owned();
@@ -1393,7 +1555,7 @@ mod tests {
         });
         let robot: Arc<dyn RobotPort> = Arc::new(robot);
         let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
-        let hash = missions.plan(steps()).await.data["hash"]
+        let hash = missions.plan(steps(), By::Model).await.data["hash"]
             .as_str()
             .unwrap()
             .to_owned();
@@ -1408,7 +1570,7 @@ mod tests {
         let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
         let plan = json!({"steps": [{"skill": "GoToPlace", "why": "go to the dock",
                                      "args": [{"name": "place", "value": "dock"}]}]});
-        let out = missions.plan(plan).await;
+        let out = missions.plan(plan, By::Model).await;
         assert_eq!(out.status, Status::Succeeded, "{}", out.message);
         let compiled = missions.find(out.data["hash"].as_str().unwrap()).unwrap();
         assert_eq!(compiled.plan.intent, "go to the dock");
@@ -1420,11 +1582,14 @@ mod tests {
         let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
         let bad = json!({"intent": "x", "steps": [{"skill": "PickObject", "args": {"object_id": "O99"}}]});
         for n in 1..=MAX_PLAN_ATTEMPTS {
-            let out = missions.plan(bad.clone()).await;
+            let out = missions.plan(bad.clone(), By::Model).await;
             assert_eq!(out.status, Status::Failed);
             assert!(out.message.contains(&format!("attempt {n} of")));
         }
-        assert_eq!(missions.plan(steps()).await.status, Status::Refused);
+        assert_eq!(
+            missions.plan(steps(), By::Model).await.status,
+            Status::Refused
+        );
     }
 
     #[tokio::test]
@@ -1441,7 +1606,7 @@ mod tests {
         let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
         let (events, _rx) = tokio::sync::broadcast::channel(64);
         missions.attach(SessionHandle::for_tests(&tx, events));
-        let hash = missions.plan(steps()).await.data["hash"]
+        let hash = missions.plan(steps(), By::Model).await.data["hash"]
             .as_str()
             .unwrap()
             .to_owned();
@@ -1461,7 +1626,10 @@ mod tests {
             "{text}"
         );
         missions.run_failures.store(2, Ordering::SeqCst);
-        assert_eq!(missions.plan(steps()).await.status, Status::Refused);
+        assert_eq!(
+            missions.plan(steps(), By::Model).await.status,
+            Status::Refused
+        );
     }
 
     #[tokio::test]
@@ -1492,12 +1660,108 @@ mod tests {
         assert!(tool.assess(&json!({"hash": hash})).await.is_none());
     }
 
+    /// Says the same about every plan.
+    struct Says(&'static str);
+
+    #[async_trait]
+    impl Critic for Says {
+        async fn judge(&self, _prompt: &str) -> Result<String, String> {
+            Ok(self.0.to_owned())
+        }
+    }
+
+    fn missions_asked(request: &str) -> Arc<Missions> {
+        let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+        *lock(&missions.request) = request.to_owned();
+        missions
+    }
+
+    #[tokio::test]
+    async fn a_plan_against_the_words_goes_back_once_and_then_shows_its_concern() {
+        let missions = missions_asked("Pick up the blue cup with your right hand");
+        let [tool] = missions.tools();
+        let back = tool.assess(&steps()).await.unwrap().unwrap_err();
+        assert_eq!(back.status, Status::Failed);
+        assert!(
+            back.data["concerns"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("s2: the operator said the right hand"),
+            "{}",
+            back.data
+        );
+        assert_eq!(
+            missions.plan_failures.load(Ordering::SeqCst),
+            0,
+            "not one of the model's attempts"
+        );
+        let sent_again = tool.assess(&steps()).await.unwrap().unwrap();
+        assert!(
+            sent_again
+                .reason
+                .contains("; check: s2: the operator said the right hand"),
+            "{}",
+            sent_again.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn the_critic_sends_a_wrong_plan_back_and_flags_a_doubtful_one() {
+        let rejecting = missions_asked("bring me the mug").with_critic(Arc::new(Says(
+            r#"{"verdict": "reject", "reason": "it picks up the cup, not the mug"}"#,
+        )));
+        let [tool] = rejecting.tools();
+        let back = tool.assess(&steps()).await.unwrap().unwrap_err();
+        assert_eq!(back.data["concerns"][0], "it picks up the cup, not the mug");
+        assert!(tool.assess(&steps()).await.unwrap().is_ok());
+
+        let doubtful = missions_asked("bring me the mug").with_critic(Arc::new(Says(
+            r#"{"verdict": "ask", "reason": "which mug?"}"#,
+        )));
+        let [tool] = doubtful.tools();
+        let shown = tool.assess(&steps()).await.unwrap().unwrap();
+        assert!(
+            shown.reason.ends_with("; check: which mug?"),
+            "{}",
+            shown.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn the_operator_edits_a_plan_without_spending_the_models_attempts() {
+        let missions = missions_asked("Pick up the blue cup with your right hand")
+            .with_critic(Arc::new(Says(r#"{"verdict": "reject", "reason": "no"}"#)));
+        let [tool] = missions.tools();
+        let bad = json!({"intent": "x", "steps": [{"skill": "PickObject", "args": {"object_id": "O99"}}]});
+        let problems = tool.edit(bad).await.unwrap().unwrap_err();
+        assert!(problems.message.starts_with("s1"), "{}", problems.message);
+        assert_eq!(missions.plan_failures.load(Ordering::SeqCst), 0);
+
+        // Its own concern is shown, not sent back; the critic is not asked.
+        let kept_left = tool.edit(steps()).await.unwrap().unwrap();
+        assert!(
+            kept_left.reason.contains("right hand"),
+            "{}",
+            kept_left.reason
+        );
+        assert!(
+            !kept_left.reason.contains("check: no"),
+            "{}",
+            kept_left.reason
+        );
+        let mut shorter = steps();
+        shorter["steps"].as_array_mut().unwrap().remove(0);
+        let edited = tool.edit(shorter).await.unwrap().unwrap();
+        assert_ne!(edited.args, kept_left.args, "an edit is a new plan");
+    }
+
     #[tokio::test]
     async fn the_same_plan_twice_runs_by_its_hash() {
         let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
         let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
-        let first = missions.plan(steps()).await.data["hash"].clone();
-        let second = missions.plan(steps()).await.data["hash"].clone();
+        let first = missions.plan(steps(), By::Model).await.data["hash"].clone();
+        let second = missions.plan(steps(), By::Model).await.data["hash"].clone();
         assert_eq!(first, second);
         assert!(missions.find(first.as_str().unwrap()).is_ok());
     }
@@ -1511,7 +1775,7 @@ mod tests {
         let robot: Arc<dyn RobotPort> =
             Arc::new(robot(ScriptedRun::default()).with_topic("/x/state", state));
         let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
-        let out = missions.plan(steps()).await;
+        let out = missions.plan(steps(), By::Model).await;
         assert_eq!(out.status, Status::Failed);
         let problems = out.data["problems"].to_string();
         assert!(

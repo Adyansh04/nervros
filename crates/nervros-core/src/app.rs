@@ -284,6 +284,26 @@ pub fn start(
     start_with(profile_path, robot, ledger, SessionFiles::default())
 }
 
+/// Missions, when the profile has a `[mission]` section: kept in the robot's ledger, and
+/// checked by `critic` too when a model has the `plan_check` role.
+fn missions(
+    profile: &Profile,
+    places: Arc<crate::places::Places>,
+    robot: &Arc<dyn RobotPort>,
+    ledger: &Path,
+    critic: Option<Arc<dyn crate::mission::sanity::Critic>>,
+) -> Option<Arc<Missions>> {
+    let m = Missions::new(profile, places, Arc::clone(robot))?;
+    let m = match mission_ledger(profile, ledger) {
+        Some(l) => m.with_ledger(l),
+        None => m,
+    };
+    Some(match critic {
+        Some(c) => m.with_critic(c),
+        None => m,
+    })
+}
+
 /// Starts an agent whose conversation is saved to, or resumed from, `files`. Must run inside a
 /// tokio runtime.
 ///
@@ -302,8 +322,10 @@ pub fn start_with(
         PrivacyModeConfig::Sim => PrivacyMode::Sim,
         PrivacyModeConfig::Home => PrivacyMode::Home,
     };
+    let checks_plans = !models.roles.plan_check.is_empty();
     let router = Router::with_ledger_file(models, ledger, privacy).map_err(StartError::Ledger)?;
     let llm = Arc::new(Llm::new(router));
+    let critic = checks_plans.then(|| Arc::clone(&llm) as Arc<dyn crate::mission::sanity::Critic>);
     let guard = Arc::new(Guard::new(profile.policy.clone()));
     let schemas: Arc<dyn SchemaSource> = Arc::new(RosidlSchemas::load(&profile)?);
     let mut registry = Registry::from_config(&profile.tools, &robot, &schemas, &guard)?;
@@ -327,13 +349,7 @@ pub fn start_with(
     ))))?;
     let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
     registry.add(Arc::clone(&stop))?;
-    let missions =
-        Missions::new(&profile, places, Arc::clone(&robot)).map(|m| {
-            match mission_ledger(&profile, ledger) {
-                Some(l) => m.with_ledger(l),
-                None => m,
-            }
-        });
+    let missions = missions(&profile, places, &robot, ledger, critic);
     let schedules = missions
         .as_ref()
         .map(|m| crate::schedule::Schedules::new(Arc::clone(m), Arc::clone(&guard)));

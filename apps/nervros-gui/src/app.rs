@@ -376,7 +376,12 @@ impl Gui {
     fn act(&mut self, ctx: &egui::Context, actions: Vec<Action>) {
         for a in actions {
             match a {
-                Action::Send(c) => self.agent.session.send(c),
+                Action::Send(c) => {
+                    if let Command::Edit { id, .. } = &c {
+                        self.chat.edit_sent(*id);
+                    }
+                    self.agent.session.send(c);
+                }
                 Action::Say(text) => self.say(text),
                 Action::Prefill(text) => {
                     self.input = text;
@@ -968,6 +973,7 @@ impl Gui {
             (Role::VisionCheck, "Vision check"),
             (Role::Summarise, "Summarise"),
             (Role::Segment, "Segment"),
+            (Role::PlanCheck, "Plan check"),
         ] {
             ui.label(RichText::new(name).strong());
             let (take, skipped) = router.candidates(role, Need::default(), now);

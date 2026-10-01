@@ -369,8 +369,7 @@ mod tests {
                     value: "small white mug".to_owned(),
                 },
             ],
-            timeout_s: 0.0,
-            track: None,
+            ..PlannedStep::default()
         };
         assert_eq!(
             last_seen(&step, &seen, 1000.0).as_deref(),

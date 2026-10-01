@@ -263,6 +263,7 @@ async fn models(path: &Path, check: bool) -> Result<()> {
         ("vision_check", Role::VisionCheck),
         ("summarise", Role::Summarise),
         ("segment", Role::Segment),
+        ("plan_check", Role::PlanCheck),
     ] {
         println!("{name}: {}", config.roles.chain(role).join(" > "));
     }

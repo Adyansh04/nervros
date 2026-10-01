@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use crate::guard::{Decision, Guard};
 use crate::llm::{self, AgentSource, History, LoopTool};
 use crate::mission::plan::PlannedStep;
+use crate::mission::sanity::Concern;
 use crate::providers::Role;
 use crate::providers::router::Need;
 use crate::tools::{Lane, Registry, Resource, Status, Tool, ToolOutcome};
@@ -37,6 +38,14 @@ pub enum Command {
     Approve(u64),
     /// Refuse a pending request.
     Deny(u64),
+    /// Check changed arguments for a pending request, such as an edited plan; it then waits on
+    /// those, or keeps the old ones when they fail their checks.
+    Edit {
+        /// The request.
+        id: u64,
+        /// What to check instead.
+        args: Value,
+    },
     /// Enable act-lane tools.
     Arm,
     /// Disable act-lane tools.
@@ -164,7 +173,7 @@ pub enum Event {
     },
     /// The operator must approve a call.
     ApprovalRequested {
-        /// Answer with `Approve(id)` or `Deny(id)`.
+        /// Answer with `Approve(id)`, `Deny(id)` or `Edit`.
         id: u64,
         /// The tool.
         tool: String,
@@ -172,6 +181,22 @@ pub enum Event {
         args: Value,
         /// Why approval is needed.
         reason: String,
+    },
+    /// An edit to a pending approval passed its checks: it waits on these arguments now.
+    ApprovalEdited {
+        /// The request.
+        id: u64,
+        /// What it runs with if approved.
+        args: Value,
+        /// What it does now.
+        reason: String,
+    },
+    /// An edit to a pending approval failed its checks; it still waits on what it had.
+    EditRejected {
+        /// The request.
+        id: u64,
+        /// What is wrong with the edit.
+        message: String,
     },
     /// An approval was answered or expired.
     ApprovalResolved {
@@ -217,6 +242,9 @@ pub enum Event {
         steps: Vec<PlannedStep>,
         /// The longest it can take.
         worst_case_s: f64,
+        /// Ways it may not do what the operator asked.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        concerns: Vec<Concern>,
     },
     /// Where a checked plan would take the robot, for the viewer; follows its `MissionPlanned`.
     MissionPreview {
@@ -312,9 +340,24 @@ impl Default for SessionConfig {
     }
 }
 
+/// The operator's answer to an approval.
+#[derive(Debug)]
+enum Answer {
+    Approve,
+    Deny,
+    /// Check these arguments instead, and wait again.
+    Edit(Value),
+}
+
+/// What an approval settled: the arguments to run with and what they occupy.
+struct Approved {
+    args: Value,
+    resources: Vec<Resource>,
+}
+
 struct Shared {
     events: broadcast::Sender<Event>,
-    approvals: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
+    approvals: Mutex<HashMap<u64, oneshot::Sender<Answer>>>,
     calls: AtomicU64,
     next_approval: AtomicU64,
     /// Milliseconds this turn spent waiting for the operator.
@@ -333,31 +376,91 @@ impl Shared {
         let _ = self.events.send(e);
     }
 
-    async fn ask_approval(&self, tool: &str, args: &Value, reason: String) -> bool {
+    /// Asks the operator, who may approve, deny or edit; an edit that passes its checks replaces
+    /// what is asked and the wait starts again. `None` when denied or expired.
+    async fn ask_approval(
+        &self,
+        tool: &Arc<dyn Tool>,
+        name: &str,
+        reason: String,
+        mut approved: Approved,
+    ) -> Option<Approved> {
         let id = self.next_approval.fetch_add(1, Ordering::Relaxed) + 1;
-        let (tx, rx) = oneshot::channel();
-        lock(&self.approvals).insert(id, tx);
+        let mut rx = self.listen(id);
         self.emit(Event::ApprovalRequested {
             id,
-            tool: tool.to_owned(),
-            args: args.clone(),
+            tool: name.to_owned(),
+            args: approved.args.clone(),
             reason,
         });
         let asked = Instant::now();
-        let approved = matches!(
-            tokio::time::timeout(self.config.approval_ttl, rx).await,
-            Ok(Ok(true))
-        );
+        let mut early = None;
+        let yes = loop {
+            let answer = match early.take() {
+                Some(answer) => Ok(Ok(answer)),
+                None => tokio::time::timeout(self.config.approval_ttl, &mut rx).await,
+            };
+            match answer {
+                Ok(Ok(Answer::Approve)) => break true,
+                Ok(Ok(Answer::Edit(edited))) => {
+                    // Waiting again before the check, so a stop during it still lands.
+                    rx = self.listen(id);
+                    let passed = match tool.edit(edited).await {
+                        Some(Ok(a)) => {
+                            if let Some(args) = a.args {
+                                approved.args = args;
+                            }
+                            approved.resources = a.resources;
+                            self.emit(Event::ApprovalEdited {
+                                id,
+                                args: approved.args.clone(),
+                                reason: a.reason,
+                            });
+                            true
+                        }
+                        Some(Err(out)) => {
+                            self.emit(Event::EditRejected {
+                                id,
+                                message: out.message,
+                            });
+                            false
+                        }
+                        None => {
+                            self.emit(Event::EditRejected {
+                                id,
+                                message: format!("{name} cannot be edited"),
+                            });
+                            false
+                        }
+                    };
+                    // An approval sent during the check was for the plan before it, so it does
+                    // not approve an edit nobody has seen; a denial or a newer edit stands.
+                    match rx.try_recv() {
+                        Ok(Answer::Approve) if passed => rx = self.listen(id),
+                        Ok(answer) => early = Some(answer),
+                        Err(_) => {}
+                    }
+                }
+                Ok(Ok(Answer::Deny) | Err(_)) | Err(_) => break false,
+            }
+        };
         let waited = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.waited_ms.fetch_add(waited, Ordering::Relaxed);
         lock(&self.approvals).remove(&id);
-        self.emit(Event::ApprovalResolved { id, approved });
-        approved
+        self.emit(Event::ApprovalResolved { id, approved: yes });
+        yes.then_some(approved)
     }
 
-    fn resolve(&self, id: u64, approved: bool) {
+    /// A fresh channel for the next answer to approval `id`.
+    fn listen(&self, id: u64) -> oneshot::Receiver<Answer> {
+        let (tx, rx) = oneshot::channel();
+        lock(&self.approvals).insert(id, tx);
+        rx
+    }
+
+    fn answer(&self, id: u64, answer: Answer) {
         if let Some(tx) = lock(&self.approvals).remove(&id) {
-            let _ = tx.send(approved);
+            let _ = tx.send(answer);
         }
     }
 
@@ -414,10 +517,13 @@ impl Shared {
                 Decision::Deny(r) => ToolOutcome::refused(r.message),
                 Decision::NeedApproval { reason } => {
                     let reason = assessment.map_or(reason, |a| a.reason);
-                    if self.ask_approval(&spec.name, &args, reason).await {
-                        self.run(tool, args, &spec.resources).await
-                    } else {
-                        ToolOutcome::refused("the operator did not approve this")
+                    let asked = Approved {
+                        args,
+                        resources: spec.resources.clone(),
+                    };
+                    match self.ask_approval(tool, &spec.name, reason, asked).await {
+                        Some(a) => self.run(tool, a.args, &a.resources).await,
+                        None => ToolOutcome::refused("the operator did not approve this"),
                     }
                 }
                 Decision::Allow => self.run(tool, args, &spec.resources).await,
@@ -656,8 +762,9 @@ async fn actor(
                         shared.emit(Event::Restored { exchanges: earlier.exchanges() });
                         history = earlier;
                     }
-                    Command::Approve(id) => shared.resolve(id, true),
-                    Command::Deny(id) => shared.resolve(id, false),
+                    Command::Approve(id) => shared.answer(id, Answer::Approve),
+                    Command::Deny(id) => shared.answer(id, Answer::Deny),
+                    Command::Edit { id, args } => shared.answer(id, Answer::Edit(args)),
                     Command::Arm | Command::Disarm => {
                         let armed = cmd == Command::Arm;
                         shared.guard.set_armed(armed);
@@ -765,7 +872,7 @@ fn report_context(
 fn halt(shared: &Arc<Shared>, stop: Option<&Arc<dyn Tool>>) {
     let pending: Vec<u64> = lock(&shared.approvals).keys().copied().collect();
     for id in pending {
-        shared.resolve(id, false);
+        shared.answer(id, Answer::Deny);
     }
     if let Some(stop) = stop.cloned() {
         let shared = Arc::clone(shared);
@@ -1038,7 +1145,7 @@ mod tests {
     use super::*;
     use crate::guard::Policy;
     use crate::llm::{AgentBuilder, LlmError};
-    use crate::tools::{Risk, ToolSpec};
+    use crate::tools::{Assessment, Risk, ToolSpec};
     use async_trait::async_trait;
     use rig::test_utils::{MockCompletionModel, MockTurn};
     use std::borrow::Cow;
@@ -1582,5 +1689,140 @@ mod tests {
             }
         });
         assert!(halted.await.is_ok() || events.iter().any(|e| matches!(e, Event::Halted { .. })));
+    }
+
+    /// Checks an edit as `run_mission` checks an edited plan: `{"ok": true}` passes as a new hash.
+    struct Editable(ToolSpec);
+
+    #[async_trait]
+    impl Tool for Editable {
+        fn spec(&self) -> Cow<'_, ToolSpec> {
+            Cow::Borrowed(&self.0)
+        }
+        async fn edit(&self, edited: Value) -> Option<Result<Assessment, ToolOutcome>> {
+            if edited["slow"] == true {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Some(if edited["ok"] == true {
+                Ok(Assessment {
+                    risk: Risk::Motion,
+                    resources: Vec::new(),
+                    reason: "runs the edited plan".into(),
+                    args: Some(json!({"hash": "edited"})),
+                })
+            } else {
+                Err(ToolOutcome::failed("s1: no such place"))
+            })
+        }
+        async fn call(&self, args: Value) -> ToolOutcome {
+            ToolOutcome::ok(json!({"ran": args}))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_fails_its_checks_keeps_the_request_and_one_that_passes_replaces_it() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "run_mission", json!({"hash": "planned"})),
+            MockTurn::text("Done."),
+        ]);
+        let guard = Arc::new(Guard::new(Policy::default()));
+        guard.set_armed(true);
+        let mut r = Registry::default();
+        let spec = ToolSpec::new(
+            "run_mission",
+            "Runs.",
+            json!({"type": "object"}),
+            Risk::Motion,
+        );
+        r.add(Arc::new(Editable(spec))).unwrap();
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            Arc::new(r),
+            guard,
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("go".into()));
+        let operator = |e: &Event| match e {
+            Event::ApprovalRequested { id, .. } => Some(Command::Edit {
+                id: *id,
+                args: json!({"ok": false}),
+            }),
+            Event::EditRejected { id, .. } => Some(Command::Edit {
+                id: *id,
+                args: json!({"ok": true}),
+            }),
+            Event::ApprovalEdited { id, .. } => Some(Command::Approve(*id)),
+            _ => None,
+        };
+        let events = collect_until_finished(&mut rx, operator, &session).await;
+        assert!(
+            events.iter().any(|e| matches!(e, Event::EditRejected { message, .. } if message == "s1: no such place")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, Event::ApprovalEdited { args, .. } if args["hash"] == "edited")
+            ),
+            "{events:?}"
+        );
+        let resolved: Vec<bool> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ApprovalResolved { approved, .. } => Some(*approved),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved, [true], "one request, answered once");
+        let ran = format!("{:?}", model.requests()[1].chat_history);
+        assert!(ran.contains("edited"), "it ran with the edit: {ran}");
+    }
+
+    #[tokio::test]
+    async fn an_approval_sent_while_an_edit_is_checked_does_not_approve_the_edit() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "run_mission", json!({"hash": "planned"})),
+            MockTurn::text("Not run."),
+        ]);
+        let guard = Arc::new(Guard::new(Policy::default()));
+        guard.set_armed(true);
+        let mut r = Registry::default();
+        let spec = ToolSpec::new(
+            "run_mission",
+            "Runs.",
+            json!({"type": "object"}),
+            Risk::Motion,
+        );
+        r.add(Arc::new(Editable(spec))).unwrap();
+        let session = Session::start(
+            Arc::new(Scripted(model)),
+            Arc::new(r),
+            guard,
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("go".into()));
+        let mut resolved = Vec::new();
+        loop {
+            let e = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match e {
+                Event::ApprovalRequested { id, .. } => {
+                    let args = json!({"ok": true, "slow": true});
+                    session.send(Command::Edit { id, args });
+                    session.send(Command::Approve(id));
+                }
+                // Not approved after the edit: nothing may run.
+                Event::ApprovalEdited { id, .. } => session.send(Command::Deny(id)),
+                Event::ApprovalResolved { approved, .. } => resolved.push(approved),
+                Event::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(resolved, [false]);
     }
 }

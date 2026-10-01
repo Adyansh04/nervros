@@ -10,10 +10,13 @@ use std::fmt::Write as _;
 
 use nervros_core::mission::plan::PlannedStep;
 use nervros_core::mission::preview::PreviewStep;
+use nervros_core::mission::sanity::Concern;
 use nervros_core::session::{Command, Event};
 use rerun::external::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _, icons};
 use serde_json::Value;
+
+use crate::plan_edit::{self, EditStep};
 
 /// Text never runs wider than this, for readable line lengths.
 const MAX_TEXT_WIDTH: f32 = 720.0;
@@ -55,6 +58,10 @@ pub struct Approval {
     reason: String,
     asked: Instant,
     answer: Option<bool>,
+    /// An edit is being checked.
+    checking: bool,
+    /// Why the last edit failed its checks.
+    problem: Option<String>,
 }
 
 impl Approval {
@@ -118,6 +125,10 @@ pub struct PlanCard {
     finished: Option<(String, String, String, f64)>,
     /// Where each step would take the robot, once the executor has said.
     preview: Vec<PreviewStep>,
+    /// Ways it may not do what the operator asked.
+    concerns: Vec<Concern>,
+    /// An edit replaced it before it ran.
+    replaced: bool,
 }
 
 /// The conversation.
@@ -192,6 +203,8 @@ impl Chat {
             Event::ToolStarted { .. }
             | Event::ToolFinished { .. }
             | Event::ApprovalRequested { .. }
+            | Event::ApprovalEdited { .. }
+            | Event::EditRejected { .. }
             | Event::ApprovalResolved { .. } => self.apply_tool(event),
             Event::MissionPlanned { .. }
             | Event::MissionPreview { .. }
@@ -254,7 +267,17 @@ impl Chat {
                 reason: reason.clone(),
                 asked: Instant::now(),
                 answer: None,
+                checking: false,
+                problem: None,
             })),
+            Event::ApprovalEdited { id, args, reason } => self.edited(*id, args, reason),
+            Event::EditRejected { id, message } => {
+                if let Some(a) = self.approval_mut(*id) {
+                    a.checking = false;
+                    a.problem = Some(message.clone());
+                    a.asked = Instant::now();
+                }
+            }
             Event::ApprovalResolved { id, approved } => {
                 for item in &mut self.items {
                     if let Item::Approval(a) = item
@@ -265,6 +288,46 @@ impl Chat {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn approval_mut(&mut self, id: u64) -> Option<&mut Approval> {
+        self.items.iter_mut().rev().find_map(|i| match i {
+            Item::Approval(a) if a.id == id => Some(a),
+            _ => None,
+        })
+    }
+
+    /// An edit passed: the approval now asks about the edited plan, so it moves below that
+    /// plan's card, and the plan it replaced says so.
+    fn edited(&mut self, id: u64, args: &Value, reason: &str) {
+        let Some(at) = self
+            .items
+            .iter()
+            .position(|i| matches!(i, Item::Approval(a) if a.id == id))
+        else {
+            return;
+        };
+        let Item::Approval(mut a) = self.items.remove(at) else {
+            return;
+        };
+        let before = a.args["hash"].as_str().unwrap_or_default().to_owned();
+        if let Some(p) = self.plan_mut(|p| !before.is_empty() && p.hash.starts_with(&before)) {
+            p.replaced = true;
+        }
+        a.args = args.clone();
+        reason.clone_into(&mut a.reason);
+        a.asked = Instant::now();
+        a.checking = false;
+        a.problem = None;
+        self.items.push(Item::Approval(a));
+    }
+
+    /// The operator sent an edit of approval `id` to be checked.
+    pub fn edit_sent(&mut self, id: u64) {
+        if let Some(a) = self.approval_mut(id) {
+            a.checking = true;
+            a.problem = None;
         }
     }
 
@@ -318,6 +381,7 @@ impl Chat {
                 intent,
                 steps,
                 worst_case_s,
+                concerns,
             } => self.items.push(Item::Plan(PlanCard {
                 hash: hash.clone(),
                 intent: intent.clone(),
@@ -328,6 +392,8 @@ impl Chat {
                 progress: HashMap::new(),
                 finished: None,
                 preview: Vec::new(),
+                concerns: concerns.clone(),
+                replaced: false,
             })),
             Event::MissionPreview { hash, steps } => {
                 if let Some(p) = self.plan_mut(|p| p.hash == *hash) {
@@ -630,6 +696,12 @@ fn approval_card(
     } else {
         t.widget_noninteractive_bg_stroke
     };
+    // An edit in progress lives in egui's memory under the plan it started from: once an edit
+    // passes, the approval asks about a new plan and the editor closes by itself.
+    let key = plan.map(|p| egui::Id::new(("plan_edit", a.id, p.hash.as_str())));
+    let mut editing: Option<Vec<EditStep>> = key
+        .filter(|_| a.answer.is_none())
+        .and_then(|k| ui.data(|d| d.get_temp(k)));
     card(ui, stroke).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.small_icon(&icons::WARNING, Some(t.warn_fg_color));
@@ -639,24 +711,40 @@ fn approval_card(
             };
             ui.label(RichText::new(title).strong());
         });
-        if let Some(p) = plan {
-            // The plan's card above lists the steps and follows them; this only asks.
-            let short = p.hash.get(..8).unwrap_or(&p.hash);
-            let steps = match p.steps.len() {
-                1 => "1 step".to_owned(),
-                n => format!("{n} steps"),
-            };
-            ui.label(
-                RichText::new(format!(
-                    "plan {short} · {steps} · at most {}",
-                    minutes(p.worst_case_s)
-                ))
-                .small()
-                .color(t.text_subdued),
-            );
-        } else {
-            ui.label(&a.reason);
-            code(ui, &pretty(&a.args));
+        match (plan, editing.as_mut(), key) {
+            (Some(_), Some(steps), Some(key)) => {
+                ui.label(
+                    RichText::new(
+                        "Change the steps; the plan is checked again before you approve it",
+                    )
+                    .small()
+                    .color(t.text_subdued),
+                );
+                plan_edit::editor(ui, key, steps);
+            }
+            (Some(p), ..) => {
+                // The plan's card above lists the steps and follows them; this only asks.
+                let short = p.hash.get(..8).unwrap_or(&p.hash);
+                let steps = match p.steps.len() {
+                    1 => "1 step".to_owned(),
+                    n => format!("{n} steps"),
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "plan {short} · {steps} · at most {}",
+                        minutes(p.worst_case_s)
+                    ))
+                    .small()
+                    .color(t.text_subdued),
+                );
+            }
+            (None, ..) => {
+                ui.label(&a.reason);
+                code(ui, &pretty(&a.args));
+            }
+        }
+        if let Some(problem) = a.problem.as_deref().filter(|_| a.answer.is_none()) {
+            ui.add(egui::Label::new(RichText::new(problem).small().color(t.error_fg_color)).wrap());
         }
         ui.horizontal(|ui| match a.answer {
             Some(true) => {
@@ -666,20 +754,80 @@ fn approval_card(
                 ui.label(RichText::new("Denied").color(t.text_subdued));
             }
             None => {
-                let left = ttl.saturating_sub(a.asked.elapsed()).as_secs_f32().ceil();
-                ui.label(RichText::new(format!("{left} s left")).color(t.text_subdued));
+                if a.checking {
+                    ui.spinner();
+                    ui.label(RichText::new("Checking the edit…").color(t.text_subdued));
+                } else {
+                    let left = ttl.saturating_sub(a.asked.elapsed()).as_secs_f32().ceil();
+                    ui.label(RichText::new(format!("{left} s left")).color(t.text_subdued));
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(ReButton::new("Approve").primary()).clicked() {
-                        actions.push(Action::Send(Command::Approve(a.id)));
-                    }
-                    if ui.add(ReButton::new("Deny").secondary()).clicked() {
-                        actions.push(Action::Send(Command::Deny(a.id)));
-                    }
+                    approval_buttons(ui, a, plan, &mut editing, actions);
                 });
                 ui.ctx().request_repaint_after(Duration::from_secs(1));
             }
         });
     });
+    if let Some(key) = key {
+        ui.data_mut(|d| match editing {
+            Some(steps) => {
+                d.insert_temp(key, steps);
+            }
+            None => d.remove::<Vec<EditStep>>(key),
+        });
+    }
+}
+
+/// Approve, deny, edit or apply the suggested fixes; while editing, check or cancel. Nothing
+/// can be approved while an edit is checked: it would approve a plan about to change.
+fn approval_buttons(
+    ui: &mut egui::Ui,
+    a: &Approval,
+    plan: Option<&PlanCard>,
+    editing: &mut Option<Vec<EditStep>>,
+    actions: &mut Vec<Action>,
+) {
+    let idle = !a.checking;
+    let edit = |args| Action::Send(Command::Edit { id: a.id, args });
+    if let (Some(p), Some(steps)) = (plan, editing.as_ref()) {
+        if ui
+            .add_enabled(idle && !steps.is_empty(), ReButton::new("Check").primary())
+            .clicked()
+        {
+            actions.push(edit(plan_edit::plan_args(&p.intent, steps)));
+        }
+        if ui.add(ReButton::new("Cancel").secondary()).clicked() {
+            *editing = None;
+        }
+        return;
+    }
+    if ui
+        .add_enabled(idle, ReButton::new("Approve").primary())
+        .clicked()
+    {
+        actions.push(Action::Send(Command::Approve(a.id)));
+    }
+    if ui.add(ReButton::new("Deny").secondary()).clicked() {
+        actions.push(Action::Send(Command::Deny(a.id)));
+    }
+    let Some(p) = plan else { return };
+    if ui
+        .add_enabled(idle, ReButton::new("Edit").secondary())
+        .on_hover_text("Change, move or drop steps before approving")
+        .clicked()
+    {
+        *editing = Some(plan_edit::editable(&p.steps));
+    }
+    if let Some(fixed) = plan_edit::fixed(&p.steps, &p.concerns)
+        && ui
+            .add_enabled(idle, ReButton::new("Apply fixes").secondary())
+            .on_hover_text(
+                "Change the plan as its checks suggest; it is checked again before you approve it",
+            )
+            .clicked()
+    {
+        actions.push(edit(plan_edit::plan_args(&p.intent, &fixed)));
+    }
 }
 
 /// The plan's steps with each one's state, how it has gone before, and what the preview warns of.
@@ -726,10 +874,20 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
                 });
                 ui.end_row();
                 // Only a warning earns a line of its own; the rest is in the hover.
-                if let Some(warning) = preview_note.filter(|n| n.starts_with("no path")) {
+                let warnings = preview_note
+                    .filter(|n| n.starts_with("no path"))
+                    .into_iter()
+                    .chain(
+                        p.concerns
+                            .iter()
+                            .filter(|c| c.step == s.id)
+                            .map(|c| c.message.as_str()),
+                    );
+                for warning in warnings {
                     ui.label("");
                     ui.label("");
-                    ui.label(RichText::new(warning).small().color(t.warn_fg_color));
+                    let text = RichText::new(warning).small().color(t.warn_fg_color);
+                    ui.add(egui::Label::new(text).wrap());
                     ui.end_row();
                 }
             }
@@ -786,6 +944,15 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
             ui.label(RichText::new(format!("Plan · {}", p.intent)).strong());
         });
         steps_table(ui, p);
+        for c in p.concerns.iter().filter(|c| c.step.is_empty()) {
+            ui.horizontal(|ui| {
+                ui.small_icon(&icons::WARNING, Some(t.warn_fg_color));
+                ui.add(
+                    egui::Label::new(RichText::new(&c.message).small().color(t.warn_fg_color))
+                        .wrap(),
+                );
+            });
+        }
         ui.horizontal(|ui| {
             let state = match (&p.finished, p.started) {
                 (Some((outcome, .., secs)), _) if outcome == "success" => {
@@ -807,6 +974,9 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
                         minutes(since.elapsed().as_secs_f64())
                     ))
                     .color(t.info_text_color)
+                }
+                (None, None) if p.replaced => {
+                    RichText::new("Replaced by an edited plan").color(t.text_subdued)
                 }
                 (None, None) => RichText::new(format!(
                     "Checked · at most {} · waiting to run",
@@ -913,6 +1083,7 @@ pub fn compare<S>(
 pub(crate) mod tests {
     use super::*;
     use egui_kittest::{Harness, SnapshotOptions};
+    use nervros_core::mission::plan::StepArg;
 
     pub(crate) fn sample() -> Chat {
         let mut chat = Chat::default();
@@ -971,6 +1142,11 @@ pub(crate) mod tests {
 
     /// A harness drawing `chat` on the panel background, cropped to what it draws.
     fn render(chat: Chat, name: &str) {
+        render_with(chat, name, |_| {});
+    }
+
+    /// As [`render`], with `setup` run on the context first, such as to open an editor.
+    fn render_with(chat: Chat, name: &str, setup: impl FnOnce(&egui::Context)) {
         let mut harness = Harness::builder()
             .wgpu()
             .with_size(egui::vec2(440.0, 800.0))
@@ -983,9 +1159,132 @@ pub(crate) mod tests {
                     });
             });
         style_for_tests(&harness.ctx);
+        setup(&harness.ctx);
         harness.run();
         harness.fit_contents();
         compare(&mut harness, name, &SnapshotOptions::new());
+    }
+
+    /// A plan for "turn left, then walk half a metre" that turns right and walks a metre.
+    fn doubtful_plan() -> Chat {
+        let mut chat = Chat::default();
+        chat.apply(&Event::User {
+            turn: 1,
+            text: "Turn left 90 degrees, then walk forward half a metre".to_owned(),
+        });
+        let step = |id: &str, skill: &str, args: &[(&str, &str)]| {
+            let args: Vec<StepArg> = args
+                .iter()
+                .map(|(n, v)| StepArg {
+                    name: (*n).to_owned(),
+                    value: (*v).to_owned(),
+                })
+                .collect();
+            let shown: Vec<String> = args
+                .iter()
+                .map(|a| format!("{}={}", a.name, a.value))
+                .collect();
+            PlannedStep {
+                id: id.to_owned(),
+                skill: skill.to_owned(),
+                summary: format!("{skill}({})", shown.join(", ")),
+                args,
+                timeout_s: 30.0,
+                ..PlannedStep::default()
+            }
+        };
+        let concern = |step: &str, message: &str, fix: Option<(&str, &str)>| Concern {
+            step: step.to_owned(),
+            message: message.to_owned(),
+            fix: fix.map(|(name, value)| StepArg {
+                name: name.to_owned(),
+                value: value.to_owned(),
+            }),
+        };
+        chat.apply(&Event::MissionPlanned {
+            hash: "5be0c1d9f2a4".to_owned(),
+            intent: "turn left and walk half a metre".to_owned(),
+            steps: vec![
+                step("s1", "TurnInPlace", &[("degrees", "-90")]),
+                step(
+                    "s2",
+                    "WalkStraight",
+                    &[("direction", "forward"), ("distance_m", "1.0")],
+                ),
+            ],
+            worst_case_s: 60.0,
+            concerns: vec![
+                concern(
+                    "s1",
+                    "the operator said turn left, but degrees=-90 turns the other way \
+                     (positive degrees turn left)",
+                    Some(("degrees", "90")),
+                ),
+                concern(
+                    "s2",
+                    "the operator asked for 0.5 m, but the walks add up to 1 m",
+                    Some(("distance_m", "0.5")),
+                ),
+                concern("", "the walk may end close to the table", None),
+            ],
+        });
+        chat.apply(&Event::ApprovalRequested {
+            id: 9,
+            tool: "run_mission".to_owned(),
+            args: serde_json::json!({"hash": "5be0c1d9f2a4"}),
+            reason: "runs it".to_owned(),
+        });
+        chat
+    }
+
+    #[test]
+    fn snapshot_plan_concerns() {
+        render(doubtful_plan(), "chat_plan_concerns");
+    }
+
+    #[test]
+    fn snapshot_plan_edit() {
+        let mut chat = doubtful_plan();
+        chat.edit_sent(9);
+        chat.apply(&Event::EditRejected {
+            id: 9,
+            message: "s2: distance_m must be from 0.1 to 2.0".to_owned(),
+        });
+        let Some(Item::Plan(p)) = chat.items.get(1).cloned() else {
+            panic!("the plan comes second");
+        };
+        render_with(chat, "chat_plan_edit", move |ctx| {
+            let key = egui::Id::new(("plan_edit", 9_u64, p.hash.as_str()));
+            ctx.data_mut(|d| d.insert_temp(key, plan_edit::editable(&p.steps)));
+        });
+    }
+
+    #[test]
+    fn a_passed_edit_moves_the_approval_below_its_new_plan() {
+        let mut chat = doubtful_plan();
+        chat.edit_sent(9);
+        assert!(matches!(chat.items.last(), Some(Item::Approval(a)) if a.checking));
+        chat.apply(&Event::MissionPlanned {
+            hash: "e7f3aa01c2d4".to_owned(),
+            intent: "turn left and walk half a metre".to_owned(),
+            steps: Vec::new(),
+            worst_case_s: 60.0,
+            concerns: Vec::new(),
+        });
+        chat.apply(&Event::ApprovalEdited {
+            id: 9,
+            args: serde_json::json!({"hash": "e7f3aa01c2d4"}),
+            reason: "runs the edited plan".to_owned(),
+        });
+        let Some(Item::Approval(a)) = chat.items.last() else {
+            panic!("the approval comes last");
+        };
+        assert!(!a.checking);
+        assert_eq!(
+            chat.plan_for(a).map(|p| p.hash.as_str()),
+            Some("e7f3aa01c2d4")
+        );
+        assert!(matches!(&chat.items[1], Item::Plan(p) if p.replaced));
     }
 
     #[test]
@@ -1030,9 +1329,8 @@ pub(crate) mod tests {
             id: id.to_owned(),
             skill: summary.split('(').next().unwrap_or_default().to_owned(),
             summary: summary.to_owned(),
-            args: Vec::new(),
             timeout_s: 300.0,
-            track: None,
+            ..PlannedStep::default()
         };
         chat.apply(&Event::MissionPlanned {
             hash: "a91f3c2e77d04b1e".to_owned(),
@@ -1046,6 +1344,7 @@ pub(crate) mod tests {
                 ),
             ],
             worst_case_s: 1140.0,
+            concerns: Vec::new(),
         });
         chat.apply(&Event::ApprovalRequested {
             id: 3,
@@ -1103,9 +1402,9 @@ pub(crate) mod tests {
             id: id.to_owned(),
             skill: summary.split('(').next().unwrap_or_default().to_owned(),
             summary: summary.to_owned(),
-            args: Vec::new(),
             timeout_s: 300.0,
             track,
+            ..PlannedStep::default()
         };
         let track = |succeeded, runs, typical_s, last: Option<&str>| Track {
             runs,
@@ -1136,6 +1435,7 @@ pub(crate) mod tests {
                 step("s4", "PlaceInto(container_id=tray_1, arm=left)", None),
             ],
             worst_case_s: 1500.0,
+            concerns: Vec::new(),
         });
         let preview = |id: &str, note: &str| PreviewStep {
             id: id.to_owned(),

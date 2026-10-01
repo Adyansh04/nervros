@@ -153,8 +153,13 @@ pub(crate) struct ChatOptions {
     pub(crate) resume: Option<String>,
 }
 
-/// A checked plan, each step with how it has gone before.
-fn print_plan(hash: &str, steps: &[nervros_core::mission::plan::PlannedStep], worst_case_s: f64) {
+/// A checked plan, each step with how it has gone before, then what may not match the request.
+fn print_plan(
+    hash: &str,
+    steps: &[nervros_core::mission::plan::PlannedStep],
+    worst_case_s: f64,
+    concerns: &[nervros_core::mission::sanity::Concern],
+) {
     let short = hash.get(..8).unwrap_or(hash);
     println!("  plan {short} ({worst_case_s:.0} s at most):");
     for s in steps {
@@ -165,6 +170,14 @@ fn print_plan(hash: &str, steps: &[nervros_core::mission::plan::PlannedStep], wo
             format!("  ({} of {} ok{typical})", t.succeeded, t.runs)
         });
         println!("    {} {}{record}", s.id, s.summary);
+    }
+    for c in concerns {
+        let step = if c.step.is_empty() {
+            String::new()
+        } else {
+            format!("{}: ", c.step)
+        };
+        println!("    ! {step}{}", c.message);
     }
 }
 
@@ -202,6 +215,8 @@ fn print_event(e: &Event, logs: &Path) {
         } => {
             println!("  ? approve #{id}: {tool} {args} ({reason}); answer /yes {id} or /no {id}");
         }
+        Event::ApprovalEdited { id, reason, .. } => println!("  approval #{id} edited: {reason}"),
+        Event::EditRejected { id, message } => println!("  edit of #{id} refused: {message}"),
         Event::ApprovalResolved { id, approved } => {
             println!("  approval #{id}: {}", if *approved { "yes" } else { "no" });
         }
@@ -214,8 +229,9 @@ fn print_event(e: &Event, logs: &Path) {
             hash,
             steps,
             worst_case_s,
+            concerns,
             ..
-        } => print_plan(hash, steps, *worst_case_s),
+        } => print_plan(hash, steps, *worst_case_s, concerns),
         Event::MissionPreview { steps, .. } => {
             for s in steps.iter().filter(|s| !s.note.is_empty()) {
                 println!("    {} {}", s.id, s.note);
