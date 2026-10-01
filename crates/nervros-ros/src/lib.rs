@@ -90,6 +90,29 @@ pub struct GoalResult {
     pub result: Value,
 }
 
+/// A publisher [`RobotPort::publisher`] keeps for a message sent again and again, such as a
+/// heartbeat or a held command: each message sent goes out once, the newest wins when they come
+/// faster than they go, and the publisher goes when this handle is dropped. Nothing repeats on its
+/// own, so a sender that stops shows as silence.
+#[derive(Debug)]
+pub struct Publisher {
+    message: watch::Sender<Option<Value>>,
+}
+
+impl Publisher {
+    /// A handle, and the end the publishing task follows.
+    #[must_use]
+    pub fn channel() -> (Self, watch::Receiver<Option<Value>>) {
+        let (message, follow) = watch::channel(None);
+        (Self { message }, follow)
+    }
+
+    /// Publishes `message` once.
+    pub fn send(&self, message: Value) {
+        self.message.send_replace(Some(message));
+    }
+}
+
 /// Cancels a running goal.
 pub type CancelFn = Arc<dyn Fn() -> BoxFuture<'static, Result<(), RosError>> + Send + Sync>;
 
@@ -322,6 +345,12 @@ pub trait RobotPort: Send + Sync {
         _period: Duration,
     ) -> Result<usize, RosError> {
         unsupported("publishing")
+    }
+
+    /// A publisher kept for messages sent again and again, where one per message would pay
+    /// discovery every time.
+    async fn publisher(&self, _topic: &str, _msg_type: &str) -> Result<Publisher, RosError> {
+        unsupported("keeping a publisher")
     }
 
     /// Every frame link TF has seen.

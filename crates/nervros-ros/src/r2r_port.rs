@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::tf::TfBuffer;
 use crate::{
     Endpoint, Frame, Goal, GoalResult, GoalStatus, Graph, GraphDetail, NamesAndTypes, NodeEntities,
-    QosInfo, RobotPort, RosError, TfLink, TopicEndpoints, Transform,
+    Publisher, QosInfo, RobotPort, RosError, TfLink, TopicEndpoints, Transform,
 };
 
 /// How the node is set up.
@@ -755,6 +755,36 @@ impl RobotPort for R2rPort {
             }
         }
         Ok(out)
+    }
+
+    async fn publisher(&self, topic: &str, ty: &str) -> Result<Publisher, RosError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::Publisher {
+            topic: topic.to_owned(),
+            ty: ty.to_owned(),
+            reply,
+        })?;
+        let publisher = rx.await.map_err(mw)?.map_err(|e| type_error(ty, &e))?;
+        let (handle, mut messages) = Publisher::channel();
+        let cmd = self.cmd.clone();
+        let topic = topic.to_owned();
+        tokio::spawn(async move {
+            let mut warned = false;
+            // Ends when the handle is dropped.
+            while messages.changed().await.is_ok() {
+                let Some(message) = messages.borrow_and_update().clone() else {
+                    continue;
+                };
+                if let Err(e) = publisher.publish(message)
+                    && !warned
+                {
+                    tracing::warn!(%topic, error = %e, "a kept publisher could not publish");
+                    warned = true;
+                }
+            }
+            let _ = cmd.send(Cmd::DestroyPublisher { publisher });
+        });
+        Ok(handle)
     }
 
     async fn publish(

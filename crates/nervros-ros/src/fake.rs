@@ -13,8 +13,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::tf::TfBuffer;
 use crate::{
-    Frame, Goal, GoalResult, GoalStatus, Graph, GraphDetail, NodeEntities, RobotPort, RosError,
-    TfLink, TopicEndpoints, Transform,
+    Frame, Goal, GoalResult, GoalStatus, Graph, GraphDetail, NodeEntities, Publisher, RobotPort,
+    RosError, TfLink, TopicEndpoints, Transform,
 };
 
 /// A scripted service: request in, response out.
@@ -346,6 +346,19 @@ impl RobotPort for FakeRobot {
         Ok(self.endpoints.get(topic).map_or(0, |e| e.subscribers.len()))
     }
 
+    async fn publisher(&self, topic: &str, _ty: &str) -> Result<Publisher, RosError> {
+        let (handle, mut messages) = Publisher::channel();
+        let (log, topic) = (Arc::clone(&self.published), topic.to_owned());
+        tokio::spawn(async move {
+            while messages.changed().await.is_ok() {
+                if let Some(m) = messages.borrow_and_update().clone() {
+                    lock(&log).push((topic.clone(), m));
+                }
+            }
+        });
+        Ok(handle)
+    }
+
     fn tf_links(&self) -> Vec<TfLink> {
         lock(&self.tf).links()
     }
@@ -355,6 +368,31 @@ impl RobotPort for FakeRobot {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_kept_publisher_sends_each_message_once_and_ends_with_its_handle() {
+        let robot = FakeRobot::new();
+        let publisher = robot.publisher("/beat", "x/msg/Y").await.unwrap();
+        let settle = || tokio::time::sleep(Duration::from_millis(30));
+        publisher.send(json!({"n": 1}));
+        settle().await;
+        publisher.send(json!({"n": 2}));
+        settle().await;
+        assert_eq!(
+            robot.published(),
+            [
+                ("/beat".to_owned(), json!({"n": 1})),
+                ("/beat".to_owned(), json!({"n": 2}))
+            ]
+        );
+        settle().await;
+        assert_eq!(
+            robot.published().len(),
+            2,
+            "it repeated a message on its own"
+        );
+        drop(publisher);
+    }
 
     #[tokio::test]
     async fn services_record_calls_and_answer() {
