@@ -12,7 +12,10 @@ float32 max_duration_s
 # Deadman: seconds the mission may go without a Heartbeat on the executor's ~/heartbeat topic
 # before it is stopped as StopAll stops it (halt, cancel, hold; a hand keeps its grip). The clock
 # starts when the goal is accepted. 0 turns the deadman off, for a script with a person watching.
+# The executor caps it at its own maximum.
 float32 heartbeat_timeout_s
+# The `client` of the heartbeats that keep this mission alive; another client's do not.
+string heartbeat_client
 
 uint8 MODE_EXECUTE=0
 uint8 MODE_VALIDATE=1
