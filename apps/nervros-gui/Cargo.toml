@@ -11,6 +11,10 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Spans to an OpenTelemetry collector when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+otlp = ["nervros-core/otlp"]
+
 [dependencies]
 anyhow.workspace = true
 arboard.workspace = true
@@ -24,7 +28,6 @@ rerun.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["eframe"] }

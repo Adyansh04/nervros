@@ -35,10 +35,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+    let _telemetry = nervros_core::telemetry::init();
     let main_thread = re_viewer::MainThreadToken::i_promise_i_am_on_the_main_thread();
     let args = Args::parse();
     let memory_limit = re_memory::MemoryLimit::parse(&args.memory_limit).map_err(|e| anyhow!(e))?;

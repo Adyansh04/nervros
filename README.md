@@ -50,13 +50,23 @@ nervros-cli --profile my.toml ros topic_sample '{"topic": "/odom", "mode": "hz"}
 ```
 
 `eval` runs a suite of requests against the live robot, each in a fresh session with every approval
-granted, and judges what the agent did: the tools and skills it used, the mission's outcome, the
-approvals it asked for, its reply, and how far the robot moved. A suite is a TOML list of cases (see
-grove-g1's `g1_bringup/config/nervros/eval/apartment.toml`):
+granted, and judges what the agent did: the tools and skills it used, what the tools said, the
+mission's outcome, the approvals it asked for, its reply, and how far the robot moved, on the
+simulator's own pose when the suite names it. `--repeat k` runs each case k times for pass^k, and
+`--models a,b` runs it on each model in turn to compare them; the report gives each model's pass
+rate with its interval, its calls, model time and tokens per case, and where the run came from. A
+suite is a TOML list of cases (see grove-g1's `g1_bringup/config/nervros/eval/apartment.toml`):
 
 ```bash
-nervros-cli --profile my.toml eval suite.toml --only pick   # the cases whose ids hold "pick"
+nervros-cli --profile my.toml eval suite.toml --only pick --repeat 3
 ```
+
+The same kind of case with a scripted model and a scripted robot lives in `scenarios/`, and
+`cargo test -p nervros-core --test scenarios` runs each through the whole agent, with no model and
+no ROS. `RUST_LOG=nervros_core=info` logs what the agent decides. Built with `--features otlp` and
+run with `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`, the apps send spans over OTLP/HTTP to
+a collector such as Jaeger: a span per turn with each model call and tool call inside it, and one
+per mission, schedule and watch. Prompts and replies stay out of them.
 
 With a [`[ros_tools]`](docs/profile.md#ros_tools) table the agent can look at any part of the
 graph as `ros2` would (topics with their QoS, rates, messages, nodes, services, actions,

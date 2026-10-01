@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 
 use crate::guard::Guard;
 use crate::mission::Missions;
@@ -174,6 +175,7 @@ impl Schedules {
             times,
         };
         let (me, counter) = (Arc::clone(self), Arc::clone(&left));
+        let span = crate::telemetry::job("schedule", &id, &intent);
         let task = tokio::spawn(async move {
             for run in 1..=times {
                 if run > 1 {
@@ -195,7 +197,7 @@ impl Schedules {
                     ));
                 }
             }
-        });
+        }.instrument(span));
         self.lock().push(Entry {
             info: info.clone(),
             left,
@@ -225,6 +227,7 @@ impl Schedules {
             times,
         };
         let (me, counter) = (Arc::clone(self), Arc::clone(&left));
+        let span = crate::telemetry::job("trigger", &id, &what);
         let task = tokio::spawn(async move {
             let deadline = Instant::now() + Duration::from_secs(for_min * 60);
             let mut looker = Looker::new(trigger, &me.missions).await;
@@ -262,7 +265,7 @@ impl Schedules {
                 }
                 looker.settle(&me.missions).await;
             }
-        });
+        }.instrument(span));
         self.lock().push(Entry {
             info: info.clone(),
             left,

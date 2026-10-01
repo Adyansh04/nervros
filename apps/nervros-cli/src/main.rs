@@ -208,10 +208,7 @@ fn router(models: &Path) -> Result<Router> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+    let _telemetry = nervros_core::telemetry::init();
     let cli = Cli::parse();
     match cli.command {
         Command::Models { check } => models(&models_file(&cli.profile)?, check).await,

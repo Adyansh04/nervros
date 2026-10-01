@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use nervros_ros::{Frame, Goal, GoalResult, Publisher, RobotPort, RosError};
 use serde_json::{Value, json};
+use tracing::Instrument as _;
 
 use self::catalog::Catalog;
 use self::check::Observed;
@@ -788,7 +789,12 @@ impl Missions {
             hash: compiled.sha256.clone(),
         });
         let before = self.vision.get().and_then(camera::Vision::frame);
-        tokio::spawn(Arc::clone(self).watch(id.clone(), compiled, goal, before));
+        let span = crate::telemetry::job("mission", &id, &compiled.plan.intent);
+        tokio::spawn(
+            Arc::clone(self)
+                .watch(id.clone(), compiled, goal, before)
+                .instrument(span),
+        );
         Ok(id)
     }
 
@@ -868,6 +874,7 @@ impl Missions {
                 .and_then(|r| r),
         );
         *lock(&self.running) = None;
+        tracing::Span::current().record("nervros.outcome", outcome.as_str());
         let how = if outcome == "success" {
             "succeeded".to_owned()
         } else {

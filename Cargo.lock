@@ -7474,7 +7474,6 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "toml",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -7487,6 +7486,9 @@ dependencies = [
  "futures",
  "image",
  "nervros-ros",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "reqwest 0.13.5",
  "rig",
  "rmcp 3.5.0",
@@ -7502,6 +7504,8 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -7523,7 +7527,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -8226,6 +8229,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "opentelemetry",
+ "reqwest 0.13.5",
  "tokio",
 ]
 
@@ -8241,6 +8245,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
+ "reqwest 0.13.5",
  "thiserror 2.0.21",
  "tokio",
  "tonic",
@@ -12213,6 +12218,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

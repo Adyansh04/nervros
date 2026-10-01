@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use nervros_ros::RobotPort;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 
 use crate::session::{Command, Event, SessionHandle};
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
@@ -289,33 +290,37 @@ impl Watches {
         let what = condition.describe(&topic);
         let (robot, session) = (Arc::clone(&self.robot), self.session.get().cloned());
         let (task_id, task_what) = (id.clone(), what.clone());
-        let task = tokio::spawn(async move {
-            let deadline = Instant::now() + Duration::from_secs(for_s);
-            let mut was = false;
-            while Instant::now() < deadline {
-                let looked = Instant::now();
-                let seen = holds(robot.as_ref(), &topic, &ty, &condition).await;
-                if let Some(seen) = &seen
-                    && !was
-                {
-                    let note = if say.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {say}")
-                    };
-                    let report = format!("Watch {task_id} ({task_what}) fired: {seen}.{note}");
-                    if let Some(s) = &session {
-                        s.send(Command::Report(report));
+        let span = crate::telemetry::job("watch", &id, &what);
+        let task = tokio::spawn(
+            async move {
+                let deadline = Instant::now() + Duration::from_secs(for_s);
+                let mut was = false;
+                while Instant::now() < deadline {
+                    let looked = Instant::now();
+                    let seen = holds(robot.as_ref(), &topic, &ty, &condition).await;
+                    if let Some(seen) = &seen
+                        && !was
+                    {
+                        let note = if say.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {say}")
+                        };
+                        let report = format!("Watch {task_id} ({task_what}) fired: {seen}.{note}");
+                        if let Some(s) = &session {
+                            s.send(Command::Report(report));
+                        }
+                        if !repeat {
+                            return;
+                        }
                     }
-                    if !repeat {
-                        return;
-                    }
+                    was = seen.is_some();
+                    // Rate and text looks span a window already; a value look, or a failed one, waits.
+                    tokio::time::sleep(PERIOD.saturating_sub(looked.elapsed())).await;
                 }
-                was = seen.is_some();
-                // Rate and text looks span a window already; a value look, or a failed one, waits.
-                tokio::time::sleep(PERIOD.saturating_sub(looked.elapsed())).await;
             }
-        });
+            .instrument(span),
+        );
         running.push(Entry {
             id: id.clone(),
             what: what.clone(),

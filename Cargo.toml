@@ -63,6 +63,11 @@ mimalloc = "=0.1.52"
 rerun = { version = "=0.38.1", default-features = false, features = ["native_viewer", "sdk"] }
 egui_kittest = { version = "=0.36.2", features = ["wgpu", "snapshot"] }
 humantime = "=2.4.0"
+# Span export, behind the apps' `otlp` feature; the versions rerun already builds.
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
 # The MCP client, used directly: rig 0.42's route is rmcp 2. Tools only, no client capabilities.
 rmcp = { version = "=3.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }

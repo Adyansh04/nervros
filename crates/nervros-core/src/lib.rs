@@ -28,5 +28,6 @@ pub mod secret;
 pub mod segment;
 pub mod session;
 pub mod skills;
+pub mod telemetry;
 pub mod tools;
 pub mod watch;

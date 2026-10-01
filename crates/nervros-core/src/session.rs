@@ -17,6 +17,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 
 use crate::guard::{Decision, Guard, Refusal, RuleAction};
 use crate::llm::{self, AgentSource, History, LoopTool};
@@ -437,6 +438,11 @@ impl Shared {
 
     /// Asks the operator, who may approve, deny or edit; an edit that passes its checks replaces
     /// what is asked and the wait starts again. `None` when denied or expired.
+    #[tracing::instrument(
+        name = "nervros.approval",
+        skip_all,
+        fields(nervros.tool = name, nervros.outcome = tracing::field::Empty)
+    )]
     async fn ask_approval(
         &self,
         tool: &Arc<dyn Tool>,
@@ -506,6 +512,7 @@ impl Shared {
         let waited = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.waited_ms.fetch_add(waited, Ordering::Relaxed);
         lock(&self.approvals).remove(&id);
+        tracing::Span::current().record("nervros.outcome", if yes { "approved" } else { "denied" });
         self.emit(Event::ApprovalResolved { id, approved: yes });
         yes.then_some(approved)
     }
@@ -613,10 +620,17 @@ impl Shared {
             Caller::Model => self.guard.decide(spec, args),
             Caller::Operator => self.guard.decide_operator(spec),
         };
-        match (decision, rule) {
+        let decision = match (decision, rule) {
             (Decision::Allow, Some(r)) => Decision::NeedApproval { reason: r.reason },
             (decision, _) => decision,
-        }
+        };
+        let (verdict, why) = match &decision {
+            Decision::Allow => ("allow", ""),
+            Decision::NeedApproval { reason } => ("ask", reason.as_str()),
+            Decision::Deny(r) => ("deny", r.message.as_str()),
+        };
+        tracing::info!(nervros.tool = %spec.name, nervros.guard = verdict, why, "guard");
+        decision
     }
 
     async fn invoke(
@@ -861,6 +875,7 @@ async fn actor(
     // Nobody asked for a report's reply, so a message sent during one waits for it, not refused.
     let (mut answering_report, mut queued) = (false, None::<String>);
     let start = |turn: u64, origin: Origin, history: &History| {
+        let span = turn_span(turn, &origin);
         let task = run_turn(
             turn,
             origin,
@@ -869,7 +884,8 @@ async fn actor(
             Arc::clone(&source),
             Arc::clone(&registry),
         );
-        (turn, tokio::spawn(limited(turn, Arc::clone(&shared), task)))
+        let task = limited(turn, Arc::clone(&shared), task).instrument(span);
+        (turn, tokio::spawn(task))
     };
     loop {
         let finished = async {
@@ -1120,6 +1136,31 @@ fn halt(shared: &Arc<Shared>, stop: Option<&Arc<dyn Tool>>) {
 
 /// Runs a turn under its time limit. A turn over it ends with an error, as a stopped one does;
 /// the operator's time on approvals is added back, and never runs out while one is open.
+/// A turn's span, named and shaped as OpenTelemetry's `GenAI` conventions name an agent's run, so
+/// rig records the turn's token use on it and nests its model and tool calls inside.
+fn turn_span(turn: u64, origin: &Origin) -> tracing::Span {
+    let empty = tracing::field::Empty;
+    tracing::info_span!(
+        "invoke_agent",
+        otel.name = "invoke_agent nervros",
+        gen_ai.operation.name = "invoke_agent",
+        gen_ai.agent.name = "nervros",
+        nervros.turn = turn,
+        nervros.origin = match origin {
+            Origin::User(_) => "operator",
+            Origin::Report(_) => "report",
+        },
+        gen_ai.prompt = empty,
+        gen_ai.completion = empty,
+        gen_ai.usage.input_tokens = empty,
+        gen_ai.usage.output_tokens = empty,
+        gen_ai.usage.cache_read.input_tokens = empty,
+        gen_ai.usage.cache_creation.input_tokens = empty,
+        gen_ai.usage.tool_use_prompt_tokens = empty,
+        gen_ai.usage.reasoning_tokens = empty,
+    )
+}
+
 async fn limited(
     turn: u64,
     shared: Arc<Shared>,
