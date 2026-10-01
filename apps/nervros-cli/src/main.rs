@@ -11,8 +11,9 @@ use nervros_core::providers::router::{PrivacyMode, Router};
 use nervros_core::providers::{ModelsConfig, Role, free_only, openrouter};
 
 #[cfg(feature = "ros")]
-#[cfg(feature = "ros")]
 mod eval;
+mod records;
+#[cfg(feature = "ros")]
 mod robot;
 
 #[derive(Parser)]
@@ -74,6 +75,38 @@ enum Command {
         /// Where the report goes (default: the state directory's `evals/`).
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// Print a session log as it happened: a `.ndjson` path, or `last`.
+    Replay {
+        /// The log.
+        #[arg(default_value = "last")]
+        log: String,
+    },
+    /// The missions the robot ran, newest first, from its ledger; with an id, that one in full.
+    Missions {
+        /// A mission id, or its start.
+        id: Option<String>,
+        /// How many.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// The requests no skill could do, newest first.
+    Gaps {
+        /// How many.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// A session as an eval case, with what happened as its expectations, to trim and keep.
+    Case {
+        /// The session log: a `.ndjson` path, or `last`.
+        #[arg(default_value = "last")]
+        log: String,
+        /// The case's id.
+        #[arg(long, default_value = "from-session")]
+        id: String,
+        /// Append it to this suite instead of printing it.
+        #[arg(long)]
+        append: Option<PathBuf>,
     },
     /// Check the profile's tools, topics and mission services against the live graph.
     #[cfg(feature = "ros")]
@@ -209,6 +242,10 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Replay { log } => records::replay(&log),
+        Command::Missions { id, limit } => records::missions(&cli.profile, id.as_deref(), limit),
+        Command::Gaps { limit } => records::gaps(&cli.profile, limit),
+        Command::Case { log, id, append } => records::case(&log, &id, append.as_deref()),
         #[cfg(feature = "ros")]
         Command::Doctor => robot::doctor(&cli.profile).await,
         #[cfg(feature = "ros")]

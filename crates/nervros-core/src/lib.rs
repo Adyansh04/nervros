@@ -8,6 +8,7 @@ pub mod builtins;
 pub mod context;
 pub mod doctor;
 pub mod editor;
+pub mod evalcase;
 pub mod guard;
 pub mod llm;
 pub mod log;

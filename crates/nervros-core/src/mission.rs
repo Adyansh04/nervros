@@ -9,6 +9,7 @@
 
 pub mod catalog;
 pub mod check;
+pub mod history;
 pub mod ledger;
 pub mod plan;
 pub mod preview;
@@ -385,6 +386,7 @@ impl Missions {
             "type": "object",
             "properties": {
                 "hash": {"type": "string", "description": "Instead of steps: a plan checked before"},
+                "template": {"type": "string", "description": "Instead of steps: the name of a saved plan"},
                 "check_only": {"type": "boolean", "description": "Only check the plan; do not run it"},
                 "intent": {"type": "string", "description": "What the operator asked for, in a few words"},
                 "steps": {"type": "array", "minItems": 1, "maxItems": plan::MAX_STEPS, "items": {
@@ -425,6 +427,13 @@ impl Missions {
             ));
         }
         let mut args = args;
+        // A plan saved by name runs as its steps.
+        if let Some(name) = args["template"].as_str().map(str::to_owned) {
+            match self.template(&name).await {
+                Ok(saved) => args = json!({"intent": saved.intent, "steps": saved.steps}),
+                Err(e) => return ToolOutcome::refused(e),
+            }
+        }
         // The tool's own switches, not the plan's.
         if let Some(fields) = args.as_object_mut() {
             fields.remove("check_only");
@@ -542,6 +551,20 @@ impl Missions {
     fn rejected(&self, problems: &Value) -> ToolOutcome {
         let n = self.plan_failures.fetch_add(1, Ordering::SeqCst) + 1;
         let count = problems.as_array().map_or(1, Vec::len);
+        if n == MAX_PLAN_ATTEMPTS {
+            // Planning gives up here: what was asked goes in the skill-gap log.
+            let why: Vec<&str> = problems
+                .as_array()
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter_map(|p| p["message"].as_str())
+                .take(3)
+                .collect();
+            self.note_gap(
+                &format!("plans kept failing their checks: {}", why.join("; ")),
+                "",
+            );
+        }
         ToolOutcome {
             status: Status::Failed,
             data: json!({"ok": false, "problems": problems}),
@@ -796,6 +819,37 @@ impl Missions {
         report
     }
 
+    /// What the operator said last.
+    pub(crate) fn request(&self) -> String {
+        lock(&self.request).clone()
+    }
+
+    /// The plan saved as `name`, counted as used.
+    async fn template(&self, name: &str) -> Result<ledger::Template, String> {
+        let Some(ledger) = self.ledger.get().cloned() else {
+            return Err("no plans are saved on this robot".to_owned());
+        };
+        let wanted = name.to_owned();
+        tokio::task::spawn_blocking(move || ledger.use_template(&wanted))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no plan is saved as \"{name}\"; the plans tool lists them"))
+    }
+
+    /// Logs what the operator asked as something no skill could do.
+    pub(crate) fn note_gap(&self, reason: &str, nearest: &str) {
+        let Some(ledger) = self.ledger.get().cloned() else {
+            return;
+        };
+        let (request, reason, nearest) = (self.request(), reason.to_owned(), nearest.to_owned());
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = ledger.note_gap(&request, &reason, &nearest) {
+                tracing::warn!(error = %e, "the skill gap was not logged");
+            }
+        });
+    }
+
     /// Each step's track record from the ledger, read off the async threads.
     async fn add_tracks(&self, steps: &mut [PlannedStep]) {
         let Some(ledger) = self.ledger.get().cloned() else {
@@ -862,7 +916,7 @@ impl Missions {
         }
     }
 
-    async fn observe(&self) -> Observed {
+    pub(crate) async fn observe(&self) -> Observed {
         let world = self.profile.world.as_ref();
         let rooms = self.latest(world.and_then(|w| w.rooms.as_ref())).await;
         let objects = self.latest(world.and_then(|w| w.objects.as_ref())).await;
@@ -987,7 +1041,9 @@ impl Tool for RunMission {
     /// A plan is checked before anyone is asked: its problems go back to the model, and a sound
     /// one is shown, approved and run by its hash.
     async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
-        args.get("steps")?;
+        if args.get("steps").is_none() && args.get("template").is_none() {
+            return None;
+        }
         if args["check_only"].as_bool() == Some(true) {
             return Some(Ok(Assessment {
                 risk: Risk::Observe,
@@ -1024,7 +1080,7 @@ impl Tool for RunMission {
 
     async fn call(&self, args: Value) -> ToolOutcome {
         // Steps reach here only to be checked: a run's were replaced by their hash.
-        if args.get("steps").is_some() {
+        if args.get("steps").is_some() || args.get("template").is_some() {
             return self.0.plan(args).await;
         }
         self.0.run(&args).await
@@ -1036,6 +1092,7 @@ mod tests {
     use super::*;
     use crate::mission::catalog::tests::CATALOG;
     use crate::places::Places;
+    use crate::session::Event;
     use nervros_ros::GoalStatus;
     use nervros_ros::fake::{FakeRobot, ScriptedRun};
     use std::path::Path;
@@ -1104,6 +1161,94 @@ mod tests {
             {"skill": "GoToPlace", "args": [{"name": "place", "value": "dock"}]},
             {"skill": "PickObject", "args": {"object_id": "O18", "phrase": "blue cup", "arm": "left"}}
         ]})
+    }
+
+    /// Waits up to five seconds for `ready`.
+    async fn eventually(mut ready: impl FnMut() -> bool) {
+        let wait = async {
+            while !ready() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("it never happened");
+    }
+
+    #[tokio::test]
+    async fn a_mission_is_kept_recalled_saved_by_name_and_run_again_and_gaps_are_logged() {
+        let run = || ScriptedRun {
+            result: Ok(GoalResult {
+                status: GoalStatus::Succeeded,
+                result: json!({"outcome": 0, "failed_step_id": "", "failure_reason": ""}),
+            }),
+            ..ScriptedRun::default()
+        };
+        let robot: Arc<dyn RobotPort> = Arc::new(robot(run()));
+        let ledger = Ledger::in_memory().unwrap();
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot)
+            .unwrap()
+            .with_ledger(Arc::clone(&ledger));
+        let (tx, _commands) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        missions.attach(SessionHandle::for_tests(&tx, events.clone()));
+        let _ = events.send(Event::User {
+            turn: 1,
+            text: "fetch me the mug from the dock".to_owned(),
+        });
+        eventually(|| missions.request().contains("mug")).await;
+
+        let hash = missions.plan(steps()).await.data["hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            missions.run(&json!({"hash": hash})).await.status,
+            Status::Accepted
+        );
+        eventually(|| ledger.recent(1).is_ok_and(|r| !r.is_empty())).await;
+        let kept = &ledger.recent(1).unwrap()[0];
+        assert_eq!(
+            (kept.outcome.as_str(), kept.request.as_str()),
+            ("success", "fetch me the mug from the dock")
+        );
+
+        let [recall, plans, gap] = history::tools(&missions);
+        let lately = recall.call(json!({"about": "missions"})).await;
+        assert!(
+            lately.data["missions"][0]
+                .as_str()
+                .unwrap()
+                .contains("fetch the mug (success)")
+        );
+        let proven = recall
+            .call(json!({"about": "plans", "query": "bring the mug"}))
+            .await;
+        assert!(
+            proven.data["plans"][0]
+                .as_str()
+                .unwrap()
+                .contains("GoToPlace(place=dock)"),
+            "{}",
+            proven.data
+        );
+
+        let saved = plans
+            .call(json!({"action": "save", "name": "mug run", "hash": hash}))
+            .await;
+        assert_eq!(saved.status, Status::Succeeded, "{}", saved.message);
+        let again = missions.plan(json!({"template": "mug run"})).await;
+        assert_eq!(again.status, Status::Succeeded, "{}", again.message);
+        assert_eq!(
+            again.data["hash"],
+            json!(hash),
+            "the same plan, checked again"
+        );
+
+        gap.call(json!({"missing": "no skill puts a mug on a sofa", "nearest": "PlaceInto"}))
+            .await;
+        eventually(|| ledger.gaps(1).is_ok_and(|g| !g.is_empty())).await;
+        assert_eq!(ledger.gaps(1).unwrap()[0].nearest, "PlaceInto");
     }
 
     #[tokio::test]

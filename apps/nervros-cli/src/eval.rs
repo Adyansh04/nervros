@@ -7,69 +7,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use nervros_core::evalcase::{Case, Expect, Suite};
 use nervros_core::profile::Profile;
 use nervros_core::session::{Command, Event};
 use nervros_ros::RobotPort;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::sync::broadcast;
-
-/// A suite: cases run in order, on one robot whose state carries from case to case.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Suite {
-    #[serde(rename = "case")]
-    cases: Vec<Case>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Case {
-    id: String,
-    /// Sent first and not judged, such as walking back to the start.
-    #[serde(default)]
-    setup: Vec<String>,
-    /// The operator's messages, in order, in one session.
-    say: Vec<String>,
-    #[serde(default = "d_max_s")]
-    max_s: u64,
-    #[serde(default)]
-    expect: Expect,
-}
-
-fn d_max_s() -> u64 {
-    240
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Expect {
-    /// Each called at least once, and it succeeded or started.
-    #[serde(default)]
-    tools: Vec<String>,
-    /// Never called.
-    #[serde(default)]
-    not_tools: Vec<String>,
-    /// Each in some checked plan's steps, such as `WalkStraight`.
-    #[serde(default)]
-    skills: Vec<String>,
-    /// How the last mission ended: `success`, `failure`, or `none` for no mission at all.
-    mission: Option<String>,
-    /// At most this many approvals asked.
-    approvals_max: Option<usize>,
-    /// The last reply holds one of these, case aside.
-    #[serde(default)]
-    reply_has: Vec<String>,
-    /// The last reply holds none of these, case aside.
-    #[serde(default)]
-    reply_lacks: Vec<String>,
-    /// How far the robot's base moved on the map, metres, `[min, max]`.
-    moved_m: Option<[f64; 2]>,
-    /// How far it turned, degrees, `[min, max]`: positive to the left (counter-clockwise), so a
-    /// turn the wrong way fails.
-    turned_deg: Option<[f64; 2]>,
-    /// Whether the conversation had to be condensed.
-    compacted: Option<bool>,
-}
 
 /// Words a reply should not use to ask for what the approval card asks.
 const ASKS_FIRST: [&str; 5] = [

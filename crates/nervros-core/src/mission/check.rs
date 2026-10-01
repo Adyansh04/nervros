@@ -177,17 +177,28 @@ pub fn last_seen(step: &PlannedStep, seen: &Observed, now_s: f64) -> Option<Stri
         .iter()
         .filter_map(|k| arg(k))
         .collect();
+    let found = find_object(seen, &keys, arg("phrase"))?;
+    Some(describe_seen(found, seen, now_s))
+}
+
+/// The world model's object that `keys` (ids or names such as `mug_4`) or `phrase` (the
+/// operator's words) refer to: an exact id first, then words in a label or name, the most
+/// recently seen winning.
+#[must_use]
+pub fn find_object<'a>(
+    seen: &'a Observed,
+    keys: &[&str],
+    phrase: Option<&str>,
+) -> Option<&'a Value> {
     let objects = seen.objects["objects"].as_array()?;
-    let found = keys
-        .iter()
+    keys.iter()
         .find_map(|k| {
             objects
                 .iter()
                 .find(|o| text(o, "id").eq_ignore_ascii_case(k))
         })
         .or_else(|| {
-            // The operator's words, then a detector's name ("mug_4" is a mug): the newest wins.
-            arg("phrase")
+            phrase
                 .map(str::to_owned)
                 .into_iter()
                 .chain(keys.iter().map(|k| words_of(k)))
@@ -198,8 +209,13 @@ pub fn last_seen(step: &PlannedStep, seen: &Observed, now_s: f64) -> Option<Stri
                         .filter(|o| named(o, &w))
                         .max_by(|a, b| seen_at(a).total_cmp(&seen_at(b)))
                 })
-        })?;
+        })
+}
 
+/// Where and when the world model last saw `found`: "small white mug O244: last seen 3 min ago
+/// in the office, on wooden tray O31".
+#[must_use]
+pub fn describe_seen(found: &Value, seen: &Observed, now_s: f64) -> String {
     let label = [text(found, "name"), text(found, "label")]
         .into_iter()
         .find(|n| !n.is_empty())
@@ -218,10 +234,12 @@ pub fn last_seen(step: &PlannedStep, seen: &Observed, now_s: f64) -> Option<Stri
         let _ = write!(line, " in the {room}");
     }
     let support_id = text(found, "support_id");
-    if let Some(support) = objects
-        .iter()
-        .find(|o| !support_id.is_empty() && text(o, "id") == support_id)
-    {
+    let support = seen.objects["objects"].as_array().and_then(|objects| {
+        objects
+            .iter()
+            .find(|o| !support_id.is_empty() && text(o, "id") == support_id)
+    });
+    if let Some(support) = support {
         let _ = write!(line, ", on {} {support_id}", text(support, "label"));
     }
     match found["state"].as_u64() {
@@ -229,7 +247,7 @@ pub fn last_seen(step: &PlannedStep, seen: &Observed, now_s: f64) -> Option<Stri
         Some(2) => line.push_str("; no longer there"),
         _ => {}
     }
-    Some(line)
+    line
 }
 
 fn text<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -258,7 +276,8 @@ fn words_of(name: &str) -> String {
         .join(" ")
 }
 
-fn how_long(seconds: f64) -> String {
+/// A duration for people: "40 s", "12 min", "3 h".
+pub(crate) fn how_long(seconds: f64) -> String {
     match seconds {
         s if s < 90.0 => format!("{s:.0} s"),
         s if s < 90.0 * 60.0 => format!("{:.0} min", s / 60.0),

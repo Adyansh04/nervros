@@ -229,9 +229,17 @@ fn robot_file(profile: &Profile, ledger: &Path, kind: &str) -> Option<PathBuf> {
     })
 }
 
+/// Where a robot's mission ledger lives under the state folder `state`.
+#[must_use]
+pub fn mission_ledger_file(profile: &Profile, state: &Path) -> PathBuf {
+    robot_file(profile, &state.join("quota.json"), "missions")
+        .unwrap_or_else(|| state.join("missions").join("robot.json"))
+        .with_extension("sqlite3")
+}
+
 /// The robot's mission ledger, beside its memory. Missions still run without one, unrecorded.
 fn mission_ledger(profile: &Profile, ledger: &Path) -> Option<Arc<crate::mission::ledger::Ledger>> {
-    let path = robot_file(profile, ledger, "missions")?.with_extension("sqlite3");
+    let path = mission_ledger_file(profile, ledger.parent()?);
     crate::mission::ledger::Ledger::open(&path)
         .map_err(|e| tracing::warn!(error = %e, path = %path.display(), "no mission ledger"))
         .ok()
@@ -332,6 +340,7 @@ pub fn start_with(
     for tool in missions
         .iter()
         .flat_map(Missions::tools)
+        .chain(missions.iter().flat_map(crate::mission::history::tools))
         .chain(schedules.iter().flat_map(crate::schedule::Schedules::tools))
     {
         registry.add(tool)?;
