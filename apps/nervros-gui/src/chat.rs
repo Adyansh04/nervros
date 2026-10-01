@@ -925,6 +925,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn snapshot_draft_and_compaction() {
+        let mut chat = Chat::default();
+        chat.apply(&Event::Compacted {
+            before: 9800,
+            after: 2100,
+            summarised: true,
+        });
+        chat.apply(&Event::User {
+            turn: 3,
+            text: "Where is the mug?".to_owned(),
+        });
+        for piece in ["The small white mug ", "is on the dining table, "] {
+            chat.apply(&Event::ReplyDelta {
+                turn: 3,
+                text: piece.to_owned(),
+            });
+        }
+        render(chat, "chat_draft");
+    }
+
+    #[test]
     fn snapshot_empty_state() {
         render(Chat::default(), "chat_empty");
     }
