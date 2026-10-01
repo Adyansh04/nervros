@@ -303,13 +303,23 @@ impl Missions {
             fields.remove("check_only");
             fields.remove("hash");
         }
-        let plan: Plan = match serde_json::from_value(args) {
+        let mut plan: Plan = match serde_json::from_value(args) {
             Ok(p) => p,
             Err(e) => {
                 return self
                     .rejected(&json!([{"step": "", "field": "", "message": e.to_string()}]));
             }
         };
+        // The local model leaves the label out, and once resent an unchanged plan until refused.
+        if plan.intent.trim().is_empty() {
+            plan.intent = plan
+                .steps
+                .iter()
+                .map(|s| s.why.trim())
+                .find(|w| !w.is_empty())
+                .unwrap_or("the plan")
+                .to_owned();
+        }
         let catalog = match self.catalog().await {
             Ok(c) => c,
             Err(e) => return ToolOutcome::failed(e),
@@ -870,6 +880,18 @@ mod tests {
                 |e| matches!(e, Event::MissionFinished { outcome, .. } if outcome == "success")
             )
         );
+    }
+
+    #[tokio::test]
+    async fn a_plan_without_an_intent_takes_its_first_reason() {
+        let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+        let plan = json!({"steps": [{"skill": "GoToPlace", "why": "go to the dock",
+                                     "args": [{"name": "place", "value": "dock"}]}]});
+        let out = missions.plan(plan).await;
+        assert_eq!(out.status, Status::Succeeded, "{}", out.message);
+        let compiled = missions.find(out.data["hash"].as_str().unwrap()).unwrap();
+        assert_eq!(compiled.plan.intent, "go to the dock");
     }
 
     #[tokio::test]

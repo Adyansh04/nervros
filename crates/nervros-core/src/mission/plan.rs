@@ -28,7 +28,8 @@ const NEAR_M: f64 = 0.6;
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plan {
-    /// What the operator asked for, in a few words.
+    /// What the operator asked for, in a few words; the first step's `why` when left out.
+    #[serde(default)]
     pub intent: String,
     /// A model's own end state, accepted and ignored: [`Compiled::goal`] comes from the steps.
     #[serde(default)]
