@@ -653,7 +653,7 @@ impl LookTool {
             "age_s": (age * 10.0).round() / 10.0, "marks": marks});
         match seen {
             Some(Ok((answer, model))) => {
-                data["answer"] = Value::String(answer);
+                data["answer"] = Value::String(crate::tools::from_world(&answer));
                 data["seen_by"] = Value::String(model);
             }
             Some(Err(why)) => data["not_seen"] = Value::String(why),
@@ -695,7 +695,7 @@ impl LookTool {
         };
         match seen {
             Some(Ok((answer, model))) => {
-                data["answer"] = Value::String(answer);
+                data["answer"] = Value::String(crate::tools::from_world(&answer));
                 data["seen_by"] = Value::String(model);
             }
             Some(Err(why)) => data["not_seen"] = Value::String(why),
@@ -977,7 +977,10 @@ mod tests {
             json!({"question": "Is there a dustbin?"}),
         )
         .await;
-        assert_eq!(out.data["answer"], "Mark 1 is a dustbin by the wall.");
+        assert_eq!(
+            out.data["answer"],
+            "<world>Mark 1 is a dustbin by the wall.</world>"
+        );
         assert_eq!(out.data["seen_by"], "fake-vlm");
         let asked = guard(&eyes.asked);
         assert!(
@@ -1039,7 +1042,10 @@ mod tests {
             .call(json!({"snapshot": id, "question": "What is mark 2?"}))
             .await;
 
-        assert_eq!(again.data["answer"], "Mark 2 is a white cup.");
+        assert_eq!(
+            again.data["answer"],
+            "<world>Mark 2 is a white cup.</world>"
+        );
         assert_eq!(again.data["marks"][1]["label"], "cup");
         assert!(again.images.is_empty(), "the operator already sees it");
         let second = guard(&eyes.asked)[1].0.clone();

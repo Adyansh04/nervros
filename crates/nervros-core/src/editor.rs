@@ -416,7 +416,7 @@ impl InspectObject {
                     };
                     match eyes.see(&prompt, image).await {
                         Ok((answer, model)) => {
-                            data["answer"] = json!(answer);
+                            data["answer"] = json!(crate::tools::from_world(&answer));
                             data["seen_by"] = json!(model);
                         }
                         Err(why) => data["not_seen"] = json!(why),

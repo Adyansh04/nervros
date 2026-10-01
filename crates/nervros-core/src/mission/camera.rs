@@ -184,13 +184,13 @@ fn answer(text: &str) -> Option<bool> {
     }
 }
 
-/// The answer after its verdict, in a sentence.
+/// The answer after its verdict, in a sentence, marked as what the camera model saw.
 fn reason(text: &str) -> String {
     let rest = text
         .trim()
         .trim_start_matches(|c: char| c.is_alphabetic())
         .trim_start_matches(|c: char| !c.is_alphanumeric());
-    rest.lines().next().unwrap_or_default().trim().to_owned()
+    crate::tools::from_world(rest.lines().next().unwrap_or_default().trim())
 }
 
 /// Before and after side by side at one height, or after alone.
@@ -291,8 +291,8 @@ mod tests {
         assert_eq!(
             checked.lines,
             [
-                "inside(O18, O31): the world model says it holds, but the camera says no: It is \
-              still on the table."
+                "inside(O18, O31): the world model says it holds, but the camera says no: \
+                 <world>It is still on the table.</world>"
             ]
         );
         let image = checked.image.unwrap();
@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(answer("Cannot tell: the tray is out of view."), None);
         assert_eq!(
             reason("No. It is still on the table.\nMore."),
-            "It is still on the table."
+            "<world>It is still on the table.</world>"
         );
     }
 }
