@@ -1,0 +1,8 @@
+# Drive the base by hand. While enabled, the executor holds the base, refuses missions, and
+# forwards each geometry_msgs/Twist on its ~/teleop_cmd topic within its speed limits; a pause in
+# those commands longer than its deadman stops the base, and StopAll ends teleop.
+
+bool enable
+---
+bool ok
+string message

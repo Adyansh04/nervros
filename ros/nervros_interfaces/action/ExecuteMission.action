@@ -9,6 +9,10 @@ string tree_xml
 string tree_sha256
 # Watchdog in seconds. 0 means the executor's default; larger values are clamped to its cap.
 float32 max_duration_s
+# Deadman: seconds the mission may go without a Heartbeat on the executor's ~/heartbeat topic
+# before it is stopped as StopAll stops it (halt, cancel, hold; a hand keeps its grip). The clock
+# starts when the goal is accepted. 0 turns the deadman off, for a script with a person watching.
+float32 heartbeat_timeout_s
 
 uint8 MODE_EXECUTE=0
 uint8 MODE_VALIDATE=1
