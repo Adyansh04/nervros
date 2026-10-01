@@ -5,6 +5,7 @@ mod chat;
 mod editor;
 mod palette;
 mod plan_edit;
+mod robot;
 mod sessions;
 mod toasts;
 

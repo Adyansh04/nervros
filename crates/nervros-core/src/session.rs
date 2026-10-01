@@ -46,6 +46,15 @@ pub enum Command {
         /// What to check instead.
         args: Value,
     },
+    /// Call a tool for the operator, such as a plan made by a click on the map: checked and
+    /// approved as a call of the model's is, outside any turn. The model hears of it only
+    /// through what the tool reports, such as a mission's end.
+    Run {
+        /// The tool.
+        tool: String,
+        /// Its arguments.
+        args: Value,
+    },
     /// Enable act-lane tools.
     Arm,
     /// Disable act-lane tools.
@@ -346,6 +355,15 @@ impl Default for SessionConfig {
     }
 }
 
+/// Who asked for a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caller {
+    /// The model, in a turn.
+    Model,
+    /// The operator, from the window.
+    Operator,
+}
+
 /// The operator's answer to an approval.
 #[derive(Debug)]
 enum Answer {
@@ -411,7 +429,7 @@ impl Shared {
                 Ok(Ok(Answer::Edit(edited))) => {
                     // Waiting again before the check, so a stop during it still lands.
                     rx = self.listen(id);
-                    let passed = match tool.edit(edited).await {
+                    let passed = match tool.assess_operator(edited).await {
                         Some(Ok(a)) => {
                             if let Some(args) = a.args {
                                 approved.args = args;
@@ -488,11 +506,19 @@ impl Shared {
         turn: u64,
         args: Value,
         flags: &TurnFlags,
+        caller: Caller,
     ) -> Value {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         // A tool whose risk depends on its arguments says what this call would do, and a call
         // that cannot go out fails here, before anyone is asked to approve it.
-        let (mut assessment, early) = match tool.assess(&args).await {
+        let assessed = match caller {
+            Caller::Operator => match tool.assess_operator(args.clone()).await {
+                Some(checked) => Some(checked),
+                None => tool.assess(&args).await,
+            },
+            Caller::Model => tool.assess(&args).await,
+        };
+        let (mut assessment, early) = match assessed {
             Some(Ok(a)) => (Some(a), None),
             Some(Err(out)) => (None, Some(out)),
             None => (None, None),
@@ -517,9 +543,13 @@ impl Shared {
             args: args.clone(),
         });
         let started = Instant::now();
+        let decision = match caller {
+            Caller::Model => self.guard.decide(&spec, &args),
+            Caller::Operator => self.guard.decide_operator(&spec),
+        };
         let outcome = match early {
             Some(out) => out,
-            None => match self.guard.decide(&spec, &args) {
+            None => match decision {
                 Decision::Deny(r) => ToolOutcome::refused(r.message),
                 Decision::NeedApproval { reason } => {
                     let reason = assessment.map_or(reason, |a| a.reason);
@@ -772,6 +802,16 @@ async fn actor(
                     Command::Approve(id) => shared.answer(id, Answer::Approve),
                     Command::Deny(id) => shared.answer(id, Answer::Deny),
                     Command::Edit { id, args } => shared.answer(id, Answer::Edit(args)),
+                    Command::Run { tool, args } => match registry.get(&tool).cloned() {
+                        Some(tool) => {
+                            let shared = Arc::clone(&shared);
+                            tokio::spawn(async move {
+                                let flags = TurnFlags::default();
+                                shared.invoke(&tool, 0, args, &flags, Caller::Operator).await;
+                            });
+                        }
+                        None => shared.emit(Event::Notice { text: format!("there is no tool {tool}") }),
+                    },
                     Command::Arm | Command::Disarm => {
                         let armed = cmd == Command::Arm;
                         shared.guard.set_armed(armed);
@@ -1033,7 +1073,10 @@ fn loop_tools(
                 invoke: Arc::new(move |args| {
                     let (tool, shared, flags) =
                         (Arc::clone(&tool), Arc::clone(&shared), Arc::clone(&flags));
-                    Box::pin(async move { shared.invoke(&tool, turn, args, &flags).await })
+                    Box::pin(async move {
+                        let caller = Caller::Model;
+                        shared.invoke(&tool, turn, args, &flags, caller).await
+                    })
                 }),
             }
         })
@@ -1706,7 +1749,7 @@ mod tests {
         fn spec(&self) -> Cow<'_, ToolSpec> {
             Cow::Borrowed(&self.0)
         }
-        async fn edit(&self, edited: Value) -> Option<Result<Assessment, ToolOutcome>> {
+        async fn assess_operator(&self, edited: Value) -> Option<Result<Assessment, ToolOutcome>> {
             if edited["slow"] == true {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -1831,5 +1874,64 @@ mod tests {
             }
         }
         assert_eq!(resolved, [false]);
+    }
+
+    #[tokio::test]
+    async fn the_operator_runs_a_tool_checked_as_their_own_and_approves_it() {
+        let guard = Arc::new(Guard::new(Policy::default()));
+        let mut r = Registry::default();
+        let spec = ToolSpec::new(
+            "run_mission",
+            "Runs.",
+            json!({"type": "object"}),
+            Risk::Motion,
+        );
+        r.add(Arc::new(Editable(spec))).unwrap();
+        let session = Session::start(
+            Arc::new(Scripted(MockCompletionModel::new([]))),
+            Arc::new(r),
+            Arc::clone(&guard),
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        let run = || Command::Run {
+            tool: "run_mission".into(),
+            args: json!({"ok": true}),
+        };
+        let mut next = async || {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        session.send(run());
+        let refused = loop {
+            if let Event::ToolFinished {
+                status, message, ..
+            } = next().await
+            {
+                break (status, message);
+            }
+        };
+        assert_eq!(refused.0, "refused");
+        assert!(refused.1.contains("arm it"), "{}", refused.1);
+
+        guard.set_armed(true);
+        session.send(run());
+        loop {
+            match next().await {
+                Event::ToolStarted { args, .. } => {
+                    assert_eq!(args["hash"], "edited", "run as checked");
+                }
+                Event::ApprovalRequested { id, .. } => session.send(Command::Approve(id)),
+                Event::ToolFinished { status, .. } => {
+                    assert_eq!(status, "succeeded");
+                    break;
+                }
+                _ => {}
+            }
+        }
     }
 }

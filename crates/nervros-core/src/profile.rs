@@ -63,6 +63,12 @@ pub struct RobotConfig {
     pub name: String,
     /// A markdown file describing the robot, its abilities and limits, for the system prompt.
     pub persona: Option<PathBuf>,
+    /// Its `sensor_msgs/msg/BatteryState` topic, for the robot dock.
+    #[serde(default)]
+    pub battery: Option<String>,
+    /// Its `diagnostic_msgs/msg/DiagnosticArray` topic with motor temperatures, for the dock.
+    #[serde(default)]
+    pub diagnostics: Option<String>,
 }
 
 /// How the agent joins the ROS graph.
@@ -307,6 +313,10 @@ pub struct MissionConfig {
     /// How long a mission may go without a heartbeat before the executor stops it.
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout_s: f64,
+    /// `Teleop` service, for driving the base by hand from the window.
+    pub teleop: Option<String>,
+    /// Where the hand-driving `geometry_msgs/msg/Twist` commands go while it is on.
+    pub teleop_cmd: Option<String>,
 }
 
 fn default_replans() -> u32 {

@@ -17,6 +17,7 @@ clap.workspace = true
 image.workspace = true
 mimalloc.workspace = true
 nervros-core = { path = "../../crates/nervros-core", features = ["rcl"] }
+nervros-ros = { path = "../../crates/nervros-ros", default-features = false }
 nervros-viz = { path = "../../crates/nervros-viz" }
 rerun.workspace = true
 serde.workspace = true
@@ -26,5 +27,4 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["eframe"] }
-nervros-ros = { path = "../../crates/nervros-ros", default-features = false }
 tempfile.workspace = true

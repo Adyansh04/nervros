@@ -55,6 +55,12 @@ struct Live {
     pub objects: Option<usize>,
     /// Each object's name, or its label, by id.
     pub object_names: HashMap<String, String>,
+    /// Where the robot stands on the map.
+    pub pose: Option<crate::robot::Pose>,
+    /// The robot's battery, when the profile names its topic.
+    pub battery: Option<Value>,
+    /// Its motor diagnostics, when the profile names their topic.
+    pub motors: Option<Value>,
 }
 
 /// What the operator clicked in the viewer, when it is something the agent can act on.
@@ -94,10 +100,11 @@ pub(crate) enum Tab {
     Events,
     Agent,
     Doctor,
+    Robot,
 }
 
 impl Tab {
-    const ALL: [(Self, &'static str); 7] = [
+    const ALL: [(Self, &'static str); 8] = [
         (Self::Mission, "Mission"),
         (Self::World, "World"),
         (Self::Layers, "Layers"),
@@ -105,6 +112,7 @@ impl Tab {
         (Self::Events, "Events"),
         (Self::Agent, "Agent"),
         (Self::Doctor, "Doctor"),
+        (Self::Robot, "Robot"),
     ];
 }
 
@@ -212,6 +220,8 @@ pub struct Gui {
     viewer_commands: re_viewer::CommandSender,
     /// The earlier moment the 3D view is paused at, if it is not following the newest data.
     viewing: Option<SystemTime>,
+    /// Driving by hand, when the profile names the executor's teleop.
+    drive: Option<crate::robot::Drive>,
 }
 
 impl Gui {
@@ -262,6 +272,8 @@ impl Gui {
             .editor
             .clone()
             .map(|client| crate::editor::WorldEditor::new(client, runtime.clone()));
+        let drive =
+            crate::robot::Drive::new(&agent.profile, Arc::clone(&agent.robot), runtime.clone());
         let (viewer_commands, receiver) = re_viewer::command_channel();
         let mut viewer = re_viewer::App::with_commands(
             main_thread,
@@ -308,6 +320,7 @@ impl Gui {
             toasts: Toasts::default(),
             viewer_commands,
             viewing: None,
+            drive,
         })
     }
 
@@ -515,6 +528,7 @@ impl Gui {
                 Key::Num5,
                 Key::Num6,
                 Key::Num7,
+                Key::Num8,
             ];
             let tab = keys.iter().position(|k| i.consume_key(Modifiers::CTRL, *k));
             (esc, stop, tab)
@@ -703,13 +717,13 @@ impl Gui {
         self.act(ui.ctx(), actions);
     }
 
-    /// What was clicked in the viewer, and messages about it to send, filled in for the operator
-    /// to read and send.
+    /// What was clicked in the viewer: a walk there to approve at once, and messages about it
+    /// filled in for the operator to read and send.
     fn picked_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let Some(picked) = self.picked.borrow().clone() else {
             return;
         };
-        let (what, prompts) = {
+        let (what, go, prompts) = {
             let live = self.live();
             match &picked {
                 Picked::Object(id) => {
@@ -718,11 +732,10 @@ impl Gui {
                         .get(id)
                         .map_or_else(|| id.clone(), |n| format!("{id} ({n})"));
                     let prompts = vec![
-                        ("Go there", format!("Walk to {what}.")),
                         ("What is it?", format!("Tell me about {what}.")),
                         ("Pick it up", format!("Pick up {what}.")),
                     ];
-                    (what, prompts)
+                    (what.clone(), walk_to_target(id, &what), prompts)
                 }
                 Picked::Room(id) => {
                     let name = live.rooms.as_ref().and_then(|m| {
@@ -740,15 +753,12 @@ impl Gui {
                             })
                     });
                     let what = name.map_or_else(|| id.clone(), |n| format!("{id} ({n})"));
-                    let prompts = vec![
-                        ("Go there", format!("Walk to {what}.")),
-                        ("What is in it?", format!("What objects are in {what}?")),
-                    ];
-                    (what, prompts)
+                    let prompts = vec![("What is in it?", format!("What objects are in {what}?"))];
+                    (what.clone(), walk_to_target(id, &what), prompts)
                 }
                 Picked::Point([x, y]) => {
                     let what = format!("x {x:.2}, y {y:.2} on the map");
-                    (what.clone(), vec![("Go there", format!("Walk to {what}."))])
+                    (what, walk_to_point(*x, *y, live.pose), Vec::new())
                 }
             }
         };
@@ -758,6 +768,16 @@ impl Gui {
                     .small()
                     .color(ui.tokens().text_subdued),
             );
+            if ui
+                .small_button("Go there")
+                .on_hover_text("Plan the walk now; you approve it before the robot moves")
+                .clicked()
+            {
+                actions.push(Action::Send(Command::Run {
+                    tool: "run_mission".to_owned(),
+                    args: go,
+                }));
+            }
             for (label, text) in prompts {
                 if ui.small_button(label).clicked() {
                     actions.push(Action::Prefill(text));
@@ -875,6 +895,7 @@ impl Gui {
                 Tab::Events => self.events_tab(ui),
                 Tab::Agent => self.agent_tab(ui),
                 Tab::Doctor => self.doctor_tab(ui),
+                Tab::Robot => self.robot_tab(ui),
             });
     }
 
@@ -957,6 +978,21 @@ impl Gui {
         };
         let actions = world_view(ui, &rooms, objects);
         self.act(ui.ctx(), actions);
+    }
+
+    fn robot_tab(&mut self, ui: &mut egui::Ui) {
+        let status = {
+            let l = self.live();
+            crate::robot::Status {
+                state: l.executor.clone(),
+                pose: l.pose,
+                rooms: l.rooms.clone(),
+                names: l.object_names.clone(),
+                battery: l.battery.clone(),
+                motors: l.motors.clone(),
+            }
+        };
+        crate::robot::tab(ui, &status, self.drive.as_mut());
     }
 
     fn layers_tab(&self, ui: &mut egui::Ui) {
@@ -1220,6 +1256,32 @@ impl Gui {
     }
 }
 
+/// A plan that walks to a room or an object of the world model.
+fn walk_to_target(id: &str, what: &str) -> Value {
+    serde_json::json!({
+        "intent": format!("walk to {what}"),
+        "steps": [{"skill": "GoToTarget", "args": [{"name": "target", "value": id}]}]
+    })
+}
+
+/// A plan that walks to a point on the map, facing the way it walked from where it stands.
+fn walk_to_point(x: f32, y: f32, from: Option<crate::robot::Pose>) -> Value {
+    let (x, y) = (f64::from(x), f64::from(y));
+    let yaw = from.map_or(0.0, |(fx, fy, heading)| {
+        if (x - fx).hypot(y - fy) < 0.05 {
+            heading
+        } else {
+            (y - fy).atan2(x - fx)
+        }
+    });
+    serde_json::json!({
+        "intent": format!("walk to x {x:.2}, y {y:.2}"),
+        "steps": [{"skill": "GoToPose", "args": [
+            {"name": "station", "value": format!("{x:.2};{y:.2};{yaw:.3}")}
+        ]}]
+    })
+}
+
 /// Today's use against the tightest daily limit: the shared pool's if the model is in one.
 fn quota(router: &Router, m: &ModelConfig, now: SystemTime) -> String {
     if m.privacy.local {
@@ -1444,6 +1506,45 @@ impl eframe::App for Gui {
     }
 }
 
+/// The executor's state and the robot's pose, once a second: the Robot tab and the stop
+/// button's label follow them.
+fn watch_robot(agent: &Agent, live: &SharedLive, ctx: &egui::Context) {
+    let (robot, profile) = (Arc::clone(&agent.robot), agent.profile.clone());
+    let (live, wake) = (Arc::clone(live), ctx.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let state = profile.mission.as_ref().map(|m| m.state.clone());
+        let (map, base) = (
+            profile.ros.map_frame.clone(),
+            profile.ros.base_frame.clone(),
+        );
+        loop {
+            tick.tick().await;
+            let executor = match &state {
+                Some(topic) => robot
+                    .latest(
+                        topic,
+                        "nervros_interfaces/msg/RobotState",
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .ok(),
+                None => None,
+            };
+            let pose = robot
+                .transform(&map, &base)
+                .ok()
+                .map(|t| (t.translation[0], t.translation[1], t.yaw()));
+            {
+                let mut l = live.lock().unwrap_or_else(PoisonError::into_inner);
+                l.executor = executor;
+                l.pose = pose;
+            }
+            wake.request_repaint();
+        }
+    });
+}
+
 /// Keeps [`Live`] current and wakes the window when the agent or the robot changes.
 fn watch(
     agent: &Agent,
@@ -1457,11 +1558,11 @@ fn watch(
             wake.request_repaint();
         }
     });
+    watch_robot(agent, live, ctx);
     let (robot, profile) = (Arc::clone(&agent.robot), agent.profile.clone());
     let (live_graph, wake) = (Arc::clone(live), ctx.clone());
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
-        let state = profile.mission.as_ref().map(|m| m.state.clone());
         let world = profile.world.clone();
         loop {
             tick.tick().await;
@@ -1497,24 +1598,33 @@ fn watch(
                         .collect()
                 })
                 .unwrap_or_default();
-            let executor = match &state {
-                Some(topic) => robot
-                    .latest(
-                        topic,
-                        "nervros_interfaces/msg/RobotState",
-                        Duration::from_secs(1),
-                    )
-                    .await
-                    .ok(),
-                None => None,
+            let read = |topic: Option<String>, msg_type: &'static str| {
+                let robot = Arc::clone(&robot);
+                async move {
+                    robot
+                        .latest(&topic?, msg_type, Duration::from_secs(1))
+                        .await
+                        .ok()
+                }
             };
+            let battery = read(
+                profile.robot.battery.clone(),
+                "sensor_msgs/msg/BatteryState",
+            )
+            .await;
+            let motors = read(
+                profile.robot.diagnostics.clone(),
+                "diagnostic_msgs/msg/DiagnosticArray",
+            )
+            .await;
             {
                 let mut l = live_graph.lock().unwrap_or_else(PoisonError::into_inner);
                 l.topics = topics;
-                l.executor = executor;
                 l.rooms = rooms;
                 l.objects = objects;
                 l.object_names = object_names;
+                l.battery = battery;
+                l.motors = motors;
             }
             wake.request_repaint();
         }
@@ -1639,6 +1749,19 @@ mod tests {
         );
         assert_eq!(Picked::from_click("/world/map", None), None);
         assert_eq!(Picked::from_click("/camera", at), None);
+    }
+
+    #[test]
+    fn a_click_on_the_floor_walks_there_facing_the_way_it_walked() {
+        let plan = walk_to_point(2.0, 1.0, Some((0.0, 1.0, 1.0)));
+        assert_eq!(plan["steps"][0]["skill"], "GoToPose");
+        assert_eq!(plan["steps"][0]["args"][0]["value"], "2.00;1.00;0.000");
+        let here = walk_to_point(0.0, 1.0, Some((0.0, 1.0, 1.0)));
+        assert_eq!(here["steps"][0]["args"][0]["value"], "0.00;1.00;1.000");
+        assert_eq!(
+            walk_to_target("O17", "O17 (red mug)")["steps"][0]["args"][0]["value"],
+            "O17"
+        );
     }
 
     #[test]

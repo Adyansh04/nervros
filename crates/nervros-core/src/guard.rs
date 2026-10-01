@@ -311,6 +311,34 @@ impl Guard {
         s.last_calls.clear();
     }
 
+    /// For a call the operator asks for directly, such as a plan from a click on the map: the
+    /// budgets and the loop breaker are for the model, so they do not count it; an observe-only
+    /// profile and a disarmed robot still refuse it; and it asks before it acts, as the plan's
+    /// card is how the operator sees what they asked for.
+    #[must_use]
+    pub fn decide_operator(&self, spec: &ToolSpec) -> Decision {
+        let lane = spec.lane();
+        if lane != Lane::Observe && self.policy.autonomy == Autonomy::Observe {
+            return Decision::Deny(Refusal::new(
+                "observe_only",
+                "this profile only observes the robot",
+            ));
+        }
+        if lane == Lane::Act && !lock(&self.state).armed {
+            return Decision::Deny(Refusal::new(
+                "disarmed",
+                "the robot is disarmed: arm it in the top bar first",
+            ));
+        }
+        if lane == Lane::Act {
+            Decision::NeedApproval {
+                reason: format!("`{}` acts on the robot", spec.name),
+            }
+        } else {
+            Decision::Allow
+        }
+    }
+
     /// Decides one call. An allowed call counts against the turn's budget.
     #[must_use]
     pub fn decide(&self, spec: &ToolSpec, args: &Value) -> Decision {

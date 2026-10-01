@@ -70,6 +70,12 @@ pub fn entries() -> Vec<Entry> {
             Cmd::Send(Command::StopMission),
         ),
         entry("Check the robot", "/doctor", "", Cmd::Doctor),
+        entry(
+            "Robot: its state, and driving by hand",
+            "/robot",
+            "Ctrl+8",
+            Cmd::Tab(Tab::Robot),
+        ),
         entry("Models and quotas", "/models", "", Cmd::Tab(Tab::Agent)),
         entry(
             "Missions, saved plans and skill gaps",

@@ -1174,9 +1174,9 @@ impl Tool for RunMission {
         Some(self.approvable(args.clone(), By::Model).await)
     }
 
-    /// The operator's edit of a plan waiting for approval, checked as the model's would be.
-    async fn edit(&self, edited: Value) -> Option<Result<Assessment, ToolOutcome>> {
-        Some(self.approvable(edited, By::Operator).await)
+    /// The operator's own plan, edited or made in the window, checked as the model's would be.
+    async fn assess_operator(&self, args: Value) -> Option<Result<Assessment, ToolOutcome>> {
+        Some(self.approvable(args, By::Operator).await)
     }
 
     /// The skill list loads when the session starts; a first message sent at once would see none.
@@ -1735,12 +1735,12 @@ mod tests {
             .with_critic(Arc::new(Says(r#"{"verdict": "reject", "reason": "no"}"#)));
         let [tool] = missions.tools();
         let bad = json!({"intent": "x", "steps": [{"skill": "PickObject", "args": {"object_id": "O99"}}]});
-        let problems = tool.edit(bad).await.unwrap().unwrap_err();
+        let problems = tool.assess_operator(bad).await.unwrap().unwrap_err();
         assert!(problems.message.starts_with("s1"), "{}", problems.message);
         assert_eq!(missions.plan_failures.load(Ordering::SeqCst), 0);
 
         // Its own concern is shown, not sent back; the critic is not asked.
-        let kept_left = tool.edit(steps()).await.unwrap().unwrap();
+        let kept_left = tool.assess_operator(steps()).await.unwrap().unwrap();
         assert!(
             kept_left.reason.contains("right hand"),
             "{}",
@@ -1753,7 +1753,7 @@ mod tests {
         );
         let mut shorter = steps();
         shorter["steps"].as_array_mut().unwrap().remove(0);
-        let edited = tool.edit(shorter).await.unwrap().unwrap();
+        let edited = tool.assess_operator(shorter).await.unwrap().unwrap();
         assert_ne!(edited.args, kept_left.args, "an edit is a new plan");
     }
 

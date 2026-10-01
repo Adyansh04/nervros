@@ -244,10 +244,11 @@ pub trait Tool: Send + Sync {
         None
     }
 
-    /// For a tool whose request the operator may change while approving it, such as a plan:
-    /// checks `edited` as [`Tool::assess`] would, for the approval to wait on instead. `None`
-    /// means it cannot be edited.
-    async fn edit(&self, _edited: Value) -> Option<Result<Assessment, ToolOutcome>> {
+    /// For a request the operator wrote or changed themselves, such as a plan edited on its
+    /// approval card or one made by a click on the map: checks it as [`Tool::assess`] would,
+    /// without what only applies to the model's requests. `None` means the tool has no such
+    /// check, and its requests cannot be edited.
+    async fn assess_operator(&self, _args: Value) -> Option<Result<Assessment, ToolOutcome>> {
         None
     }
 

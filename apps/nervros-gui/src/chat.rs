@@ -817,8 +817,8 @@ fn approval_card(
                     ui.spinner();
                     ui.label(RichText::new("Checking the edit…").color(t.text_subdued));
                 } else {
-                    let left = ttl.saturating_sub(a.asked.elapsed()).as_secs_f32().ceil();
-                    ui.label(RichText::new(format!("{left} s left")).color(t.text_subdued));
+                    let left = time_left(ttl.saturating_sub(a.asked.elapsed()));
+                    ui.label(RichText::new(left).color(t.text_subdued));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     approval_buttons(ui, a, plan, &mut editing, actions);
@@ -834,6 +834,17 @@ fn approval_card(
             }
             None => d.remove::<Vec<EditStep>>(key),
         });
+    }
+}
+
+/// How long an approval has left: whole minutes while there are more than 90 s, as a count of
+/// seconds would only distract, then seconds.
+fn time_left(left: Duration) -> String {
+    let secs = left.as_secs_f32().ceil();
+    if secs > 90.0 {
+        format!("{} min left", (secs / 60.0).ceil())
+    } else {
+        format!("{secs} s left")
     }
 }
 
@@ -1227,6 +1238,14 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_long_wait_counts_in_minutes_and_the_last_ninety_seconds_in_seconds() {
+        assert_eq!(time_left(Duration::from_mins(10)), "10 min left");
+        assert_eq!(time_left(Duration::from_secs(91)), "2 min left");
+        assert_eq!(time_left(Duration::from_millis(59_200)), "60 s left");
+        assert_eq!(time_left(Duration::ZERO), "0 s left");
+    }
+
+    #[test]
     fn a_resolved_approval_is_no_longer_pending() {
         let mut chat = sample();
         chat.apply(&Event::ApprovalResolved {
@@ -1251,7 +1270,8 @@ pub(crate) mod tests {
                     .fill(ui.tokens().panel_bg_color)
                     .inner_margin(Margin::same(16))
                     .show(ui, |ui| {
-                        chat.show(ui, Duration::from_mins(1), &mut Vec::new());
+                        // Long, so the countdown reads the same however slowly the test runs.
+                        chat.show(ui, Duration::from_mins(10), &mut Vec::new());
                     });
             });
         style_for_tests(&harness.ctx);
