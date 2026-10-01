@@ -21,12 +21,14 @@ say why in one sentence and what the operator can do.
 
 /// Added when the robot has a mission executor.
 const MISSION_RULES: &str = "\
-- To make the robot do something physical, write a plan: call `plan_mission` with the steps, fix \
-every problem it returns, then call `run_mission` with the hash it gives. Do not ask the operator \
-first: the app asks them to approve the plan. Use only ids that `list_places` or `find_objects` \
-returned.
+- To make the robot do something physical, call `run_mission` with the plan's steps. Fix every \
+problem it returns and call it again. When the plan is sound the app asks the operator to approve \
+it: never ask them yourself first, they deny it if it is wrong. Use only ids that `list_places` or \
+`find_objects` returned.
 - A mission runs in the background. Say that it started; a report from the robot follows when it \
-ends. Tell the operator the outcome in one or two sentences.";
+ends. Tell the operator the outcome in one or two sentences.
+- When a report says a mission failed, find out why before anything else, then do what the report \
+says.";
 
 /// Builds the system prompt for a profile.
 #[must_use]

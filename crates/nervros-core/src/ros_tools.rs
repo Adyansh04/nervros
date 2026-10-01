@@ -1046,12 +1046,14 @@ impl Tool for ServiceCall {
                 Assessment {
                     risk: Risk::Observe,
                     resources: Vec::new(),
+                    args: None,
                     reason: format!("reads {} ({})", p.name, p.ty),
                 }
             } else {
                 Assessment {
                     risk: Risk::Motion,
                     resources: ALL.to_vec(),
+                    args: None,
                     reason: format!("calls {} ({}) with {}", p.name, p.ty, p.payload),
                 }
             }
@@ -1173,6 +1175,7 @@ impl Tool for ActionGoal {
         Some(self.prepare(args).await.map(|p| Assessment {
             risk: Risk::Motion,
             resources: ALL.to_vec(),
+            args: None,
             reason: if Self::cancelling(args) {
                 format!("cancels every goal of {} ({})", p.name, p.ty)
             } else {
@@ -1300,6 +1303,7 @@ impl Tool for ParamSet {
         Some(self.prepare(args).await.map(|c| Assessment {
             risk: Risk::WorldEdit,
             resources: Vec::new(),
+            args: None,
             reason: format!(
                 "sets {} on {} from {} to {}",
                 c.name,
@@ -1407,6 +1411,7 @@ impl Tool for TopicPublish {
         Some(self.prepare(args).await.map(|p| Assessment {
             risk: Risk::Motion,
             resources: ALL.to_vec(),
+            args: None,
             reason: format!(
                 "publishes {} on {} ({}) {times} time(s)",
                 p.payload, p.name, p.ty

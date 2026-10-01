@@ -321,11 +321,15 @@ impl Shared {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         // A tool whose risk depends on its arguments says what this call would do, and a call
         // that cannot go out fails here, before anyone is asked to approve it.
-        let (assessment, early) = match tool.assess(&args).await {
+        let (mut assessment, early) = match tool.assess(&args).await {
             Some(Ok(a)) => (Some(a), None),
             Some(Err(out)) => (None, Some(out)),
             None => (None, None),
         };
+        let args = assessment
+            .as_mut()
+            .and_then(|a| a.args.take())
+            .unwrap_or(args);
         let spec = match &assessment {
             Some(a) => {
                 let mut spec = tool.spec().into_owned();

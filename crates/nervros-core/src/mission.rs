@@ -27,7 +27,7 @@ use self::check::Observed;
 use self::plan::{Compiled, Plan, Thing, World};
 use crate::profile::{MissionConfig, Profile};
 use crate::session::{Command, Event, SessionHandle};
-use crate::tools::{Risk, Status, Tool, ToolOutcome, ToolSpec};
+use crate::tools::{Assessment, Risk, Status, Tool, ToolOutcome, ToolSpec};
 
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(10);
 const WORLD_WAIT: Duration = Duration::from_secs(2);
@@ -118,30 +118,10 @@ impl Missions {
         }))
     }
 
-    /// The two tools.
+    /// `run_mission`, the one tool: it checks a plan, and runs it once the operator approves.
     #[must_use]
-    pub fn tools(self: &Arc<Self>) -> [Arc<dyn Tool>; 2] {
-        [
-            Arc::new(PlanMission(Arc::clone(self))),
-            Arc::new(RunMission {
-                missions: Arc::clone(self),
-                spec: ToolSpec {
-                    timeout: SERVICE_TIMEOUT,
-                    ..ToolSpec::new(
-                        "run_mission",
-                        "Runs a plan that plan_mission accepted, by its hash. The operator approves \
-                         it first. Returns once the robot starts; a report follows when it ends.",
-                        json!({
-                            "type": "object",
-                            "properties": {"hash": {"type": "string", "description": "The hash plan_mission returned"}},
-                            "required": ["hash"],
-                            "additionalProperties": false
-                        }),
-                        Risk::Manipulation,
-                    )
-                },
-            }),
-        ]
+    pub fn tools(self: &Arc<Self>) -> [Arc<dyn Tool>; 1] {
+        [Arc::new(RunMission(Arc::clone(self)))]
     }
 
     /// Connects to the session so missions can report; also loads the catalog, so the first
@@ -246,7 +226,7 @@ impl Missions {
         }
     }
 
-    fn plan_spec(&self) -> ToolSpec {
+    fn run_spec(&self) -> ToolSpec {
         let catalog = lock(&self.catalog).clone();
         let (skills, listing) = match &catalog {
             Some(c) => (
@@ -255,19 +235,25 @@ impl Missions {
             ),
             None => (
                 json!({"type": "string"}),
-                "(the skill list loads on first use; call plan_mission to get it)".to_owned(),
+                "(the skill list loads on first use; call run_mission with check_only to get it)"
+                    .to_owned(),
             ),
         };
         let description = format!(
-            "Checks a plan for the robot without moving it and returns the plan's hash; then call \
-             run_mission with the hash. Each step names a skill and gives every one of its arguments \
-             as {{name, value}}, such as {{\"skill\": \"GoToPlace\", \"args\": [{{\"name\": \"place\", \
-             \"value\": \"kitchen\"}}]}}. Use ids from list_places and find_objects. A walk up to an \
-             object that a step must be near is added for you. Skills, by their exact names: {listing}"
+            "Makes the robot do something: give the plan's steps. It is checked first, and any \
+             problems come back to fix; then the operator approves it in the app and the robot \
+             starts, so never ask them yourself. Each step names a skill and gives every one of its \
+             arguments as {{name, value}}, such as {{\"skill\": \"GoToPlace\", \"args\": \
+             [{{\"name\": \"place\", \"value\": \"kitchen\"}}]}}. Use ids from list_places and \
+             find_objects. A walk up to an object that a step must be near is added for you. \
+             check_only: true only checks it, for when the operator asks to see a plan; hash runs a \
+             plan checked before. Skills, by their exact names: {listing}"
         );
         let parameters = json!({
             "type": "object",
             "properties": {
+                "hash": {"type": "string", "description": "Instead of steps: a plan checked before"},
+                "check_only": {"type": "boolean", "description": "Only check the plan; do not run it"},
                 "intent": {"type": "string", "description": "What the operator asked for, in a few words"},
                 "goal": {"type": "array", "items": {"type": "string"},
                          "description": "What should hold at the end: at(place), holding(arm, object_id), inside(object_id, container_id), on(object_id, surface_id)"},
@@ -287,12 +273,11 @@ impl Missions {
                     "additionalProperties": false
                 }}
             },
-            "required": ["intent", "steps"],
             "additionalProperties": false
         });
         ToolSpec {
             timeout: SERVICE_TIMEOUT * 2,
-            ..ToolSpec::new("plan_mission", &description, parameters, Risk::Observe)
+            ..ToolSpec::new("run_mission", &description, parameters, Risk::Manipulation)
         }
     }
 
@@ -308,6 +293,12 @@ impl Missions {
             return ToolOutcome::refused(format!(
                 "this request already failed {failed} times; tell the operator what went wrong instead of retrying"
             ));
+        }
+        let mut args = args;
+        // The tool's own switches, not the plan's.
+        if let Some(fields) = args.as_object_mut() {
+            fields.remove("check_only");
+            fields.remove("hash");
         }
         let plan: Plan = match serde_json::from_value(args) {
             Ok(p) => p,
@@ -362,7 +353,7 @@ impl Missions {
             "hash": compiled.sha256,
             "steps": compiled.steps.iter().map(|s| format!("{} {}", s.id, s.summary)).collect::<Vec<_>>(),
             "worst_case_s": worst.round(),
-            "next": "call run_mission with this hash; the operator approves it first"
+            "next": "only checked: to run it, call run_mission with this hash; the operator approves it then"
         });
         let mut planned = lock(&self.planned);
         // The same plan compiles to the same tree: keep one copy, or its hash reads as ambiguous.
@@ -381,7 +372,7 @@ impl Missions {
             status: Status::Failed,
             data: json!({"ok": false, "problems": problems}),
             message: format!(
-                "the plan has {count} problem(s); fix them all and call plan_mission again (attempt {n} of {MAX_PLAN_ATTEMPTS})"
+                "the plan has {count} problem(s); fix them all and call run_mission again (attempt {n} of {MAX_PLAN_ATTEMPTS})"
             ),
             images: Vec::new(),
         }
@@ -396,7 +387,9 @@ impl Missions {
             .collect();
         match hits.as_slice() {
             [one] => Ok((*one).clone()),
-            [] => Err("no accepted plan has this hash; call plan_mission first".to_owned()),
+            [] => {
+                Err("no checked plan has this hash; give run_mission the steps instead".to_owned())
+            }
             _ => Err("the hash is ambiguous; use the full hash".to_owned()),
         }
     }
@@ -505,10 +498,15 @@ impl Missions {
             let _ = write!(report, " Failed at {step}{what}: {reason}.");
             if n > self.config.max_replans {
                 report.push_str(
-                    " This request has failed too often: do not retry; tell the operator.",
+                    " This request has failed too often: do not retry. Tell the operator what went \
+                     wrong and what would help.",
                 );
             } else {
-                report.push_str(" You may plan once more if the cause is clear.");
+                report.push_str(
+                    " Find out why (robot_state, look, log_tail) and say it in one sentence. If a \
+                     changed plan can work, run it now: the operator approves it. If not, say what is \
+                     needed.",
+                );
             }
         }
         if !seen.state.is_null() {
@@ -621,34 +619,50 @@ fn step_of(text: &str) -> Option<String> {
         .next_back()
 }
 
-/// `plan_mission`.
-struct PlanMission(Arc<Missions>);
-
-#[async_trait]
-impl Tool for PlanMission {
-    fn spec(&self) -> Cow<'_, ToolSpec> {
-        Cow::Owned(self.0.plan_spec())
-    }
-
-    async fn call(&self, args: Value) -> ToolOutcome {
-        self.0.plan(args).await
-    }
-}
-
 /// `run_mission`.
-struct RunMission {
-    missions: Arc<Missions>,
-    spec: ToolSpec,
-}
+struct RunMission(Arc<Missions>);
 
 #[async_trait]
 impl Tool for RunMission {
     fn spec(&self) -> Cow<'_, ToolSpec> {
-        Cow::Borrowed(&self.spec)
+        Cow::Owned(self.0.run_spec())
+    }
+
+    /// A plan is checked before anyone is asked: its problems go back to the model, and a sound
+    /// one is shown, approved and run by its hash.
+    async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
+        args.get("steps")?;
+        if args["check_only"].as_bool() == Some(true) {
+            return Some(Ok(Assessment {
+                risk: Risk::Observe,
+                resources: Vec::new(),
+                reason: "checks a plan".to_owned(),
+                args: None,
+            }));
+        }
+        let out = self.0.plan(args.clone()).await;
+        if out.status != Status::Succeeded {
+            return Some(Err(out));
+        }
+        let steps = out.data["steps"].as_array().map_or(0, Vec::len);
+        let minutes = (out.data["worst_case_s"].as_f64().unwrap_or(0.0) / 60.0).ceil();
+        Some(Ok(Assessment {
+            risk: Risk::Manipulation,
+            resources: Vec::new(),
+            reason: format!(
+                "runs \"{}\": {steps} step(s), at most {minutes} min",
+                args["intent"].as_str().unwrap_or("the plan")
+            ),
+            args: Some(json!({"hash": out.data["hash"]})),
+        }))
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
-        self.missions.run(&args).await
+        // Steps reach here only to be checked: a run's were replaced by their hash.
+        if args.get("steps").is_some() {
+            return self.0.plan(args).await;
+        }
+        self.0.run(&args).await
     }
 }
 
@@ -818,9 +832,40 @@ mod tests {
             text.contains("Failed at s2 PickObject(") && text.contains("grasp slipped"),
             "{text}"
         );
-        assert!(text.contains("plan once more"), "{text}");
+        assert!(
+            text.contains("run it now: the operator approves it"),
+            "{text}"
+        );
         missions.run_failures.store(2, Ordering::SeqCst);
         assert_eq!(missions.plan(steps()).await.status, Status::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_plan_is_checked_before_anyone_is_asked_to_run_it() {
+        let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+        let [tool] = missions.tools();
+        let sound = tool.assess(&steps()).await.unwrap().unwrap();
+        assert_eq!(sound.risk, Risk::Manipulation);
+        let hash = sound.args.unwrap()["hash"].as_str().unwrap().to_owned();
+        assert_eq!(hash.len(), 64);
+        let bad = json!({"intent": "x", "steps": [{"skill": "PickObject", "args": {"object_id": "O99"}}]});
+        let problems = tool.assess(&bad).await.unwrap().unwrap_err();
+        assert_eq!(problems.status, Status::Failed);
+        assert!(
+            problems.message.contains("call run_mission again"),
+            "{}",
+            problems.message
+        );
+        let mut only = steps();
+        only["check_only"] = json!(true);
+        assert_eq!(
+            tool.assess(&only).await.unwrap().unwrap().risk,
+            Risk::Observe
+        );
+        let checked = tool.call(only).await;
+        assert_eq!(checked.data["hash"], hash);
+        assert!(tool.assess(&json!({"hash": hash})).await.is_none());
     }
 
     #[tokio::test]

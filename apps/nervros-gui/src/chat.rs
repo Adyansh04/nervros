@@ -100,7 +100,7 @@ pub enum Item {
     Plan(PlanCard),
 }
 
-/// A plan from `plan_mission`, updated as its mission runs.
+/// A plan `run_mission` checked, updated as its mission runs.
 #[derive(Clone)]
 pub struct PlanCard {
     hash: String,

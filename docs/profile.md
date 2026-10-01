@@ -243,8 +243,9 @@ buries the map in them; hovering a box names it either way.
 ### `[mission]`
 
 The robot's mission executor, which runs behaviour trees; see
-[the executor contract](executor.md). With this section the agent gets `plan_mission` and
-`run_mission`.
+[the executor contract](executor.md). With this section the agent gets `run_mission`: it checks
+a plan, shows it, and runs it once the operator approves, so the operator approves once, in the
+app, and the agent never asks first in the chat. `check_only` only checks a plan.
 
 | Key | Default | |
 |---|---|---|
@@ -277,7 +278,7 @@ pose = { x = 0.0, y = 0.0, yaw = 0.0 }   # in frame, default "map"
 
 Every robot gets `list_places`, `robot_state` and `stop`. `stop` is always allowed, armed or not,
 because it only makes the robot do less. `look` comes with `[look]`, `segment` with `[segment]`,
-and `plan_mission` and `run_mission` with `[mission]`.
+and `run_mission` with `[mission]`.
 
 The rest are the checks you would run yourself before blaming the model:
 

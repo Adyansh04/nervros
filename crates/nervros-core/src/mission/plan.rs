@@ -24,7 +24,7 @@ const SLACK: f64 = 1.2;
 /// skills ask for about half a metre.
 const NEAR_M: f64 = 0.6;
 
-/// What the model sends to `plan_mission`.
+/// What the model sends to `run_mission`.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plan {

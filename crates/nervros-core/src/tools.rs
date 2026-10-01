@@ -225,6 +225,8 @@ pub struct Assessment {
     pub resources: Vec<Resource>,
     /// What the operator is asked to approve, such as "calls /x (pkg/srv/T)".
     pub reason: String,
+    /// The arguments the call runs with, when checking settled them: a plan becomes its hash.
+    pub args: Option<Value>,
 }
 
 /// A callable tool.
