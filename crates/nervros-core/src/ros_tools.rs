@@ -137,8 +137,10 @@ impl Ctx {
     async fn topic_type(&self, topic: &str) -> Result<String, ToolOutcome> {
         let graph = self.graph().await?;
         find_type(&graph.topics, topic).ok_or_else(|| {
-            ToolOutcome::failed(format!(
-                "no topic `{topic}` in the graph; ros_graph lists the topics"
+            ToolOutcome::failed(missing(
+                "topic",
+                topic,
+                graph.topics.iter().map(|(n, _)| n.as_str()),
             ))
         })
     }
@@ -147,8 +149,10 @@ impl Ctx {
     async fn service_type(&self, service: &str) -> Result<String, ToolOutcome> {
         let graph = self.graph().await?;
         find_type(&graph.services, service).ok_or_else(|| {
-            ToolOutcome::failed(format!(
-                "no service `{service}` in the graph; ros_graph lists the services"
+            ToolOutcome::failed(missing(
+                "service",
+                service,
+                graph.services.iter().map(|(n, _)| n.as_str()),
             ))
         })
     }
@@ -156,13 +160,15 @@ impl Ctx {
     /// The type of an action, from the type of its feedback topic.
     async fn action_type(&self, action: &str) -> Result<String, ToolOutcome> {
         let graph = self.graph().await?;
-        actions(&graph)
-            .into_iter()
+        let all = actions(&graph);
+        all.iter()
             .find(|(name, _)| name == action)
-            .map(|(_, ty)| ty)
+            .map(|(_, ty)| ty.clone())
             .ok_or_else(|| {
-                ToolOutcome::failed(format!(
-                    "no action `{action}` in the graph; ros_graph lists the actions"
+                ToolOutcome::failed(missing(
+                    "action",
+                    action,
+                    all.iter().map(|(n, _)| n.as_str()),
                 ))
             })
     }
@@ -191,6 +197,29 @@ impl Ctx {
 
 fn failed(e: &RosError) -> ToolOutcome {
     ToolOutcome::failed(e.to_string())
+}
+
+/// Why `name` is not one of `kind` in the graph, naming those like it: a small model guesses
+/// `/odom` where the robot has `/Odometry_loc`, and needs the real name more than the advice to
+/// list everything.
+pub(crate) fn missing<'a>(kind: &str, name: &str, known: impl Iterator<Item = &'a str>) -> String {
+    let word = name.rsplit('/').next().unwrap_or(name).to_lowercase();
+    let like: Vec<&str> = if word.len() < 3 {
+        Vec::new()
+    } else {
+        known
+            .filter(|n| n.to_lowercase().contains(&word))
+            .take(5)
+            .collect()
+    };
+    if like.is_empty() {
+        format!("no {kind} `{name}` in the graph; ros_graph lists them")
+    } else {
+        format!(
+            "no {kind} `{name}` in the graph; ones like it: {}",
+            like.join(", ")
+        )
+    }
 }
 
 fn find_type(list: &[(String, Vec<String>)], name: &str) -> Option<String> {
@@ -1660,6 +1689,17 @@ pub fn tools(
 mod tests {
     use nervros_ros::fake::FakeRobot;
     use nervros_ros::{NodeEntities, QosInfo, TopicEndpoints};
+
+    #[test]
+    fn a_missing_name_comes_back_with_the_ones_like_it() {
+        let known = ["/Odometry_loc", "/g1_odometry_publisher/odom", "/scan"];
+        let text = super::missing("topic", "/odom", known.into_iter());
+        assert!(
+            text.contains("/Odometry_loc, /g1_odometry_publisher/odom"),
+            "{text}"
+        );
+        assert!(super::missing("topic", "/x", known.into_iter()).contains("ros_graph lists them"));
+    }
 
     use super::*;
     use crate::guard::Policy;

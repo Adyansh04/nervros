@@ -251,7 +251,13 @@ impl Watches {
             .iter()
             .find(|(name, _)| *name == topic)
             .map(|(_, types)| types.first().cloned().unwrap_or_default())
-            .ok_or_else(|| format!("no topic `{topic}` in the graph; ros_graph lists them"))?;
+            .ok_or_else(|| {
+                crate::ros_tools::missing(
+                    "topic",
+                    &topic,
+                    graph.topics.iter().map(|(n, _)| n.as_str()),
+                )
+            })?;
         Ok((topic, ty))
     }
 
