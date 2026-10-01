@@ -7,6 +7,7 @@
 //! executor accepts; the mission runs in the background, its progress goes out as session events,
 //! and when it ends the model gets a report with the outcome and the goal checks.
 
+pub mod camera;
 pub mod catalog;
 pub mod check;
 pub mod history;
@@ -23,7 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use nervros_ros::{Goal, GoalResult, Publisher, RobotPort, RosError};
+use nervros_ros::{Frame, Goal, GoalResult, Publisher, RobotPort, RosError};
 use serde_json::{Value, json};
 
 use self::catalog::Catalog;
@@ -110,6 +111,8 @@ pub struct Missions {
     request: Mutex<String>,
     /// A second opinion on the model's plans, when a model has the role.
     critic: OnceLock<Arc<dyn Critic>>,
+    /// The camera's view of a mission's end, when the robot has a camera and a vision model.
+    vision: OnceLock<camera::Vision>,
     /// Whether a plan for this request already went back for not matching the operator's words:
     /// once is a hint, twice would argue with a model that may be right.
     questioned: AtomicBool,
@@ -173,6 +176,7 @@ impl Missions {
             ledger: OnceLock::new(),
             request: Mutex::default(),
             critic: OnceLock::new(),
+            vision: OnceLock::new(),
             questioned: AtomicBool::new(false),
         }))
     }
@@ -190,6 +194,14 @@ impl Missions {
     pub fn with_critic(self: Arc<Self>, critic: Arc<dyn Critic>) -> Arc<Self> {
         // Set once, at start-up.
         let _ = self.critic.set(critic);
+        self
+    }
+
+    /// Checks each successful mission's goals through the camera too.
+    #[must_use]
+    pub fn with_vision(self: Arc<Self>, vision: camera::Vision) -> Arc<Self> {
+        // Set once, at start-up.
+        let _ = self.vision.set(vision);
         self
     }
 
@@ -769,7 +781,8 @@ impl Missions {
             id: id.clone(),
             hash: compiled.sha256.clone(),
         });
-        tokio::spawn(Arc::clone(self).watch(id.clone(), compiled, goal));
+        let before = self.vision.get().and_then(camera::Vision::frame);
+        tokio::spawn(Arc::clone(self).watch(id.clone(), compiled, goal, before));
         Ok(id)
     }
 
@@ -820,7 +833,13 @@ impl Missions {
         ))
     }
 
-    async fn watch(self: Arc<Self>, id: String, compiled: Compiled, goal: Goal) {
+    async fn watch(
+        self: Arc<Self>,
+        id: String,
+        compiled: Compiled,
+        goal: Goal,
+        before: Option<Arc<Frame>>,
+    ) {
         let started = Instant::now();
         let started_s = ledger::now_s();
         let mut times = StepTimes::default();
@@ -884,12 +903,28 @@ impl Missions {
             Some(id) => self.object_story(id).await,
             None => Vec::new(),
         };
+        let camera = match self.vision.get().filter(|_| outcome == "success") {
+            Some(vision) => {
+                let verdicts = check::check(&compiled.goal, &seen);
+                vision.check(&verdicts, &seen, before.as_ref()).await
+            }
+            None => camera::Checked::default(),
+        };
+        if let Some(image) = &camera.image {
+            self.emit(Event::Snapshot {
+                id: image.snapshot.clone(),
+                jpeg: Arc::clone(&image.jpeg),
+                width: image.width,
+                height: image.height,
+                marks: Vec::new(),
+            });
+        }
         let report = self.report(
             &id,
             &compiled,
             (&outcome, &step, &reason),
             elapsed,
-            (&seen, &story),
+            (&seen, &story, &camera.lines),
         );
         if let Some(s) = self.session.get() {
             s.send(Command::Report(report));
@@ -904,7 +939,7 @@ impl Missions {
         compiled: &Compiled,
         (outcome, step, reason): (&str, &str, &str),
         elapsed: f64,
-        (seen, story): (&Observed, &[String]),
+        (seen, story, camera): (&Observed, &[String], &[String]),
     ) -> String {
         let mut report = format!(
             "Mission {id} ({}) ended: {outcome} after {elapsed:.0} s.",
@@ -926,6 +961,13 @@ impl Missions {
                     })
                     .collect();
                 let _ = write!(report, " Goal checks: {}.", lines.join("; "));
+            }
+            if !camera.is_empty() {
+                let _ = write!(
+                    report,
+                    " Camera check, before and after: {}.",
+                    camera.join("; ")
+                );
             }
         } else {
             let n = self.run_failures.fetch_add(1, Ordering::SeqCst) + 1;

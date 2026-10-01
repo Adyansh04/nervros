@@ -43,7 +43,7 @@ pub struct Observed {
     pub state: Value,
 }
 
-fn object<'v>(objects: &'v Value, id: &str) -> Option<&'v Value> {
+pub(crate) fn object<'v>(objects: &'v Value, id: &str) -> Option<&'v Value> {
     objects["objects"]
         .as_array()?
         .iter()

@@ -147,20 +147,28 @@ fn orphan_notice(state: &serde_json::Value) -> Option<String> {
     ))
 }
 
-/// `look`, `segment` and the world editor's tools, as the profile has them; the editor client too,
-/// for the app.
+/// What seeing set up beyond its tools: the world editor's client, for the app, and the camera
+/// check of a mission's end, for the missions.
+struct Seeing {
+    editor: Option<Arc<crate::editor::EditorClient>>,
+    vision: Option<crate::mission::camera::Vision>,
+}
+
+/// `look`, `point`, `segment` and the world editor's tools, as the profile has them.
 fn seeing_tools(
     profile: &Profile,
     robot: &Arc<dyn RobotPort>,
     llm: &Arc<Llm>,
     snapshots: &Arc<SnapshotStore>,
     registry: &mut Registry,
-) -> Result<Option<Arc<crate::editor::EditorClient>>, StartError> {
+) -> Result<Seeing, StartError> {
     let robot = Arc::clone(robot);
     let snapshots = Arc::clone(snapshots);
     let llm = Arc::clone(llm);
+    let mut seen_by = None;
     if let Some(look) = profile.look.clone() {
         let cameras = Cameras::start(&look, &robot).map_err(StartError::Look)?;
+        seen_by = Some(Arc::clone(&cameras));
         let eyes: Arc<dyn crate::look::Eyes> = Arc::clone(&llm) as Arc<dyn crate::look::Eyes>;
         registry.add(Arc::new(LookTool::new(
             look,
@@ -202,7 +210,12 @@ fn seeing_tools(
             registry.add(tool)?;
         }
     }
-    Ok(editor)
+    let vision = seen_by.map(|cameras| crate::mission::camera::Vision {
+        eyes: Arc::clone(&llm) as Arc<dyn crate::look::Eyes>,
+        cameras,
+        snapshots: Arc::clone(&snapshots),
+    });
+    Ok(Seeing { editor, vision })
 }
 
 /// `list_places`, `tag_place` and `forget_place`, over the profile's places and the ones remembered
@@ -296,24 +309,28 @@ pub fn start(
     start_with(profile_path, robot, ledger, SessionFiles::default())
 }
 
-/// Missions, when the profile has a `[mission]` section: kept in the robot's ledger, and
-/// checked by `critic` too when a model has the `plan_check` role.
+/// Missions, when the profile has a `[mission]` section: kept in the robot's ledger, checked by
+/// `critic` too when a model has the `plan_check` role, and their ends seen through the camera
+/// with `vision`.
 fn missions(
     profile: &Profile,
     places: Arc<crate::places::Places>,
     robot: &Arc<dyn RobotPort>,
     ledger: &Path,
     critic: Option<Arc<dyn crate::mission::sanity::Critic>>,
+    vision: Option<crate::mission::camera::Vision>,
 ) -> Option<Arc<Missions>> {
-    let m = Missions::new(profile, places, Arc::clone(robot))?;
-    let m = match mission_ledger(profile, ledger) {
-        Some(l) => m.with_ledger(l),
-        None => m,
-    };
-    Some(match critic {
-        Some(c) => m.with_critic(c),
-        None => m,
-    })
+    let mut m = Missions::new(profile, places, Arc::clone(robot))?;
+    if let Some(l) = mission_ledger(profile, ledger) {
+        m = m.with_ledger(l);
+    }
+    if let Some(c) = critic {
+        m = m.with_critic(c);
+    }
+    if let Some(v) = vision {
+        m = m.with_vision(v);
+    }
+    Some(m)
 }
 
 /// Starts an agent whose conversation is saved to, or resumed from, `files`. Must run inside a
@@ -342,7 +359,7 @@ pub fn start_with(
     let schemas: Arc<dyn SchemaSource> = Arc::new(RosidlSchemas::load(&profile)?);
     let mut registry = Registry::from_config(&profile.tools, &robot, &schemas, &guard)?;
     let snapshots = Arc::new(SnapshotStore::default());
-    let editor = seeing_tools(&profile, &robot, &llm, &snapshots, &mut registry)?;
+    let seeing = seeing_tools(&profile, &robot, &llm, &snapshots, &mut registry)?;
     let places = place_tools(&profile, &robot, ledger, &mut registry)?;
     registry.add(Arc::new(RobotState::new(
         &profile,
@@ -361,7 +378,7 @@ pub fn start_with(
     ))))?;
     let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
     registry.add(Arc::clone(&stop))?;
-    let missions = missions(&profile, places, &robot, ledger, critic);
+    let missions = missions(&profile, places, &robot, ledger, critic, seeing.vision);
     let schedules = missions
         .as_ref()
         .map(|m| crate::schedule::Schedules::new(Arc::clone(m), Arc::clone(&guard)));
@@ -421,7 +438,7 @@ pub fn start_with(
         snapshots,
         llm,
         tools,
-        editor,
+        editor: seeing.editor,
         memory,
         schedules,
         missions,
