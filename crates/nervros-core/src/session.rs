@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::guard::{Decision, Guard};
+use crate::guard::{Decision, Guard, Refusal, RuleAction};
 use crate::llm::{self, AgentSource, History, LoopTool};
 use crate::mission::plan::PlannedStep;
 use crate::mission::sanity::Concern;
@@ -582,6 +582,28 @@ impl Shared {
         })
     }
 
+    /// The guard's decision, tightened by the profile's rule for this call: its refusal stands
+    /// over everything, and its question makes an allowed call ask.
+    fn decide(
+        &self,
+        spec: &ToolSpec,
+        args: &Value,
+        caller: Caller,
+        rule: Option<crate::guard::ArgRule>,
+    ) -> Decision {
+        if let Some(r) = rule.as_ref().filter(|r| r.then == RuleAction::Deny) {
+            return Decision::Deny(Refusal::new("rule", r.reason.clone()));
+        }
+        let decision = match caller {
+            Caller::Model => self.guard.decide(spec, args),
+            Caller::Operator => self.guard.decide_operator(spec),
+        };
+        match (decision, rule) {
+            (Decision::Allow, Some(r)) => Decision::NeedApproval { reason: r.reason },
+            (decision, _) => decision,
+        }
+    }
+
     async fn invoke(
         &self,
         tool: &Arc<dyn Tool>,
@@ -592,6 +614,8 @@ impl Shared {
     ) -> Value {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         let assessed = Self::assess(tool, &args, caller).await;
+        // The profile's rules read the arguments as they were sent, before checking settled them.
+        let rule = self.guard.rule(&tool.spec().name, &args).cloned();
         let (mut assessment, early) = match assessed {
             Some(Ok(a)) => (Some(a), None),
             Some(Err(out)) => (None, Some(out)),
@@ -617,10 +641,7 @@ impl Shared {
             args: args.clone(),
         });
         let started = Instant::now();
-        let decision = match caller {
-            Caller::Model => self.guard.decide(&spec, &args),
-            Caller::Operator => self.guard.decide_operator(&spec),
-        };
+        let decision = self.decide(&spec, &args, caller, rule);
         let outcome = match early {
             Some(out) => out,
             None => match decision {
@@ -2174,5 +2195,59 @@ mod tests {
             "{read}"
         );
         assert_eq!(model.requests().len(), 2, "no turn of its own: it was read");
+    }
+
+    #[tokio::test]
+    async fn a_profile_rule_refuses_one_value_and_asks_before_another() {
+        let policy: crate::guard::Policy = toml::from_str(
+            r#"
+            [[rule]]
+            tool = "find_objects"
+            arg = "query"
+            matches = "*knife*"
+            then = "deny"
+            reason = "do not look for knives"
+            [[rule]]
+            tool = "find_objects"
+            arg = "query"
+            matches = "*bedroom*"
+            then = "ask"
+            reason = "the bedroom is private"
+            "#,
+        )
+        .unwrap();
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "find_objects", json!({"query": "the knife"})),
+            MockTurn::tool_call("c2", "find_objects", json!({"query": "the bedroom lamp"})),
+            MockTurn::text("Done."),
+        ]);
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            registry(Risk::Observe),
+            Arc::new(Guard::new(policy)),
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("find things".into()));
+        let approve = |e: &Event| match e {
+            Event::ApprovalRequested { id, .. } => Some(Command::Approve(*id)),
+            _ => None,
+        };
+        let events = collect_until_finished(&mut rx, approve, &session).await;
+        let finished: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolFinished {
+                    status, message, ..
+                } => Some((*status, message.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished[0], ("refused", "do not look for knives"));
+        assert_eq!(finished[1].0, "succeeded", "asked, then run");
+        assert!(events.iter().any(
+            |e| matches!(e, Event::ApprovalRequested { reason, .. } if reason == "the bedroom is private")
+        ));
     }
 }

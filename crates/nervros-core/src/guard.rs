@@ -94,6 +94,56 @@ pub struct Policy {
     /// velocity and joint commands, controller switches, lifecycle changes.
     #[serde(default = "default_hard_deny_types")]
     pub hard_deny_types: Vec<String>,
+    /// Refusals or approvals the profile adds for particular arguments, `[[policy.rule]]`. They
+    /// only ever tighten: no rule lets through what the guard would stop.
+    #[serde(default, rename = "rule")]
+    pub rules: Vec<ArgRule>,
+}
+
+/// A tightening for one tool's arguments: never this value, or ask the operator first.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArgRule {
+    /// The tool, or `*` for every tool.
+    pub tool: String,
+    /// The argument, as a dotted path; `*` stands for every entry of a list, as `steps.*.skill`.
+    pub arg: String,
+    /// The values it applies to, globbed like `hard_deny`; a number or a flag as its text.
+    pub matches: String,
+    /// Refuse the call, or ask the operator first.
+    pub then: RuleAction,
+    /// Why, for the model and the operator.
+    pub reason: String,
+}
+
+/// What a rule does.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleAction {
+    /// The call is refused.
+    Deny,
+    /// The operator approves the call first, even where nothing else would ask.
+    Ask,
+}
+
+/// The values at a dotted path, every entry of a list where the path says `*`.
+fn values_at<'a>(value: &'a Value, path: &[&str]) -> Vec<&'a Value> {
+    let Some((first, rest)) = path.split_first() else {
+        return vec![value];
+    };
+    match (*first, value) {
+        ("*", Value::Array(items)) => items.iter().flat_map(|v| values_at(v, rest)).collect(),
+        ("*", Value::Object(fields)) => fields.values().flat_map(|v| values_at(v, rest)).collect(),
+        (key, Value::Object(fields)) => fields
+            .get(key)
+            .map_or_else(Vec::new, |v| values_at(v, rest)),
+        (index, Value::Array(items)) => index
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| items.get(i))
+            .map_or_else(Vec::new, |v| values_at(v, rest)),
+        _ => Vec::new(),
+    }
 }
 
 fn d_ttl() -> Duration {
@@ -147,6 +197,7 @@ impl Default for Policy {
             budgets: Budgets::default(),
             hard_deny: default_hard_deny(),
             hard_deny_types: default_hard_deny_types(),
+            rules: Vec::new(),
         }
     }
 }
@@ -192,7 +243,9 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    fn new(rule: &'static str, message: impl Into<String>) -> Self {
+    /// A refusal by `rule`, telling the model `message`.
+    #[must_use]
+    pub fn new(rule: &'static str, message: impl Into<String>) -> Self {
         Self {
             rule,
             message: message.into(),
@@ -339,6 +392,26 @@ impl Guard {
         }
     }
 
+    /// The profile's rule for a call, as the model or the operator sent its arguments: a refusal
+    /// over a request to ask.
+    #[must_use]
+    pub fn rule(&self, tool: &str, args: &Value) -> Option<&ArgRule> {
+        let hits = || {
+            self.policy.rules.iter().filter(|r| {
+                (r.tool == "*" || r.tool == tool)
+                    && values_at(args, &r.arg.split('.').collect::<Vec<_>>())
+                        .iter()
+                        .any(|v| {
+                            let text = v.as_str().map_or_else(|| v.to_string(), str::to_owned);
+                            glob_match(&r.matches, &text)
+                        })
+            })
+        };
+        hits()
+            .find(|r| r.then == RuleAction::Deny)
+            .or_else(|| hits().next())
+    }
+
     /// Decides one call. An allowed call counts against the turn's budget.
     #[must_use]
     pub fn decide(&self, spec: &ToolSpec, args: &Value) -> Decision {
@@ -444,6 +517,53 @@ mod tests {
 
     fn spec(name: &str, risk: Risk) -> ToolSpec {
         ToolSpec::new(name, "test", json!({"type": "object"}), risk)
+    }
+
+    #[test]
+    fn a_rule_reads_the_arguments_by_path_and_a_refusal_beats_a_question() {
+        let policy: Policy = toml::from_str(
+            r#"
+            [[rule]]
+            tool = "run_mission"
+            arg = "steps.*.skill"
+            matches = "Pick*"
+            then = "ask"
+            reason = "picking needs a person watching"
+            [[rule]]
+            tool = "*"
+            arg = "steps.*.args.object_id"
+            matches = "knife*"
+            then = "deny"
+            reason = "the robot does not handle knives"
+            [[rule]]
+            tool = "schedule"
+            arg = "times"
+            matches = "4*"
+            then = "ask"
+            reason = "a schedule this long"
+            "#,
+        )
+        .unwrap();
+        let guard = Guard::new(policy);
+        let plan = |object: &str| {
+            json!({"steps": [{"skill": "GoToPlace"},
+                             {"skill": "PickObject", "args": {"object_id": object}}]})
+        };
+        let ask = guard.rule("run_mission", &plan("mug_4")).unwrap();
+        assert_eq!(ask.then, RuleAction::Ask);
+        let deny = guard.rule("run_mission", &plan("knife_2")).unwrap();
+        assert_eq!(deny.reason, "the robot does not handle knives");
+        assert_eq!(
+            guard.rule("schedule", &json!({"times": 48})).unwrap().then,
+            RuleAction::Ask,
+            "a number by its text"
+        );
+        assert!(guard.rule("schedule", &json!({"times": 5})).is_none());
+        assert!(
+            guard
+                .rule("run_mission", &json!({"hash": "ab12"}))
+                .is_none()
+        );
     }
 
     #[test]
