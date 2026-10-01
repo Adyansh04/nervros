@@ -40,6 +40,7 @@ does not declare, is for the generic tools of [`[ros_tools]`](#ros_tools), behin
 | `hide_fields` | none | Request fields the model neither sees nor fills, such as an embedding. |
 | `defaults` | none | Values the request starts from; the model's arguments go on top. |
 | `schema` | generated | A full JSON Schema to use instead. |
+| `world_text` | none | Result fields that hold text read from the world, such as names a detector or a describer gave: each is fenced as `<world>...</world>`, which the model is told is data, never instructions. Text on a sign or a box must not steer the robot. |
 
 A name on the policy's `hard_deny` list cannot become a tool at all: the start fails.
 
@@ -51,6 +52,15 @@ A name on the policy's `hard_deny` list cannot become a tool at all: the start f
 |---|---|---|
 | `name` | required | Shown in the app and told to the model. |
 | `persona` | none | A markdown file about the robot, its abilities and limits, added to the system prompt. |
+| `battery` | none | A `sensor_msgs/msg/BatteryState` topic, shown in the Robot tab. |
+| `diagnostics` | none | A `diagnostic_msgs/msg/DiagnosticArray` topic with motor temperatures; the Robot tab shows the hottest. |
+
+`skills` (at the top level, beside `[robot]`) lists folders of skills, relative to the profile:
+procedures for what the agent meets rarely and must get right, such as navigation that never came
+up. Each skill is a folder holding a `SKILL.md` that starts with a front matter of `name` (lower
+case words joined by `-`) and `description` (when to use it). The system prompt carries one line
+per skill; the `skill` tool reads one in full when it fits. `nervros-cli skills` lists them and
+says what could not be read.
 
 ### `[ros]`
 
@@ -83,6 +93,19 @@ models, and sends text only to models that are local or do not train on it.
 | `budgets.repeat_break` | `3` | The same call with the same arguments this many times in a row is refused. |
 | `hard_deny` | see below | ROS names no tool may reach; `*` matches anything. Setting it replaces the defaults. |
 | `hard_deny_types` | see below | Interface types no generic tool may call, send or publish, globbed the same way. |
+| `rule` | none | Rules on a tool's arguments, below. |
+
+Rules only tighten: one can refuse a call or make it ask, never let through what the guard would
+not.
+
+```toml
+[[policy.rule]]
+tool = "run_mission"            # or "*" for every tool
+arg = "steps.*.args.*.value"    # a dotted path; * is every entry of a list
+matches = "R5"                  # globbed like hard_deny; a number or a flag as its text
+then = "deny"                   # or "ask": the operator approves it first, armed or not
+reason = "the bedroom is private"
+```
 
 The default `hard_deny` covers what commands motors, velocities or controllers directly:
 `rt/lowcmd`, `/lowcmd`, `/rt/*`, `*cmd_vel*`, `/controller_manager/*`, `*/set_parameters`,
@@ -206,6 +229,10 @@ how much of each the camera has seen, and plots that share with the room and obj
 `list_places`, `robot_state` and missions read rooms and objects. The app's World tab lists the
 rooms with their floor and walls seen, and its Explore button asks the agent to explore.
 
+`history` names canopy's `canopy_msgs/srv/ObjectHistory` service: what happened to each object,
+when it appeared, moved, went missing, was seen again or merged. `recall` reads it, and a failed
+mission's report says where its object was last seen.
+
 ### `[viz]`
 
 What the viewer draws beyond the world model, each optional: `plan` (`{ topic, type }`, the
@@ -254,7 +281,22 @@ app, and the agent never asks first in the chat. `check_only` only checks a plan
 | `catalog` | required | The `GetCatalog` service. |
 | `stop` | required | The `StopAll` service, which the Stop button and `stop` call. |
 | `state` | required | The `RobotState` topic. |
-| `max_replans` | `2` | Failed missions for one request before the agent must hand back to the operator. |
+| `max_replans` | `2` | Failed missions for one request, counted until the operator speaks again, before the agent must hand back to the operator. |
+| `preview` | none | The `PreviewMission` service: the viewer draws where a plan's walks end and the paths to them beside its approval card, and the card marks a step the preview cannot reach. |
+| `heartbeat` | none | Where the agent publishes `nervros_interfaces/msg/Heartbeat` while a mission runs, from the session's own loop: the executor stops a mission whose agent is gone, crashed or hung. Without it a mission runs on alone. |
+| `heartbeat_timeout_s` | `2.0` | How long a mission may go without a heartbeat; the executor clamps it to its own limit. |
+| `teleop` | none | The `Teleop` service: Drive in the Robot tab hands the base to the operator while no mission runs. |
+| `teleop_cmd` | none | Where the hand-driving `geometry_msgs/msg/Twist` commands go; the executor caps their speed and stops the base when they pause. |
+
+Before a plan reaches the operator it is checked against their words: a left turn planned as a
+right one, a walk the wrong way or of another length, the other hand. Such a plan goes back to the
+model once, and comes to the operator with its concerns and their fixes. A request that names what
+to handle only as "it", said first in a session, is refused with word to ask; a request with a
+clock ("every 10 minutes") goes to `schedule`. With a `plan_check` model in the models file, a
+second model judges the plan from the operator's words too; with a `plan` model other than the
+routine one, it advises the planner once a request's plans have failed twice. Missions are kept in
+a ledger beside the quota file: the card shows how each step went before, and `recall`, the
+Mission tab and `nervros-cli missions` read it.
 
 ### `[[place]]`
 
@@ -279,6 +321,36 @@ place first, as it walks to any object the world model knows.
 
 `file`: the [models file](models.md).
 
+### `[[mcp_server]]`
+
+Tools from an MCP server, behind the same guard as every other tool. Only the tools listed exist
+for the agent, and each only while its definition is the one approved: `nervros-cli mcp pin` keeps
+each tool's definition, by a hash of its canonical form and its text, in `mcp.lock.json` beside the
+profile, and a tool whose definition changed is left out until it is pinned again. A tool acts,
+with arming and approval, unless the profile marks it `observe`; the server's own hints are not
+believed. What a tool returns is cut to a size and fenced with the server and tool it came from.
+
+```toml
+[[mcp_server]]
+id = "docs"                          # tools appear as docs__<name>
+transport = "stdio"                  # or "http" with url and, optionally, bearer_file
+command = "/usr/local/bin/docs-mcp"  # absolute; nothing is fetched to run it
+args = ["--root", "/srv/docs"]
+env = { LANG = "C.UTF-8" }           # its whole environment: no model key reaches it
+open_world = false                   # true when it reaches the internet: off in home mode
+[mcp_server.tools.search]
+observe = true
+description = "Searches the robot's manuals."
+```
+
+| Key | Default | |
+|---|---|---|
+| `max_result_bytes` | `8192` | A result past this is cut. |
+| `timeout` | `"20s"` | How long a call may take. |
+
+`nervros-cli mcp` lists each server's tools and whether they are pinned; the doctor and the app's
+Doctor tab show a server that did not connect.
+
 ## Builtin tools
 
 Every robot gets `list_places`, `robot_state` and `stop`. `stop` is always allowed, armed or not,
@@ -294,5 +366,13 @@ The rest are the checks you would run yourself before blaming the model:
 | `watches` | Lists the running watches, or cancels one or all. |
 | `plot` | Draws a number from a topic's messages over time in the app's Plots tab, as `rqt_plot` does, for two minutes unless told longer. |
 | `memory` | Keeps what the operator asks it to remember across sessions ("the kitchen door sticks"), in the state directory, one file per robot; lists and forgets notes. The notes join the system prompt on every turn, and the Agent tab lists them. Remembering and forgetting are approved like an edit. |
-| `schedule` | With `[mission]`: runs a plan again and again, such as a patrol every 30 minutes, a set number of times. The operator approves it once for all its runs; a run is skipped while the robot is disarmed or busy, and stopping the robot cancels every schedule. The Mission tab lists them. |
+| `schedule` | With `[mission]`: runs a plan again and again, such as a patrol every 30 minutes, a set number of times, or each time something happens: an object of a kind appears, in a room or anywhere, or a condition on a topic as `watch` takes it becomes true. The operator approves it once for all its runs; a run is skipped while the robot is disarmed or busy, and stopping the robot cancels every schedule. The Mission tab lists them. |
+| `recall` | With `[mission]`: what the robot did lately, from the mission ledger, what happened to an object, from `[world] history`, and the operator's notes. |
+| `plans` | With `[mission]`: saves a plan that worked by name ("evening check"), lists them, and runs one again. |
+| `skill_gap` | With `[mission]`: logs a request no skill can do, and why; planning that gives up logs one itself. The Mission tab and `nervros-cli gaps` list them. |
+| `point` | With a `segment` model in the models file: points at what the operator names in a camera's newest frame, including things no detector marks, and says which mark a point lands on. |
+| `skill` | With `skills`: reads one skill's procedure. |
+
+`look` can also answer about an earlier snapshot, and look closer at one mark: it crops the mark
+from the full frame at a higher resolution for the vision model, for a label or a small part.
 | `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each asks for approval when supervised, like a world edit. |
