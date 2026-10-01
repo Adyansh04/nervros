@@ -280,6 +280,7 @@ fn print_event(e: &Event, logs: &Path) {
         | Event::TurnFinished { .. }
         | Event::Plot { .. }
         | Event::Context { .. }
+        | Event::ModelCall { .. }
         | Event::ReplyDelta { .. } => {}
         Event::Restored { exchanges } => {
             println!(
@@ -355,9 +356,10 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
             )
         }
     };
-    let files = nervros_core::app::SessionFiles {
+    let files = nervros_core::app::StartOptions {
         history: Some(logs_dir.join(format!("session-{stamp}.history.json"))),
         resume,
+        model: None,
     };
     let agent =
         nervros_core::app::start_with(profile_path, robot, &state.join("quota.json"), files)

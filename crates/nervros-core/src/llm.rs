@@ -5,16 +5,16 @@
 //! transport failure moves on without parking, and the answer names the model that gave it.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use futures::future::BoxFuture;
 use rig::agent::tool::ToolOutput;
 use rig::agent::{
-    AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent, HookContext,
-    InvalidToolCallAction, InvalidToolCallContext, ObservationAction, RequestPatch,
+    AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, InvalidToolCallAction,
+    InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, RequestPatch,
 };
 use rig::client::CompletionClient as _;
 use rig::completion::{Chat as _, Message, Prompt as _, PromptError};
@@ -852,8 +852,9 @@ struct TurnHook {
     last: usize,
     /// Tokens left for the history and the prompt in the model's window, when it is known.
     room: Option<usize>,
-    /// The input tokens of the latest request, as the provider counted them.
-    used: Arc<AtomicU64>,
+    on_call: Option<OnCall>,
+    /// When the pending call was sent.
+    sent: Mutex<Option<Instant>>,
     /// The system prompt for the last call, which says no tool can be called.
     last_word: String,
 }
@@ -891,21 +892,33 @@ impl AgentHook for TurnHook {
                     .preamble(self.last_word.clone()),
             );
         }
+        if let Ok(mut sent) = self.sent.lock() {
+            *sent = Some(Instant::now());
+        }
         patch.map_or_else(
             CompletionCallAction::continue_run,
             CompletionCallAction::patch,
         )
     }
 
-    async fn on_completion_response(
+    /// Fired for every call, streamed or not, which a response hook is not.
+    async fn on_model_turn_finished(
         &self,
         _ctx: &HookContext,
-        event: CompletionResponseEvent<'_>,
-    ) -> ObservationAction {
-        if event.usage.input_tokens > 0 {
-            self.used.store(event.usage.input_tokens, Ordering::Relaxed);
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        if let Some(on_call) = &self.on_call {
+            let sent = self.sent.lock().ok().and_then(|mut s| s.take());
+            on_call(CallCost {
+                input_tokens: event.usage.input_tokens,
+                cached_tokens: event.usage.cached_input_tokens,
+                output_tokens: event.usage.output_tokens,
+                ms: sent.map_or(0, |t| {
+                    u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+                }),
+            });
         }
-        ObservationAction::continue_run()
+        ModelTurnAction::Continue
     }
 
     /// Small models invent tool names; the model gets the real ones back as the call's result
@@ -942,14 +955,30 @@ pub struct TurnSetup<'a> {
     pub started: Arc<AtomicBool>,
     /// The model's context window in tokens, when known.
     pub window: Option<usize>,
-    /// Where the input tokens of the turn's latest request are written.
-    pub used: Arc<AtomicU64>,
+    /// Given what each model call cost.
+    pub on_call: Option<OnCall>,
     /// Given each piece of reply text as it arrives, when the model streams.
     pub delta: Option<OnDelta>,
 }
 
 /// What is given each piece of a streamed reply.
 pub type OnDelta = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// What one model call cost, as the provider reported it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallCost {
+    /// Prompt tokens.
+    pub input_tokens: u64,
+    /// Of those, read from the provider's prompt cache.
+    pub cached_tokens: u64,
+    /// Reply tokens.
+    pub output_tokens: u64,
+    /// From sending the request to the whole reply.
+    pub ms: u64,
+}
+
+/// What is given each model call's cost.
+pub type OnCall = Arc<dyn Fn(CallCost) + Send + Sync>;
 
 /// Added to the system prompt for a turn's last model call.
 const LAST_CALL: &str = "You cannot call a tool now: this request is out of steps. Answer the \
@@ -1031,7 +1060,8 @@ pub async fn chat(
             room: setup.window.map(|w| {
                 w.saturating_sub(fixed_cost(setup.preamble, setup.tools) + RESERVE_TOKENS)
             }),
-            used: setup.used,
+            on_call: setup.on_call,
+            sent: Mutex::new(None),
             last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
         });
     let agent = builder.build();

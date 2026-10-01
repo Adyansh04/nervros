@@ -289,13 +289,16 @@ fn debug_tools(
     Ok(watches)
 }
 
-/// Where a session keeps its conversation, and the conversation it carries on.
+/// How a session starts: where it keeps its conversation, the conversation it carries on, and
+/// the model it talks on.
 #[derive(Debug, Default, Clone)]
-pub struct SessionFiles {
+pub struct StartOptions {
     /// Written after every turn, so the session can be resumed.
     pub history: Option<PathBuf>,
     /// An earlier conversation to carry on.
     pub resume: Option<crate::llm::History>,
+    /// The only model for the routine role, by its `models.toml` id: an eval's arm.
+    pub model: Option<String>,
 }
 
 /// Starts an agent with a fresh conversation that is not saved. Must run inside a tokio runtime.
@@ -308,7 +311,7 @@ pub fn start(
     robot: Arc<dyn RobotPort>,
     ledger: &Path,
 ) -> Result<Agent, StartError> {
-    start_with(profile_path, robot, ledger, SessionFiles::default())
+    start_with(profile_path, robot, ledger, StartOptions::default())
 }
 
 /// Missions, when the profile has a `[mission]` section: kept in the robot's ledger, checked by
@@ -355,8 +358,20 @@ fn say_orphan(
     });
 }
 
-/// Starts an agent whose conversation is saved to, or resumed from, `files`. Must run inside a
-/// tokio runtime.
+/// Runs the routine role on `id` alone.
+fn pin_routine(models: &mut ModelsConfig, id: String) -> Result<(), crate::providers::ConfigError> {
+    if models.model(&id).is_none() {
+        return Err(crate::providers::ConfigError::Unknown {
+            from: "the model asked for".to_owned(),
+            kind: "model",
+            id,
+        });
+    }
+    models.roles.routine = vec![id];
+    Ok(())
+}
+
+/// Starts an agent as `options` say. Must run inside a tokio runtime.
 ///
 /// # Errors
 ///
@@ -365,10 +380,13 @@ pub fn start_with(
     profile_path: &Path,
     robot: Arc<dyn RobotPort>,
     ledger: &Path,
-    files: SessionFiles,
+    options: StartOptions,
 ) -> Result<Agent, StartError> {
     let profile = Profile::load(profile_path)?;
-    let models = ModelsConfig::load(&profile.resolve(&profile.models.file))?;
+    let mut models = ModelsConfig::load(&profile.resolve(&profile.models.file))?;
+    if let Some(id) = options.model {
+        pin_routine(&mut models, id)?;
+    }
     let privacy = match profile.privacy.mode {
         PrivacyModeConfig::Sim => PrivacyMode::Sim,
         PrivacyModeConfig::Home => PrivacyMode::Home,
@@ -420,8 +438,8 @@ pub fn start_with(
         max_model_calls: usize::try_from(profile.policy.budgets.model_calls).unwrap_or(6),
         approval_ttl: profile.policy.approval_ttl,
         turn_time: profile.policy.budgets.wall_time,
-        history_file: files.history,
-        resume: files.resume,
+        history_file: options.history,
+        resume: options.resume,
         notes: Some(Arc::clone(&memory) as Arc<dyn crate::memory::Notes>),
         pulse: missions
             .as_ref()

@@ -139,6 +139,16 @@ pub struct PlanCard {
     nodes: Vec<(String, String)>,
 }
 
+/// What a session's model calls cost, summed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Spent {
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub output_tokens: u64,
+    pub ms: u64,
+}
+
 /// The conversation.
 #[derive(Default)]
 pub struct Chat {
@@ -150,6 +160,8 @@ pub struct Chat {
     pub model: Option<String>,
     /// Tokens the latest request took of the model's window, when the window is known.
     pub context: Option<(u64, u64)>,
+    /// What the session's model calls cost.
+    pub spent: Spent,
     /// The reply as it streams in, until it arrives whole or a tool call takes over.
     pub draft: Option<String>,
     last_user: Option<String>,
@@ -225,6 +237,19 @@ impl Chat {
             | Event::MissionFinished { .. } => self.apply_mission(event),
             // The viewer draws it; the tool's card already says what.
             Event::Plot { .. } => {}
+            Event::ModelCall {
+                input_tokens,
+                cached_tokens,
+                output_tokens,
+                ms,
+                ..
+            } => {
+                self.spent.calls += 1;
+                self.spent.input_tokens += input_tokens;
+                self.spent.cached_tokens += cached_tokens;
+                self.spent.output_tokens += output_tokens;
+                self.spent.ms += ms;
+            }
             Event::Context { .. }
             | Event::Restored { .. }
             | Event::Compacted { .. }

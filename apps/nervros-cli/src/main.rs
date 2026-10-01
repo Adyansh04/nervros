@@ -73,6 +73,13 @@ enum Command {
         /// Only the cases whose ids hold this.
         #[arg(long)]
         only: Option<String>,
+        /// Trials per case and model; the report gives pass^k for k = this.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+        repeat: u16,
+        /// Run the routine role on each of these `models.toml` ids in turn, instead of the
+        /// profile's chain, and compare them.
+        #[arg(long, value_delimiter = ',')]
+        models: Vec<String>,
         /// Where the report goes (default: the state directory's `evals/`).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -247,11 +254,22 @@ async fn main() -> Result<()> {
             .await
         }
         #[cfg(feature = "ros")]
-        Command::Eval { suite, only, out } => {
+        Command::Eval {
+            suite,
+            only,
+            repeat,
+            models,
+            out,
+        } => {
             let out = out.unwrap_or_else(eval::default_out);
-            let failed = eval::run(&cli.profile, &suite, only.as_deref(), &out).await?;
+            let options = eval::Options {
+                only,
+                repeat: usize::from(repeat),
+                models,
+            };
+            let failed = eval::run(&cli.profile, &suite, &options, &out).await?;
             if failed > 0 {
-                anyhow::bail!("{failed} case(s) failed");
+                anyhow::bail!("{failed} trial(s) failed");
             }
             Ok(())
         }

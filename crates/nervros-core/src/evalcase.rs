@@ -10,9 +10,21 @@ use serde_json::Value;
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Suite {
+    /// Where a simulator publishes the base's true pose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truth: Option<Truth>,
     /// The cases.
     #[serde(rename = "case", default)]
     pub cases: Vec<Case>,
+}
+
+/// A simulator's `nav_msgs/msg/Odometry` of the base's true pose: moves and turns are judged on
+/// it rather than on the robot's own estimate, which can be off by a metre or a quarter turn.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Truth {
+    /// Such as `/g1_sensor_relay/base_state`.
+    pub topic: String,
 }
 
 /// One case.
@@ -134,6 +146,7 @@ pub fn from_log(log: &str, id: &str) -> Case {
 /// It cannot be written as TOML (it always can).
 pub fn to_toml(case: &Case) -> Result<String, toml::ser::Error> {
     toml::to_string(&Suite {
+        truth: None,
         cases: vec![case.clone()],
     })
 }

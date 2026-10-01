@@ -1327,6 +1327,19 @@ impl Gui {
                         "Tokens the latest request took; /compact condenses the conversation",
                     );
             }
+            let spent = self.chat.spent;
+            if spent.calls > 0 {
+                let cached = spent.cached_tokens * 100 / spent.input_tokens.max(1);
+                ui.label(subdued(format!("{} calls, {cached}% cached", spent.calls)))
+                    .on_hover_text(format!(
+                        "Model calls this session: {} tokens in, {} of them read from the model's \
+                         prompt cache, {} out, {:.0} s waiting",
+                        crate::chat::thousands(spent.input_tokens),
+                        crate::chat::thousands(spent.cached_tokens),
+                        crate::chat::thousands(spent.output_tokens),
+                        Duration::from_millis(spent.ms).as_secs_f64(),
+                    ));
+            }
             if let Some(bytes) = re_memory::MemoryUse::capture().counted {
                 #[expect(clippy::cast_precision_loss, reason = "shown to one decimal")]
                 let gb = bytes as f64 / 1e9;

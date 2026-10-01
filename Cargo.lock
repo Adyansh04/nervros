@@ -7465,11 +7465,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "humantime",
  "nervros-core",
  "nervros-ros",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "toml",
  "tracing-subscriber",

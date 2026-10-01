@@ -171,6 +171,21 @@ pub enum Event {
         /// The new text.
         text: String,
     },
+    /// A model call ended: what it cost, for the log and the evals.
+    ModelCall {
+        /// Turn number.
+        turn: u64,
+        /// The model id from `models.toml`.
+        model: String,
+        /// Prompt tokens, as the provider counted them.
+        input_tokens: u64,
+        /// Of those, read from the provider's prompt cache.
+        cached_tokens: u64,
+        /// Reply tokens.
+        output_tokens: u64,
+        /// From the request to the whole reply.
+        ms: u64,
+    },
     /// How full the model's context was on the turn's latest request.
     Context {
         /// Tokens the request took, as the provider counted them, or as estimated.
@@ -1028,6 +1043,24 @@ async fn fit_window(
 }
 
 /// Passes a streamed reply's pieces to the UI.
+/// Each model call's cost, to the log and to `used`, the context gauge's count.
+fn costs(shared: &Arc<Shared>, turn: u64, model: &str, used: &Arc<AtomicU64>) -> llm::OnCall {
+    let (shared, model, used) = (Arc::clone(shared), model.to_owned(), Arc::clone(used));
+    Arc::new(move |cost: llm::CallCost| {
+        if cost.input_tokens > 0 {
+            used.store(cost.input_tokens, Ordering::Relaxed);
+        }
+        shared.emit(Event::ModelCall {
+            turn,
+            model: model.clone(),
+            input_tokens: cost.input_tokens,
+            cached_tokens: cost.cached_tokens,
+            output_tokens: cost.output_tokens,
+            ms: cost.ms,
+        });
+    })
+}
+
 fn deltas(shared: &Arc<Shared>, turn: u64) -> llm::OnDelta {
     let shared = Arc::clone(shared);
     Arc::new(move |text: &str| {
@@ -1276,7 +1309,7 @@ async fn run_turn(
             tools: &tools,
             started: Arc::clone(&flags.started),
             window,
-            used: Arc::clone(&used),
+            on_call: Some(costs(&shared, turn, &model, &used)),
             delta: Some(deltas(&shared, turn)),
         };
         let result = llm::chat(&model, Arc::clone(&source), setup, &mut updated, &text).await;
@@ -1417,6 +1450,11 @@ mod tests {
             2,
             "the tool call and the reply are two requests"
         );
+        let costed = events
+            .iter()
+            .filter(|e| matches!(e, Event::ModelCall { model, turn: 1, .. } if model == "mock"))
+            .count();
+        assert_eq!(costed, 2, "each request's cost is logged: {events:?}");
     }
 
     #[tokio::test]

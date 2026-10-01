@@ -52,13 +52,13 @@ fn main() -> Result<()> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let files = nervros_core::app::SessionFiles {
+    let files = nervros_core::app::StartOptions {
         history: Some(
             state
                 .join("logs")
                 .join(format!("session-{stamp}.history.json")),
         ),
-        resume: None,
+        ..Default::default()
     };
     let agent =
         nervros_core::app::start_with(&args.profile, robot, &state.join("quota.json"), files)

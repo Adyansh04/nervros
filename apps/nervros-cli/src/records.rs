@@ -79,6 +79,17 @@ fn describe(e: &Value) -> Option<String> {
             }
             line
         }
+        "model_call" => {
+            let n = |k: &str| e[k].as_u64().unwrap_or_default();
+            format!(
+                "  . {} {} ms: {} in ({} cached), {} out",
+                s("model"),
+                n("ms"),
+                n("input_tokens"),
+                n("cached_tokens"),
+                n("output_tokens")
+            )
+        }
         "notice" => format!("  ! {}", s("text")),
         "error" => format!("  error: {}", s("text")),
         _ => return None,
