@@ -64,7 +64,8 @@ struct Expect {
     reply_lacks: Vec<String>,
     /// How far the robot's base moved on the map, metres, `[min, max]`.
     moved_m: Option<[f64; 2]>,
-    /// How far it turned, degrees, `[min, max]`.
+    /// How far it turned, degrees, `[min, max]`: positive to the left (counter-clockwise), so a
+    /// turn the wrong way fails.
     turned_deg: Option<[f64; 2]>,
     /// Whether the conversation had to be condensed.
     compacted: Option<bool>,
@@ -214,7 +215,7 @@ async fn run_case(
         seen.moved_m = Some((b.0 - a.0).hypot(b.1 - a.1));
         let turn = (b.2 - a.2 + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
             - std::f64::consts::PI;
-        seen.turned_deg = Some(turn.to_degrees().abs());
+        seen.turned_deg = Some(turn.to_degrees());
     }
     Ok(seen)
 }
