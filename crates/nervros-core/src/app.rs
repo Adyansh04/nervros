@@ -169,6 +169,16 @@ fn seeing_tools(
             Arc::clone(&snapshots),
             Some(eyes),
         )))?;
+        // Pointing asks the models that outline, a skill few models have.
+        if !llm.router().config().roles.segment.is_empty() {
+            let pointer = Arc::clone(&llm) as Arc<dyn crate::segment::Outliner>;
+            registry.add(Arc::new(crate::point::PointTool::new(
+                Arc::clone(&cameras),
+                Arc::clone(&robot),
+                Arc::clone(&snapshots),
+                pointer,
+            )))?;
+        }
         if let Some(segment) = profile.segment.clone() {
             let outliner = Arc::clone(&llm) as Arc<dyn crate::segment::Outliner>;
             registry.add(Arc::new(SegmentTool::new(

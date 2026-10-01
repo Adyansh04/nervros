@@ -285,7 +285,7 @@ enum View {
     Overlay,
 }
 
-fn inside(region: &Instance, x: u32, y: u32) -> bool {
+pub(crate) fn inside(region: &Instance, x: u32, y: u32) -> bool {
     let (bx, by, bw, bh) = region.bbox;
     if x < bx || y < by || x >= bx + bw || y >= by + bh {
         return false;

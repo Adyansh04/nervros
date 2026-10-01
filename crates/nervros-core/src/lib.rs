@@ -16,6 +16,7 @@ pub mod look;
 pub mod memory;
 pub mod mission;
 pub mod places;
+pub mod point;
 pub mod profile;
 pub mod providers;
 pub mod ros_tools;
