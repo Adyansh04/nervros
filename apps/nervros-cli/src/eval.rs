@@ -428,18 +428,31 @@ fn report(provenance: &Provenance, trials: &[Trial]) -> String {
     for m in &provenance.models {
         let _ = writeln!(out, "- `{m}`");
     }
+    // Without --models, the profile's routine chain answered.
+    let chain = provenance
+        .models
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect::<Vec<_>>()
+        .join(" > ");
+    let name = |a: Option<&String>| a.map_or(chain.as_str(), String::as_str).to_owned();
     let k = provenance.repeat;
+    let (k_head, k_rule) = if k > 1 {
+        (format!(" pass^{k} |"), "---|")
+    } else {
+        (String::new(), "")
+    };
     let _ = write!(
         out,
-        "\n## Summary\n\n| Model | Trials | pass^1 (95 % CI) | pass^{k} | Calls | Model s | Tokens in | Cached | Tokens out |\n|---|---|---|---|---|---|---|---|---|\n"
+        "\n## Summary\n\n| Model | Trials | pass^1 (95 % CI) |{k_head} Calls | Model s | Tokens in | Cached | Tokens out |\n|---|---|---|{k_rule}---|---|---|---|---|\n"
     );
     for a in &arms {
         let mine: Vec<&Trial> = trials.iter().filter(|t| t.model.as_ref() == *a).collect();
-        summary_row(&mut out, arm(*a), &mine, &cases, k);
+        summary_row(&mut out, &name(*a), &mine, &cases, k);
     }
     out.push_str("\nCalls, model seconds and tokens are means per trial.\n\n## Cases\n\n| Case |");
     for a in &arms {
-        let _ = write!(out, " {} |", arm(*a));
+        let _ = write!(out, " {} |", name(*a));
     }
     out.push_str(" s | Problems and notes |\n|---|");
     out.push_str(&"---|".repeat(arms.len() + 2));
@@ -459,7 +472,7 @@ fn report(provenance: &Provenance, trials: &[Trial]) -> String {
                 let _ = writeln!(
                     out,
                     "\n**{id}** ({}): {}",
-                    arm(*a),
+                    name(*a),
                     reply.replace('\n', " ")
                 );
             }
@@ -486,11 +499,19 @@ fn summary_row(out: &mut String, model: &str, mine: &[&Trial], cases: &[&str], k
         real(mine.iter().map(|t| f(&t.seen)).sum::<u64>()) / real(n.max(1))
     };
     let (input, cached) = (mean(&|s| s.input_tokens), mean(&|s| s.cached_tokens));
+    // pass^1 is the second column already.
+    let pass_k = if k > 1 {
+        format!(
+            " {:.2} |",
+            per_case.iter().sum::<f64>() / real(per_case.len().max(1))
+        )
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         out,
-        "| {model} | {n} | {:.2} ({lo:.2}-{hi:.2}) | {:.2} | {:.1} | {:.0} | {input:.0} | {:.0} % | {:.0} |",
+        "| {model} | {n} | {:.2} ({lo:.2}-{hi:.2}) |{pass_k} {:.1} | {:.0} | {input:.0} | {:.0} % | {:.0} |",
         real(c) / real(n.max(1)),
-        per_case.iter().sum::<f64>() / real(per_case.len().max(1)),
         mean(&|s| s.calls),
         mean(&|s| s.model_ms) / 1000.0,
         if input > 0.0 {
