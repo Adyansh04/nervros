@@ -179,16 +179,18 @@ mod tests {
 
     #[test]
     fn required_fields_types_ranges_and_lengths_are_checked() {
-        let problems = check(
+        // Fields come in the map's order, which depends on serde_json's features.
+        let mut problems = check(
             &schema(),
             &json!({"retries": 3.5, "check_only": "yes", "steps": []}),
         );
+        problems.sort();
         assert_eq!(
             problems,
             [
-                "`skill` is missing",
                 "`check_only` must be true or false, not \"yes\"",
                 "`retries` must be a whole number, not 3.5",
+                "`skill` is missing",
                 "`steps` needs at least 1 entries",
             ]
         );

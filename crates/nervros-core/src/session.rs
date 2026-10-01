@@ -8,7 +8,8 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,7 @@ use crate::mission::plan::PlannedStep;
 use crate::mission::sanity::Concern;
 use crate::providers::Role;
 use crate::providers::router::Need;
-use crate::tools::{Assessment, Lane, Registry, Resource, Status, Tool, ToolOutcome};
+use crate::tools::{Assessment, Lane, Registry, Resource, Status, Tool, ToolOutcome, ToolSpec};
 
 /// What a UI or the CLI asks the session to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -379,9 +380,18 @@ struct Approved {
     resources: Vec<Resource>,
 }
 
+/// Denials in a row after which the model is told to stop asking and ask the operator instead.
+const DENIAL_BREAK: u32 = 3;
+/// The same failure this many times in a row in a turn is stuck, not unlucky.
+const STUCK_AFTER: u32 = 3;
+
 struct Shared {
     events: broadcast::Sender<Event>,
     approvals: Mutex<HashMap<u64, oneshot::Sender<Answer>>>,
+    /// Approvals the operator turned down in a row since they last approved one or spoke.
+    denials: AtomicU32,
+    /// This turn's last failed result, as tool and message, and how often it came in a row.
+    repeated: Mutex<(String, u32)>,
     calls: AtomicU64,
     next_approval: AtomicU64,
     /// Milliseconds this turn spent waiting for the operator.
@@ -527,6 +537,41 @@ impl Shared {
         }
     }
 
+    /// Asks the operator, then runs it if they approve. After `DENIAL_BREAK` denials in a row the
+    /// model is told to stop asking, and asks no more until the operator approves or speaks.
+    async fn approved_run(
+        &self,
+        tool: &Arc<dyn Tool>,
+        spec: &ToolSpec,
+        args: Value,
+        reason: String,
+        caller: Caller,
+    ) -> ToolOutcome {
+        if caller == Caller::Model && self.denials.load(Ordering::SeqCst) >= DENIAL_BREAK {
+            return ToolOutcome::refused(format!(
+                "the operator turned down the last {DENIAL_BREAK} requests: stop asking, and ask \
+                 them what they want instead"
+            ));
+        }
+        let asked = Approved {
+            args,
+            resources: spec.resources.clone(),
+        };
+        if let Some(a) = self.ask_approval(tool, &spec.name, reason, asked).await {
+            self.denials.store(0, Ordering::SeqCst);
+            return self.run(tool, a.args, &a.resources).await;
+        }
+        let n = self.denials.fetch_add(1, Ordering::SeqCst) + 1;
+        ToolOutcome::refused(if n >= DENIAL_BREAK {
+            format!(
+                "the operator did not approve this, {n} times in a row: stop acting and ask them \
+                 what they want"
+            )
+        } else {
+            "the operator did not approve this".to_owned()
+        })
+    }
+
     async fn invoke(
         &self,
         tool: &Arc<dyn Tool>,
@@ -572,14 +617,7 @@ impl Shared {
                 Decision::Deny(r) => ToolOutcome::refused(r.message),
                 Decision::NeedApproval { reason } => {
                     let reason = assessment.map_or(reason, |a| a.reason);
-                    let asked = Approved {
-                        args,
-                        resources: spec.resources.clone(),
-                    };
-                    match self.ask_approval(tool, &spec.name, reason, asked).await {
-                        Some(a) => self.run(tool, a.args, &a.resources).await,
-                        None => ToolOutcome::refused("the operator did not approve this"),
-                    }
+                    self.approved_run(tool, &spec, args, reason, caller).await
                 }
                 Decision::Allow => self.run(tool, args, &spec.resources).await,
             },
@@ -618,7 +656,31 @@ impl Shared {
             message: crate::tools::clip(&outcome.message, 2000),
             ms,
         });
+        let mut outcome = outcome;
+        if let Some(n) = self.stuck(&spec.name, &outcome) {
+            let _ = write!(
+                outcome.message,
+                " This came back the same {n} times in a row: do not try it again; tell the \
+                 operator what is stuck."
+            );
+        }
         outcome.for_model(self.config.result_chars)
+    }
+
+    /// How often this turn's failures have come back the same in a row, once that is stuck.
+    fn stuck(&self, tool: &str, outcome: &ToolOutcome) -> Option<u32> {
+        let mut last = lock(&self.repeated);
+        if matches!(outcome.status, Status::Succeeded | Status::Accepted) {
+            *last = (String::new(), 0);
+            return None;
+        }
+        let said = format!("{tool}: {}", outcome.message);
+        if last.0 == said {
+            last.1 += 1;
+        } else {
+            *last = (said, 1);
+        }
+        (last.1 >= STUCK_AFTER).then_some(last.1)
     }
 }
 
@@ -691,6 +753,8 @@ impl Session {
             approvals: Mutex::default(),
             calls: AtomicU64::new(0),
             next_approval: AtomicU64::new(0),
+            denials: AtomicU32::new(0),
+            repeated: Mutex::default(),
             waited_ms: AtomicU64::new(0),
             guard,
             config,
@@ -768,6 +832,8 @@ async fn actor(
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     Command::User(text) => {
+                        // The operator speaking is a new say on what they want.
+                        shared.denials.store(0, Ordering::SeqCst);
                         if running.is_some() {
                             let note = if answering_report && queued.is_none() {
                                 queued = Some(text);
@@ -1111,6 +1177,7 @@ async fn run_turn(
     registry: Arc<Registry>,
 ) -> Option<History> {
     shared.guard.begin_turn();
+    *lock(&shared.repeated) = (String::new(), 0);
     shared.emit(Event::TurnStarted { turn });
     let text = match origin {
         Origin::User(text) => {
@@ -1952,5 +2019,85 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// Fails the same way every time, whatever it is asked.
+    struct Broken(ToolSpec);
+
+    #[async_trait]
+    impl Tool for Broken {
+        fn spec(&self) -> Cow<'_, ToolSpec> {
+            Cow::Borrowed(&self.0)
+        }
+        async fn call(&self, _args: Value) -> ToolOutcome {
+            ToolOutcome::failed("the camera is not publishing")
+        }
+    }
+
+    fn one_tool(tool: Arc<dyn Tool>) -> Arc<Registry> {
+        let mut r = Registry::default();
+        r.add(tool).unwrap();
+        Arc::new(r)
+    }
+
+    #[tokio::test]
+    async fn after_three_denials_in_a_row_the_model_is_told_to_stop_asking() {
+        let calls: Vec<MockTurn> = (1..=4)
+            .map(|n| MockTurn::tool_call(format!("c{n}"), "find_objects", json!({"n": n})))
+            .chain([MockTurn::text("I will ask what you want.")])
+            .collect();
+        let model = MockCompletionModel::new(calls);
+        let guard = Arc::new(Guard::new(Policy::default()));
+        guard.set_armed(true);
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            registry(Risk::Motion),
+            guard,
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("go".into()));
+        let deny = |e: &Event| match e {
+            Event::ApprovalRequested { id, .. } => Some(Command::Deny(*id)),
+            _ => None,
+        };
+        let events = collect_until_finished(&mut rx, deny, &session).await;
+        let asked = events
+            .iter()
+            .filter(|e| matches!(e, Event::ApprovalRequested { .. }))
+            .count();
+        assert_eq!(asked, 3, "the fourth is not asked");
+        let seen = format!("{:?}", model.requests().last().unwrap().chat_history);
+        assert!(seen.contains("3 times in a row"), "{seen}");
+        assert!(seen.contains("turned down the last 3 requests"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn the_same_failure_three_times_in_a_row_is_called_stuck() {
+        let calls: Vec<MockTurn> = (1..=3)
+            .map(|n| MockTurn::tool_call(format!("c{n}"), "look", json!({"n": n})))
+            .chain([MockTurn::text("The camera is stuck.")])
+            .collect();
+        let model = MockCompletionModel::new(calls);
+        let spec = ToolSpec::new("look", "Looks.", json!({"type": "object"}), Risk::Observe);
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            one_tool(Arc::new(Broken(spec))),
+            Arc::new(Guard::new(Policy::default())),
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("look".into()));
+        collect_until_finished(&mut rx, |_| None, &session).await;
+        let requests = model.requests();
+        let second = format!("{:?}", requests[2].chat_history);
+        assert!(!second.contains("came back the same"), "twice is not stuck");
+        let third = format!("{:?}", requests[3].chat_history);
+        assert!(
+            third.contains("came back the same 3 times in a row"),
+            "{third}"
+        );
     }
 }
