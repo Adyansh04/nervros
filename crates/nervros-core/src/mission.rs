@@ -7,6 +7,7 @@
 //! executor accepts; the mission runs in the background, its progress goes out as session events,
 //! and when it ends the model gets a report with the outcome and the goal checks.
 
+pub mod advice;
 pub mod camera;
 pub mod catalog;
 pub mod check;
@@ -112,6 +113,8 @@ pub struct Missions {
     request: Mutex<String>,
     /// A second opinion on the model's plans, when a model has the role.
     critic: OnceLock<Arc<dyn Critic>>,
+    /// A stronger model to ask when the model's plans keep failing, when one has the role.
+    advisor: OnceLock<Arc<dyn advice::Advisor>>,
     /// The camera's view of a mission's end, when the robot has a camera and a vision model.
     vision: OnceLock<camera::Vision>,
     /// Whether a plan for this request already went back for not matching the operator's words:
@@ -177,6 +180,7 @@ impl Missions {
             ledger: OnceLock::new(),
             request: Mutex::default(),
             critic: OnceLock::new(),
+            advisor: OnceLock::new(),
             vision: OnceLock::new(),
             questioned: AtomicBool::new(false),
         }))
@@ -195,6 +199,14 @@ impl Missions {
     pub fn with_critic(self: Arc<Self>, critic: Arc<dyn Critic>) -> Arc<Self> {
         // Set once, at start-up.
         let _ = self.critic.set(critic);
+        self
+    }
+
+    /// Asks `advisor` how to fix a request's plans once they have failed twice.
+    #[must_use]
+    pub fn with_advisor(self: Arc<Self>, advisor: Arc<dyn advice::Advisor>) -> Arc<Self> {
+        // Set once, at start-up.
+        let _ = self.advisor.set(advisor);
         self
     }
 
@@ -480,6 +492,8 @@ impl Missions {
                 ));
             }
         }
+        // As sent, for the advisor: the plan below loses what did not parse.
+        let sent = args.clone();
         let mut args = args;
         // A plan saved by name runs as its steps.
         if let Some(name) = args["template"].as_str().map(str::to_owned) {
@@ -496,10 +510,13 @@ impl Missions {
         let mut plan: Plan = match serde_json::from_value(args) {
             Ok(p) => p,
             Err(e) => {
-                return self.rejected(
-                    &json!([{"step": "", "field": "", "message": e.to_string()}]),
-                    by,
-                );
+                return self
+                    .rejected(
+                        &json!([{"step": "", "field": "", "message": e.to_string()}]),
+                        &sent,
+                        by,
+                    )
+                    .await;
             }
         };
         // The local model leaves the label out, and once resent an unchanged plan until refused.
@@ -519,7 +536,7 @@ impl Missions {
         let world = self.world_of(&self.observe().await);
         let mut compiled = match plan::compile(&plan, &catalog, &world) {
             Ok(c) => c,
-            Err(problems) => return self.rejected(&json!(problems), by),
+            Err(problems) => return self.rejected(&json!(problems), &sent, by).await,
         };
         let reply = match self
             .robot
@@ -541,7 +558,7 @@ impl Missions {
                 .as_str()
                 .and_then(|d| serde_json::from_str::<Value>(d).ok())
                 .unwrap_or_else(|| json!([{"message": "the executor rejected the plan"}]));
-            return self.rejected(&diagnostics, by);
+            return self.rejected(&diagnostics, &sent, by).await;
         }
         if by == By::Model {
             self.plan_failures.store(0, Ordering::SeqCst);
@@ -669,7 +686,7 @@ impl Missions {
         ToolOutcome::ok(out)
     }
 
-    fn rejected(&self, problems: &Value, by: By) -> ToolOutcome {
+    async fn rejected(&self, problems: &Value, plan: &Value, by: By) -> ToolOutcome {
         if by == By::Operator {
             let lines: Vec<String> = problems
                 .as_array()
@@ -705,14 +722,31 @@ impl Missions {
                 "",
             );
         }
+        let mut message = format!(
+            "the plan has {count} problem(s); fix them all and call run_mission again (attempt {n} of {MAX_PLAN_ATTEMPTS})"
+        );
+        if n == advice::ADVISE_AFTER
+            && let Some(advice) = self.advice(plan, problems).await
+        {
+            let _ = write!(message, ". A stronger model suggests: {advice}");
+        }
         ToolOutcome {
             status: Status::Failed,
             data: json!({"ok": false, "problems": problems}),
-            message: format!(
-                "the plan has {count} problem(s); fix them all and call run_mission again (attempt {n} of {MAX_PLAN_ATTEMPTS})"
-            ),
+            message,
             images: Vec::new(),
         }
+    }
+
+    /// The advisor's word on a failed plan, when there is an advisor and it answers.
+    async fn advice(&self, plan: &Value, problems: &Value) -> Option<String> {
+        let advisor = self.advisor.get()?;
+        let skills = self.catalog().await.ok()?.describe();
+        let request = lock(&self.request).clone();
+        let said = advisor
+            .advise(&advice::prompt(&request, &skills, plan, problems))
+            .await?;
+        Some(crate::tools::clip(said.trim(), advice::ADVICE_CHARS))
     }
 
     pub(crate) fn find(&self, hash: &str) -> Result<Compiled, String> {
@@ -1802,6 +1836,46 @@ mod tests {
         let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
         *lock(&missions.request) = request.to_owned();
         missions
+    }
+
+    /// An advisor that keeps what it was asked.
+    struct Advises(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl advice::Advisor for Advises {
+        async fn advise(&self, prompt: &str) -> Option<String> {
+            lock(&self.0).push(prompt.to_owned());
+            Some("Find the object first: O99 is not in the world model.".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stronger_model_is_asked_once_the_plans_have_failed_twice() {
+        let advisor = Arc::new(Advises(Mutex::new(Vec::new())));
+        let missions = missions_asked("bring me the cup")
+            .with_advisor(Arc::clone(&advisor) as Arc<dyn advice::Advisor>);
+        let bad = json!({"intent": "x", "steps": [{"skill": "PickObject", "args": {"object_id": "O99"}}]});
+        let first = missions.plan(bad.clone(), By::Model).await;
+        assert!(!first.message.contains("suggests"), "{}", first.message);
+        let second = missions.plan(bad.clone(), By::Model).await;
+        assert!(
+            second.message.ends_with(
+                "A stronger model suggests: Find the object first: O99 is not in the world model."
+            ),
+            "{}",
+            second.message
+        );
+        let third = missions.plan(bad, By::Model).await;
+        assert!(!third.message.contains("suggests"), "{}", third.message);
+        let asked = lock(&advisor.0);
+        assert_eq!(asked.len(), 1, "asked once");
+        assert!(
+            asked[0].starts_with("The operator asked: bring me the cup")
+                && asked[0].contains("O99")
+                && asked[0].contains("PickObject("),
+            "{}",
+            asked[0]
+        );
     }
 
     #[tokio::test]

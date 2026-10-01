@@ -795,6 +795,27 @@ impl crate::segment::Outliner for Llm {
 }
 
 #[async_trait::async_trait]
+impl crate::mission::advice::Advisor for Llm {
+    async fn advise(&self, prompt: &str) -> Option<String> {
+        let asked = self
+            .ask(Ask {
+                role: Role::Plan,
+                preamble: crate::mission::advice::ADVISOR_PREAMBLE,
+                prompt,
+                image: None,
+            })
+            .await;
+        match asked {
+            Ok(a) => Some(a.text),
+            Err(e) => {
+                tracing::info!(error = %e, "no advice");
+                None
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
 impl crate::mission::sanity::Critic for Llm {
     async fn judge(&self, prompt: &str) -> Result<String, String> {
         self.ask(Ask {

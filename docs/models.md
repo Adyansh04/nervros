@@ -59,7 +59,7 @@ privacy = { trains = false }
 | `privacy.local` | `false` | Runs on this machine; see the profile's `[privacy]`. |
 | `privacy.trains` | `false` | The provider may train on what it is sent. |
 | `params` | none | Request fields passed to the provider as they are, such as Gemini's `{ generation_config = { thinking_level = "low" } }`. |
-| `context` | none | Its context window in tokens. Past half of it, the conversation is condensed before a turn: a `summarise` model sums up the older part, or old tool results are cut. Within a turn each request is cut to fit. The window shows how full it is, and `/compact` condenses it at once. Unset, nothing is cut. |
+| `context` | none | Its context window in tokens. Past half of it, the conversation is condensed before a turn: tool results before the operator's newest message are cut to a line, and when that is not enough a `summarise` model sums up the older part as goal, done, open and facts. Within a turn each request is cut to fit. The window shows how full it is; `/compact` condenses it at once, and right-clicking a message condenses up to it. Unset, nothing is cut. |
 | `stream` | `false` | Its replies appear word by word in the window. |
 
 ```toml
@@ -72,15 +72,20 @@ openrouter_free = { rpd = 50 }
 ```toml
 [roles]
 routine = ["qwen3.5-9b-local"]        # conversation and tool calls
-plan = ["qwen3.5-9b-local"]           # writing mission plans
+plan = ["gemini-3.8-flash"]           # advice when the routine model's plans keep failing
+plan_check = ["gemini-3.8-flash"]     # a second opinion on each plan before it is shown
 vision_check = ["qwen3.5-9b-local"]   # what `look` sees: questions about the camera frame
 summarise = ["qwen3.5-9b-local"]      # captions and summaries
-segment = ["gemini-3.5-flash-lite"]   # outlines for `segment`
+segment = ["gemini-3.5-flash-lite"]   # outlines for `segment`, points for `point`
 ```
 
 A turn tries its role's models in order and skips a model that lacks what the turn needs, is over a
 limit, or would break the privacy mode. Local models not in the list are tried after the others,
-except for `segment`: outlining is a skill few models have, so only the models listed are asked.
+except for `segment` and `plan_check`: outlining is a skill few models have, and a second opinion
+from the same model is no second opinion, so only the models listed are asked. `plan` is asked once
+a request's plans have failed their checks twice, with the request, the skills, the last plan and
+what was wrong with it; its few lines of advice go back to the routine model with the failure. It
+is asked only when it lists other models than `routine`, and a model out of quota gives no advice.
 Gemini's free tier outlines well:
 
 ```toml

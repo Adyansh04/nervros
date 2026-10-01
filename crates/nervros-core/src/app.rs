@@ -318,14 +318,15 @@ pub fn start(
 }
 
 /// Missions, when the profile has a `[mission]` section: kept in the robot's ledger, checked by
-/// `critic` too when a model has the `plan_check` role, and their ends seen through the camera
-/// with `vision`.
+/// `critic` too when a model has the `plan_check` role, helped by `advisor` when the `plan` role
+/// has models of its own, and their ends seen through the camera with `vision`.
 fn missions(
     profile: &Profile,
     places: Arc<crate::places::Places>,
     robot: &Arc<dyn RobotPort>,
     ledger: &Path,
     critic: Option<Arc<dyn crate::mission::sanity::Critic>>,
+    advisor: Option<Arc<dyn crate::mission::advice::Advisor>>,
     vision: Option<crate::mission::camera::Vision>,
 ) -> Option<Arc<Missions>> {
     let mut m = Missions::new(profile, places, Arc::clone(robot))?;
@@ -334,6 +335,9 @@ fn missions(
     }
     if let Some(c) = critic {
         m = m.with_critic(c);
+    }
+    if let Some(a) = advisor {
+        m = m.with_advisor(a);
     }
     if let Some(v) = vision {
         m = m.with_vision(v);
@@ -361,8 +365,20 @@ fn say_orphan(
     });
 }
 
-/// The profile's models, with the routine role on `model` alone when one is given.
-fn load_models(profile: &Profile, model: Option<String>) -> Result<ModelsConfig, StartError> {
+/// The model layer and the second opinions it gives on plans.
+struct ModelLayer {
+    llm: Arc<Llm>,
+    privacy: PrivacyMode,
+    critic: Option<Arc<dyn crate::mission::sanity::Critic>>,
+    advisor: Option<Arc<dyn crate::mission::advice::Advisor>>,
+}
+
+/// The profile's models behind one router, the routine role on `model` alone when one is given.
+fn model_layer(
+    profile: &Profile,
+    ledger: &Path,
+    model: Option<String>,
+) -> Result<ModelLayer, StartError> {
     let mut models = ModelsConfig::load(&profile.resolve(&profile.models.file))?;
     if let Some(id) = model {
         if models.model(&id).is_none() {
@@ -375,7 +391,21 @@ fn load_models(profile: &Profile, model: Option<String>) -> Result<ModelsConfig,
         }
         models.roles.routine = vec![id];
     }
-    Ok(models)
+    let privacy = match profile.privacy.mode {
+        PrivacyModeConfig::Sim => PrivacyMode::Sim,
+        PrivacyModeConfig::Home => PrivacyMode::Home,
+    };
+    let checks_plans = !models.roles.plan_check.is_empty();
+    // An advisor that is the planner itself would only repeat it.
+    let advises = !models.roles.plan.is_empty() && models.roles.plan != models.roles.routine;
+    let router = Router::with_ledger_file(models, ledger, privacy).map_err(StartError::Ledger)?;
+    let llm = Arc::new(Llm::new(router));
+    Ok(ModelLayer {
+        critic: checks_plans.then(|| Arc::clone(&llm) as Arc<dyn crate::mission::sanity::Critic>),
+        advisor: advises.then(|| Arc::clone(&llm) as Arc<dyn crate::mission::advice::Advisor>),
+        llm,
+        privacy,
+    })
 }
 
 /// Starts an agent as `options` say. Must run inside a tokio runtime.
@@ -390,15 +420,8 @@ pub fn start_with(
     options: StartOptions,
 ) -> Result<Agent, StartError> {
     let profile = Profile::load(profile_path)?;
-    let models = load_models(&profile, options.model)?;
-    let privacy = match profile.privacy.mode {
-        PrivacyModeConfig::Sim => PrivacyMode::Sim,
-        PrivacyModeConfig::Home => PrivacyMode::Home,
-    };
-    let checks_plans = !models.roles.plan_check.is_empty();
-    let router = Router::with_ledger_file(models, ledger, privacy).map_err(StartError::Ledger)?;
-    let llm = Arc::new(Llm::new(router));
-    let critic = checks_plans.then(|| Arc::clone(&llm) as Arc<dyn crate::mission::sanity::Critic>);
+    let models = model_layer(&profile, ledger, options.model)?;
+    let llm = Arc::clone(&models.llm);
     let guard = Arc::new(Guard::new(profile.policy.clone()));
     let schemas: Arc<dyn SchemaSource> = Arc::new(RosidlSchemas::load(&profile)?);
     let mut registry = Registry::from_config(&profile.tools, &robot, &schemas, &guard)?;
@@ -416,7 +439,7 @@ pub fn start_with(
         }
     }
     let watches = debug_tools(&profile, &robot, &mut registry)?;
-    let mcp = mcp_tools(&profile, privacy, &mut registry)?;
+    let mcp = mcp_tools(&profile, models.privacy, &mut registry)?;
     let skills = skill_tools(&profile, &mut registry)?;
     let memory = crate::memory::Memory::new(robot_file(&profile, ledger, "memory"));
     registry.add(Arc::new(crate::memory::MemoryTool::new(Arc::clone(
@@ -424,7 +447,15 @@ pub fn start_with(
     ))))?;
     let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
     registry.add(Arc::clone(&stop))?;
-    let missions = missions(&profile, places, &robot, ledger, critic, seeing.vision);
+    let missions = missions(
+        &profile,
+        places,
+        &robot,
+        ledger,
+        models.critic,
+        models.advisor,
+        seeing.vision,
+    );
     let schedules = missions
         .as_ref()
         .map(|m| crate::schedule::Schedules::new(Arc::clone(m), Arc::clone(&guard)));
