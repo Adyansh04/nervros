@@ -325,12 +325,10 @@ fn judge(expect: &Expect, seen: &Seen) -> Vec<String> {
     {
         problems.push(format!("the reply has none of {:?}", expect.reply_has));
     }
-    for w in expect
-        .reply_lacks
-        .iter()
-        .map(String::as_str)
-        .chain(ASKS_FIRST)
-    {
+    // Offering a follow-up is fine; asking leave for a plan the approval card asks about is not.
+    let planned = !seen.skills.is_empty() || !seen.missions.is_empty();
+    let asks = ASKS_FIRST.iter().copied().filter(|_| planned);
+    for w in expect.reply_lacks.iter().map(String::as_str).chain(asks) {
         if last.contains(&w.to_lowercase()) {
             problems.push(format!("the reply says \"{w}\""));
         }
