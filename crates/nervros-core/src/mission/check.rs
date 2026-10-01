@@ -167,6 +167,12 @@ fn at(target: &str, seen: &Observed, out: impl Fn(Option<bool>, String) -> Verdi
 /// it replans: a pick that found nothing is often a pick of something already moved.
 #[must_use]
 pub fn last_seen(step: &PlannedStep, seen: &Observed, now_s: f64) -> Option<String> {
+    Some(describe_seen(step_object(step, seen)?, seen, now_s))
+}
+
+/// The world model's object a step is about, by its id, name or phrase arguments.
+#[must_use]
+pub fn step_object<'a>(step: &PlannedStep, seen: &'a Observed) -> Option<&'a Value> {
     let arg = |name: &str| {
         step.args
             .iter()
@@ -177,8 +183,53 @@ pub fn last_seen(step: &PlannedStep, seen: &Observed, now_s: f64) -> Option<Stri
         .iter()
         .filter_map(|k| arg(k))
         .collect();
-    let found = find_object(seen, &keys, arg("phrase"))?;
-    Some(describe_seen(found, seen, now_s))
+    find_object(seen, &keys, arg("phrase"))
+}
+
+/// canopy's object history (`ObjectEvent`s, oldest first) as a line per object: "O12 mug:
+/// appeared 2 h ago in R2; went missing 1 h ago; removed 58 min ago".
+#[must_use]
+pub fn story(events: &[Value], now_s: f64) -> Vec<String> {
+    let mut lines: Vec<(String, String)> = Vec::new();
+    for e in events {
+        let id = text(e, "id");
+        let ago = how_long(now_s - stamp_s(&e["stamp"]));
+        let room = text(e, "room_id");
+        let other = text(e, "other_id");
+        let mut phrase = match text(e, "kind") {
+            "appeared" => format!("appeared {ago} ago"),
+            "moved" => format!("moved {ago} ago"),
+            "missing" => format!("went missing {ago} ago"),
+            "seen_again" => format!("seen again {ago} ago"),
+            "removed" => format!("removed {ago} ago"),
+            "merged" => format!("found to be part of {other} {ago} ago"),
+            other => format!("{other} {ago} ago"),
+        };
+        if !room.is_empty() && matches!(text(e, "kind"), "appeared" | "moved") {
+            let _ = write!(phrase, " in {room}");
+        }
+        if text(e, "kind") == "appeared" && !other.is_empty() {
+            let _ = write!(phrase, ", maybe {other} moved there");
+        }
+        if !text(e, "detail").is_empty() {
+            let _ = write!(phrase, " ({})", text(e, "detail"));
+        }
+        match lines.iter_mut().find(|(i, _)| i == id) {
+            Some((_, line)) => {
+                let _ = write!(line, "; {phrase}");
+            }
+            None => lines.push((
+                id.to_owned(),
+                format!("{id} {}: {phrase}", text(e, "label")),
+            )),
+        }
+    }
+    lines.into_iter().map(|(_, line)| line).collect()
+}
+
+fn stamp_s(stamp: &Value) -> f64 {
+    let sec = stamp["sec"].as_f64().unwrap_or(0.0);
+    sec + stamp["nanosec"].as_f64().unwrap_or(0.0) * 1e-9
 }
 
 /// The world model's object that `keys` (ids or names such as `mug_4`) or `phrase` (the
@@ -256,8 +307,7 @@ fn text<'a>(v: &'a Value, key: &str) -> &'a str {
 
 /// When an object was last seen, in seconds since the epoch; 0 when it never was.
 fn seen_at(o: &Value) -> f64 {
-    let t = &o["last_seen"];
-    t["sec"].as_f64().unwrap_or(0.0) + t["nanosec"].as_f64().unwrap_or(0.0) * 1e-9
+    stamp_s(&o["last_seen"])
 }
 
 /// Whether an object's label or name is, or holds, `words`.
@@ -313,6 +363,27 @@ mod tests {
                 {"id": "O31", "support_id": "", "pose": {"position": {"x": 3.0, "y": 3.0}}, "size": {"x": 0.4, "y": 0.3}}]}),
             state: json!({"holding_left": "", "holding_right": "O17"}),
         }
+    }
+
+    #[test]
+    fn an_objects_story_reads_as_a_line_per_object_and_a_move_links_them() {
+        let event = |id: &str, kind: &str, ago: f64, room: &str, other: &str| {
+            json!({"id": id, "label": "mug", "kind": kind, "stamp": {"sec": 10_000.0 - ago, "nanosec": 0},
+                   "room_id": room, "other_id": other, "detail": ""})
+        };
+        let events = [
+            event("O12", "appeared", 7200.0, "R2", ""),
+            event("O12", "missing", 3600.0, "R2", ""),
+            event("O31", "appeared", 2400.0, "R3", "O12"),
+            event("O12", "removed", 1800.0, "R2", ""),
+        ];
+        assert_eq!(
+            story(&events, 10_000.0),
+            [
+                "O12 mug: appeared 2 h ago in R2; went missing 60 min ago; removed 30 min ago",
+                "O31 mug: appeared 40 min ago in R3, maybe O12 moved there",
+            ]
+        );
     }
 
     #[test]

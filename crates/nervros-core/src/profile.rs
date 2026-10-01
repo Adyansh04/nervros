@@ -342,6 +342,9 @@ pub struct WorldConfig {
     pub coverage: Option<TopicRef>,
     /// Where the robot has been (`nav_msgs/msg/Path`), drawn as a line.
     pub trail: Option<TopicRef>,
+    /// canopy's `ObjectHistory` service: what happened to an object, for `recall` and for a
+    /// failed mission's report.
+    pub history: Option<String>,
 }
 
 /// What the viewer draws beyond the world model.

@@ -129,11 +129,20 @@ impl Tool for Recall {
                     return ToolOutcome::failed("`query` names the object");
                 }
                 let seen = self.missions.observe().await;
-                match find_object(&seen, &[query.as_str()], Some(&query)) {
-                    Some(found) => {
+                let story = self.missions.object_story(&query).await;
+                match (
+                    find_object(&seen, &[query.as_str()], Some(&query)),
+                    story.is_empty(),
+                ) {
+                    (Some(found), true) => {
                         ToolOutcome::ok(json!({"seen": describe_seen(found, &seen, now_s)}))
                     }
-                    None => ToolOutcome::failed(format!(
+                    (Some(found), false) => ToolOutcome::ok(json!({
+                        "seen": describe_seen(found, &seen, now_s),
+                        "history": story,
+                    })),
+                    (None, false) => ToolOutcome::ok(json!({"history": story})),
+                    (None, true) => ToolOutcome::failed(format!(
                         "the world model knows nothing called \"{query}\"; find_objects searches it"
                     )),
                 }

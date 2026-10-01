@@ -873,7 +873,24 @@ impl Missions {
                 .collect(),
         });
         let seen = self.observe().await;
-        let report = self.report(&id, &compiled, (&outcome, &step, &reason), elapsed, &seen);
+        // What happened to what the failed step was about: often it was moved, not missed.
+        let object = compiled
+            .steps
+            .iter()
+            .find(|s| s.id == step && outcome != "success")
+            .and_then(|s| check::step_object(s, &seen))
+            .and_then(|o| o["id"].as_str());
+        let story = match object {
+            Some(id) => self.object_story(id).await,
+            None => Vec::new(),
+        };
+        let report = self.report(
+            &id,
+            &compiled,
+            (&outcome, &step, &reason),
+            elapsed,
+            (&seen, &story),
+        );
         if let Some(s) = self.session.get() {
             s.send(Command::Report(report));
         }
@@ -887,7 +904,7 @@ impl Missions {
         compiled: &Compiled,
         (outcome, step, reason): (&str, &str, &str),
         elapsed: f64,
-        seen: &Observed,
+        (seen, story): (&Observed, &[String]),
     ) -> String {
         let mut report = format!(
             "Mission {id} ({}) ended: {outcome} after {elapsed:.0} s.",
@@ -918,6 +935,9 @@ impl Missions {
             if let Some(line) = failed.and_then(|s| check::last_seen(s, seen, ledger::now_s())) {
                 let _ = write!(report, " The world model: {line}.");
             }
+            if !story.is_empty() {
+                let _ = write!(report, " What happened to it: {}.", story.join(". "));
+            }
             report.push_str(if n > self.config.max_replans {
                 " This request has failed too often: do not retry. Tell the operator what went \
                  wrong and what would help."
@@ -940,6 +960,34 @@ impl Missions {
             }
         }
         report
+    }
+
+    /// What happened to the objects `query` names, a line each, from the world model's history;
+    /// none when the profile names no history service or it does not answer.
+    pub(crate) async fn object_story(&self, query: &str) -> Vec<String> {
+        let Some(service) = self.profile.world.as_ref().and_then(|w| w.history.as_ref()) else {
+            return Vec::new();
+        };
+        let request = json!({"query": query, "since": {"sec": 0, "nanosec": 0}, "max_events": 30});
+        match self
+            .robot
+            .call(
+                service,
+                "canopy_msgs/srv/ObjectHistory",
+                request,
+                SERVICE_TIMEOUT,
+            )
+            .await
+        {
+            Ok(reply) => check::story(
+                reply["events"].as_array().map_or(&[][..], Vec::as_slice),
+                ledger::now_s(),
+            ),
+            Err(e) => {
+                tracing::info!(error = %e, "no object history");
+                Vec::new()
+            }
+        }
     }
 
     /// What the operator said last.
@@ -1274,6 +1322,7 @@ mod tests {
             name = "t"
             [world]
             objects = { topic = "/objects", type = "canopy_msgs/msg/WorldObjectArray" }
+            history = "/x/history"
             [mission]
             execute = "/x/execute"
             validate = "/x/validate"
@@ -1607,7 +1656,18 @@ mod tests {
             }),
             ..ScriptedRun::default()
         };
-        let robot: Arc<dyn RobotPort> = Arc::new(robot(failing()));
+        let now = ledger::now_s();
+        let history = move |req: &Value| {
+            assert_eq!(req["query"], "O18", "the failed step's object");
+            let at = |ago: f64| json!({"sec": (now - ago).floor(), "nanosec": 0});
+            Ok(json!({"events": [
+                {"id": "O18", "label": "blue cup", "kind": "appeared", "stamp": at(7200.0),
+                 "room_id": "R2", "other_id": "", "detail": ""},
+                {"id": "O18", "label": "blue cup", "kind": "missing", "stamp": at(600.0),
+                 "room_id": "R2", "other_id": "", "detail": ""}]}))
+        };
+        let robot: Arc<dyn RobotPort> =
+            Arc::new(robot(failing()).with_service("/x/history", history));
         let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
         let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
         let (events, _rx) = tokio::sync::broadcast::channel(64);
@@ -1629,6 +1689,12 @@ mod tests {
         );
         assert!(
             text.contains("run it now: the operator approves it"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "What happened to it: O18 blue cup: appeared 2 h ago in R2; went missing 10 min ago."
+            ),
             "{text}"
         );
         missions.run_failures.store(2, Ordering::SeqCst);
