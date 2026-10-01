@@ -11,6 +11,8 @@ use nervros_core::providers::router::{PrivacyMode, Router};
 use nervros_core::providers::{ModelsConfig, Role, free_only, openrouter};
 
 #[cfg(feature = "ros")]
+#[cfg(feature = "ros")]
+mod eval;
 mod robot;
 
 #[derive(Parser)]
@@ -56,6 +58,19 @@ enum Command {
         /// Approve every request; for scripted runs only.
         #[arg(long)]
         approve: bool,
+    },
+    /// Run a suite of requests against the live robot, each in a fresh session approving every
+    /// request, and report which cases did what they expect.
+    #[cfg(feature = "ros")]
+    Eval {
+        /// The suite, a TOML file of `[[case]]`s.
+        suite: PathBuf,
+        /// Only the cases whose ids hold this.
+        #[arg(long)]
+        only: Option<String>,
+        /// Where the report goes (default: the state directory's `evals/`).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Check the profile's tools, topics and mission services against the live graph.
     #[cfg(feature = "ros")]
@@ -171,6 +186,15 @@ async fn main() -> Result<()> {
                 robot::ChatOptions { say, arm, approve },
             )
             .await
+        }
+        #[cfg(feature = "ros")]
+        Command::Eval { suite, only, out } => {
+            let out = out.unwrap_or_else(eval::default_out);
+            let failed = eval::run(&cli.profile, &suite, only.as_deref(), &out).await?;
+            if failed > 0 {
+                anyhow::bail!("{failed} case(s) failed");
+            }
+            Ok(())
         }
         #[cfg(feature = "ros")]
         Command::Doctor => robot::doctor(&cli.profile).await,
