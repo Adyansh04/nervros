@@ -49,6 +49,15 @@ cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 nervros-cli --profile my.toml ros topic_sample '{"topic": "/odom", "mode": "hz"}'
 ```
 
+`eval` runs a suite of requests against the live robot, each in a fresh session with every approval
+granted, and judges what the agent did: the tools and skills it used, the mission's outcome, the
+approvals it asked for, its reply, and how far the robot moved. A suite is a TOML list of cases (see
+grove-g1's `g1_bringup/config/nervros/eval/apartment.toml`):
+
+```bash
+nervros-cli --profile my.toml eval suite.toml --only pick   # the cases whose ids hold "pick"
+```
+
 With a [`[ros_tools]`](docs/profile.md#ros_tools) table the agent can look at any part of the
 graph as `ros2` would (topics with their QoS, rates, messages, nodes, services, actions,
 parameters, TF and logs), and, where the profile lists them, call services, send action goals,
