@@ -23,7 +23,7 @@ use crate::mission::plan::PlannedStep;
 use crate::mission::sanity::Concern;
 use crate::providers::Role;
 use crate::providers::router::Need;
-use crate::tools::{Lane, Registry, Resource, Status, Tool, ToolOutcome};
+use crate::tools::{Assessment, Lane, Registry, Resource, Status, Tool, ToolOutcome};
 
 /// What a UI or the CLI asks the session to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -500,6 +500,33 @@ impl Shared {
         tool.call(args).await
     }
 
+    /// What a call would do, for a tool whose risk depends on its arguments, and the answer when
+    /// it cannot go out at all, before anyone is asked to approve it. The model's arguments are
+    /// checked against the schema first: a skill name it made up ends here.
+    async fn assess(
+        tool: &Arc<dyn Tool>,
+        args: &Value,
+        caller: Caller,
+    ) -> Option<Result<Assessment, ToolOutcome>> {
+        match caller {
+            Caller::Model => {
+                let invalid = crate::argcheck::check(&tool.spec().parameters, args);
+                if invalid.is_empty() {
+                    tool.assess(args).await
+                } else {
+                    Some(Err(ToolOutcome::failed(format!(
+                        "{}; call it again with arguments that fit",
+                        invalid.join("; ")
+                    ))))
+                }
+            }
+            Caller::Operator => match tool.assess_operator(args.clone()).await {
+                Some(checked) => Some(checked),
+                None => tool.assess(args).await,
+            },
+        }
+    }
+
     async fn invoke(
         &self,
         tool: &Arc<dyn Tool>,
@@ -509,15 +536,7 @@ impl Shared {
         caller: Caller,
     ) -> Value {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
-        // A tool whose risk depends on its arguments says what this call would do, and a call
-        // that cannot go out fails here, before anyone is asked to approve it.
-        let assessed = match caller {
-            Caller::Operator => match tool.assess_operator(args.clone()).await {
-                Some(checked) => Some(checked),
-                None => tool.assess(&args).await,
-            },
-            Caller::Model => tool.assess(&args).await,
-        };
+        let assessed = Self::assess(tool, &args, caller).await;
         let (mut assessment, early) = match assessed {
             Some(Ok(a)) => (Some(a), None),
             Some(Err(out)) => (None, Some(out)),
@@ -1195,7 +1214,7 @@ mod tests {
     use super::*;
     use crate::guard::Policy;
     use crate::llm::{AgentBuilder, LlmError};
-    use crate::tools::{Assessment, Risk, ToolSpec};
+    use crate::tools::{Risk, ToolSpec};
     use async_trait::async_trait;
     use rig::test_utils::{MockCompletionModel, MockTurn};
     use std::borrow::Cow;

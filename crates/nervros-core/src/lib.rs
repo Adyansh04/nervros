@@ -4,6 +4,7 @@
 //! a rig upgrade touches one module.
 
 pub mod app;
+pub mod argcheck;
 pub mod builtins;
 pub mod context;
 pub mod doctor;
