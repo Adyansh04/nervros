@@ -442,6 +442,28 @@ fn spec() -> ToolSpec {
     )
 }
 
+/// What a clock schedule's numbers say that the operator's words do not.
+fn numbers_differ(request: &str, every_min: u64, times: u64) -> Option<String> {
+    let asked = crate::mission::sanity::repeat(request)?;
+    let real = |n: u64| f64::from(u32::try_from(n).unwrap_or(u32::MAX));
+    let mut wrong = Vec::new();
+    if (asked.every_min - real(every_min)).abs() > 0.01 && asked.every_min >= 1.0 {
+        wrong.push(format!(
+            "every {} min, not every_min={every_min}",
+            asked.every_min
+        ));
+    }
+    if let Some(n) = asked.times.filter(|n| (n - real(times)).abs() > 0.01) {
+        wrong.push(format!("{n} times in all, not times={times}"));
+    }
+    (!wrong.is_empty()).then(|| {
+        format!(
+            "the operator asked for {}: make the schedule match their words",
+            wrong.join(" and ")
+        )
+    })
+}
+
 struct ScheduleTool {
     spec: ToolSpec,
     schedules: Arc<Schedules>,
@@ -508,6 +530,11 @@ impl Tool for ScheduleTool {
             .unwrap_or(0)
             .clamp(1, MAX_EVERY_MIN);
         let times = args["times"].as_u64().unwrap_or(0).clamp(1, MAX_TIMES);
+        if args.get("when").is_none()
+            && let Some(wrong) = numbers_differ(&self.schedules.missions.request(), every, times)
+        {
+            return Some(Err(ToolOutcome::refused(wrong)));
+        }
         let trigger = match args.get("when").filter(|w| w.is_object()) {
             Some(when) => match Trigger::parse(when, &self.schedules.missions).await {
                 Ok(t) => Some(t),
@@ -627,6 +654,24 @@ mod tests {
 
     fn object(id: &str, label: &str, room: &str, state: u64) -> Value {
         json!({"id": id, "label": label, "room_id": room, "state": state})
+    }
+
+    #[test]
+    fn a_schedule_must_count_as_the_operator_did() {
+        let asked = "Every minute, turn left 90 degrees, 2 times in all.";
+        assert_eq!(numbers_differ(asked, 1, 2), None);
+        let wrong = numbers_differ(asked, 1, 48).unwrap();
+        assert!(wrong.contains("2 times in all, not times=48"), "{wrong}");
+        assert!(
+            numbers_differ("every 5 minutes check the door", 1, 3)
+                .unwrap()
+                .contains("every 5 min")
+        );
+        assert_eq!(
+            numbers_differ("turn left twice", 1, 7),
+            None,
+            "no clock, no schedule to match"
+        );
     }
 
     #[tokio::test]

@@ -348,6 +348,57 @@ fn is_number(word: &str) -> bool {
     amount(word).is_some() || MORE.contains(&word)
 }
 
+/// Verbs that act on the thing named right after them.
+const HANDLING: [&str; 11] = [
+    "pick", "grab", "take", "bring", "fetch", "put", "place", "drop", "carry", "hold", "hand",
+];
+/// Words that stand for a thing said before.
+const POINTING: [&str; 6] = ["it", "that", "this", "them", "those", "these"];
+
+/// The word a request uses for what to handle when it names nothing, as `it` in "pick it up":
+/// said first in a session, nobody knows what it is.
+#[must_use]
+pub fn unnamed(request: &str) -> Option<String> {
+    words(request)
+        .windows(2)
+        .find(|p| HANDLING.contains(&p[0].as_str()) && POINTING.contains(&p[1].as_str()))
+        .map(|p| p[1].clone())
+}
+
+/// What a request asks to repeat on a clock, as "every 5 minutes, 3 times".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Repeat {
+    /// Minutes between runs.
+    pub every_min: f64,
+    /// Runs in all, when it says.
+    pub times: Option<f64>,
+}
+
+/// The repeat a request asks for: `None` unless it says how often, as a count alone ("turn
+/// left 4 times") is one plan of several steps.
+#[must_use]
+pub fn repeat(request: &str) -> Option<Repeat> {
+    let words = words(request);
+    let at = words.iter().position(|w| w == "every")?;
+    let next = |n: usize| words.get(at + n).map(String::as_str);
+    let (count, unit) = match next(1)? {
+        unit @ ("minute" | "hour" | "second") => (1.0, unit),
+        n => (amount(n)?, next(2)?),
+    };
+    let every_min = match unit.trim_end_matches('s') {
+        "minute" | "min" => count,
+        "hour" => count * 60.0,
+        "second" | "sec" => count / 60.0,
+        _ => return None,
+    };
+    let times = if words.iter().any(|w| w == "twice") {
+        Some(2.0)
+    } else {
+        single(&words, &["times"])
+    };
+    Some(Repeat { every_min, times })
+}
+
 /// Tells the critic its job and the one answer it may give.
 pub const CRITIC_PREAMBLE: &str = "You check a robot's plan against what the operator asked, \
     before the operator approves it. Answer with one JSON object only: {\"verdict\": \"ok\" or \
@@ -478,6 +529,48 @@ mod tests {
                 Some((c.step.clone(), f.name.clone(), f.value.clone()))
             })
             .collect()
+    }
+
+    #[test]
+    fn a_thing_to_handle_named_only_by_it_is_unnamed() {
+        assert_eq!(unnamed("Pick it up.").as_deref(), Some("it"));
+        assert_eq!(
+            unnamed("Bring that one to the sofa").as_deref(),
+            Some("that")
+        );
+        assert_eq!(unnamed("Pick up the small white mug"), None);
+        assert_eq!(unnamed("Turn it around"), None, "not a thing to handle");
+    }
+
+    #[test]
+    fn a_repeat_needs_a_clock_and_reads_its_count() {
+        assert_eq!(
+            repeat("Every minute, turn left 90 degrees, 2 times in all."),
+            Some(Repeat {
+                every_min: 1.0,
+                times: Some(2.0)
+            })
+        );
+        assert_eq!(
+            repeat("every 30 minutes walk through the rooms, 6 times"),
+            Some(Repeat {
+                every_min: 30.0,
+                times: Some(6.0)
+            })
+        );
+        assert_eq!(
+            repeat("check the kitchen every 2 hours twice"),
+            Some(Repeat {
+                every_min: 120.0,
+                times: Some(2.0)
+            })
+        );
+        assert_eq!(
+            repeat("Turn left 90 degrees 4 times"),
+            None,
+            "steps, not a schedule"
+        );
+        assert_eq!(repeat("look at every room"), None);
     }
 
     #[test]

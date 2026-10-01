@@ -95,7 +95,10 @@ pub struct Missions {
     planned: Mutex<VecDeque<Compiled>>,
     running: Mutex<Option<Running>>,
     plan_failures: AtomicU32,
+    /// Missions of the operator's latest request that failed.
     run_failures: AtomicU32,
+    /// The operator's messages in this session.
+    said: AtomicU32,
     /// The plan that ran last in this request, and how it ended: run again unchanged on the
     /// model's own, it repeats a done task or fails the same way.
     last: Mutex<Option<(String, String)>>,
@@ -172,6 +175,7 @@ impl Missions {
             running: Mutex::default(),
             plan_failures: AtomicU32::new(0),
             run_failures: AtomicU32::new(0),
+            said: AtomicU32::new(0),
             last: Mutex::default(),
             session: OnceLock::new(),
             heartbeat: Mutex::default(),
@@ -259,6 +263,7 @@ impl Missions {
                     }
                     Ok(Event::User { text, .. }) => {
                         *lock(&me.request) = text;
+                        me.said.fetch_add(1, Ordering::SeqCst);
                         me.plan_failures.store(0, Ordering::SeqCst);
                         me.run_failures.store(0, Ordering::SeqCst);
                         me.questioned.store(false, Ordering::SeqCst);
@@ -479,18 +484,10 @@ impl Missions {
     }
 
     async fn plan(&self, args: Value, by: By) -> ToolOutcome {
-        if by == By::Model {
-            if self.plan_failures.load(Ordering::SeqCst) >= MAX_PLAN_ATTEMPTS {
-                return ToolOutcome::refused(format!(
-                    "{MAX_PLAN_ATTEMPTS} plans in a row failed their checks; tell the operator what is missing instead"
-                ));
-            }
-            let failed = self.run_failures.load(Ordering::SeqCst);
-            if failed > self.config.max_replans {
-                return ToolOutcome::refused(format!(
-                    "this request already failed {failed} times; tell the operator what went wrong instead of retrying"
-                ));
-            }
+        if by == By::Model
+            && let Some(refusal) = self.may_plan()
+        {
+            return refusal;
         }
         // As sent, for the advisor: the plan below loses what did not parse.
         let sent = args.clone();
@@ -521,13 +518,7 @@ impl Missions {
         };
         // The local model leaves the label out, and once resent an unchanged plan until refused.
         if plan.intent.trim().is_empty() {
-            plan.intent = plan
-                .steps
-                .iter()
-                .map(|s| s.why.trim())
-                .find(|w| !w.is_empty())
-                .unwrap_or("the plan")
-                .to_owned();
+            plan.intent = self.intent_of(&plan);
         }
         let catalog = match self.catalog().await {
             Ok(c) => c,
@@ -776,13 +767,8 @@ impl Missions {
                 r.id
             ));
         }
-        if let Some((hash, how)) = lock(&self.last).as_ref()
-            && *hash == compiled.sha256
-        {
-            return ToolOutcome::refused(format!(
-                "this exact plan just ran and {how}; running it unchanged would repeat that. Change \
-                 the plan to deal with what the report said, or tell the operator"
-            ));
+        if let Some(refusal) = self.unchanged(&compiled.sha256) {
+            return refusal;
         }
         match self.launch(compiled).await {
             Ok(id) => ToolOutcome {
@@ -794,6 +780,55 @@ impl Missions {
             },
             Err(e) => ToolOutcome::failed(e),
         }
+    }
+
+    /// Why the model may not plan for this request any more, or at all yet.
+    fn may_plan(&self) -> Option<ToolOutcome> {
+        if self.plan_failures.load(Ordering::SeqCst) >= MAX_PLAN_ATTEMPTS {
+            return Some(ToolOutcome::refused(format!(
+                "{MAX_PLAN_ATTEMPTS} plans in a row failed their checks; tell the operator what is missing instead"
+            )));
+        }
+        let failed = self.run_failures.load(Ordering::SeqCst);
+        if failed > self.config.max_replans {
+            return Some(ToolOutcome::refused(format!(
+                "this request already failed {failed} times; tell the operator what went wrong instead of retrying"
+            )));
+        }
+        // A guess at what "it" is moves the wrong thing; asking costs a sentence.
+        let unnamed = sanity::unnamed(&lock(&self.request));
+        if let Some(word) = unnamed.filter(|_| self.said.load(Ordering::SeqCst) <= 1) {
+            return Some(ToolOutcome::refused(format!(
+                "the operator said \"{word}\" and nothing before it says what that is; ask \
+                 them which thing they mean"
+            )));
+        }
+        None
+    }
+
+    /// A name for a plan the model left unnamed: its first reason, else the operator's words.
+    fn intent_of(&self, plan: &Plan) -> String {
+        let asked = lock(&self.request)
+            .trim()
+            .trim_end_matches(['.', '!', '?'])
+            .to_owned();
+        plan.steps
+            .iter()
+            .map(|s| s.why.trim())
+            .find(|w| !w.is_empty())
+            .map(str::to_owned)
+            .or_else(|| (!asked.is_empty()).then(|| crate::tools::clip(&asked, 60)))
+            .unwrap_or_else(|| "the plan".to_owned())
+    }
+
+    /// The refusal for running the plan that just ran and failed, unchanged.
+    fn unchanged(&self, hash: &str) -> Option<ToolOutcome> {
+        let last = lock(&self.last);
+        let (_, how) = last.as_ref().filter(|(ran, _)| ran == hash)?;
+        Some(ToolOutcome::refused(format!(
+            "this exact plan just ran and {how}; running it unchanged would repeat that. Change \
+             the plan to deal with what the report said, or tell the operator"
+        )))
     }
 
     /// Sends a checked plan to the executor and watches it; its id.
@@ -992,8 +1027,10 @@ impl Missions {
             "Mission {id} ({}) ended: {outcome} after {elapsed:.0} s.",
             compiled.plan.intent
         );
+        let mut next = "";
+        // Failures count per request, not in a row: a detour that works between two blocked
+        // walks does not start the count again, and the operator's next message does.
         if outcome == "success" {
-            self.run_failures.store(0, Ordering::SeqCst);
             let verdicts = check::check(&compiled.goal, seen);
             if !verdicts.is_empty() {
                 let lines: Vec<String> = verdicts
@@ -1027,14 +1064,14 @@ impl Missions {
             if !story.is_empty() {
                 let _ = write!(report, " What happened to it: {}.", story.join(". "));
             }
-            report.push_str(if n > self.config.max_replans {
-                " This request has failed too often: do not retry. Tell the operator what went \
+            next = if n > self.config.max_replans {
+                "This request has failed too often: do not retry. Tell the operator what went \
                  wrong and what would help."
             } else {
-                " Find out why (robot_state, look, log_tail) and say it in one sentence. If a \
+                "Find out why (robot_state, look, log_tail) and say it in one sentence. If a \
                  changed plan can work, run it now: the operator approves it. If not, say what is \
                  needed."
-            });
+            };
         }
         if !seen.state.is_null() {
             let hands: Vec<String> = ["left", "right"]
@@ -1047,6 +1084,11 @@ impl Missions {
             if !hands.is_empty() {
                 let _ = write!(report, " Now {}.", hands.join(" and "));
             }
+        }
+        // What the model should do next goes on its own line, after what happened.
+        if !next.is_empty() {
+            report.push('\n');
+            report.push_str(next);
         }
         report
     }
@@ -1303,7 +1345,9 @@ impl Tool for RunMission {
     /// one is shown, approved and run by its hash.
     async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
         if args.get("steps").is_none() && args.get("template").is_none() {
-            return None;
+            // A plan by its hash that just failed is refused before anyone is asked to approve it.
+            let hash = self.0.find(args["hash"].as_str()?).ok()?.sha256;
+            return self.0.unchanged(&hash).map(Err);
         }
         if args["check_only"].as_bool() == Some(true) {
             return Some(Ok(Assessment {
@@ -1312,6 +1356,14 @@ impl Tool for RunMission {
                 reason: "checks a plan".to_owned(),
                 args: None,
             }));
+        }
+        // Run now, it would be once; a schedule runs it now and then on its clock.
+        if let Some(r) = sanity::repeat(&lock(&self.0.request)) {
+            return Some(Err(ToolOutcome::refused(format!(
+                "the operator asked for it every {} min: check one run of it with check_only, \
+                 then give the steps to schedule, which runs it now and then on time",
+                r.every_min
+            ))));
         }
         Some(self.approvable(args.clone(), By::Model).await)
     }
@@ -1350,6 +1402,11 @@ impl RunMission {
             return Err(out);
         }
         let hash = out.data["hash"].as_str().unwrap_or_default().to_owned();
+        if by == By::Model
+            && let Some(refusal) = self.0.unchanged(&hash)
+        {
+            return Err(refusal);
+        }
         let steps = out.data["steps"].as_array().map_or(0, Vec::len);
         let minutes = (out.data["worst_case_s"].as_f64().unwrap_or(0.0) / 60.0).ceil();
         let intent = self
@@ -1388,10 +1445,12 @@ fn questioned(concerns: &[Concern]) -> ToolOutcome {
     let lines: Vec<String> = concerns.iter().map(concern_line).collect();
     ToolOutcome {
         status: Status::Failed,
+        message: format!(
+            "{}. The plan may not do what the operator asked: fix it, or if it is right, send it \
+             again unchanged and the operator sees these concerns when approving",
+            lines.join("; ")
+        ),
         data: json!({"ok": false, "concerns": lines}),
-        message: "the plan may not do what the operator asked; fix it, or if it is right, send it \
-                  again unchanged and the operator sees these concerns when approving"
-            .to_owned(),
         images: Vec::new(),
     }
 }
@@ -1858,6 +1917,65 @@ mod tests {
         let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
         *lock(&missions.request) = request.to_owned();
         missions
+    }
+
+    #[tokio::test]
+    async fn a_first_request_for_it_is_asked_about_not_guessed() {
+        let missions = missions_asked("Pick it up.");
+        missions.said.store(1, Ordering::SeqCst);
+        let out = missions.plan(steps(), By::Model).await;
+        assert_eq!(out.status, Status::Refused);
+        assert!(
+            out.message.contains("which thing they mean"),
+            "{}",
+            out.message
+        );
+        missions.said.store(2, Ordering::SeqCst);
+        let later = missions.plan(steps(), By::Model).await;
+        assert_eq!(
+            later.status,
+            Status::Succeeded,
+            "said after something: {}",
+            later.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeat_goes_to_a_schedule_not_a_run() {
+        let missions = missions_asked("Every minute, pick up the blue cup, 2 times in all.");
+        let [tool] = missions.tools();
+        let back = tool.assess(&steps()).await.unwrap().unwrap_err();
+        assert_eq!(back.status, Status::Refused);
+        assert!(back.message.contains("schedule"), "{}", back.message);
+        let checked = tool.assess(&json!({"check_only": true, "steps": []})).await;
+        assert!(matches!(checked, Some(Ok(_))), "checking one run is fine");
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_plan_takes_the_operators_words_and_a_failed_rerun_is_not_asked() {
+        let missions = missions_asked("Fetch the blue cup for me.");
+        let mut plan = steps();
+        plan.as_object_mut().unwrap().remove("intent");
+        let [tool] = missions.tools();
+        let sound = tool.assess(&plan).await.unwrap().unwrap();
+        let hash = sound.args.unwrap()["hash"].as_str().unwrap().to_owned();
+        assert_eq!(
+            missions.find(&hash).unwrap().plan.intent,
+            "Fetch the blue cup for me"
+        );
+        *lock(&missions.last) = Some((hash.clone(), "failed at s2: grasp slipped".to_owned()));
+        let again = tool.assess(&plan).await.unwrap().unwrap_err();
+        assert!(
+            again.message.contains("just ran and failed"),
+            "{}",
+            again.message
+        );
+        let by_hash = tool
+            .assess(&json!({"hash": hash}))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(by_hash.status, Status::Refused);
     }
 
     /// An advisor that keeps what it was asked.
