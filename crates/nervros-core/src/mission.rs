@@ -193,6 +193,11 @@ impl Missions {
         self
     }
 
+    /// The robot the missions run on.
+    pub(crate) fn robot(&self) -> &Arc<dyn RobotPort> {
+        &self.robot
+    }
+
     /// Where finished missions are kept, if anywhere.
     #[must_use]
     pub fn ledger(&self) -> Option<&Arc<Ledger>> {

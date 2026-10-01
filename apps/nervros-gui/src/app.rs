@@ -961,10 +961,14 @@ impl Gui {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&s.id).monospace().small());
                 ui.label(RichText::new(&s.intent).small());
-                let when = format!(
-                    "every {} min, {} of {} runs left",
-                    s.every_min, s.left, s.times
-                );
+                let when = if s.when.is_empty() {
+                    format!(
+                        "every {} min, {} of {} runs left",
+                        s.every_min, s.left, s.times
+                    )
+                } else {
+                    format!("when {}, {} of {} runs left", s.when, s.left, s.times)
+                };
                 ui.label(RichText::new(when).small().color(ui.tokens().text_subdued));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui

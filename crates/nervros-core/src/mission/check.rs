@@ -261,7 +261,7 @@ fn seen_at(o: &Value) -> f64 {
 }
 
 /// Whether an object's label or name is, or holds, `words`.
-fn named(o: &Value, words: &str) -> bool {
+pub(crate) fn named(o: &Value, words: &str) -> bool {
     let words = words.to_lowercase();
     [text(o, "label"), text(o, "name")]
         .iter()
