@@ -46,6 +46,10 @@ pub struct Agent {
     pub missions: Option<Arc<Missions>>,
     /// What the MCP servers brought, for the doctor.
     pub mcp: Vec<crate::doctor::Check>,
+    /// What the operator should hear as the session starts, before anything subscribes to it.
+    pub notices: Vec<String>,
+    /// Requests the last session ended waiting on the operator for, to offer again.
+    pub unanswered: Vec<crate::session::Unanswered>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -408,6 +412,38 @@ fn model_layer(
     })
 }
 
+/// Where a session keeps the requests waiting on the operator: beside its conversation, so one
+/// that keeps a conversation keeps what it was asking too. And what the last session left there.
+fn waiting_requests(history: Option<&Path>) -> (Option<PathBuf>, Vec<crate::session::Unanswered>) {
+    let file = history.map(|h| h.with_file_name("pending.json"));
+    let left = file
+        .as_deref()
+        .map(crate::session::take_unanswered)
+        .unwrap_or_default();
+    (file, left)
+}
+
+/// The missions' tools, their history's and the schedules', and the schedules themselves.
+fn mission_tools(
+    missions: Option<&Arc<Missions>>,
+    guard: &Arc<Guard>,
+    registry: &mut Registry,
+) -> Result<Option<Arc<crate::schedule::Schedules>>, StartError> {
+    let Some(missions) = missions else {
+        return Ok(None);
+    };
+    let schedules = crate::schedule::Schedules::new(Arc::clone(missions), Arc::clone(guard));
+    for tool in missions
+        .tools()
+        .into_iter()
+        .chain(crate::mission::history::tools(missions))
+        .chain(schedules.tools())
+    {
+        registry.add(tool)?;
+    }
+    Ok(Some(schedules))
+}
+
 /// Starts an agent as `options` say. Must run inside a tokio runtime.
 ///
 /// # Errors
@@ -421,6 +457,7 @@ pub fn start_with(
 ) -> Result<Agent, StartError> {
     let profile = Profile::load(profile_path)?;
     let models = model_layer(&profile, ledger, options.model)?;
+    let (pending_file, unanswered) = waiting_requests(options.history.as_deref());
     let llm = Arc::clone(&models.llm);
     let guard = Arc::new(Guard::new(profile.policy.clone()));
     let schemas: Arc<dyn SchemaSource> = Arc::new(RosidlSchemas::load(&profile)?);
@@ -456,23 +493,14 @@ pub fn start_with(
         models.advisor,
         seeing.vision,
     );
-    let schedules = missions
-        .as_ref()
-        .map(|m| crate::schedule::Schedules::new(Arc::clone(m), Arc::clone(&guard)));
-    for tool in missions
-        .iter()
-        .flat_map(Missions::tools)
-        .chain(missions.iter().flat_map(crate::mission::history::tools))
-        .chain(schedules.iter().flat_map(crate::schedule::Schedules::tools))
-    {
-        registry.add(tool)?;
-    }
+    let schedules = mission_tools(missions.as_ref(), &guard, &mut registry)?;
     let tools = registry.iter().map(|t| t.spec().name.clone()).collect();
     let config = SessionConfig {
         preamble: system_prompt(&profile, &skills),
         max_model_calls: usize::try_from(profile.policy.budgets.model_calls).unwrap_or(6),
         approval_ttl: profile.policy.approval_ttl,
         turn_time: profile.policy.budgets.wall_time,
+        pending_file,
         history_file: options.history,
         resume: options.resume,
         notes: Some(Arc::clone(&memory) as Arc<dyn crate::memory::Notes>),
@@ -498,11 +526,6 @@ pub fn start_with(
         s.attach(session.handle());
     }
     watches.attach(session.handle());
-    for check in mcp.iter().filter(|c| !c.ok) {
-        session.handle().emit(crate::session::Event::Notice {
-            text: check.what.clone(),
-        });
-    }
     say_orphan(&profile, &robot, session.handle());
     Ok(Agent {
         session,
@@ -516,7 +539,13 @@ pub fn start_with(
         memory,
         schedules,
         missions,
+        notices: mcp
+            .iter()
+            .filter(|c| !c.ok)
+            .map(|c| c.what.clone())
+            .collect(),
         mcp,
+        unanswered,
     })
 }
 

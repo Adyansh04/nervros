@@ -1321,6 +1321,12 @@ impl Tool for RunMission {
         Some(self.approvable(args, By::Operator).await)
     }
 
+    /// A checked plan's hash dies with the session that checked it; its steps do not.
+    fn ask_again(&self, args: &Value) -> Option<Value> {
+        let plan = self.0.find(args["hash"].as_str()?).ok()?.plan;
+        serde_json::to_value(plan).ok()
+    }
+
     /// The skill list loads when the session starts; a first message sent at once would see none.
     async fn ready(&self) {
         let _ = tokio::time::timeout(SERVICE_TIMEOUT / 2, self.0.catalog()).await;
@@ -1706,6 +1712,22 @@ mod tests {
         missions.run(&json!({"hash": hash})).await;
         let goal = lock(&sent).clone().expect("no goal was sent");
         assert_eq!(goal["heartbeat_timeout_s"], json!(0.0));
+    }
+
+    #[tokio::test]
+    async fn a_plan_left_unanswered_is_asked_again_as_its_steps() {
+        let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+        let [tool] = missions.tools();
+        let checked = tool.assess(&steps()).await.unwrap().unwrap();
+        let again = tool.ask_again(&checked.args.unwrap()).unwrap();
+        assert!(
+            again["steps"].is_array() && again.get("hash").is_none(),
+            "{again}"
+        );
+        let out = missions.plan(again, By::Operator).await;
+        assert_eq!(out.status, Status::Succeeded, "{}", out.message);
+        assert!(tool.ask_again(&json!({"hash": "0000000000"})).is_none());
     }
 
     #[tokio::test]

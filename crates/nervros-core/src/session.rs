@@ -7,13 +7,13 @@
 //! ends instead of repeating an action. Every tool call passes the guard.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -25,7 +25,9 @@ use crate::mission::plan::PlannedStep;
 use crate::mission::sanity::Concern;
 use crate::providers::Role;
 use crate::providers::router::Need;
-use crate::tools::{Assessment, Lane, Registry, Resource, Status, Tool, ToolOutcome, ToolSpec};
+use crate::tools::{
+    Assessment, Lane, Registry, Resource, Risk, Status, Tool, ToolOutcome, ToolSpec,
+};
 
 /// What a UI or the CLI asks the session to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +40,9 @@ pub enum Command {
     StopMission,
     /// Approve a pending request.
     Approve(u64),
+    /// Approve a pending request, and let its tool run without asking for the rest of the
+    /// session, unless it moves the robot or the profile's rules ask for it.
+    AllowForSession(u64),
     /// Refuse a pending request.
     Deny(u64),
     /// Check changed arguments for a pending request, such as an edited plan; it then waits on
@@ -224,6 +229,8 @@ pub enum Event {
         args: Value,
         /// Why approval is needed.
         reason: String,
+        /// Whether `AllowForSession` would spare asking again: never for what moves the robot.
+        can_allow: bool,
     },
     /// An edit to a pending approval passed its checks: it waits on these arguments now.
     ApprovalEdited {
@@ -358,6 +365,33 @@ pub struct SessionConfig {
     /// Called from the session's own loop, the one that serves Stop, every [`PULSE_PERIOD`]:
     /// a heartbeat fed from it stops when that loop does.
     pub pulse: Option<Arc<dyn Pulse>>,
+    /// Where requests waiting on the operator are kept while they wait, so that a session
+    /// that ends first leaves them for the next to ask again ([`take_unanswered`]).
+    pub pending_file: Option<std::path::PathBuf>,
+}
+
+/// A request the operator had not answered when its session ended.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Unanswered {
+    /// The tool.
+    pub tool: String,
+    /// Its arguments, as they would be sent anew.
+    pub args: Value,
+    /// Why it asked.
+    pub reason: String,
+}
+
+/// The requests an earlier session left unanswered in `file`; the file goes, so each is offered
+/// once.
+#[must_use]
+pub fn take_unanswered(file: &std::path::Path) -> Vec<Unanswered> {
+    let Ok(text) = std::fs::read(file) else {
+        return Vec::new();
+    };
+    if let Err(e) = std::fs::remove_file(file) {
+        tracing::warn!(error = %e, "the unanswered requests stay");
+    }
+    serde_json::from_slice(&text).unwrap_or_default()
 }
 
 /// How often the session's loop calls [`SessionConfig::pulse`].
@@ -382,6 +416,7 @@ impl Default for SessionConfig {
             resume: None,
             notes: None,
             pulse: None,
+            pending_file: None,
         }
     }
 }
@@ -399,6 +434,8 @@ enum Caller {
 #[derive(Debug)]
 enum Answer {
     Approve,
+    /// Approve, and stop asking about this tool for the session.
+    AllowForSession,
     Deny,
     /// Check these arguments instead, and wait again.
     Edit(Value),
@@ -428,6 +465,10 @@ struct Shared {
     next_approval: AtomicU64,
     /// Milliseconds this turn spent waiting for the operator.
     waited_ms: AtomicU64,
+    /// Tools the operator let run without asking for the rest of the session.
+    allowed: Mutex<HashSet<String>>,
+    /// Requests waiting on the operator, by approval id, as `pending_file` keeps them.
+    waiting: Mutex<BTreeMap<u64, Unanswered>>,
     guard: Arc<Guard>,
     config: SessionConfig,
 }
@@ -454,15 +495,19 @@ impl Shared {
         tool: &Arc<dyn Tool>,
         name: &str,
         reason: String,
+        risk: Risk,
         mut approved: Approved,
     ) -> Option<Approved> {
+        let can_allow = !matches!(risk, Risk::Motion | Risk::Manipulation);
         let id = self.next_approval.fetch_add(1, Ordering::Relaxed) + 1;
         let mut rx = self.listen(id);
+        self.keep_waiting(id, tool, name, &reason, &approved.args);
         self.emit(Event::ApprovalRequested {
             id,
             tool: name.to_owned(),
             args: approved.args.clone(),
-            reason,
+            reason: reason.clone(),
+            can_allow,
         });
         let asked = Instant::now();
         let mut early = None;
@@ -473,6 +518,19 @@ impl Shared {
             };
             match answer {
                 Ok(Ok(Answer::Approve)) => break true,
+                Ok(Ok(Answer::AllowForSession)) => {
+                    let text = if can_allow {
+                        lock(&self.allowed).insert(name.to_owned());
+                        format!(
+                            "`{name}` runs without asking for the rest of this session, except \
+                             what moves the robot"
+                        )
+                    } else {
+                        format!("`{name}` moves the robot, so it still asks every time")
+                    };
+                    self.emit(Event::Notice { text });
+                    break true;
+                }
                 Ok(Ok(Answer::Edit(edited))) => {
                     // Waiting again before the check, so a stop during it still lands.
                     rx = self.listen(id);
@@ -482,6 +540,7 @@ impl Shared {
                                 approved.args = args;
                             }
                             approved.resources = a.resources;
+                            self.keep_waiting(id, tool, name, &reason, &approved.args);
                             self.emit(Event::ApprovalEdited {
                                 id,
                                 args: approved.args.clone(),
@@ -518,9 +577,52 @@ impl Shared {
         let waited = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.waited_ms.fetch_add(waited, Ordering::Relaxed);
         lock(&self.approvals).remove(&id);
+        self.done_waiting(id);
         tracing::Span::current().record("nervros.outcome", if yes { "approved" } else { "denied" });
         self.emit(Event::ApprovalResolved { id, approved: yes });
         yes.then_some(approved)
+    }
+
+    /// Keeps approval `id` where the next session finds it if this one ends first.
+    fn keep_waiting(&self, id: u64, tool: &Arc<dyn Tool>, name: &str, reason: &str, args: &Value) {
+        if self.config.pending_file.is_none() {
+            return;
+        }
+        if let Some(args) = tool.ask_again(args) {
+            let entry = Unanswered {
+                tool: name.to_owned(),
+                args,
+                reason: reason.to_owned(),
+            };
+            lock(&self.waiting).insert(id, entry);
+            self.write_waiting();
+        }
+    }
+
+    fn done_waiting(&self, id: u64) {
+        if lock(&self.waiting).remove(&id).is_some() {
+            self.write_waiting();
+        }
+    }
+
+    fn write_waiting(&self) {
+        let Some(file) = &self.config.pending_file else {
+            return;
+        };
+        let waiting = lock(&self.waiting);
+        let written = if waiting.is_empty() {
+            match std::fs::remove_file(file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            serde_json::to_vec(&waiting.values().collect::<Vec<_>>())
+                .map_err(std::io::Error::other)
+                .and_then(|json| std::fs::write(file, json))
+        };
+        if let Err(e) = written {
+            tracing::warn!(error = %e, "the requests waiting on the operator were not kept");
+        }
     }
 
     /// A fresh channel for the next answer to approval `id`.
@@ -595,7 +697,10 @@ impl Shared {
             args,
             resources: spec.resources.clone(),
         };
-        if let Some(a) = self.ask_approval(tool, &spec.name, reason, asked).await {
+        if let Some(a) = self
+            .ask_approval(tool, &spec.name, reason, spec.risk, asked)
+            .await
+        {
             self.denials.store(0, Ordering::SeqCst);
             return self.run(tool, a.args, &a.resources).await;
         }
@@ -628,6 +733,14 @@ impl Shared {
         };
         let decision = match (decision, rule) {
             (Decision::Allow, Some(r)) => Decision::NeedApproval { reason: r.reason },
+            // Allowed for the session, unless this call moves the robot.
+            (Decision::NeedApproval { .. }, None)
+                if caller == Caller::Model
+                    && !matches!(spec.risk, Risk::Motion | Risk::Manipulation)
+                    && lock(&self.allowed).contains(&spec.name) =>
+            {
+                Decision::Allow
+            }
             (decision, _) => decision,
         };
         let (verdict, why) = match &decision {
@@ -833,6 +946,8 @@ impl Session {
             repeated: Mutex::default(),
             steer: Mutex::default(),
             waited_ms: AtomicU64::new(0),
+            allowed: Mutex::default(),
+            waiting: Mutex::default(),
             guard,
             config,
         });
@@ -981,6 +1096,7 @@ async fn actor(
                         history = earlier;
                     }
                     Command::Approve(id) => shared.answer(id, Answer::Approve),
+                    Command::AllowForSession(id) => shared.answer(id, Answer::AllowForSession),
                     Command::Deny(id) => shared.answer(id, Answer::Deny),
                     Command::Edit { id, args } => shared.answer(id, Answer::Edit(args)),
                     Command::Run { tool, args } => match registry.get(&tool).cloned() {
@@ -1908,6 +2024,98 @@ mod tests {
                 .any(|e| matches!(e, Event::Error { text, .. } if text.contains("longer than")))
         );
         assert!(!events.iter().any(|e| matches!(e, Event::Reply { .. })));
+    }
+
+    /// Two calls of the one tool in one turn, the second with other arguments.
+    fn twice() -> MockCompletionModel {
+        MockCompletionModel::new([
+            MockTurn::tool_call("c1", "find_objects", json!({"n": 1})),
+            MockTurn::tool_call("c2", "find_objects", json!({"n": 2})),
+            MockTurn::text("done"),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_tool_allowed_for_the_session_stops_asking_unless_it_moves_the_robot() {
+        for (risk, asked) in [(Risk::WorldEdit, 1), (Risk::Motion, 2)] {
+            let guard = Arc::new(Guard::new(Policy::default()));
+            guard.set_armed(true);
+            let session = Session::start(
+                Arc::new(Scripted(twice())),
+                registry(risk),
+                guard,
+                None,
+                SessionConfig::default(),
+            );
+            let mut rx = session.subscribe();
+            session.send(Command::User("go".into()));
+            let allow = |e: &Event| match e {
+                Event::ApprovalRequested { id, .. } => Some(Command::AllowForSession(*id)),
+                _ => None,
+            };
+            let events = collect_until_finished(&mut rx, allow, &session).await;
+            let n = events
+                .iter()
+                .filter(|e| matches!(e, Event::ApprovalRequested { .. }))
+                .count();
+            assert_eq!(n, asked, "{risk:?}: {events:?}");
+            let ran = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        Event::ToolFinished {
+                            status: "succeeded",
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(ran, 2, "{risk:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_left_waiting_is_kept_for_the_next_session_and_dropped_once_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pending.json");
+        let guard = Arc::new(Guard::new(Policy::default()));
+        guard.set_armed(true);
+        let config = SessionConfig {
+            pending_file: Some(file.clone()),
+            ..SessionConfig::default()
+        };
+        let session = Session::start(
+            Arc::new(Scripted(twice())),
+            registry(Risk::WorldEdit),
+            guard,
+            None,
+            config,
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("go".into()));
+        let id = loop {
+            if let Event::ApprovalRequested { id, .. } = rx.recv().await.unwrap() {
+                break id;
+            }
+        };
+        let kept: Vec<Unanswered> = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            (kept[0].tool.as_str(), &kept[0].args),
+            ("find_objects", &json!({"n": 1}))
+        );
+        session.send(Command::Deny(id));
+        let deny = |e: &Event| match e {
+            Event::ApprovalRequested { id, .. } => Some(Command::Deny(*id)),
+            _ => None,
+        };
+        collect_until_finished(&mut rx, deny, &session).await;
+        assert!(!file.exists(), "answered, nothing waits");
+
+        std::fs::write(&file, serde_json::to_vec(&kept).unwrap()).unwrap();
+        assert_eq!(take_unanswered(&file), kept);
+        assert!(take_unanswered(&file).is_empty(), "offered once");
     }
 
     #[tokio::test]

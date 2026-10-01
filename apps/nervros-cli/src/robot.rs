@@ -256,8 +256,16 @@ fn print_event(e: &Event, logs: &Path) {
             tool,
             args,
             reason,
+            can_allow,
         } => {
-            println!("  ? approve #{id}: {tool} {args} ({reason}); answer /yes {id} or /no {id}");
+            let allow = if *can_allow {
+                format!(", /allow {id} for the session,")
+            } else {
+                String::new()
+            };
+            println!(
+                "  ? approve #{id}: {tool} {args} ({reason}); answer /yes {id}{allow} or /no {id}"
+            );
         }
         Event::ApprovalEdited { id, reason, .. } => println!("  approval #{id} edited: {reason}"),
         Event::EditRejected { id, message } => println!("  edit of #{id} refused: {message}"),
@@ -325,6 +333,8 @@ fn parse_line(line: &str) -> Option<SessionCommand> {
         _ => {
             if let Some(id) = arg("/yes") {
                 Some(SessionCommand::Approve(id))
+            } else if let Some(id) = arg("/allow") {
+                Some(SessionCommand::AllowForSession(id))
             } else if let Some(id) = arg("/no") {
                 Some(SessionCommand::Deny(id))
             } else {
@@ -377,6 +387,16 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
         agent.tools.join(", "),
         log_path.display()
     );
+    for notice in &agent.notices {
+        println!("  ! {notice}");
+    }
+    for (n, u) in agent.unanswered.iter().enumerate() {
+        println!(
+            "  ? waiting for your approval when the last session ended: {} (/again {})",
+            u.reason,
+            n + 1
+        );
+    }
     let mut events = agent.session.subscribe();
     if options.arm {
         agent.session.send(SessionCommand::Arm);
@@ -384,40 +404,61 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
     // Discovery and the camera need a moment after the node starts.
     tokio::time::sleep(Duration::from_secs(2)).await;
     if !options.say.is_empty() {
-        // Missions outlive the turn that started them: wait for their reports too.
-        let (mut open, mut awaiting_report) = (0u32, false);
-        for text in options.say {
-            println!("you> {text}");
-            agent.session.send(SessionCommand::User(text.clone()));
-            // A report's reply can run first: wait for the turn this message starts.
-            let mut mine = None;
-            loop {
-                let e = events.recv().await.context("the session ended")?;
-                if let Event::ApprovalRequested { id, .. } = &e
-                    && options.approve
+        return say_all(&agent, &mut events, options.say, options.approve, &blobs).await;
+    }
+    interactive(&agent, events, blobs).await
+}
+
+/// Sends each message in turn and waits for its turn, the missions it starts and their reports;
+/// approves every request when `approve`.
+async fn say_all(
+    agent: &nervros_core::app::Agent,
+    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    say: Vec<String>,
+    approve: bool,
+    blobs: &Path,
+) -> Result<()> {
+    // Missions outlive the turn that started them: wait for their reports too.
+    let (mut open, mut awaiting_report) = (0u32, false);
+    for text in say {
+        println!("you> {text}");
+        agent.session.send(SessionCommand::User(text.clone()));
+        // A report's reply can run first: wait for the turn this message starts.
+        let mut mine = None;
+        loop {
+            let e = events.recv().await.context("the session ended")?;
+            if let Event::ApprovalRequested { id, .. } = &e
+                && approve
+            {
+                agent.session.send(SessionCommand::Approve(*id));
+            }
+            print_event(&e, blobs);
+            match e {
+                Event::MissionStarted { .. } => open += 1,
+                Event::MissionFinished { .. } => {
+                    open = open.saturating_sub(1);
+                    awaiting_report = true;
+                }
+                Event::Report { .. } => awaiting_report = false,
+                Event::User { turn, text: sent } if sent == text => mine = Some(turn),
+                Event::TurnFinished { turn }
+                    if mine.is_some_and(|m| turn >= m) && open == 0 && !awaiting_report =>
                 {
-                    agent.session.send(SessionCommand::Approve(*id));
+                    break;
                 }
-                print_event(&e, &blobs);
-                match e {
-                    Event::MissionStarted { .. } => open += 1,
-                    Event::MissionFinished { .. } => {
-                        open = open.saturating_sub(1);
-                        awaiting_report = true;
-                    }
-                    Event::Report { .. } => awaiting_report = false,
-                    Event::User { turn, text: sent } if sent == text => mine = Some(turn),
-                    Event::TurnFinished { turn }
-                        if mine.is_some_and(|m| turn >= m) && open == 0 && !awaiting_report =>
-                    {
-                        break;
-                    }
-                    _ => {}
-                }
+                _ => {}
             }
         }
-        return Ok(());
     }
+    Ok(())
+}
+
+/// Reads the operator's lines until `/quit`, printing what the session reports meanwhile.
+async fn interactive(
+    agent: &nervros_core::app::Agent,
+    mut events: tokio::sync::broadcast::Receiver<Event>,
+    blobs: std::path::PathBuf,
+) -> Result<()> {
     let printer = tokio::spawn(async move {
         while let Ok(e) = events.recv().await {
             print_event(&e, &blobs);
@@ -427,6 +468,18 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
     while let Some(line) = lines.next_line().await? {
         if line.trim() == "/quit" {
             break;
+        }
+        let again = line
+            .trim()
+            .strip_prefix("/again")
+            .and_then(|n| n.trim().parse::<usize>().ok())
+            .and_then(|n| agent.unanswered.get(n.checked_sub(1)?));
+        if let Some(u) = again {
+            agent.session.send(SessionCommand::Run {
+                tool: u.tool.clone(),
+                args: u.args.clone(),
+            });
+            continue;
         }
         if let Some(cmd) = parse_line(&line) {
             agent.session.send(cmd);

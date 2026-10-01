@@ -285,6 +285,13 @@ pub trait Tool: Send + Sync {
     /// answered; the session asks before each turn. Most specs are complete from the start.
     async fn ready(&self) {}
 
+    /// The arguments to ask the operator about this call again in a later session, when this one
+    /// ended waiting on their approval: as they would be sent anew. `None` when it cannot be
+    /// asked again.
+    fn ask_again(&self, args: &Value) -> Option<Value> {
+        Some(args.clone())
+    }
+
     /// Runs it. Errors are outcomes, never panics.
     async fn call(&self, args: Value) -> ToolOutcome;
 }

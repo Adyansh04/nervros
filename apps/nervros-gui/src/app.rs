@@ -299,6 +299,16 @@ impl Gui {
         let live = Arc::new(Mutex::new(Live::default()));
         let recheck = watch(&agent, &live, &cc.egui_ctx);
         let events = agent.session.subscribe();
+        let mut chat = Chat::default();
+        chat.items
+            .extend(agent.notices.iter().cloned().map(crate::chat::Item::Notice));
+        chat.items.extend(
+            agent
+                .unanswered
+                .iter()
+                .cloned()
+                .map(|u| crate::chat::Item::Unanswered(u, std::cell::Cell::new(false))),
+        );
         let agent_snapshots = Arc::clone(&agent.snapshots);
         Ok(Self {
             viewer,
@@ -307,7 +317,7 @@ impl Gui {
             live,
             log_path,
             sessions: None,
-            chat: Chat::default(),
+            chat,
             event_log: VecDeque::new(),
             input: String::new(),
             history: Vec::new(),
@@ -1212,7 +1222,7 @@ impl Gui {
         let now = SystemTime::now();
         for (role, name) in [
             (Role::Routine, "Routine"),
-            (Role::Plan, "Plan"),
+            (Role::Plan, "Plan advice"),
             (Role::VisionCheck, "Vision check"),
             (Role::Summarise, "Summarise"),
             (Role::Segment, "Segment"),

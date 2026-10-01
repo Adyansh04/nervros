@@ -1,7 +1,7 @@
 //! The conversation as the operator sees it: items built from session events, and how each one
 //! is drawn. Colours and sizes come from `re_ui`'s tokens so chat and viewer read as one app.
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use nervros_core::mission::plan::PlannedStep;
 use nervros_core::mission::preview::PreviewStep;
 use nervros_core::mission::sanity::Concern;
-use nervros_core::session::{Command, Event};
+use nervros_core::session::{Command, Event, Unanswered};
 use rerun::external::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _, icons};
 use serde_json::Value;
@@ -58,6 +58,8 @@ pub struct Approval {
     tool: String,
     args: Value,
     reason: String,
+    /// Approving can cover the rest of the session.
+    can_allow: bool,
     asked: Instant,
     answer: Option<bool>,
     /// An edit is being checked.
@@ -114,6 +116,8 @@ pub enum Item {
     Report(String),
     /// A plan, and the mission that runs it.
     Plan(PlanCard),
+    /// A request the last session ended waiting on, and whether it was taken up or put aside.
+    Unanswered(Unanswered, Cell<bool>),
 }
 
 /// A plan `run_mission` checked, updated as its mission runs.
@@ -297,11 +301,13 @@ impl Chat {
                 tool,
                 args,
                 reason,
+                can_allow,
             } => self.items.push(Item::Approval(Approval {
                 id: *id,
                 tool: tool.clone(),
                 args: args.clone(),
                 reason: reason.clone(),
+                can_allow: *can_allow,
                 asked: Instant::now(),
                 answer: None,
                 checking: false,
@@ -563,6 +569,7 @@ impl Chat {
                     Item::Error(text) => error_card(ui, text, self.last_user.as_deref(), actions),
                     Item::Report(text) => report(ui, text),
                     Item::Plan(p) => plan_card(ui, p, actions),
+                    Item::Unanswered(u, done) => unanswered_card(ui, u, done, actions),
                 }
             });
         }
@@ -887,6 +894,47 @@ fn approval_card(
     }
 }
 
+/// A request the last session ended waiting on: asked again only if the operator wants it, and
+/// checked again then, since the robot and its world have moved on.
+fn unanswered_card(
+    ui: &mut egui::Ui,
+    u: &Unanswered,
+    done: &Cell<bool>,
+    actions: &mut Vec<Action>,
+) {
+    let t = ui.tokens();
+    card(ui, t.widget_noninteractive_bg_stroke).show(ui, |ui| {
+        ui.label(RichText::new("Waiting for your approval when the app last closed").strong());
+        ui.label(&u.reason);
+        // A plan's reason names it already; anything else shows what it would send.
+        if u.args.get("steps").is_none() {
+            code(ui, &pretty(&u.args));
+        }
+        ui.horizontal(|ui| {
+            if done.get() {
+                ui.label(RichText::new("Done").color(t.text_subdued));
+                return;
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(ReButton::new("Ask again").primary())
+                    .on_hover_text("Check it again now and ask for your approval")
+                    .clicked()
+                {
+                    actions.push(Action::Send(Command::Run {
+                        tool: u.tool.clone(),
+                        args: u.args.clone(),
+                    }));
+                    done.set(true);
+                }
+                if ui.add(ReButton::new("Dismiss").secondary()).clicked() {
+                    done.set(true);
+                }
+            });
+        });
+    });
+}
+
 /// How long an approval has left: whole minutes while there are more than 90 s, as a count of
 /// seconds would only distract, then seconds.
 fn time_left(left: Duration) -> String {
@@ -930,7 +978,20 @@ fn approval_buttons(
     if ui.add(ReButton::new("Deny").secondary()).clicked() {
         actions.push(Action::Send(Command::Deny(a.id)));
     }
-    let Some(p) = plan else { return };
+    let Some(p) = plan else {
+        if a.can_allow
+            && ui
+                .add_enabled(idle, ReButton::new("Allow for session").secondary())
+                .on_hover_text(
+                    "Approve, and let this tool run without asking for the rest of the session; \
+                 what moves the robot still asks",
+                )
+                .clicked()
+        {
+            actions.push(Action::Send(Command::AllowForSession(a.id)));
+        }
+        return;
+    };
     if ui
         .add_enabled(idle, ReButton::new("Edit").secondary())
         .on_hover_text("Change, move or drop steps before approving")
@@ -1273,6 +1334,7 @@ pub(crate) mod tests {
             tool: "navigate".to_owned(),
             args: serde_json::json!({"place": "kitchen"}),
             reason: "moves the base".to_owned(),
+            can_allow: false,
         });
         chat.apply(&Event::TurnFinished { turn: 1 });
         chat
@@ -1434,6 +1496,7 @@ pub(crate) mod tests {
             tool: "run_mission".to_owned(),
             args: serde_json::json!({"hash": "5be0c1d9f2a4"}),
             reason: "runs it".to_owned(),
+            can_allow: false,
         });
         chat
     }
@@ -1551,6 +1614,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn snapshot_unanswered_and_allow() {
+        let mut chat = Chat::default();
+        chat.items.push(Item::Unanswered(
+            Unanswered {
+                tool: "run_mission".to_owned(),
+                args: serde_json::json!({"intent": "bring the red mug to the sofa", "steps": []}),
+                reason: "runs \"bring the red mug to the sofa\": 4 step(s), at most 6 min"
+                    .to_owned(),
+            },
+            Cell::new(false),
+        ));
+        chat.apply(&Event::ApprovalRequested {
+            id: 3,
+            tool: "set_parameter".to_owned(),
+            args: serde_json::json!({"node": "/controller_server", "name": "max_vel_x", "value": 0.3}),
+            reason: "`set_parameter` acts on the robot".to_owned(),
+            can_allow: true,
+        });
+        render(chat, "chat_unanswered");
+    }
+
+    #[test]
     fn snapshot_draft_and_compaction() {
         let mut chat = Chat::default();
         chat.apply(&Event::Compacted {
@@ -1609,6 +1694,7 @@ pub(crate) mod tests {
             tool: "run_mission".to_owned(),
             args: serde_json::json!({"hash": "a91f3c2e"}),
             reason: "`run_mission` acts on the robot".to_owned(),
+            can_allow: false,
         });
         chat.apply(&Event::ApprovalResolved {
             id: 3,
@@ -1715,6 +1801,7 @@ pub(crate) mod tests {
             tool: "run_mission".to_owned(),
             args: serde_json::json!({"hash": "7c01d2aa9e3b"}),
             reason: "`run_mission` acts on the robot".to_owned(),
+            can_allow: false,
         });
         render(chat, "chat_plan_records");
     }
