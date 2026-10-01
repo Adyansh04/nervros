@@ -1229,9 +1229,27 @@ fn report(ui: &mut egui::Ui, text: &str) {
             ui.horizontal_wrapped(|ui| {
                 ui.small_icon(&icons::AGENT, Some(ui.tokens().text_subdued));
                 ui.label(RichText::new("Robot report").small().strong());
-                ui.label(RichText::new(text).small().color(ui.tokens().text_subdued));
+                ui.label(
+                    RichText::new(report_text(text))
+                        .small()
+                        .color(ui.tokens().text_subdued),
+                );
             });
         });
+}
+
+/// A robot report as the operator reads it: what happened, with mission ids cut to their first
+/// eight characters; the line after it tells the model what to do next.
+fn report_text(text: &str) -> String {
+    let first = text.lines().next().unwrap_or(text);
+    first
+        .split(' ')
+        .map(|w| {
+            let id = w.len() == 36 && w.chars().filter(|c| *c == '-').count() == 4;
+            if id { &w[..8] } else { w }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn notice(ui: &mut egui::Ui, text: &str) {
@@ -1368,6 +1386,16 @@ pub(crate) mod tests {
             approved: false,
         });
         assert_eq!(chat.pending().count(), 0);
+    }
+
+    #[test]
+    fn a_report_shows_what_happened_with_short_ids() {
+        let text = "Mission 01a0f95c-2c09-7662-b4ee-222fda068459 (turn left) ended: failure after \
+                    2 s. Failed at s1.\nFind out why and say it in one sentence.";
+        assert_eq!(
+            report_text(text),
+            "Mission 01a0f95c (turn left) ended: failure after 2 s. Failed at s1."
+        );
     }
 
     #[test]

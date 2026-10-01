@@ -1763,6 +1763,10 @@ fn watch(
 }
 
 #[cfg(test)]
+#[path = "live_eval.rs"]
+mod live_eval;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable as _;
