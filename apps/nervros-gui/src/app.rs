@@ -856,14 +856,20 @@ impl Gui {
             {
                 self.attachments.paste(ui.ctx());
             }
+            let hint = if working {
+                "Say something while it works: it reads it at its next step · Esc stops it"
+            } else {
+                "Message the robot · Enter sends, Shift+Enter adds a line"
+            };
             let edit = egui::TextEdit::multiline(&mut self.input)
                 .id(id)
-                .hint_text("Message the robot · Enter sends, Shift+Enter adds a line")
+                .hint_text(hint)
                 .desired_rows(2)
                 .desired_width(ui.available_width() - 72.0)
                 .margin(Margin::symmetric(8, 6));
             ui.add(edit);
-            if working {
+            let has_text = !self.input.trim().is_empty();
+            if working && !has_text {
                 if ui
                     .add(ReButton::new("Stop").secondary())
                     .on_hover_text("Stops the reply (Esc)")
@@ -872,9 +878,8 @@ impl Gui {
                     actions.push(Action::Send(Command::StopGeneration));
                 }
             } else {
-                let can_send = !self.input.trim().is_empty();
-                let send = ui.add_enabled(can_send, ReButton::new("Send").primary());
-                if can_send && (enter || send.clicked()) {
+                let send = ui.add_enabled(has_text, ReButton::new("Send").primary());
+                if has_text && (enter || send.clicked()) {
                     actions.push(Action::Say(
                         std::mem::take(&mut self.input).trim().to_owned(),
                     ));

@@ -238,6 +238,12 @@ impl Missions {
             // The operator speaking resets the retry limits: it is a new request.
             loop {
                 match events.recv().await {
+                    // Said while the agent works, it adds to the request rather than replacing it.
+                    Ok(Event::Steer { text, .. }) => {
+                        let mut request = lock(&me.request);
+                        request.push(' ');
+                        request.push_str(&text);
+                    }
                     Ok(Event::User { text, .. }) => {
                         *lock(&me.request) = text;
                         me.plan_failures.store(0, Ordering::SeqCst);

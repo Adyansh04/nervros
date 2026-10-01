@@ -79,6 +79,14 @@ pub enum Event {
         /// Turn number.
         turn: u64,
     },
+    /// A message the operator sent while a turn ran: the model reads it with its next tool
+    /// result, or in a turn of its own when the turn ends first.
+    Steer {
+        /// The running turn.
+        turn: u64,
+        /// The text.
+        text: String,
+    },
     /// The operator's message that started a turn.
     User {
         /// Turn number.
@@ -392,6 +400,8 @@ struct Shared {
     denials: AtomicU32,
     /// This turn's last failed result, as tool and message, and how often it came in a row.
     repeated: Mutex<(String, u32)>,
+    /// What the operator said during the running turn, for its next tool result.
+    steer: Mutex<Vec<String>>,
     calls: AtomicU64,
     next_approval: AtomicU64,
     /// Milliseconds this turn spent waiting for the operator.
@@ -657,6 +667,16 @@ impl Shared {
             ms,
         });
         let mut outcome = outcome;
+        if caller == Caller::Model {
+            let said = std::mem::take(&mut *lock(&self.steer));
+            if !said.is_empty() {
+                let _ = write!(
+                    outcome.message,
+                    " The operator said while you worked: \"{}\". Take it into account now.",
+                    said.join(" ")
+                );
+            }
+        }
         if let Some(n) = self.stuck(&spec.name, &outcome) {
             let _ = write!(
                 outcome.message,
@@ -755,6 +775,7 @@ impl Session {
             next_approval: AtomicU64::new(0),
             denials: AtomicU32::new(0),
             repeated: Mutex::default(),
+            steer: Mutex::default(),
             waited_ms: AtomicU64::new(0),
             guard,
             config,
@@ -834,14 +855,19 @@ async fn actor(
                     Command::User(text) => {
                         // The operator speaking is a new say on what they want.
                         shared.denials.store(0, Ordering::SeqCst);
-                        if running.is_some() {
-                            let note = if answering_report && queued.is_none() {
-                                queued = Some(text);
-                                "queued until the reply to the report ends"
+                        if let Some((turn, _)) = &running {
+                            if answering_report {
+                                if queued.is_none() {
+                                    queued = Some(text);
+                                    shared.emit(Event::Notice { text: "queued until the reply to the report ends".into() });
+                                } else {
+                                    shared.emit(Event::Notice { text: "one message is queued already; wait or stop it".into() });
+                                }
                             } else {
-                                "still working on the last message; wait or stop it"
-                            };
-                            shared.emit(Event::Notice { text: note.into() });
+                                // Steering: the model reads it with its next tool result.
+                                lock(&shared.steer).push(text.clone());
+                                shared.emit(Event::Steer { turn: *turn, text });
+                            }
                             continue;
                         }
                         turns += 1;
@@ -866,6 +892,14 @@ async fn actor(
                             shared.emit(Event::TurnFinished { turn });
                         }
                         halt(&shared, stop.as_ref().filter(|_| mission));
+                        // Esc stops the reply to say something else: what was said meanwhile goes
+                        // now. A stop of the robot drops it.
+                        let said = std::mem::take(&mut *lock(&shared.steer));
+                        if !said.is_empty() && !mission {
+                            turns += 1;
+                            running = Some(start(turns, Origin::User(said.join(" ")), &history));
+                            answering_report = false;
+                        }
                     }
                     Command::Compact => {
                         if running.is_some() {
@@ -912,7 +946,9 @@ async fn actor(
                     }
                     shared.emit(Event::TurnFinished { turn });
                 }
-                if let Some(text) = queued.take() {
+                // What the operator said that no tool result carried goes in a turn of its own.
+                let unread = std::mem::take(&mut *lock(&shared.steer));
+                if let Some(text) = queued.take().or_else(|| (!unread.is_empty()).then(|| unread.join(" "))) {
                     turns += 1;
                     running = Some(start(turns, Origin::User(text), &history));
                     answering_report = false;
@@ -2099,5 +2135,44 @@ mod tests {
             third.contains("came back the same 3 times in a row"),
             "{third}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_message_sent_mid_turn_reaches_the_model_with_its_next_tool_result() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("c1", "look", json!({})),
+            MockTurn::text("Looking at the kitchen too."),
+        ]);
+        let spec = ToolSpec::new("look", "Looks.", json!({"type": "object"}), Risk::Observe);
+        let slow = Slow(spec, Duration::from_millis(300));
+        let session = Session::start(
+            Arc::new(Scripted(model.clone())),
+            one_tool(Arc::new(slow)),
+            Arc::new(Guard::new(Policy::default())),
+            None,
+            SessionConfig::default(),
+        );
+        let mut rx = session.subscribe();
+        session.send(Command::User("look around".into()));
+        let mut steered = false;
+        loop {
+            let e = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match e {
+                Event::ToolStarted { .. } => session.send(Command::User("and the kitchen".into())),
+                Event::Steer { text, .. } => steered = text == "and the kitchen",
+                Event::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(steered, "shown as said during the turn");
+        let read = format!("{:?}", model.requests()[1].chat_history);
+        assert!(
+            read.contains("The operator said while you worked: \\\"and the kitchen\\\""),
+            "{read}"
+        );
+        assert_eq!(model.requests().len(), 2, "no turn of its own: it was read");
     }
 }

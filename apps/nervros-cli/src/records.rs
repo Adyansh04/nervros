@@ -48,6 +48,7 @@ fn describe(e: &Value) -> Option<String> {
     let s = |k: &str| e[k].as_str().unwrap_or_default();
     Some(match s("kind") {
         "user" => format!("you> {}", s("text")),
+        "steer" => format!("you, while it worked> {}", s("text")),
         "reply" => format!("robot> {}", s("text").replace('\n', " ")),
         "report" => format!("report> {}", s("text")),
         "tool_started" => format!("  > {} {}", s("tool"), e["args"]),

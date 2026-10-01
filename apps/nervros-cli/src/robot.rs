@@ -181,9 +181,53 @@ fn print_plan(
     }
 }
 
+/// A mission's events: its plan, preview, progress and end.
+fn print_mission(e: &Event) {
+    match e {
+        Event::MissionPlanned {
+            hash,
+            steps,
+            worst_case_s,
+            concerns,
+            ..
+        } => print_plan(hash, steps, *worst_case_s, concerns),
+        Event::MissionPreview { steps, .. } => {
+            for s in steps.iter().filter(|s| !s.note.is_empty()) {
+                println!("    {} {}", s.id, s.note);
+            }
+        }
+        Event::MissionStarted { id, .. } => println!("  [mission {id} started]"),
+        Event::MissionProgress {
+            step, node, status, ..
+        } => {
+            if node.is_empty() {
+                println!("  [{step} {status}]");
+            } else {
+                println!("  [{step} {node} {status}]");
+            }
+        }
+        Event::MissionFinished {
+            outcome,
+            failed_step,
+            reason,
+            elapsed_s,
+            ..
+        } => {
+            let why = if failed_step.is_empty() {
+                String::new()
+            } else {
+                format!(" at {failed_step}: {reason}")
+            };
+            println!("  [mission {outcome} after {elapsed_s:.0} s{why}]");
+        }
+        _ => {}
+    }
+}
+
 fn print_event(e: &Event, logs: &Path) {
     match e {
         Event::Reply { text, model, .. } => println!("robot> {text}\n        [{model}]"),
+        Event::Steer { text, .. } => println!("you, while it works> {text}"),
         Event::ToolStarted { tool, args, .. } => println!("  > {tool} {args}"),
         Event::ToolFinished {
             tool,
@@ -225,42 +269,11 @@ fn print_event(e: &Event, logs: &Path) {
         Event::Notice { text } => println!("  [{text}]"),
         Event::Error { text, .. } => println!("  [error: {text}]"),
         Event::Report { text, .. } => println!("report> {text}"),
-        Event::MissionPlanned {
-            hash,
-            steps,
-            worst_case_s,
-            concerns,
-            ..
-        } => print_plan(hash, steps, *worst_case_s, concerns),
-        Event::MissionPreview { steps, .. } => {
-            for s in steps.iter().filter(|s| !s.note.is_empty()) {
-                println!("    {} {}", s.id, s.note);
-            }
-        }
-        Event::MissionStarted { id, .. } => println!("  [mission {id} started]"),
-        Event::MissionProgress {
-            step, node, status, ..
-        } => {
-            if node.is_empty() {
-                println!("  [{step} {status}]");
-            } else {
-                println!("  [{step} {node} {status}]");
-            }
-        }
-        Event::MissionFinished {
-            outcome,
-            failed_step,
-            reason,
-            elapsed_s,
-            ..
-        } => {
-            let why = if failed_step.is_empty() {
-                String::new()
-            } else {
-                format!(" at {failed_step}: {reason}")
-            };
-            println!("  [mission {outcome} after {elapsed_s:.0} s{why}]");
-        }
+        Event::MissionPlanned { .. }
+        | Event::MissionPreview { .. }
+        | Event::MissionStarted { .. }
+        | Event::MissionProgress { .. }
+        | Event::MissionFinished { .. } => print_mission(e),
         // Plots are drawn by the app's viewer; the tool's reply already says what it plots.
         Event::User { .. }
         | Event::TurnStarted { .. }

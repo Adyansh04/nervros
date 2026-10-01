@@ -209,7 +209,8 @@ impl Chat {
             Event::Halted { reason } => self.items.push(Item::Notice(format!("Stopped: {reason}"))),
             Event::Notice { text } => self.items.push(Item::Notice(text.clone())),
             Event::Error { text, .. } => self.items.push(Item::Error(text.clone())),
-            Event::User { text, .. } => self.push_user(text.clone()),
+            // Said while the agent works: the model reads it with its next step.
+            Event::User { text, .. } | Event::Steer { text, .. } => self.push_user(text.clone()),
             Event::Report { text, .. } => self.items.push(Item::Report(text.clone())),
             Event::ToolStarted { .. }
             | Event::ToolFinished { .. }
