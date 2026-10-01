@@ -21,9 +21,6 @@ use rerun::external::egui::{
 use rerun::external::re_log_channel::LogReceiver;
 use rerun::external::re_sdk_types::blueprint::components::PanelState;
 use rerun::external::re_ui::{ReButton, UiExt as _};
-use rerun::external::re_viewer::external::re_viewer_context::{
-    SystemCommand, SystemCommandSender as _,
-};
 use rerun::external::{eframe, re_memory, re_viewer};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -504,9 +501,7 @@ impl Gui {
                     .on_hover_text("Put the viewer's panes back the way NervROS lays them out")
                     .clicked()
                 {
-                    self.viewer
-                        .command_sender
-                        .send_system(SystemCommand::ClearActiveBlueprint);
+                    self.bridge.reset_layout();
                 }
                 let mut armed = self.agent.guard.armed();
                 let label = if armed { "Armed" } else { "Observe only" };
@@ -1242,6 +1237,7 @@ fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::kittest::Queryable as _;
     use egui_kittest::{Harness, SnapshotOptions};
     use nervros_ros::fake::FakeRobot;
 
@@ -1441,6 +1437,12 @@ mod tests {
         harness.run_steps(8);
         // The status bar's memory and frame-time figures differ on every run.
         let options = SnapshotOptions::new().max_failed_pixels(1500);
+        crate::chat::compare(&mut harness, "window", &options);
+        // Reset layout lays the panes out the same way again.
+        harness.get_by_label("Reset layout").click();
+        harness.run_steps(2);
+        harness.input_mut().events.push(egui::Event::PointerGone);
+        harness.run_steps(8);
         crate::chat::compare(&mut harness, "window", &options);
     }
 }

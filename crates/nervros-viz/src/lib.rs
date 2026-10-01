@@ -78,7 +78,16 @@ pub fn in_process() -> rerun::RecordingStreamResult<(RecordingStream, LogReceive
 pub struct Bridge {
     /// Every layer the viewer draws, which the operator can hide.
     pub layers: Arc<Layers>,
+    rec: RecordingStream,
+    cameras: Vec<(String, String)>,
     _tasks: JoinSet<()>,
+}
+
+impl Bridge {
+    /// Puts the viewer's panes back as NervROS lays them out.
+    pub fn reset_layout(&self) {
+        layout(&self.rec, &self.cameras);
+    }
 }
 
 /// A layer as a task draws it: its name in [`Layers`] and the entity it draws under.
@@ -123,7 +132,8 @@ pub fn spawn(
         profile.ros.base_frame.clone(),
     ));
     bridge.robot_model(profile);
-    bridge.cameras(profile);
+    let cameras = bridge.cameras(profile);
+    layout(rec, &cameras);
     bridge.world(profile);
     bridge.profile_layers(profile);
     bridge
@@ -131,6 +141,8 @@ pub fn spawn(
         .spawn(agent(rec.clone(), Arc::clone(robot), events));
     Bridge {
         layers: bridge.layers,
+        rec: rec.clone(),
+        cameras,
         _tasks: bridge.tasks,
     }
 }
@@ -176,7 +188,8 @@ impl Spawner {
 
     /// Every camera the profile names, each in its own view, the first in the world when the
     /// profile gives its lens; with the detector's boxes on the frames.
-    fn cameras(&mut self, profile: &Profile) {
+    /// Draws every camera and its detections; returns each camera's name and entity path.
+    fn cameras(&mut self, profile: &Profile) -> Vec<(String, String)> {
         let lens = profile
             .viz
             .as_ref()
@@ -210,7 +223,7 @@ impl Spawner {
             );
             views.push((name, path));
         }
-        layout(&self.rec, &views);
+        views
     }
 
     fn world(&mut self, profile: &Profile) {
@@ -389,8 +402,9 @@ fn draw_detections(rec: &RecordingStream, path: &str, msg: &Value) {
 
 /// The default layout: the world large; beside it the first camera over the others and the agent's
 /// last marked image, in tabs as the chat shows that image too; and the agent's log and the
-/// mission's steps in a strip below, as wide as the viewer so their columns read. Only a default,
-/// so a layout the operator arranges is kept.
+/// mission's steps in a strip below, as wide as the viewer so their columns read. It is made
+/// active, not only the default: the viewer would otherwise restore the last session's layout,
+/// closed panes and an older version's layout included.
 fn layout(rec: &RecordingStream, cameras: &[(String, String)]) {
     use rerun::blueprint::{
         Blueprint, BlueprintActivation, Horizontal, Spatial2DView, Spatial3DView,
@@ -439,7 +453,7 @@ fn layout(rec: &RecordingStream, cameras: &[(String, String)]) {
     ]);
     let root = Vertical::new([top.into(), strip.into()]).with_row_shares([3.0, 1.0]);
     let activation = BlueprintActivation {
-        make_active: false,
+        make_active: true,
         make_default: true,
     };
     if let Err(e) = Blueprint::new(root)
