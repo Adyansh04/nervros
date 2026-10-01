@@ -49,10 +49,83 @@ pub struct Profile {
     /// Generic ROS tools: the graph, topics, parameters and logs, and where listed, calls and
     /// publishing.
     pub ros_tools: Option<crate::ros_tools::RosToolsConfig>,
+    /// MCP servers whose tools the agent may use, each tool by name.
+    #[serde(rename = "mcp_server", default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+    /// Folders of skills, `SKILL.md` procedures for rare situations, relative to the profile.
+    #[serde(default)]
+    pub skills: Vec<PathBuf>,
     /// The models file, relative to the profile.
     pub models: ModelsRef,
     #[serde(skip)]
     dir: PathBuf,
+}
+
+/// An MCP server: how to reach it, and which of its tools the agent may use.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Short, as a tool-name prefix: `docs` makes `docs__search`.
+    pub id: String,
+    /// How to reach it.
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// For stdio: the program, as an absolute path; nothing is fetched to run it.
+    pub command: Option<PathBuf>,
+    /// For stdio: its arguments.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// For stdio: its whole environment. Nothing else passes, so no model key reaches it.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// For http: the endpoint.
+    pub url: Option<String>,
+    /// For http: a file holding a bearer token, read at connect.
+    pub bearer_file: Option<PathBuf>,
+    /// The tools the agent may use, by the server's names; any other the server has does not
+    /// exist for the agent.
+    #[serde(default)]
+    pub tools: BTreeMap<String, McpToolConfig>,
+    /// A result past this many bytes is cut.
+    #[serde(default = "default_mcp_result_bytes")]
+    pub max_result_bytes: usize,
+    /// How long a call may take.
+    #[serde(default = "default_mcp_timeout", deserialize_with = "duration")]
+    pub timeout: Duration,
+    /// It reaches the internet: off in the `home` privacy mode.
+    #[serde(default)]
+    pub open_world: bool,
+}
+
+fn default_mcp_result_bytes() -> usize {
+    8192
+}
+
+fn default_mcp_timeout() -> Duration {
+    Duration::from_secs(20)
+}
+
+/// How an MCP server is reached.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// A child process speaking on its stdin and stdout.
+    #[default]
+    Stdio,
+    /// Streamable HTTP.
+    Http,
+}
+
+/// What the profile says of one MCP tool. The server's own hints are never trusted.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolConfig {
+    /// `observe` for a tool that only reads; anything else acts, with the arming and approval
+    /// that takes.
+    #[serde(default)]
+    pub observe: bool,
+    /// What the model reads instead of the server's description.
+    pub description: Option<String>,
 }
 
 /// Who the robot is.

@@ -25,6 +25,7 @@ futures.workspace = true
 image.workspace = true
 reqwest.workspace = true
 rig.workspace = true
+rmcp.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
 secrecy.workspace = true
@@ -38,5 +39,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 rig = { workspace = true, features = ["test-utils"] }
+# An in-process MCP server for the client's tests.
+rmcp = { workspace = true, features = ["server", "macros"] }
 bytes.workspace = true
 tempfile.workspace = true

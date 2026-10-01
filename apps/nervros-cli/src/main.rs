@@ -12,6 +12,7 @@ use nervros_core::providers::{ModelsConfig, Role, free_only, openrouter};
 
 #[cfg(feature = "ros")]
 mod eval;
+mod mcp;
 mod records;
 #[cfg(feature = "ros")]
 mod robot;
@@ -108,6 +109,18 @@ enum Command {
         #[arg(long)]
         append: Option<PathBuf>,
     },
+    /// The profile's MCP servers: each tool it names, and whether its definition is approved.
+    /// With `pin`, approve a server's tools as they are now, after reading them.
+    Mcp {
+        /// `pin` to approve.
+        action: Option<String>,
+        /// For pin: the server's id.
+        server: Option<String>,
+        /// For pin: its tools to approve; all it names when none.
+        tools: Vec<String>,
+    },
+    /// The profile's skills, as the agent's index lists them, and any that could not be read.
+    Skills,
     /// Check the profile's tools, topics and mission services against the live graph.
     #[cfg(feature = "ros")]
     Doctor,
@@ -246,11 +259,31 @@ async fn main() -> Result<()> {
         Command::Missions { id, limit } => records::missions(&cli.profile, id.as_deref(), limit),
         Command::Gaps { limit } => records::gaps(&cli.profile, limit),
         Command::Case { log, id, append } => records::case(&log, &id, append.as_deref()),
+        Command::Mcp {
+            action,
+            server,
+            tools,
+        } => mcp::run(&cli.profile, action.as_deref(), server.as_deref(), &tools).await,
+        Command::Skills => skills(&cli.profile),
         #[cfg(feature = "ros")]
         Command::Doctor => robot::doctor(&cli.profile).await,
         #[cfg(feature = "ros")]
         Command::Ros { tool, args } => robot::ros(&cli.profile, &tool, &args).await,
     }
+}
+
+fn skills(profile: &Path) -> Result<()> {
+    let profile = nervros_core::profile::Profile::load(profile).context("loading the profile")?;
+    let dirs: Vec<PathBuf> = profile.skills.iter().map(|d| profile.resolve(d)).collect();
+    let (skills, problems) = nervros_core::skills::load(&dirs);
+    match nervros_core::skills::index(&skills) {
+        Some(index) => println!("{index}"),
+        None => println!("no skills"),
+    }
+    for problem in problems {
+        println!("left out: {problem}");
+    }
+    Ok(())
 }
 
 async fn models(path: &Path, check: bool) -> Result<()> {

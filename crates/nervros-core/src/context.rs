@@ -35,13 +35,17 @@ ends. Tell the operator the outcome in one or two sentences.
 - When a report says a mission failed, find out why before anything else, then do what the report \
 says.";
 
-/// Builds the system prompt for a profile.
+/// Builds the system prompt for a profile and its skills.
 #[must_use]
-pub fn system_prompt(profile: &Profile) -> String {
+pub fn system_prompt(profile: &Profile, skills: &[crate::skills::Skill]) -> String {
     let mut out = RULES.to_owned();
     if profile.mission.is_some() {
         out.push('\n');
         out.push_str(MISSION_RULES);
+    }
+    if let Some(index) = crate::skills::index(skills) {
+        out.push_str("\n\n");
+        out.push_str(&index);
     }
     let _ = write!(out, "\n\nThe robot is: {}.", profile.robot.name);
     if let Some(path) = &profile.robot.persona {

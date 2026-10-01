@@ -63,6 +63,8 @@ mimalloc = "=0.1.52"
 rerun = { version = "=0.38.1", default-features = false, features = ["native_viewer", "sdk"] }
 egui_kittest = { version = "=0.36.2", features = ["wgpu", "snapshot"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
+# The MCP client, used directly: rig 0.42's route is rmcp 2. Tools only, no client capabilities.
+rmcp = { version = "=3.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 rig = "=0.42.0"
 # The mission ledger. Bundled: one SQLite for every build, whatever the host has.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }

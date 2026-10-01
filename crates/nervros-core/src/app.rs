@@ -44,6 +44,8 @@ pub struct Agent {
     pub schedules: Option<Arc<crate::schedule::Schedules>>,
     /// Missions, when the robot has an executor: their ledger is the window's history.
     pub missions: Option<Arc<Missions>>,
+    /// What the MCP servers brought, for the doctor.
+    pub mcp: Vec<crate::doctor::Check>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -333,6 +335,26 @@ fn missions(
     Some(m)
 }
 
+/// A mission started before this session runs on unwatched: says so, once, at start.
+fn say_orphan(
+    profile: &Profile,
+    robot: &Arc<dyn RobotPort>,
+    handle: crate::session::SessionHandle,
+) {
+    let Some(state) = profile.mission.as_ref().map(|m| m.state.clone()) else {
+        return;
+    };
+    let robot = Arc::clone(robot);
+    tokio::spawn(async move {
+        let latched = robot
+            .latest(&state, "nervros_interfaces/msg/RobotState", ORPHAN_WAIT)
+            .await;
+        if let Some(text) = latched.ok().as_ref().and_then(orphan_notice) {
+            handle.emit(crate::session::Event::Notice { text });
+        }
+    });
+}
+
 /// Starts an agent whose conversation is saved to, or resumed from, `files`. Must run inside a
 /// tokio runtime.
 ///
@@ -372,6 +394,8 @@ pub fn start_with(
         }
     }
     let watches = debug_tools(&profile, &robot, &mut registry)?;
+    let mcp = mcp_tools(&profile, privacy, &mut registry)?;
+    let skills = skill_tools(&profile, &mut registry)?;
     let memory = crate::memory::Memory::new(robot_file(&profile, ledger, "memory"));
     registry.add(Arc::new(crate::memory::MemoryTool::new(Arc::clone(
         &memory,
@@ -392,7 +416,7 @@ pub fn start_with(
     }
     let tools = registry.iter().map(|t| t.spec().name.clone()).collect();
     let config = SessionConfig {
-        preamble: system_prompt(&profile),
+        preamble: system_prompt(&profile, &skills),
         max_model_calls: usize::try_from(profile.policy.budgets.model_calls).unwrap_or(6),
         approval_ttl: profile.policy.approval_ttl,
         turn_time: profile.policy.budgets.wall_time,
@@ -418,18 +442,12 @@ pub fn start_with(
         s.attach(session.handle());
     }
     watches.attach(session.handle());
-    if let Some(state) = profile.mission.as_ref().map(|m| m.state.clone()) {
-        // A mission started before this session runs on unwatched: say so, once, at start.
-        let (robot, handle) = (Arc::clone(&robot), session.handle());
-        tokio::spawn(async move {
-            let latched = robot
-                .latest(&state, "nervros_interfaces/msg/RobotState", ORPHAN_WAIT)
-                .await;
-            if let Some(text) = latched.ok().as_ref().and_then(orphan_notice) {
-                handle.emit(crate::session::Event::Notice { text });
-            }
+    for check in mcp.iter().filter(|c| !c.ok) {
+        session.handle().emit(crate::session::Event::Notice {
+            text: check.what.clone(),
         });
     }
+    say_orphan(&profile, &robot, session.handle());
     Ok(Agent {
         session,
         profile,
@@ -442,7 +460,48 @@ pub fn start_with(
         memory,
         schedules,
         missions,
+        mcp,
     })
+}
+
+/// The profile's skills, and the `skill` tool to read them when there are any. A folder or file
+/// that cannot be read is logged and left out.
+fn skill_tools(
+    profile: &Profile,
+    registry: &mut Registry,
+) -> Result<Vec<crate::skills::Skill>, StartError> {
+    let dirs: Vec<PathBuf> = profile.skills.iter().map(|d| profile.resolve(d)).collect();
+    let (skills, problems) = crate::skills::load(&dirs);
+    for problem in problems {
+        tracing::warn!(%problem, "a skill was left out");
+    }
+    if !skills.is_empty() {
+        registry.add(Arc::new(crate::skills::SkillTool::new(skills.clone())))?;
+    }
+    Ok(skills)
+}
+
+/// The approved tools of the profile's MCP servers, connected once at start: the tool set stays
+/// fixed for the session, which keeps the model server's prompt cache whole.
+fn mcp_tools(
+    profile: &Profile,
+    privacy: PrivacyMode,
+    registry: &mut Registry,
+) -> Result<Vec<crate::doctor::Check>, StartError> {
+    if profile.mcp_servers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let home = privacy == PrivacyMode::Home;
+    // Start-up is not async; the runtime it runs in has threads to spare for this one wait.
+    let (servers, checks) = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(crate::mcp::connect_all(profile, home))
+    });
+    for server in &servers {
+        for tool in server.tools() {
+            registry.add(tool)?;
+        }
+    }
+    Ok(checks)
 }
 
 #[cfg(test)]

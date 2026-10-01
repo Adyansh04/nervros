@@ -1255,7 +1255,11 @@ impl Gui {
     }
 
     fn doctor_tab(&self, ui: &mut egui::Ui) {
-        let checks = self.live().checks.clone();
+        // What the MCP servers brought at start goes with what the robot answers now.
+        let checks = self.live().checks.clone().map(|mut c| {
+            c.extend(self.agent.mcp.iter().cloned());
+            c
+        });
         match checks {
             None => {
                 ui.horizontal(|ui| {
