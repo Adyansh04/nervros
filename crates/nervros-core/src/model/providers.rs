@@ -174,6 +174,30 @@ impl Role {
         Self::Segment,
         Self::PlanCheck,
     ];
+
+    /// Its key in `models.toml`'s `[roles]`, such as `vision_check`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Routine => "routine",
+            Self::Plan => "plan",
+            Self::VisionCheck => "vision_check",
+            Self::Summarise => "summarise",
+            Self::Segment => "segment",
+            Self::PlanCheck => "plan_check",
+        }
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|r| r.name() == name)
+            .ok_or_else(|| format!("no role `{name}`"))
+    }
 }
 
 /// Ordered model ids per role; the first usable one is tried first.
