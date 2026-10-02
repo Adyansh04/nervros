@@ -16,11 +16,11 @@ use nervros_ros::{Frame, RobotPort};
 use serde_json::{Value, json};
 
 use crate::llm::ImageInput;
-use crate::look::{
-    Camera, Cameras, Instance, PALETTE, SnapshotStore, badge, parse_detections, tint,
-};
 use crate::profile::{SegmentBackend, SegmentConfig};
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
+use crate::vision::{
+    Camera, Cameras, Instance, PALETTE, SnapshotStore, badge, parse_detections, tint,
+};
 
 /// The type of `[segment] service`.
 pub const SERVICE_TYPE: &str = "canopy_msgs/srv/Segment";

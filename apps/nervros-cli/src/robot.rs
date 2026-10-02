@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use nervros_core::look::{Cameras, LookTool, SnapshotStore};
+use nervros_core::look::LookTool;
 use nervros_core::profile::Profile;
 use nervros_core::segment::SegmentTool;
 use nervros_core::tools::{Status, Tool};
+use nervros_core::vision::{Cameras, SnapshotStore};
 
 pub(crate) async fn look(profile_path: &Path, camera: Option<String>, out: &Path) -> Result<()> {
     let profile = Profile::load(profile_path).context("loading the profile")?;

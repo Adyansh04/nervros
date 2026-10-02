@@ -12,8 +12,9 @@ use nervros_ros::Frame;
 use super::check::{Observed, Verdict, object};
 use super::plan::predicate;
 use crate::llm::{ImageFormat, ImageInput};
-use crate::look::{Cameras, Eyes, SnapshotStore};
+use crate::look::Eyes;
 use crate::tools::ImageArtifact;
+use crate::vision::{Cameras, SnapshotStore};
 
 /// The height both frames are scaled to, side by side.
 const HEIGHT_PX: u32 = 384;

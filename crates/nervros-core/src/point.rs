@@ -12,9 +12,9 @@ use nervros_ros::RobotPort;
 use serde_json::{Value, json};
 
 use crate::llm::ImageInput;
-use crate::look::{Cameras, Instance, SnapshotStore, draw_marks, marks_json, parse_detections};
 use crate::segment::{Outliner, inside};
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
+use crate::vision::{Cameras, Instance, SnapshotStore, draw_marks, marks_json, parse_detections};
 
 /// Detections this far in time from the frame are of another moment.
 const SAME_MOMENT: Duration = Duration::from_millis(500);

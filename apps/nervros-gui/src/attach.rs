@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
-use nervros_core::look::SnapshotStore;
 use nervros_core::session::Event;
 use nervros_core::tools::ImageArtifact;
+use nervros_core::vision::SnapshotStore;
 use rerun::external::egui::{self, RichText};
 use rerun::external::re_ui::{UiExt as _, icons};
 

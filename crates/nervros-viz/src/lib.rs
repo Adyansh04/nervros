@@ -380,7 +380,7 @@ async fn scan(
 
 /// The detector's boxes on a camera frame, labelled and coloured by label.
 fn draw_detections(rec: &RecordingStream, path: &str, msg: &Value) {
-    let found = nervros_core::look::parse_detections(msg).instances;
+    let found = nervros_core::vision::parse_detections(msg).instances;
     let (mins, sizes): (Vec<[f32; 2]>, Vec<[f32; 2]>) = found
         .iter()
         .map(|d| {

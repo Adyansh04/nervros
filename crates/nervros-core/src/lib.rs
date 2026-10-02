@@ -31,6 +31,7 @@ pub mod session;
 pub mod skills;
 pub mod telemetry;
 pub mod tools;
+pub mod vision;
 pub mod watch;
 
 /// Whole seconds since the Unix epoch; 0 for a clock set before it.

@@ -12,9 +12,10 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Value, json};
 
 use crate::llm::{ImageFormat, ImageInput};
-use crate::look::{Eyes, SnapshotStore};
+use crate::look::Eyes;
 use crate::profile::EditorConfig;
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
+use crate::vision::SnapshotStore;
 
 /// The ops `edit_world` passes on, as the editor names them.
 pub const OPS: [&str; 13] = [

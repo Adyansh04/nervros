@@ -10,7 +10,7 @@ use crate::builtins::{ListPlaces, RobotState, Stop};
 use crate::context::system_prompt;
 use crate::guard::Guard;
 use crate::llm::Llm;
-use crate::look::{Cameras, LookTool, SnapshotStore};
+use crate::look::LookTool;
 use crate::mission::Missions;
 use crate::profile::Profile;
 use crate::providers::ModelsConfig;
@@ -19,6 +19,7 @@ use crate::schemas::RosidlSchemas;
 use crate::segment::SegmentTool;
 use crate::session::{Session, SessionConfig};
 use crate::tools::{Registry, SchemaSource, Tool};
+use crate::vision::{Cameras, SnapshotStore};
 
 /// A running agent.
 pub struct Agent {
