@@ -82,7 +82,7 @@ pub(crate) fn draw_occupied(
         }
     };
     if let Some(grid) = grid(msg, cell) {
-        put_grid(rec, path, grid, rerun::ColorModel::RGBA, lift, false);
+        put_grid(rec, path, grid, rerun::ColorModel::RGBA, lift);
     }
 }
 

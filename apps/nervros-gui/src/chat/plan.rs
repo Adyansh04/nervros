@@ -10,31 +10,25 @@ use rerun::external::egui;
 use rerun::external::egui::{Align, Color32, Layout, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _, icons};
 
-use super::view::card;
 use super::{Action, PlanCard};
+use crate::theme;
 
 /// The plan's steps with each one's state, how it has gone before, and what the preview warns of.
 fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
-    let t = ui.tokens();
     egui::Grid::new(("plan_steps", &p.hash))
         .num_columns(3)
-        .spacing([8.0, 4.0])
+        .spacing([10.0, 6.0])
         .show(ui, |ui| {
             for s in &p.steps {
                 let (status, node) = p.progress.get(&s.id).cloned().unwrap_or_default();
                 let failed = p.finished.as_ref().is_some_and(|f| f.1 == s.id);
                 let (color, mark) = if failed {
-                    (t.error_fg_color, "✗")
+                    (theme::ERROR, "✗")
                 } else {
-                    node_look(ui, &status)
+                    node_look(&status)
                 };
                 ui.label(RichText::new(mark).color(color));
-                ui.label(
-                    RichText::new(&s.id)
-                        .monospace()
-                        .size(12.0)
-                        .color(t.text_subdued),
-                );
+                ui.label(RichText::new(&s.id).monospace().color(theme::FAINT));
                 let text = if status == "running" && !node.is_empty() {
                     format!("{} · {node}", s.summary)
                 } else {
@@ -47,7 +41,7 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
                     .map(|v| v.note.as_str())
                     .filter(|n| !n.is_empty());
                 ui.horizontal(|ui| {
-                    let summary = ui.label(RichText::new(text).monospace().size(12.0));
+                    let summary = ui.label(RichText::new(text).monospace());
                     if let Some(note) = preview_note {
                         summary.on_hover_text(note);
                     }
@@ -67,7 +61,7 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
                 for warning in warnings {
                     ui.label("");
                     ui.label("");
-                    let text = RichText::new(warning).small().color(t.warn_fg_color);
+                    let text = RichText::new(warning).size(13.0).color(theme::WARN);
                     ui.add(egui::Label::new(text).wrap());
                     ui.end_row();
                 }
@@ -76,14 +70,13 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
 }
 
 /// A step's or node's status as a coloured mark.
-fn node_look(ui: &egui::Ui, status: &str) -> (Color32, &'static str) {
-    let t = ui.tokens();
+fn node_look(status: &str) -> (Color32, &'static str) {
     match status {
-        "failure" => (t.error_fg_color, "✗"),
-        "success" => (t.success_text_color, "✓"),
-        "running" => (t.info_text_color, "●"),
-        "skipped" => (t.text_subdued, "–"),
-        _ => (t.text_subdued, "○"),
+        "failure" => (theme::ERROR, "✗"),
+        "success" => (theme::SUCCESS, "✓"),
+        "running" => (theme::INFO, "●"),
+        "skipped" => (theme::FAINT, "–"),
+        _ => (theme::FAINT, "○"),
     }
 }
 
@@ -93,7 +86,7 @@ pub fn tree_panel(ui: &mut egui::Ui, p: &PlanCard) {
     if p.nodes.is_empty() {
         return;
     }
-    ui.add_space(8.0);
+    ui.add_space(12.0);
     egui::CollapsingHeader::new(RichText::new("Behaviour tree").strong())
         .id_salt(("tree", &p.hash))
         .default_open(true)
@@ -103,11 +96,11 @@ pub fn tree_panel(ui: &mut egui::Ui, p: &PlanCard) {
                 let name = path.rsplit('/').next().unwrap_or(path);
                 // BehaviorTree.CPP names an unnamed node by its type and uid, as "Sequence::3".
                 let name = name.split_once("::").map_or(name, |(n, _)| n);
-                let (colour, mark) = node_look(ui, status);
+                let (colour, mark) = node_look(status);
                 ui.horizontal(|ui| {
                     ui.add_space(14.0 * f32::from(depth));
                     ui.label(RichText::new(mark).color(colour));
-                    ui.label(RichText::new(name).monospace().size(12.0))
+                    ui.label(RichText::new(name).monospace())
                         .on_hover_text(format!("{path}: {status}"));
                 });
             }
@@ -119,16 +112,15 @@ fn track_label(ui: &mut egui::Ui, s: &PlannedStep) {
     let Some(track) = &s.track else {
         return;
     };
-    let t = ui.tokens();
     let mut text = format!("{} of {}", track.succeeded, track.runs);
     if let Some(typical) = track.typical_s {
         let _ = write!(text, " · {}", minutes(typical));
     }
     // Under three in four is worth a second look before approving.
     let color = if track.succeeded * 4 < track.runs * 3 {
-        t.warn_fg_color
+        theme::WARN
     } else {
-        t.text_subdued
+        theme::FAINT
     };
     let mut hover = format!(
         "{} succeeded {} of its last {} runs",
@@ -151,32 +143,34 @@ pub(super) fn minutes(seconds: f64) -> String {
 
 /// A plan and its mission: steps with live state, and one action while it runs.
 pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
-    let t = ui.tokens();
-    let stroke = match &p.finished {
-        Some((Outcome::Success, ..)) => t.success_text_color,
-        Some(_) => t.error_fg_color,
-        None if p.mission.is_some() => t.info_text_color,
-        None => t.widget_noninteractive_bg_stroke,
+    let colour = match &p.finished {
+        Some((Outcome::Success, ..)) => theme::SUCCESS,
+        Some(_) => theme::ERROR,
+        None if p.mission.is_some() => theme::INFO,
+        None => theme::FAINT,
     };
-    card(ui, stroke).show(ui, |ui| {
+    theme::status_card(ui, colour, |ui| {
+        ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            ui.small_icon(&icons::PLAN_PENDING, Some(t.text_subdued));
-            ui.label(RichText::new(format!("Plan · {}", p.intent)).strong());
+            ui.label(RichText::new("Plan").small().color(theme::FAINT));
+            ui.add(egui::Label::new(RichText::new(&p.intent).strong().size(14.5)).wrap());
         });
+        ui.add_space(2.0);
         steps_table(ui, p);
         for c in p.concerns.iter().filter(|c| c.step.is_empty()) {
             ui.horizontal(|ui| {
-                ui.small_icon(&icons::WARNING, Some(t.warn_fg_color));
+                ui.small_icon(&icons::WARNING, Some(theme::WARN));
                 ui.add(
-                    egui::Label::new(RichText::new(&c.message).small().color(t.warn_fg_color))
+                    egui::Label::new(RichText::new(&c.message).size(13.0).color(theme::WARN))
                         .wrap(),
                 );
             });
         }
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
             let state = match (&p.finished, p.started) {
                 (Some((Outcome::Success, .., secs)), _) => {
-                    RichText::new(format!("Done in {}", minutes(*secs))).color(t.success_text_color)
+                    RichText::new(format!("Done in {}", minutes(*secs))).color(theme::SUCCESS)
                 }
                 (Some((outcome, step, reason, _)), _) => {
                     let at = if step.is_empty() {
@@ -185,7 +179,7 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
                         format!(" at {step}")
                     };
                     RichText::new(format!("{}{at}: {reason}", capitalise(outcome.as_str())))
-                        .color(t.error_fg_color)
+                        .color(theme::ERROR)
                 }
                 (None, Some(since)) => {
                     ui.ctx().request_repaint_after(Duration::from_secs(1));
@@ -193,18 +187,18 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
                         "Running {}",
                         minutes(since.elapsed().as_secs_f64())
                     ))
-                    .color(t.info_text_color)
+                    .color(theme::INFO)
                 }
                 (None, None) if p.replaced => {
-                    RichText::new("Replaced by an edited plan").color(t.text_subdued)
+                    RichText::new("Replaced by an edited plan").color(theme::FAINT)
                 }
                 (None, None) => RichText::new(format!(
                     "Checked · at most {} · waiting to run",
                     minutes(p.worst_case_s)
                 ))
-                .color(t.text_subdued),
+                .color(theme::DIM),
             };
-            ui.label(state.small());
+            ui.add(egui::Label::new(state.size(13.0)).wrap());
             if p.mission.is_some() && p.finished.is_none() {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.add(ReButton::new("Stop").small().secondary()).clicked() {

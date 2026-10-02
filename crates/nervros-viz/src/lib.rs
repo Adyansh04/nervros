@@ -18,6 +18,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 
 mod agent;
+mod blueprint;
 mod grid;
 mod layers;
 mod objects;
@@ -29,7 +30,8 @@ mod tasks;
 pub use layers::Layers;
 
 use agent::agent;
-use spawner::{Spawner, layout};
+use blueprint::Layout;
+use spawner::Spawner;
 use tasks::pose;
 
 const POSE_PERIOD: Duration = Duration::from_millis(100);
@@ -49,6 +51,13 @@ const MODEL_PATH: &str = "world/robot/model";
 
 /// The plan awaiting approval or running: its walks and where each step ends.
 const PLAN_PATH: &str = "world/plan";
+
+/// The robot's ring and heading arrow.
+const ROBOT_MARK: [u8; 3] = [80, 170, 255];
+
+/// What the 3D view tracks to follow the robot: two unseen points around it, whose span sets how
+/// far back the viewer orbits.
+const FOLLOW_PATH: &str = "world/robot/follow";
 
 /// The viewer's name for the frame of the `world/robot` entity, which the model hangs from.
 const ROBOT_FRAME: &str = "tf#/world/robot";
@@ -93,15 +102,26 @@ pub fn in_process() -> rerun::RecordingStreamResult<(RecordingStream, LogReceive
 pub struct Bridge {
     /// Every layer the viewer draws, which the operator can hide.
     pub layers: Arc<Layers>,
-    rec: RecordingStream,
-    cameras: Vec<(String, String)>,
+    layout: Arc<Layout>,
     _tasks: JoinSet<()>,
 }
 
 impl Bridge {
-    /// Puts the viewer's panes back as NervROS lays them out.
+    /// Puts the viewer's panes back as NervROS lays them out, the 3D view on the latest map.
     pub fn reset_layout(&self) {
-        layout(&self.rec, &self.cameras);
+        self.layout.send();
+    }
+
+    /// Keeps the 3D view on the robot from the angle it has, or frames the whole map again; the
+    /// layout is sent anew, so its panes are put back too.
+    pub fn follow(&self, on: bool) {
+        self.layout.follow(on);
+    }
+
+    /// Whether the 3D view keeps to the robot.
+    #[must_use]
+    pub fn following(&self) -> bool {
+        self.layout.following()
     }
 }
 
@@ -127,17 +147,16 @@ pub fn spawn(
         profile.ros.base_frame.clone(),
     ));
     bridge.robot_model(profile);
-    let cameras = bridge.cameras(profile);
-    layout(rec, &cameras);
-    bridge.world(profile);
+    let layout = Arc::new(Layout::new(rec.clone(), bridge.cameras(profile)));
+    layout.send();
+    bridge.world(profile, &layout);
     bridge.profile_layers(profile);
     bridge
         .tasks
         .spawn(agent(rec.clone(), Arc::clone(robot), events));
     Bridge {
         layers: bridge.layers,
-        rec: rec.clone(),
-        cameras,
+        layout,
         _tasks: bridge.tasks,
     }
 }
@@ -172,10 +191,10 @@ mod tests {
     use nervros_ros::Transform;
 
     use super::*;
-    use crate::grid::{coverage_colour, grid, occupancy, seen, seen_colour};
+    use crate::grid::{coverage_colour, grid, known_extent, map_colour, seen, seen_colour};
     use crate::objects::object_colour;
     use crate::rooms::area;
-    use crate::tasks::{ModelFrame, load_model, moved, pinhole};
+    use crate::tasks::{ModelFrame, load_model, moved, pinhole, pose_model};
 
     #[test]
     fn a_urdf_gives_the_frames_tf_moves() {
@@ -212,6 +231,51 @@ mod tests {
     }
 
     #[test]
+    fn each_pose_names_the_frames_it_moves() {
+        // A row without frame names moves the entity's own frame: the model then kept its rest
+        // pose with the pelvis on the floor.
+        use rerun::external::re_chunk::Chunk;
+        use rerun::external::re_log_types::LogMsg;
+        let lift = Transform {
+            translation: [0.0, 0.0, 0.73],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        };
+        let robot =
+            nervros_ros::fake::FakeRobot::new().with_transform("base_footprint", "pelvis", lift);
+        let pelvis = ModelFrame {
+            entity: "world/robot/model/joints/root".into(),
+            tf: ("base_footprint".into(), "pelvis".into()),
+            parent: ROBOT_FRAME.into(),
+        };
+        let (rec, storage) = RecordingStreamBuilder::new("test").memory().unwrap();
+        pose_model(&rec, &robot, &[pelvis], &mut [None]);
+        rec.flush_blocking().unwrap();
+        let rows: Vec<Chunk> = storage
+            .take()
+            .into_iter()
+            .filter_map(|m| match m {
+                LogMsg::ArrowMsg(_, arrow) => Chunk::from_arrow_msg(&arrow).ok(),
+                _ => None,
+            })
+            .filter(|c| c.entity_path().to_string() == "/world/robot/model/joints/root")
+            .collect();
+        assert!(!rows.is_empty(), "the root was posed");
+        for chunk in rows {
+            let has =
+                |d: rerun::ComponentDescriptor| chunk.components().get_array(d.component).is_some();
+            assert!(has(rerun::Transform3D::descriptor_translation()));
+            assert!(
+                has(rerun::Transform3D::descriptor_child_frame()),
+                "names the pelvis"
+            );
+            assert!(
+                has(rerun::Transform3D::descriptor_parent_frame()),
+                "and the robot it hangs from"
+            );
+        }
+    }
+
+    #[test]
     fn small_motions_are_not_logged() {
         let a = Transform::IDENTITY;
         let mut b = a;
@@ -228,12 +292,14 @@ mod tests {
                      "origin": {"position": {"x": 1.0, "y": -1.0, "z": 0.0}}},
             "data": [0, 100, -1, 65]
         });
-        let g = grid(&msg, occupancy).unwrap();
+        let g = grid(&msg, map_colour).unwrap();
+        let [clear, wall, floor] = [-1, 100, 0].map(map_colour);
         assert_eq!(
             g.bytes,
-            vec![255, 65, 0, 100],
+            [clear, wall, floor, wall].concat(),
             "the second ROS row is the image's first"
         );
+        assert_eq!(clear[3], 0, "the unknown stays clear");
         assert_eq!(g.size, [2, 2]);
         assert!(
             g.corner
@@ -244,9 +310,27 @@ mod tests {
         let short =
             serde_json::json!({"info": {"resolution": 0.5, "width": 2, "height": 2}, "data": [0]});
         assert!(
-            grid(&short, occupancy).is_none(),
+            grid(&short, map_colour).is_none(),
             "a grid with missing cells is not drawn"
         );
+    }
+
+    #[test]
+    fn a_map_is_framed_on_its_known_cells_not_its_unknown_margin() {
+        // 4 x 3 cells of 0.5 m from (1, -1); only the middle two columns of the top two rows
+        // are known.
+        let msg = serde_json::json!({
+            "info": {"resolution": 0.5, "width": 4, "height": 3,
+                     "origin": {"position": {"x": 1.0, "y": -1.0, "z": 0.0}}},
+            "data": [-1, -1, -1, -1,  -1, 0, 100, -1,  -1, 0, -1, -1]
+        });
+        assert_eq!(known_extent(&msg), Some([1.5, -0.5, 2.5, 0.5]));
+        let unknown = serde_json::json!({
+            "info": {"resolution": 0.5, "width": 2, "height": 1,
+                     "origin": {"position": {"x": 0.0, "y": 0.0, "z": 0.0}}},
+            "data": [-1, -1]
+        });
+        assert_eq!(known_extent(&unknown), None, "nothing known frames nothing");
     }
 
     #[test]

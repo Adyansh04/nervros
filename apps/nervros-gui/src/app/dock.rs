@@ -2,53 +2,80 @@
 
 use nervros_core::session::Command;
 use rerun::external::egui;
-use rerun::external::egui::{Align, Layout, RichText};
-use rerun::external::re_ui::{ReButton, UiExt as _};
+use rerun::external::egui::{Align, CornerRadius, Frame, Layout, Margin, RichText};
+use rerun::external::re_ui::{ReButton, UiExt as _, icons};
 
 use super::{Gui, Tab};
+use crate::theme;
 
 impl Gui {
     pub(super) fn dock(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        // Wrapped, so the tabs never widen the dock past what the operator gave it.
-        ui.horizontal_wrapped(|ui| {
-            for (tab, name) in Tab::ALL {
-                let count = if tab == Tab::Approvals {
-                    self.chat.pending().count()
-                } else {
-                    0
-                };
-                let label = if count > 0 {
-                    format!("{name} ({count})")
-                } else {
-                    name.to_owned()
-                };
-                if ui
-                    .add(
-                        ReButton::new(label)
-                            .small()
-                            .ghost()
-                            .selected(self.tab == tab),
-                    )
-                    .clicked()
-                {
-                    self.tab = tab;
-                }
-            }
-        });
-        ui.full_span_separator();
-        ui.add_space(8.0);
+        ui.add_space(12.0);
+        self.tab_bar(ui);
+        ui.add_space(14.0);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| match self.tab {
-                Tab::Mission => self.mission_tab(ui),
-                Tab::World => self.world_tab(ui),
-                Tab::Layers => self.layers_tab(ui),
-                Tab::Approvals => self.approvals_tab(ui),
-                Tab::Events => self.events_tab(ui),
-                Tab::Agent => self.agent_tab(ui),
-                Tab::Doctor => self.doctor_tab(ui),
-                Tab::Robot => self.robot_tab(ui),
+            .show(ui, |ui| {
+                match self.tab {
+                    Tab::Mission => self.mission_tab(ui),
+                    Tab::World => self.world_tab(ui),
+                    Tab::Layers => self.layers_tab(ui),
+                    Tab::Approvals => self.approvals_tab(ui),
+                    Tab::Events => self.events_tab(ui),
+                    Tab::Agent => self.agent_tab(ui),
+                    Tab::Doctor => self.doctor_tab(ui),
+                    Tab::Robot => self.robot_tab(ui),
+                }
+                ui.add_space(12.0);
+            });
+    }
+
+    /// The tabs as two rows of four equal segments: eight names never fit one row of a dock,
+    /// and a row that wraps wherever the width runs out reads as a mistake.
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let pending = self.chat.pending().count();
+        Frame::new()
+            .fill(theme::SURFACE)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(3))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+                ui.spacing_mut().button_padding = egui::vec2(4.0, 4.0);
+                let width = ((ui.available_width() - 9.0) / 4.0).floor();
+                for row in Tab::ALL.chunks(4) {
+                    ui.horizontal(|ui| {
+                        for &(tab, name) in row {
+                            let selected = self.tab == tab;
+                            // Amber while a request waits, so it shows from any tab.
+                            let waiting = tab == Tab::Approvals && pending > 0;
+                            let colour = match (waiting, selected) {
+                                (true, _) => theme::WARN,
+                                (false, true) => theme::TEXT,
+                                (false, false) => theme::DIM,
+                            };
+                            let label = RichText::new(name).size(13.0).color(colour);
+                            let button = egui::Button::new(label)
+                                .fill(if selected {
+                                    theme::RAISED
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                })
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(CornerRadius::same(7))
+                                .min_size(egui::vec2(width, 28.0));
+                            let response = ui.add(button);
+                            let response = if waiting {
+                                response.on_hover_text(format!("{pending} waiting for you"))
+                            } else {
+                                response
+                            };
+                            if response.clicked() {
+                                self.tab = tab;
+                            }
+                        }
+                    });
+                }
             });
     }
 
@@ -79,13 +106,13 @@ impl Gui {
         if list.is_empty() {
             return;
         }
-        ui.add_space(12.0);
-        ui.label(RichText::new("Schedules").strong());
+        ui.add_space(16.0);
+        theme::section(ui, "Schedules");
         let mut cancel = None;
         for s in &list {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&s.id).monospace().small());
-                ui.label(RichText::new(&s.intent).small());
+                ui.label(RichText::new(&s.id).monospace().color(theme::FAINT));
+                ui.label(&s.intent);
                 let when = if s.when.is_empty() {
                     format!(
                         "every {} min, {} of {} runs left",
@@ -94,7 +121,7 @@ impl Gui {
                 } else {
                     format!("when {}, {} of {} runs left", s.when, s.left, s.times)
                 };
-                ui.label(RichText::new(when).small().color(ui.tokens().text_subdued));
+                ui.label(RichText::new(when).small().color(theme::DIM));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
                         .add(ReButton::new("Cancel").small().secondary())
@@ -140,10 +167,13 @@ impl Gui {
             return;
         }
         for (id, tool, reason) in pending {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(tool).monospace());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(ReButton::new("Approve").small().primary()).clicked() {
+            theme::status_card(ui, theme::WARN, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(tool).monospace().strong());
+                // What it would do, so the dock alone is enough to decide.
+                ui.label(RichText::new(reason).color(theme::DIM));
+                ui.horizontal(|ui| {
+                    if ui.add(ReButton::new("Approve").small().blue()).clicked() {
                         self.agent.session.send(Command::Approve(id));
                     }
                     if ui.add(ReButton::new("Deny").small().secondary()).clicked() {
@@ -151,16 +181,7 @@ impl Gui {
                     }
                 });
             });
-            // What it would do, so the dock alone is enough to decide.
-            ui.add(
-                egui::Label::new(
-                    RichText::new(reason)
-                        .small()
-                        .color(ui.tokens().text_subdued),
-                )
-                .wrap(),
-            );
-            ui.add_space(6.0);
+            ui.add_space(8.0);
         }
     }
 
@@ -169,12 +190,7 @@ impl Gui {
             empty(ui, "Session events appear here, newest first.");
         }
         for line in &self.event_log {
-            ui.label(
-                RichText::new(line)
-                    .monospace()
-                    .size(11.0)
-                    .color(ui.tokens().text_subdued),
-            );
+            ui.label(RichText::new(line).monospace().size(11.5).color(theme::DIM));
         }
     }
 
@@ -193,24 +209,34 @@ impl Gui {
             }
             Some(checks) => {
                 let bad = checks.iter().filter(|c| !c.ok).count();
-                if bad == 0 {
-                    ui.success_label("Everything the profile names is there.");
+                let (colour, head) = if bad == 0 {
+                    (
+                        theme::SUCCESS,
+                        "Everything the profile names is there".to_owned(),
+                    )
                 } else {
-                    ui.warning_label(format!("{bad} of {} checks failed.", checks.len()));
-                }
-                ui.add_space(8.0);
+                    (
+                        theme::WARN,
+                        format!("{bad} of {} checks failed", checks.len()),
+                    )
+                };
+                theme::status_card(ui, colour, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(head).strong());
+                });
+                ui.add_space(10.0);
                 for c in &checks {
                     ui.horizontal(|ui| {
-                        let t = ui.tokens();
-                        ui.bullet(if c.ok {
-                            t.success_text_color
+                        let (icon, colour) = if c.ok {
+                            (&icons::SUCCESS, theme::SUCCESS)
                         } else {
-                            t.error_fg_color
-                        });
-                        ui.label(RichText::new(&c.what).size(12.0));
+                            (&icons::ERROR, theme::ERROR)
+                        };
+                        ui.small_icon(icon, Some(colour));
+                        ui.label(&c.what);
                     });
                 }
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 if ui
                     .add(ReButton::new("Check again").small().secondary())
                     .clicked()
@@ -224,5 +250,8 @@ impl Gui {
 }
 
 pub(super) fn empty(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).color(ui.tokens().text_subdued));
+    ui.horizontal(|ui| {
+        ui.small_icon(&icons::INFO, Some(theme::FAINT));
+        ui.label(RichText::new(text).color(theme::DIM));
+    });
 }

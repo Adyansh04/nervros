@@ -4,7 +4,6 @@ use rerun::external::egui;
 use rerun::external::egui::{
     Align2, Color32, FontId, Key, Modifiers, Pos2, Rect, Sense, Shape, Stroke, Vec2,
 };
-use rerun::external::re_ui::UiExt as _;
 use serde_json::json;
 
 use super::geometry::{Shape2, in_polygon, reshape, room_centre, wall_yaw};
@@ -14,6 +13,7 @@ use super::world::{
 use super::{
     Call, Drag, Grip, HANDLE_PX, MIN_SIDE_M, Mode, Picked, ROTATE_PX, View, WorldEditor, lock,
 };
+use crate::theme;
 
 impl WorldEditor {
     fn to_screen(&self, world: &World, [x, y]: [f64; 2]) -> Pos2 {
@@ -183,7 +183,7 @@ impl WorldEditor {
                 Align2::CENTER_CENTER,
                 text,
                 FontId::proportional(14.0),
-                ui.tokens().text_subdued,
+                theme::DIM,
             );
             return;
         };
@@ -211,7 +211,7 @@ impl WorldEditor {
             .and_then(|p| self.object_at(&world, self.to_world(&world, p)))
             .map(|o| o.id);
         self.draw(&painter, &world, hovered);
-        self.overlay(ui, &painter, rect);
+        self.overlay(&painter, rect);
     }
 
     fn gestures(&mut self, ui: &egui::Ui, response: &egui::Response, world: &World) {
@@ -578,7 +578,7 @@ impl WorldEditor {
     }
 
     /// The hint for the gesture a mode waits for, and a small legend.
-    fn overlay(&self, ui: &egui::Ui, painter: &egui::Painter, rect: Rect) {
+    fn overlay(&self, painter: &egui::Painter, rect: Rect) {
         let hint = match self.mode {
             Mode::Browse => None,
             Mode::Add => {
@@ -611,28 +611,21 @@ impl WorldEditor {
                 2.0,
                 colour,
             );
-            let galley = painter.layout_no_wrap(
-                name.to_owned(),
-                FontId::proportional(11.0),
-                ui.tokens().text_subdued,
-            );
+            let galley =
+                painter.layout_no_wrap(name.to_owned(), FontId::proportional(11.0), theme::DIM);
             let width = galley.size().x;
             painter.galley(
                 Pos2::new(x + 14.0, y - galley.size().y / 2.0),
                 galley,
-                ui.tokens().text_subdued,
+                theme::DIM,
             );
             x += width + 30.0;
         }
         let dashed = painter.layout_no_wrap(
             "dashed: box set by hand".to_owned(),
             FontId::proportional(11.0),
-            ui.tokens().text_subdued,
+            theme::DIM,
         );
-        painter.galley(
-            Pos2::new(x, y - dashed.size().y / 2.0),
-            dashed,
-            ui.tokens().text_subdued,
-        );
+        painter.galley(Pos2::new(x, y - dashed.size().y / 2.0), dashed, theme::DIM);
     }
 }

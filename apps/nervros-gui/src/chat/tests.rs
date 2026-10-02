@@ -143,7 +143,7 @@ fn render_with(chat: Chat, name: &str, setup: impl FnOnce(&egui::Context)) {
         .with_size(egui::vec2(440.0, 800.0))
         .build_ui(move |ui| {
             Frame::new()
-                .fill(ui.tokens().panel_bg_color)
+                .fill(theme::BG)
                 .inner_margin(Margin::same(16))
                 .show(ui, |ui| {
                     // Long, so the countdown reads the same however slowly the test runs.
@@ -299,7 +299,7 @@ fn snapshot_tree_panel() {
         .with_size(egui::vec2(440.0, 600.0))
         .build_ui(move |ui| {
             Frame::new()
-                .fill(ui.tokens().panel_bg_color)
+                .fill(theme::BG)
                 .inner_margin(Margin::same(16))
                 .show(ui, |ui| tree_panel(ui, &plan));
         });

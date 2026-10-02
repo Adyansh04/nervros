@@ -293,5 +293,9 @@ fn live_eval() {
         run.wait(Duration::from_secs(1));
         run.save(&format!("tab-{}", name.to_lowercase()));
     }
+    // The 3D view close on the robot, as Follow robot shows it.
+    run.harness.state().bridge.follow(true);
+    run.wait(Duration::from_secs(3));
+    run.save("follow");
     drop(rec);
 }

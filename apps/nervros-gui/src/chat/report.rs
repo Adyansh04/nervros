@@ -4,20 +4,26 @@ use rerun::external::egui;
 use rerun::external::egui::{CornerRadius, Frame, Margin, RichText};
 use rerun::external::re_ui::{UiExt as _, icons};
 
+use crate::theme;
+
+/// A report from the robot, not the agent: its own colour, so the two never read as one voice.
 pub(super) fn report(ui: &mut egui::Ui, text: &str) {
     Frame::new()
-        .fill(ui.tokens().faint_bg_color)
+        .fill(theme::SURFACE)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
         .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(10, 6))
+        .inner_margin(Margin::symmetric(10, 7))
         .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.small_icon(&icons::AGENT, Some(ui.tokens().text_subdued));
-                ui.label(RichText::new("Robot report").small().strong());
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.small_icon(&icons::AGENT, Some(theme::ROBOT));
                 ui.label(
-                    RichText::new(report_text(text))
-                        .small()
-                        .color(ui.tokens().text_subdued),
+                    RichText::new("Robot")
+                        .strong()
+                        .size(13.0)
+                        .color(theme::ROBOT),
                 );
+                ui.add(egui::Label::new(RichText::new(report_text(text)).size(13.0)).wrap());
             });
         });
 }

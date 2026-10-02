@@ -2,6 +2,7 @@
 //! The session checks the edit as it checks the model's plans; until it passes, the plan that was
 //! asked about stays the one that runs if approved.
 
+use crate::theme;
 use nervros_core::mission::plan::PlannedStep;
 use nervros_core::mission::sanity::Concern;
 use rerun::external::egui::{self, Align, CornerRadius, Frame, Layout, Margin, RichText};
@@ -76,20 +77,19 @@ pub fn plan_args(intent: &str, steps: &[EditStep]) -> Value {
 
 /// Draws each step with its arguments as fields, and buttons to move and drop it.
 pub fn editor(ui: &mut egui::Ui, salt: egui::Id, steps: &mut Vec<EditStep>) {
-    let t = ui.tokens();
     let mut moved: Option<(usize, usize)> = None;
     let mut dropped: Option<usize> = None;
     let last = steps.len().saturating_sub(1);
     for (i, step) in steps.iter_mut().enumerate() {
         Frame::new()
-            .fill(t.faint_bg_color)
+            .fill(theme::SURFACE)
             .corner_radius(CornerRadius::same(6))
             .inner_margin(Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let number = RichText::new(format!("{}", i + 1)).monospace().size(12.0);
-                    ui.label(number.color(t.text_subdued));
+                    ui.label(number.color(theme::DIM));
                     ui.label(RichText::new(&step.skill).monospace().size(12.0).strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let drop = ui.small_icon_button_widget(&icons::TRASH, "Drop this step");
@@ -111,7 +111,7 @@ pub fn editor(ui: &mut egui::Ui, salt: egui::Id, steps: &mut Vec<EditStep>) {
                 }
                 ui.horizontal_wrapped(|ui| {
                     for (name, value) in &mut step.args {
-                        ui.label(RichText::new(name.as_str()).small().color(t.text_subdued));
+                        ui.label(RichText::new(name.as_str()).small().color(theme::DIM));
                         // As wide as the value, so "dining_table_side" and "90" both read whole.
                         let chars = u16::try_from(value.chars().count()).unwrap_or(u16::MAX);
                         let width = (f32::from(chars) * 7.5 + 16.0).clamp(48.0, 180.0);

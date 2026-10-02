@@ -339,7 +339,6 @@ impl WorldEditor {
 #[cfg(test)]
 mod tests {
     use rerun::external::egui::Color32;
-    use rerun::external::re_ui::UiExt as _;
     use serde_json::json;
 
     use super::geometry::{in_polygon, wall_yaw};
@@ -425,11 +424,7 @@ mod tests {
             .build_ui(move |ui| {
                 egui::Panel::right("editor_panel")
                     .exact_size(340.0)
-                    .frame(
-                        egui::Frame::new()
-                            .fill(ui.tokens().panel_bg_color)
-                            .inner_margin(12),
-                    )
+                    .frame(egui::Frame::new().fill(crate::theme::BG).inner_margin(12))
                     .show(ui, |ui| editor.panel(ui));
                 egui::CentralPanel::no_frame().show(ui, |ui| editor.canvas(ui));
             });

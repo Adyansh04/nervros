@@ -14,8 +14,8 @@ use tokio::time::{MissedTickBehavior, interval};
 use crate::objects::object_colour;
 use crate::spawner::Layer;
 use crate::{
-    CAMERA_PERIOD, CAMERA_QUALITY, MODEL_PATH, POSE_PERIOD, ROBOT_FRAME, SCAN_PERIOD, TOPIC_WAIT,
-    f32s, layers, put, put_static,
+    CAMERA_PERIOD, CAMERA_QUALITY, FOLLOW_PATH, MODEL_PATH, POSE_PERIOD, ROBOT_FRAME, ROBOT_MARK,
+    SCAN_PERIOD, TOPIC_WAIT, f32s, layers, put, put_static,
 };
 
 /// A laser scan as points in the map, redrawn as scans arrive.
@@ -100,10 +100,38 @@ pub(super) async fn pose(
     map: String,
     base: String,
 ) {
+    // A ring on the floor and an arrow the way it faces, in one bright colour: in a view framed
+    // on the whole map the model alone is a few pixels tall.
+    let ring: Vec<[f32; 3]> = (0u8..=48)
+        .map(|i| {
+            let a = f32::from(i) * std::f32::consts::TAU / 48.0;
+            [0.45 * a.cos(), 0.45 * a.sin(), 0.02]
+        })
+        .collect();
+    put_static(
+        &rec,
+        "world/robot/marker",
+        &rerun::LineStrips3D::new([ring])
+            .with_radii([0.025])
+            .with_colors([ROBOT_MARK]),
+    );
+    // Rerun orbits a tracked entity at 1.5 times the sphere around its region of interest, which
+    // for points is their mean +- 2 sigma, twice the span of two: these give about 5.6 m around
+    // the robot's middle.
+    put_static(
+        &rec,
+        FOLLOW_PATH,
+        &rerun::Points3D::new([[-1.2, -1.2, 0.05], [1.2, 1.2, 1.55]])
+            .with_radii([0.0])
+            .with_colors([[0, 0, 0, 0]]),
+    );
     put_static(
         &rec,
         "world/robot/heading",
-        &rerun::Arrows3D::from_vectors([[0.5, 0.0, 0.0]]).with_radii([0.02]),
+        &rerun::Arrows3D::from_vectors([[0.75, 0.0, 0.0]])
+            .with_origins([[0.0, 0.0, 0.02]])
+            .with_radii([0.04])
+            .with_colors([ROBOT_MARK]),
     );
     let mut tick = interval(POSE_PERIOD);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -216,7 +244,7 @@ pub(super) async fn robot_model(
 }
 
 /// Logs each model frame TF has and that moved since it was last logged.
-fn pose_model(
+pub(super) fn pose_model(
     rec: &RecordingStream,
     robot: &dyn RobotPort,
     frames: &[ModelFrame],
@@ -229,22 +257,16 @@ fn pose_model(
         if last.as_ref().is_some_and(|l| !moved(l, &t)) {
             continue;
         }
-        // The frames' names never change: logged once, not with every pose.
-        if last.is_none() {
-            put_static(
-                rec,
-                &frame.entity,
-                &rerun::Transform3D::update_fields()
-                    .with_parent_frame(frame.parent.as_str())
-                    .with_child_frame(frame.tf.1.as_str()),
-            );
-        }
+        // The frames' names go in every row: the viewer gives a row without them to the entity's
+        // own frame, which left the model at its rest pose with the pelvis on the floor.
         put(
             rec,
             &frame.entity,
             &rerun::Transform3D::update_fields()
                 .with_translation(f32s(t.translation))
-                .with_rotation(rerun::Quaternion::from_xyzw(f32s(t.rotation))),
+                .with_rotation(rerun::Quaternion::from_xyzw(f32s(t.rotation)))
+                .with_parent_frame(frame.parent.as_str())
+                .with_child_frame(frame.tf.1.as_str()),
         );
         *last = Some(t);
     }

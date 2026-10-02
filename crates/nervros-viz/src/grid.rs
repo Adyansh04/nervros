@@ -49,7 +49,6 @@ pub(super) fn put_grid(
     grid: Grid,
     model: rerun::ColorModel,
     lift: f32,
-    map: bool,
 ) {
     let format = rerun::components::ImageFormat::from_color_model(
         grid.size,
@@ -57,44 +56,78 @@ pub(super) fn put_grid(
         rerun::ChannelDatatype::U8,
     );
     let [x, y, _] = grid.corner;
-    let mut layer =
-        rerun::GridMap::new(grid.bytes, format, grid.cell_m).with_translation([x, y, lift]);
-    if map {
-        layer = layer.with_colormap(rerun::components::Colormap::RvizMap);
-    }
+    // Below full opacity the viewer blends a grid, its clear cells included; at full opacity it
+    // draws them black and hides whatever lies under them.
+    let layer = rerun::GridMap::new(grid.bytes, format, grid.cell_m)
+        .with_translation([x, y, lift])
+        .with_opacity(0.999);
     // Static: only the newest grid is kept, where a new one a second would pile up.
     put_static(rec, path, &layer);
 }
 
-/// ROS occupancy (-1 unknown, 0 free, 100 occupied) in the byte values `Colormap::RvizMap` reads.
-pub(super) fn occupancy(v: i64) -> [u8; 1] {
-    if v < 0 {
-        [255]
-    } else {
-        [u8::try_from(v.min(100)).unwrap_or(100)]
+/// ROS occupancy (-1 unknown, 0 free, 100 occupied) for a dark view: the floor a shade above the
+/// background, walls light, and the unknown clear, so the map reads as the building alone.
+pub(super) fn map_colour(v: i64) -> [u8; 4] {
+    match v {
+        ..0 => [0, 0, 0, 0],
+        0..50 => [0x2e, 0x35, 0x40, 255],
+        _ => [0xc9, 0xcf, 0xd8, 255],
     }
 }
 
-/// canopy's coverage values as colours over the map: seen green, still to see amber, written off
-/// grey, the rest clear.
+/// canopy's coverage values as colours over the map: still to see a strong amber, as it is what
+/// the operator looks for; seen a faint green and written off a faint grey, so a well-seen
+/// building stays a plan and does not turn into a green field; the rest clear.
 pub(super) fn coverage_colour(v: i64) -> [u8; 4] {
     match v {
-        SEEN => [70, 180, 90, 110],
+        SEEN => [70, 180, 90, 38],
         TO_SEE => [240, 160, 40, 150],
-        WRITTEN_OFF => [130, 130, 130, 90],
+        WRITTEN_OFF => [130, 130, 130, 50],
         _ => [0, 0, 0, 0],
     }
 }
 
+/// Where a grid has known cells, free or occupied: `[x0, y0, x1, y1]` in the map frame. Unknown
+/// cells can reach far past the building and would frame a view on nothing.
+pub(super) fn known_extent(msg: &Value) -> Option<[f32; 4]> {
+    let info = &msg["info"];
+    let res = num(&info["resolution"]);
+    let width = usize::try_from(info["width"].as_u64()?).ok()?;
+    let data = msg["data"].as_array()?;
+    if res <= 0.0 || width == 0 {
+        return None;
+    }
+    let (mut c0, mut r0, mut c1, mut r1) = (usize::MAX, usize::MAX, 0, 0);
+    for (i, v) in data.iter().enumerate() {
+        if v.as_i64().is_some_and(|v| v >= 0) {
+            let (c, r) = (i % width, i / width);
+            (c0, r0, c1, r1) = (c0.min(c), r0.min(r), c1.max(c), r1.max(r));
+        }
+    }
+    if c0 > c1 {
+        return None;
+    }
+    let origin = &info["origin"]["position"];
+    let (x, y) = (num(&origin["x"]), num(&origin["y"]));
+    #[expect(clippy::cast_precision_loss, reason = "cell counts far below 2^52")]
+    let at = |cell: usize| cell as f64 * res;
+    Some(f32s([
+        x + at(c0),
+        y + at(r0),
+        x + at(c1 + 1),
+        y + at(r1 + 1),
+    ]))
+}
+
 pub(super) fn draw_map(rec: &RecordingStream, path: &str, msg: &Value) {
-    if let Some(g) = grid(msg, occupancy) {
-        put_grid(rec, path, g, rerun::ColorModel::L, 0.0, true);
+    if let Some(g) = grid(msg, map_colour) {
+        put_grid(rec, path, g, rerun::ColorModel::RGBA, 0.0);
     }
 }
 
 pub(super) fn draw_coverage(rec: &RecordingStream, path: &str, msg: &Value) {
     if let Some(g) = grid(msg, coverage_colour) {
-        put_grid(rec, path, g, rerun::ColorModel::RGBA, 0.01, false);
+        put_grid(rec, path, g, rerun::ColorModel::RGBA, 0.01);
     }
 }
 
