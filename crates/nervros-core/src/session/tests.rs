@@ -1,36 +1,23 @@
-use super::*;
-use crate::guard::Policy;
-use crate::llm::{AgentBuilder, LlmError};
-use crate::tools::{Risk, ToolSpec};
-use async_trait::async_trait;
-use rig::test_utils::{MockCompletionModel, MockTurn};
 use std::borrow::Cow;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::Value;
-use serde_json::json;
+use async_trait::async_trait;
+use rig::test_utils::{MockCompletionModel, MockTurn};
+use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use super::approval::Unanswered;
-use super::approval::take_unanswered;
+use super::approval::{Unanswered, take_unanswered};
 use super::config::SessionConfig;
-use super::event::Command;
-use super::event::Event;
-use super::event::is_stop_word;
-use crate::guard::Guard;
-use crate::llm::AgentSource;
-use crate::llm::History;
+use super::event::{Command, Event, is_stop_word};
+use super::*;
+use crate::guard::{Guard, Policy};
+use crate::llm::{AgentBuilder, AgentSource, History, LlmError};
 use crate::lock;
 use crate::providers::Role;
 use crate::providers::router::Need;
-use crate::tools::Assessment;
-use crate::tools::Registry;
-use crate::tools::Status;
-use crate::tools::Tool;
-use crate::tools::ToolOutcome;
+use crate::tools::{Assessment, Registry, Risk, Status, Tool, ToolOutcome, ToolSpec};
 
 struct Scripted(MockCompletionModel);
 

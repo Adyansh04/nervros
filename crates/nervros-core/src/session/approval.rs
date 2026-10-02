@@ -4,19 +4,15 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use super::Shared;
 use super::calls::Approved;
 use super::event::Event;
-use super::millis;
+use super::{Shared, millis};
 use crate::lock;
-use crate::tools::Lane;
-use crate::tools::Risk;
-use crate::tools::Tool;
+use crate::tools::{Lane, Risk, Tool};
 
 /// A request the operator had not answered when its session ended.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -1,32 +1,24 @@
-use super::*;
-use super::{advice, history};
-use crate::mission::catalog::tests::CATALOG;
-use crate::places::Places;
-use crate::session::Event;
-use nervros_ros::GoalStatus;
-use nervros_ros::fake::{FakeRobot, ScriptedRun};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nervros_ros::GoalResult;
-use nervros_ros::RobotPort;
-use serde_json::Value;
-use serde_json::json;
+use nervros_ros::fake::{FakeRobot, ScriptedRun};
+use nervros_ros::{GoalResult, GoalStatus, RobotPort};
+use serde_json::{Value, json};
 
 use super::execution::step_of;
 use super::ledger::Ledger;
 use super::plan::Author as By;
 use super::sanity::Critic;
+use super::{advice, history, *};
 use crate::lock;
+use crate::mission::catalog::tests::CATALOG;
+use crate::places::Places;
 use crate::profile::Profile;
-use crate::session::Command;
-use crate::session::SessionHandle;
-use crate::tools::Risk;
-use crate::tools::Status;
+use crate::session::{Command, Event, SessionHandle};
+use crate::tools::{Risk, Status};
 
 fn profile() -> Profile {
     profile_with("")

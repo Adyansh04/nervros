@@ -3,15 +3,11 @@
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 
-use super::check;
-use super::check::Observed;
-use super::plan::Compiled;
 use serde_json::json;
 
-use super::Missions;
-use super::Outcome;
-use super::SERVICE_TIMEOUT;
-use super::held_by;
+use super::check::Observed;
+use super::plan::Compiled;
+use super::{Missions, Outcome, SERVICE_TIMEOUT, check, held_by};
 
 impl Missions {
     /// What the model reads when a mission ends: how it went, the goal checks or why it failed

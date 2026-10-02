@@ -4,22 +4,14 @@ use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use serde_json::{Value, json};
+
 use super::plan::Author as By;
 use super::sanity::Concern;
-use super::{plan, sanity};
-use async_trait::async_trait;
-use serde_json::Value;
-use serde_json::json;
-
-use super::Missions;
-use super::SERVICE_TIMEOUT;
+use super::{Missions, SERVICE_TIMEOUT, plan, sanity};
 use crate::lock;
-use crate::tools::Assessment;
-use crate::tools::Risk;
-use crate::tools::Status;
-use crate::tools::Tool;
-use crate::tools::ToolOutcome;
-use crate::tools::ToolSpec;
+use crate::tools::{Assessment, Risk, Status, Tool, ToolOutcome, ToolSpec};
 
 impl Missions {
     /// `run_mission`'s spec, its skill list read off the catalog as it is now.

@@ -8,27 +8,16 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
 
-use super::Shared;
 use super::approval::Answer;
 use super::calls::Caller;
 use super::config::PULSE_PERIOD;
-use super::event::Command;
-use super::event::Event;
-use super::save;
-use super::turn::Origin;
-use super::turn::TurnFlags;
-use super::turn::limited;
-use super::turn::run_turn;
-use super::turn::turn_span;
-use super::window::COMPACT_ROOM;
-use super::window::Condense;
-use super::window::compact;
-use super::window::room_for;
-use crate::llm::AgentSource;
-use crate::llm::History;
+use super::event::{Command, Event};
+use super::turn::{Origin, TurnFlags, limited, run_turn, turn_span};
+use super::window::{COMPACT_ROOM, Condense, compact, room_for};
+use super::{Shared, save};
+use crate::llm::{AgentSource, History};
 use crate::lock;
-use crate::tools::Registry;
-use crate::tools::Status;
+use crate::tools::{Registry, Status};
 
 #[expect(
     clippy::too_many_lines,

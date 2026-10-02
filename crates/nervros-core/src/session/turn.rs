@@ -1,27 +1,18 @@
 //! One turn: its tools, its time limit, and trying the routine role's models in order.
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::Shared;
 use super::calls::Caller;
 use super::event::Event;
-use super::window::fit_window;
-use super::window::preamble;
-use super::window::report_context;
-use crate::llm;
-use crate::llm::AgentSource;
-use crate::llm::History;
-use crate::llm::LoopTool;
-use crate::lock;
+use super::window::{fit_window, preamble, report_context};
+use crate::llm::{AgentSource, History, LoopTool};
 use crate::providers::Role;
 use crate::providers::router::Need;
 use crate::tools::Registry;
+use crate::{llm, lock};
 
 /// Each model call's cost, to the log and to `used`, the context gauge's count.
 fn costs(shared: &Arc<Shared>, turn: u64, model: &str, used: &Arc<AtomicU64>) -> llm::OnCall {

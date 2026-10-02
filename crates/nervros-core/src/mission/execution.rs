@@ -1,39 +1,21 @@
 //! Running a mission: launching it on the executor, watching it, and keeping how it went.
 
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use super::ledger::MissionRecord;
-use super::ledger::StepRecord;
-use super::plan::Author as By;
-use super::plan::Compiled;
-use super::plan::PlannedStep;
-use super::{camera, check, ledger};
-use nervros_ros::Frame;
-use nervros_ros::Goal;
-use nervros_ros::GoalResult;
-use nervros_ros::RosError;
-use serde_json::Value;
-use serde_json::json;
+use nervros_ros::{Frame, Goal, GoalResult, RosError};
+use serde_json::{Value, json};
 use tracing::Instrument as _;
 
-use super::Claim;
-use super::EXECUTE;
-use super::LIVENESS;
-use super::LOST_AFTER;
-use super::Missions;
-use super::Outcome;
-use super::Running;
-use super::SERVICE_TIMEOUT;
-use super::STATE;
-use super::STATE_FRESH;
-use super::STATUSES;
+use super::ledger::{MissionRecord, StepRecord};
+use super::plan::{Author as By, Compiled, PlannedStep};
+use super::{
+    Claim, EXECUTE, LIVENESS, LOST_AFTER, Missions, Outcome, Running, SERVICE_TIMEOUT, STATE,
+    STATE_FRESH, STATUSES, camera, check, ledger,
+};
 use crate::lock;
-use crate::session::Command;
-use crate::session::Event;
-use crate::tools::Status;
-use crate::tools::ToolOutcome;
+use crate::session::{Command, Event};
+use crate::tools::{Status, ToolOutcome};
 
 impl Missions {
     /// Runs an approved plan, unless a mission runs or this one just failed the same way.

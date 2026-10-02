@@ -1,41 +1,25 @@
-//! Planning: the catalog and the world a plan compiles against, the checks a plan passes, and what the model is told when it fails.
+//! Planning: the catalog and the world a plan compiles against, the checks a plan passes, and what
+//! the model is told when it fails.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
 
 use super::catalog::Catalog;
 use super::check::Observed;
-use super::plan::Author as By;
-use super::plan::Compiled;
-use super::plan::Plan;
-use super::plan::PlannedStep;
-use super::plan::Thing;
-use super::plan::World;
-use super::sanity::Concern;
-use super::sanity::Verdict;
-use super::{advice, ledger, plan, preview, sanity};
-use serde_json::Value;
-use serde_json::json;
-
-use super::CATALOG_RETRY;
-use super::CRITIC_TIMEOUT;
-use super::KEPT_PLANS;
-use super::MAX_PLAN_ATTEMPTS;
-use super::MIN_HASH_PREFIX;
-use super::Missions;
-use super::SERVICE_TIMEOUT;
-use super::STATE;
-use super::STATE_FRESH;
-use super::WORLD_WAIT;
-use super::held_by;
-use super::tool::concern_line;
-use super::tool::questioned;
+use super::plan::{Author as By, Compiled, Plan, PlannedStep, Thing, World};
+use super::sanity::{Concern, Verdict};
+use super::tool::{concern_line, questioned};
+use super::{
+    CATALOG_RETRY, CRITIC_TIMEOUT, KEPT_PLANS, MAX_PLAN_ATTEMPTS, MIN_HASH_PREFIX, Missions,
+    SERVICE_TIMEOUT, STATE, STATE_FRESH, WORLD_WAIT, advice, held_by, ledger, plan, preview,
+    sanity,
+};
 use crate::lock;
 use crate::session::Event;
-use crate::tools::Status;
-use crate::tools::ToolOutcome;
+use crate::tools::{Status, ToolOutcome};
 
 impl Missions {
     /// Asks the executor where a checked plan would take the robot, and tells the window: the

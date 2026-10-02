@@ -5,26 +5,15 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use serde_json::Value;
-use serde_json::json;
+use serde_json::{Value, json};
 
-use super::Shared;
 use super::approval::DENIAL_BREAK;
 use super::event::Event;
-use super::millis;
 use super::turn::TurnFlags;
-use crate::guard::Decision;
-use crate::guard::Refusal;
-use crate::guard::RuleAction;
+use super::{Shared, millis};
+use crate::guard::{Decision, Refusal, RuleAction};
 use crate::lock;
-use crate::tools::Assessment;
-use crate::tools::Lane;
-use crate::tools::Resource;
-use crate::tools::Risk;
-use crate::tools::Status;
-use crate::tools::Tool;
-use crate::tools::ToolOutcome;
-use crate::tools::ToolSpec;
+use crate::tools::{Assessment, Lane, Resource, Risk, Status, Tool, ToolOutcome, ToolSpec};
 
 /// Who asked for a tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
