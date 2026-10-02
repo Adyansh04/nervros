@@ -37,6 +37,7 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// What the actor, its turns and their tool calls share.
 struct Shared {
     events: broadcast::Sender<Event>,
     approvals: Mutex<HashMap<u64, Asked>>,
