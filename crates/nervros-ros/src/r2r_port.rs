@@ -884,60 +884,38 @@ impl RobotPort for R2rPort {
         rx.await.map_err(mw)?
     }
 
-    async fn sample_sizes(
-        &self,
-        topic: &str,
-        ty: &str,
-        window: Duration,
-        max: usize,
-    ) -> Result<Vec<(Duration, usize)>, RosError> {
+    async fn arrivals(&self, topic: &str, ty: &str) -> Result<BoxStream<'static, usize>, RosError> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::SubscribeRaw {
             topic: topic.to_owned(),
             ty: ty.to_owned(),
             reply,
         })?;
-        let mut stream = rx.await.map_err(mw)??;
-        let start = tokio::time::Instant::now();
-        let mut out = Vec::new();
-        while out.len() < max {
-            match tokio::time::timeout_at(start + window, stream.next()).await {
-                Ok(Some(bytes)) => out.push((start.elapsed(), bytes.len())),
-                _ => break,
-            }
-        }
-        Ok(out)
+        Ok(rx.await.map_err(mw)??.map(|bytes| bytes.len()).boxed())
     }
 
-    async fn sample_messages(
+    async fn messages(
         &self,
         topic: &str,
         ty: &str,
-        count: usize,
-        timeout: Duration,
-    ) -> Result<Vec<Value>, RosError> {
+    ) -> Result<BoxStream<'static, Result<Value, RosError>>, RosError> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::SubscribeSample {
             topic: topic.to_owned(),
             ty: ty.to_owned(),
             reply,
         })?;
-        let mut stream = rx.await.map_err(mw)??;
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut out = Vec::new();
-        while out.len() < count {
-            match tokio::time::timeout_at(deadline, stream.next()).await {
-                Ok(Some(Ok(v))) => out.push(v),
-                Ok(Some(Err(e))) => {
-                    return Err(RosError::Conversion {
-                        name: topic.to_owned(),
-                        message: e.to_string(),
-                    });
-                }
-                _ => break,
-            }
-        }
-        Ok(out)
+        let name = topic.to_owned();
+        Ok(rx
+            .await
+            .map_err(mw)??
+            .map(move |m| {
+                m.map_err(|e| RosError::Conversion {
+                    name: name.clone(),
+                    message: e.to_string(),
+                })
+            })
+            .boxed())
     }
 
     async fn publisher(&self, topic: &str, ty: &str) -> Result<Publisher, RosError> {

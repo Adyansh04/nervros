@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::StreamExt as _;
+use futures::stream::BoxStream;
 use nervros_ros::{RobotPort, RosError};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
@@ -172,7 +174,7 @@ pub(crate) async fn holds(
 ) -> Result<Option<String>, String> {
     match condition {
         Condition::RateBelow(hz) => {
-            let window = RATE_WINDOW.max(Duration::from_secs_f64(2.0 / hz).min(MAX_RATE_WINDOW));
+            let window = rate_window(*hz);
             let arrivals = robot
                 .sample_sizes(topic, ty, window, 100_000)
                 .await
@@ -201,14 +203,90 @@ pub(crate) async fn holds(
                 .sample_messages(topic, ty, 1000, RATE_WINDOW)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(msgs
-                .iter()
-                .map(Value::to_string)
-                .find(|body| body.to_lowercase().contains(text))
-                .map(|body| {
-                    let excerpt: String = body.chars().take(200).collect();
-                    format!("it said {excerpt}")
-                }))
+            Ok(msgs.iter().find_map(|m| said(m, text)))
+        }
+    }
+}
+
+/// A rate is measured over two of its periods, within bounds.
+fn rate_window(hz: f64) -> Duration {
+    RATE_WINDOW.max(Duration::from_secs_f64(2.0 / hz).min(MAX_RATE_WINDOW))
+}
+
+/// What `message` said, when it says `text`.
+fn said(message: &Value, text: &str) -> Option<String> {
+    let body = message.to_string();
+    body.to_lowercase().contains(text).then(|| {
+        let excerpt: String = body.chars().take(200).collect();
+        format!("it said {excerpt}")
+    })
+}
+
+/// What a watch looks through. A rate or text watch keeps one subscription for its whole life:
+/// one per look would be matched again every window, and miss what arrives meanwhile.
+enum Looker {
+    /// The newest message, read at each look.
+    Latest,
+    /// Each message's size, counted per window.
+    Arrivals(BoxStream<'static, usize>),
+    /// Each message, read as it comes.
+    Messages(BoxStream<'static, Result<Value, RosError>>),
+}
+
+impl Looker {
+    async fn open(
+        robot: &dyn RobotPort,
+        topic: &str,
+        ty: &str,
+        condition: &Condition,
+    ) -> Result<Self, String> {
+        match condition {
+            Condition::RateBelow(_) => robot.arrivals(topic, ty).await.map(Self::Arrivals),
+            Condition::Text(_) => robot.messages(topic, ty).await.map(Self::Messages),
+            Condition::Value { .. } => Ok(Self::Latest),
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    /// One look: `Some(what was seen)` when the condition holds.
+    async fn look(
+        &mut self,
+        robot: &dyn RobotPort,
+        topic: &str,
+        ty: &str,
+        condition: &Condition,
+    ) -> Result<Option<String>, String> {
+        const ENDED: &str = "its subscription ended";
+        match (self, condition) {
+            (Self::Arrivals(sizes), Condition::RateBelow(hz)) => {
+                let window = rate_window(*hz);
+                let end = tokio::time::Instant::now() + window;
+                let mut count = 0u32;
+                loop {
+                    match tokio::time::timeout_at(end, sizes.next()).await {
+                        Ok(Some(_)) => count += 1,
+                        Ok(None) => return Err(ENDED.to_owned()),
+                        Err(_) => break,
+                    }
+                }
+                let rate = f64::from(count) / window.as_secs_f64();
+                Ok((rate < *hz).then(|| format!("{rate:.1} Hz")))
+            }
+            (Self::Messages(messages), Condition::Text(text)) => {
+                let end = tokio::time::Instant::now() + RATE_WINDOW;
+                loop {
+                    match tokio::time::timeout_at(end, messages.next()).await {
+                        Ok(Some(m)) => {
+                            if let Some(seen) = said(&m.map_err(|e| e.to_string())?, text) {
+                                return Ok(Some(seen));
+                            }
+                        }
+                        Ok(None) => return Err(ENDED.to_owned()),
+                        Err(_) => return Ok(None),
+                    }
+                }
+            }
+            _ => holds(robot, topic, ty, condition).await,
         }
     }
 }
@@ -317,6 +395,9 @@ impl Watches {
     async fn start(self: &Arc<Self>, args: &Value) -> Result<ToolOutcome, String> {
         let condition = Condition::parse(args)?;
         let (topic, ty) = self.topic(args, condition.reads_messages()).await?;
+        let mut eyes = Looker::open(self.robot.as_ref(), &topic, &ty, &condition)
+            .await
+            .map_err(|e| format!("cannot read {topic}: {e}"))?;
         let for_s = args["for_s"]
             .as_u64()
             .unwrap_or(DEFAULT_FOR_S)
@@ -341,7 +422,7 @@ impl Watches {
                 let mut was = false;
                 while Instant::now() < deadline {
                     let looked = Instant::now();
-                    let seen = match holds(robot.as_ref(), &topic, &ty, &condition).await {
+                    let seen = match eyes.look(robot.as_ref(), &topic, &ty, &condition).await {
                         Ok(seen) => seen,
                         // Watching what cannot be read would report silence for hours.
                         Err(e) => {
@@ -614,6 +695,42 @@ mod tests {
             Condition::parse(&json!({"condition": "text", "contains": "ERROR"})).unwrap(),
             Condition::Text("error".into())
         );
+    }
+
+    #[tokio::test]
+    async fn rate_and_text_watches_read_one_subscription_and_fire() {
+        let robot: Arc<dyn RobotPort> = Arc::new(
+            FakeRobot::new()
+                .with_topic("/scan", json!({"ranges": []}))
+                .with_rate("/scan", 4.0, 100)
+                .with_topic("/log", json!({"msg": "Motor ERROR on joint 3"})),
+        );
+        let watches = Watches::new(robot, Vec::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        watches.attach(SessionHandle::for_tests(&tx, events));
+        for args in [
+            json!({"topic": "/log", "condition": "text", "contains": "error"}),
+            json!({"topic": "/scan", "condition": "rate_below", "hz": 8}),
+        ] {
+            watches.start(&args).await.unwrap();
+        }
+        let mut reports = Vec::new();
+        while reports.len() < 2 {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(Command::Report(text))) => reports.push(text),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(reports[0].contains("Motor ERROR"), "{reports:?}");
+        // About the 4 Hz the topic runs at: the window counts one subscription's arrivals.
+        let rate: f64 = reports[1]
+            .rsplit("fired: ")
+            .next()
+            .and_then(|r| r.strip_suffix(" Hz."))
+            .and_then(|r| r.parse().ok())
+            .unwrap();
+        assert!((3.0..=4.5).contains(&rate), "{reports:?}");
     }
 
     #[tokio::test]

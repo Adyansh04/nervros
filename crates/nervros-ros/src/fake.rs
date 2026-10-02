@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt as _;
+use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -16,6 +18,9 @@ use crate::{
     Frame, Goal, GoalResult, GoalStatus, Graph, GraphDetail, NodeEntities, Publisher, RobotPort,
     RosError, TfLink, TopicEndpoints, Transform,
 };
+
+/// How often a followed topic repeats its value.
+const MESSAGE_EVERY: Duration = Duration::from_millis(100);
 
 /// A scripted service: request in, response out.
 pub type ServiceFn = Arc<dyn Fn(&Value) -> Result<Value, RosError> + Send + Sync>;
@@ -322,6 +327,40 @@ impl RobotPort for FakeRobot {
             .take(max)
             .map(|t| (t, bytes))
             .collect())
+    }
+
+    async fn arrivals(
+        &self,
+        topic: &str,
+        _ty: &str,
+    ) -> Result<BoxStream<'static, usize>, RosError> {
+        let Some(&(hz, bytes)) = self.rates.get(topic) else {
+            return Ok(futures::stream::pending().boxed());
+        };
+        // Paced as the rate says, so a reader counts what it would on a robot.
+        let step = Duration::from_secs_f64(1.0 / hz);
+        Ok(futures::stream::repeat(bytes)
+            .then(move |b| async move {
+                tokio::time::sleep(step).await;
+                b
+            })
+            .boxed())
+    }
+
+    async fn messages(
+        &self,
+        topic: &str,
+        _ty: &str,
+    ) -> Result<BoxStream<'static, Result<Value, RosError>>, RosError> {
+        let Some(value) = lock(&self.topics).get(topic).cloned() else {
+            return Ok(futures::stream::pending().boxed());
+        };
+        Ok(futures::stream::repeat(value)
+            .then(|v| async move {
+                tokio::time::sleep(MESSAGE_EVERY).await;
+                Ok(v)
+            })
+            .boxed())
     }
 
     async fn sample_messages(

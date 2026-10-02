@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt as _;
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -336,27 +338,65 @@ pub trait RobotPort: Send + Sync {
         unsupported("listing a node's topics and services")
     }
 
-    /// Arrival times since the start and serialized sizes of a topic's messages over `window`,
-    /// at most `max` of them, subscribing best effort as `ros2 topic hz` does.
-    async fn sample_sizes(
+    /// The serialized size of each message on a topic from now until the stream is dropped,
+    /// subscribing best effort as `ros2 topic hz` does: one subscription for a reader that keeps
+    /// counting.
+    async fn arrivals(
         &self,
         _topic: &str,
         _msg_type: &str,
-        _window: Duration,
-        _max: usize,
+    ) -> Result<BoxStream<'static, usize>, RosError> {
+        unsupported("following a topic")
+    }
+
+    /// Each message on a topic from now until the stream is dropped, as JSON.
+    async fn messages(
+        &self,
+        _topic: &str,
+        _msg_type: &str,
+    ) -> Result<BoxStream<'static, Result<Value, RosError>>, RosError> {
+        unsupported("following a topic")
+    }
+
+    /// Arrival times since the start and serialized sizes of a topic's messages over `window`,
+    /// at most `max` of them.
+    async fn sample_sizes(
+        &self,
+        topic: &str,
+        msg_type: &str,
+        window: Duration,
+        max: usize,
     ) -> Result<Vec<(Duration, usize)>, RosError> {
-        unsupported("sampling a topic")
+        let mut sizes = self.arrivals(topic, msg_type).await?;
+        let start = tokio::time::Instant::now();
+        let mut out = Vec::new();
+        while out.len() < max {
+            match tokio::time::timeout_at(start + window, sizes.next()).await {
+                Ok(Some(size)) => out.push((start.elapsed(), size)),
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 
     /// Up to `count` messages from a new subscription, as JSON, waiting up to `timeout`.
     async fn sample_messages(
         &self,
-        _topic: &str,
-        _msg_type: &str,
-        _count: usize,
-        _timeout: Duration,
+        topic: &str,
+        msg_type: &str,
+        count: usize,
+        timeout: Duration,
     ) -> Result<Vec<Value>, RosError> {
-        unsupported("echoing a topic")
+        let mut messages = self.messages(topic, msg_type).await?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut out = Vec::new();
+        while out.len() < count {
+            match tokio::time::timeout_at(deadline, messages.next()).await {
+                Ok(Some(message)) => out.push(message?),
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 
     /// Publishes `message` `count` times, `period` apart, and returns how many subscribers were
