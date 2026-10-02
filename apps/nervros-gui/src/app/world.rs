@@ -3,13 +3,14 @@
 use std::fmt::Write as _;
 
 use rerun::external::egui;
-use rerun::external::egui::{Align, Layout, RichText};
+use rerun::external::egui::{Align, CornerRadius, Layout, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _};
 use serde_json::Value;
 
 use super::dock::empty;
 use super::{EXPLORE_REQUEST, Gui};
 use crate::chat::Action;
+use crate::theme;
 
 impl Gui {
     pub(super) fn world_tab(&mut self, ui: &mut egui::Ui) {
@@ -19,7 +20,7 @@ impl Gui {
         }
         if self.editor.is_some()
             && ui
-                .add(ReButton::new("Edit the world").small())
+                .add(ReButton::new("Edit the world").small().secondary())
                 .on_hover_text("Fix labels, boxes and rooms on the saved floor plan")
                 .clicked()
         {
@@ -72,7 +73,7 @@ pub(super) fn world_view(ui: &mut egui::Ui, rooms: &Value, objects: Option<usize
         ui.label(RichText::new(head).strong());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui
-                .button("Explore")
+                .add(ReButton::new("Explore").small().blue())
                 .on_hover_text(
                     "Ask the robot to explore the building. You approve the mission it plans.",
                 )
@@ -82,15 +83,18 @@ pub(super) fn world_view(ui: &mut egui::Ui, rooms: &Value, objects: Option<usize
             }
         });
     });
-    ui.add_space(4.0);
+    ui.add_space(8.0);
     egui::ScrollArea::vertical().show(ui, |ui| {
+        // Long room names are cut, whole in their hover: wrapped, a grid row grows ragged.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         egui::Grid::new("world_rooms")
             .num_columns(4)
             .striped(true)
-            .spacing([10.0, 6.0])
+            .max_col_width(110.0)
+            .spacing([10.0, 8.0])
             .show(ui, |ui| {
                 for head in ["Room", "Floor seen", "Walls seen", "Objects"] {
-                    ui.label(RichText::new(head).small().color(ui.tokens().text_subdued));
+                    ui.label(RichText::new(head).small().color(theme::FAINT));
                 }
                 ui.end_row();
                 for r in &list {
@@ -106,15 +110,31 @@ pub(super) fn world_view(ui: &mut egui::Ui, rooms: &Value, objects: Option<usize
                     .filter(|t| !t.is_empty())
                     .collect::<Vec<_>>()
                     .join(" ");
-                    ui.label(name);
+                    ui.label(RichText::new(&name).size(13.5))
+                        .on_hover_text(&name);
                     for k in ["floor_coverage", "face_coverage"] {
                         match fraction(r, k) {
                             #[expect(clippy::cast_possible_truncation, reason = "a fraction")]
                             Some(f) => {
+                                // Green once the camera has seen nearly all of it.
+                                let fill = if f >= 0.9 {
+                                    theme::SUCCESS
+                                } else if f >= 0.5 {
+                                    theme::WARN
+                                } else {
+                                    theme::ERROR
+                                };
                                 ui.add(
                                     egui::ProgressBar::new(f as f32)
-                                        .desired_width(90.0)
-                                        .text(format!("{:.0}%", f * 100.0)),
+                                        .desired_width(70.0)
+                                        .desired_height(16.0)
+                                        .fill(fill.gamma_multiply(0.75))
+                                        .corner_radius(CornerRadius::same(4))
+                                        .text(
+                                            RichText::new(format!("{:.0}%", f * 100.0))
+                                                .size(12.0)
+                                                .color(theme::TEXT),
+                                        ),
                                 );
                             }
                             None => {
@@ -141,22 +161,22 @@ pub(super) fn layers_view(ui: &mut egui::Ui, layers: &nervros_viz::Layers) {
         empty(ui, "The profile gives the viewer nothing to draw.");
         return;
     }
+    theme::section(ui, "Layers");
     ui.label(
         RichText::new("What the world and camera views draw. A hidden layer is cleared.")
-            .small()
-            .color(ui.tokens().text_subdued),
+            .color(theme::DIM),
     );
-    ui.add_space(6.0);
+    ui.add_space(8.0);
     for (name, mut shown) in list {
         ui.horizontal(|ui| {
-            if ui.toggle_switch(12.0, &mut shown).changed() {
+            if ui.toggle_switch(14.0, &mut shown).changed() {
                 layers.set(&name, shown);
             }
             let text = RichText::new(&name);
             ui.label(if shown {
                 text
             } else {
-                text.color(ui.tokens().text_subdued)
+                text.color(theme::FAINT)
             });
         });
         ui.add_space(2.0);

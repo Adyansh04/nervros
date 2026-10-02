@@ -12,10 +12,10 @@ use nervros_core::app::Agent;
 use nervros_core::doctor::Check;
 use nervros_core::mission::{Outcome, held_by};
 use nervros_core::session::{Command, Event};
-use rerun::external::egui::{self, Frame, Key, Margin, Modifiers, RichText};
+use rerun::external::egui::{self, Color32, Frame, Key, Margin, Modifiers, RichText};
 use rerun::external::re_log_channel::LogReceiver;
 use rerun::external::re_sdk_types::blueprint::components::PanelState;
-use rerun::external::re_ui::{CommandPalette, UiExt as _};
+use rerun::external::re_ui::{CommandPalette, ReButton};
 use rerun::external::re_viewer::SystemCommandSender as _;
 use rerun::external::re_viewer::external::re_log_types::{TimeReal, TimelineName};
 use rerun::external::re_viewer::external::re_viewer_context::TimeControlCommand;
@@ -25,6 +25,7 @@ use tokio::sync::broadcast;
 
 use crate::chat::{Action, Chat};
 use crate::palette::{self, Cmd};
+use crate::theme;
 use crate::toasts::{Kind, Toasts};
 
 mod agent_tab;
@@ -170,12 +171,14 @@ const STOP_BEFORE_CLOSE: Duration = Duration::from_secs(8);
 fn close_dialog(ctx: &egui::Context, failed: bool) -> Option<CloseChoice> {
     let mut choice = None;
     let modal = egui::Modal::new(egui::Id::new("nervros_close")).show(ctx, |ui| {
-        ui.set_max_width(380.0);
+        theme::apply(ui);
+        ui.set_max_width(400.0);
         if failed {
             ui.label(
                 RichText::new("The robot did not confirm the stop")
                     .strong()
-                    .color(ui.tokens().error_fg_color),
+                    .size(16.0)
+                    .color(theme::ERROR),
             );
             ui.add_space(6.0);
             ui.label(
@@ -183,7 +186,7 @@ fn close_dialog(ctx: &egui::Context, failed: bool) -> Option<CloseChoice> {
                  running with nobody watching; the chat says what the robot answered.",
             );
         } else {
-            ui.label(RichText::new("A mission is running").strong());
+            ui.label(RichText::new("A mission is running").strong().size(16.0));
             ui.add_space(6.0);
             ui.label(
                 "Closing leaves it running with nobody watching. Stop the robot first, or leave \
@@ -192,13 +195,18 @@ fn close_dialog(ctx: &egui::Context, failed: bool) -> Option<CloseChoice> {
         }
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            if ui.button("Stop it and close").clicked() {
+            let stop = egui::Button::new(RichText::new("Stop it and close").color(Color32::WHITE))
+                .fill(theme::STOP);
+            if ui.add(stop).clicked() {
                 choice = Some(CloseChoice::StopAndClose);
             }
-            if ui.button("Leave it running").clicked() {
+            if ui
+                .add(ReButton::new("Leave it running").secondary())
+                .clicked()
+            {
                 choice = Some(CloseChoice::LeaveRunning);
             }
-            if ui.button("Cancel").clicked() {
+            if ui.add(ReButton::new("Cancel").ghost()).clicked() {
                 choice = Some(CloseChoice::Cancel);
             }
         });
@@ -346,7 +354,8 @@ impl Gui {
             input: String::new(),
             history: Vec::new(),
             history_pos: None,
-            tab: Tab::Approvals,
+            // A request to approve opens its tab; until then the plan and past missions.
+            tab: Tab::Mission,
             dock_open: true,
             recheck,
             picked,
@@ -516,6 +525,7 @@ impl Gui {
             }
             Cmd::Dock => self.dock_open = !self.dock_open,
             Cmd::ResetLayout => self.bridge.reset_layout(),
+            Cmd::Follow => self.bridge.follow(!self.bridge.following()),
             Cmd::EditWorld => {
                 if self.editor.is_some() {
                     self.editing = !self.editing;
@@ -632,40 +642,54 @@ impl eframe::App for Gui {
         }
         self.keys(ui.ctx());
         self.guard_close(ui.ctx());
-        let t = ui.tokens();
+        let edge = egui::Stroke::new(1.0, theme::BORDER);
         egui::Panel::top("nervros_top")
             .frame(
                 Frame::new()
-                    .fill(t.top_bar_color)
-                    .inner_margin(Margin::symmetric(12, 8)),
+                    .fill(theme::BAR)
+                    .stroke(edge)
+                    .inner_margin(Margin::symmetric(14, 8)),
             )
-            .show(ui, |ui| self.top_bar(ui));
+            .show(ui, |ui| {
+                theme::apply(ui);
+                self.top_bar(ui);
+            });
         egui::Panel::bottom("nervros_status")
             .frame(
                 Frame::new()
-                    .fill(t.bottom_bar_color)
-                    .inner_margin(Margin::symmetric(12, 4)),
+                    .fill(theme::BAR)
+                    .stroke(edge)
+                    .inner_margin(Margin::symmetric(14, 5)),
             )
-            .show(ui, |ui| self.status_bar(ui, frame));
+            .show(ui, |ui| {
+                theme::apply(ui);
+                self.status_bar(ui, frame);
+            });
         egui::Panel::left("nervros_chat")
-            .default_size(440.0)
-            .size_range(320.0..=720.0)
+            .default_size(460.0)
+            .size_range(340.0..=760.0)
             .frame(
                 Frame::new()
-                    .fill(t.panel_bg_color)
-                    .inner_margin(Margin::symmetric(16, 8)),
+                    .fill(theme::BG)
+                    .inner_margin(Margin::symmetric(16, 0)),
             )
-            .show(ui, |ui| self.chat_panel(ui));
+            .show(ui, |ui| {
+                theme::apply(ui);
+                self.chat_panel(ui);
+            });
         if self.dock_open {
             egui::Panel::right("nervros_dock")
-                .default_size(340.0)
-                .size_range(280.0..=640.0)
+                .default_size(360.0)
+                .size_range(300.0..=640.0)
                 .frame(
                     Frame::new()
-                        .fill(t.panel_bg_color)
-                        .inner_margin(Margin::symmetric(12, 4)),
+                        .fill(theme::BG)
+                        .inner_margin(Margin::symmetric(14, 0)),
                 )
-                .show(ui, |ui| self.dock(ui));
+                .show(ui, |ui| {
+                    theme::apply(ui);
+                    self.dock(ui);
+                });
         }
         match (&mut self.editor, self.editing) {
             (Some(editor), true) => {
@@ -832,9 +856,10 @@ mod tests {
             .wgpu()
             .with_size(egui::vec2(420.0, 300.0))
             .build_ui(move |ui| {
+                theme::apply(ui);
                 Frame::new()
-                    .fill(ui.tokens().panel_bg_color)
-                    .inner_margin(Margin::same(12))
+                    .fill(theme::BG)
+                    .inner_margin(Margin::same(14))
                     .show(ui, |ui| {
                         let _ = world_view(ui, &rooms, Some(13));
                     });
@@ -862,9 +887,10 @@ mod tests {
             .wgpu()
             .with_size(egui::vec2(340.0, 300.0))
             .build_ui(move |ui| {
+                theme::apply(ui);
                 Frame::new()
-                    .fill(ui.tokens().panel_bg_color)
-                    .inner_margin(Margin::same(12))
+                    .fill(theme::BG)
+                    .inner_margin(Margin::same(14))
                     .show(ui, |ui| layers_view(ui, &layers));
             });
         crate::testkit::style_for_tests(&harness.ctx);

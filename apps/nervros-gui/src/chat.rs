@@ -13,8 +13,9 @@ use nervros_core::mission::sanity::Concern;
 use nervros_core::session::{Command, Event, Unanswered};
 use nervros_core::tools::Status;
 use rerun::external::egui::{self, Color32, RichText};
-use rerun::external::re_ui::UiExt as _;
 use serde_json::Value;
+
+use crate::theme;
 
 mod approval;
 mod plan;
@@ -23,12 +24,13 @@ mod report;
 pub(crate) mod tests;
 mod view;
 
-pub(crate) use plan::{capitalise, plan_card, tree_panel};
+pub(crate) use plan::{plan_card, tree_panel};
 pub(crate) use view::{decode, spinner, thousands};
 
 use approval::approval_card;
 use approval::unanswered_card;
 use report::report;
+use view::agent_header;
 use view::empty_state;
 use view::error_card;
 use view::image_card;
@@ -217,6 +219,18 @@ impl Item {
             text: text.into(),
             retry: None,
         }
+    }
+
+    /// What the agent says or does, as against what the operator, the robot or the app says.
+    fn is_agents(&self) -> bool {
+        matches!(
+            self,
+            Self::Reply { .. }
+                | Self::Tool(_)
+                | Self::Image { .. }
+                | Self::Approval(_)
+                | Self::Plan(_)
+        )
     }
 }
 
@@ -601,7 +615,7 @@ impl Chat {
             return;
         }
         let width = ui.available_width().min(MAX_TEXT_WIDTH);
-        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.spacing_mut().item_spacing.y = 10.0;
         // "Condense up to here" counts what the conversation keeps as the operator's.
         let mut later = self
             .items
@@ -611,7 +625,15 @@ impl Chat {
         let mut heights = self.heights.borrow_mut();
         heights.resize(self.items.len(), 0.0);
         let shown = ui.clip_rect();
-        for (item, height) in self.items.iter().zip(heights.iter_mut()) {
+        // The agent's name heads its first item after each message or robot report.
+        let mut turn_starts = true;
+        for (n, (item, height)) in self.items.iter().zip(heights.iter_mut()).enumerate() {
+            let header = turn_starts && item.is_agents();
+            if item.is_agents() {
+                turn_starts = false;
+            } else if matches!(item, Item::User { .. } | Item::Report(_)) {
+                turn_starts = true;
+            }
             // A long conversation lays out only what is on screen; the rest keeps its place.
             let top = ui.cursor().top();
             if *height > 0.0 && (top + *height < shown.top() || top > shown.bottom()) {
@@ -624,15 +646,22 @@ impl Chat {
             *height = ui
                 .scope(|ui| {
                     ui.set_max_width(width);
+                    if header {
+                        if n > 0 {
+                            ui.add_space(4.0);
+                        }
+                        agent_header(ui, self.model_after(n));
+                    }
                     match item {
                         Item::User { text, turn } => {
                             let keep = turn.then(|| {
                                 later -= 1;
                                 later
                             });
+                            ui.add_space(4.0);
                             user_bubble(ui, text, keep, actions);
                         }
-                        Item::Reply { text, model } => reply(ui, text, model),
+                        Item::Reply { text, .. } => reply(ui, text),
                         Item::Tool(t) => tool_chip(ui, t),
                         Item::Image {
                             id,
@@ -667,19 +696,41 @@ impl Chat {
                 .height();
         }
         drop(heights);
+        self.show_live(ui, turn_starts);
+    }
+
+    /// The reply as it streams in, and how long the turn has run; `turn_starts` when the agent
+    /// has not yet said anything since the last message.
+    fn show_live(&self, ui: &mut egui::Ui, turn_starts: bool) {
         if let Some(draft) = self.draft.as_deref().filter(|d| !d.trim().is_empty()) {
-            reply(ui, draft, "…");
+            if turn_starts {
+                agent_header(ui, self.model.as_deref());
+            }
+            reply(ui, draft);
         }
         if let Some(since) = self.turn {
             ui.horizontal(|ui| {
                 spinner(ui);
                 let secs = since.elapsed().as_secs();
                 ui.label(
-                    RichText::new(format!("Working… {secs} s")).color(ui.tokens().text_subdued),
+                    RichText::new(format!("Working… {secs} s"))
+                        .size(13.0)
+                        .color(theme::DIM),
                 );
             });
             // Only while a turn runs, so an idle app does not redraw.
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
+    }
+
+    /// The model that answered the turn holding item `n`: its first reply's.
+    fn model_after(&self, n: usize) -> Option<&str> {
+        self.items[n..]
+            .iter()
+            .take_while(|i| !matches!(i, Item::User { .. } | Item::Report(_)))
+            .find_map(|i| match i {
+                Item::Reply { model, .. } => Some(model.as_str()),
+                _ => None,
+            })
     }
 }

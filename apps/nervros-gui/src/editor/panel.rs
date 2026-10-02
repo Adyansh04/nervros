@@ -7,15 +7,14 @@ use serde_json::json;
 
 use super::world::{CHECKED, OBJECT, Object, REMOVED, Room, SUSPECT, World};
 use super::{Call, Form, Mode, Picked, WorldEditor, lock};
+use crate::theme;
 
 impl WorldEditor {
     /// The dock's side of the editor: the toolbar, the selection, the review and removed lists.
     pub(crate) fn panel(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let Some(world) = self.world() else {
-            ui.label(
-                RichText::new("No world from the editor yet.").color(ui.tokens().text_subdued),
-            );
+            ui.label(RichText::new("No world from the editor yet.").color(theme::DIM));
             return;
         };
         let (busy, status) = {
@@ -63,11 +62,7 @@ impl WorldEditor {
             });
         });
         if let Some((text, error)) = status {
-            let colour = if error {
-                REMOVED
-            } else {
-                ui.tokens().text_subdued
-            };
+            let colour = if error { REMOVED } else { theme::DIM };
             ui.label(RichText::new(text).small().color(colour));
         }
         ui.add_space(6.0);
@@ -87,7 +82,7 @@ impl WorldEditor {
             ui.label(
                 RichText::new("Saved as one the operator saw: canopy keeps its box.")
                     .small()
-                    .color(ui.tokens().text_subdued),
+                    .color(theme::DIM),
             );
             text_field(ui, "What it is", &mut self.form.label, &world.labels);
             text_field(ui, "Name", &mut self.form.name, &[]);
@@ -129,7 +124,7 @@ impl WorldEditor {
             ui.label(
                 RichText::new("The voxels inside the drawn box become a new object.")
                     .small()
-                    .color(ui.tokens().text_subdued),
+                    .color(theme::DIM),
             );
             text_field(ui, "What the part is", &mut self.form.label, &world.labels);
             text_field(ui, "Name", &mut self.form.name, &[]);
@@ -158,7 +153,7 @@ impl WorldEditor {
                     RichText::new(
                         "Click an object or a room on the map. Drag to pan, scroll to zoom.",
                     )
-                    .color(ui.tokens().text_subdued),
+                    .color(theme::DIM),
                 );
             }
         }
@@ -276,7 +271,7 @@ impl WorldEditor {
             .num_columns(2)
             .spacing([10.0, 2.0])
             .show(ui, |ui| {
-                let dim = ui.tokens().text_subdued;
+                let dim = theme::DIM;
                 for (k, v) in facts {
                     ui.label(RichText::new(k).small().color(dim));
                     ui.label(RichText::new(v).small());
@@ -428,7 +423,7 @@ impl WorldEditor {
         ui.label(
             RichText::new(format!("typed by {typed}"))
                 .small()
-                .color(ui.tokens().text_subdued),
+                .color(theme::DIM),
         );
         let check = if room.checked {
             "Uncheck"
@@ -490,7 +485,7 @@ impl WorldEditor {
             ui.label(
                 RichText::new("Nothing to review.")
                     .small()
-                    .color(ui.tokens().text_subdued),
+                    .color(theme::DIM),
             );
         }
         for item in &world.suggestions {
@@ -560,7 +555,7 @@ fn badge(ui: &mut egui::Ui, text: &str, colour: Color32) {
 
 /// A labelled text field with a menu of known words beside it.
 fn text_field(ui: &mut egui::Ui, title: &str, value: &mut String, words: &[String]) {
-    ui.label(RichText::new(title).small().color(ui.tokens().text_subdued));
+    ui.label(RichText::new(title).small().color(theme::DIM));
     ui.horizontal(|ui| {
         let width = if words.is_empty() {
             ui.available_width()

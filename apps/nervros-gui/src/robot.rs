@@ -8,11 +8,12 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::theme;
 use nervros_core::mission::held_by;
 use nervros_core::profile::Profile;
 use nervros_ros::{Publisher, RobotPort};
 use rerun::external::egui::{self, Key, RichText};
-use rerun::external::re_ui::{ReButton, UiExt as _};
+use rerun::external::re_ui::ReButton;
 use serde_json::{Value, json};
 
 /// How often a held command is sent; the executor stops the base after 0.4 s without one.
@@ -222,50 +223,45 @@ fn keys_held(ctx: &egui::Context) -> [f64; 3] {
 /// The tab.
 pub fn tab(ui: &mut egui::Ui, status: &Status, drive: Option<&mut Drive>) {
     state_section(ui, status);
-    ui.add_space(12.0);
+    ui.add_space(18.0);
     if let Some(drive) = drive {
         drive_section(ui, status, drive);
     } else {
-        ui.label(RichText::new("Drive by hand").strong());
+        theme::section(ui, "Drive by hand");
         ui.label(
             RichText::new("The profile names no teleop service, so the window cannot drive.")
-                .small()
-                .color(ui.tokens().text_subdued),
+                .color(theme::DIM),
         );
     }
 }
 
 fn state_section(ui: &mut egui::Ui, status: &Status) {
-    let t = ui.tokens();
-    let subdued = |text: String| RichText::new(text).small().color(t.text_subdued);
-    ui.label(RichText::new("Robot").strong());
+    theme::section(ui, "Robot");
     let Some(state) = &status.state else {
-        ui.label(subdued(
-            "No word from the executor: its state shows here once it runs.".to_owned(),
-        ));
+        ui.label(
+            RichText::new("No word from the executor: its state shows here once it runs.")
+                .color(theme::DIM),
+        );
         return;
     };
     let can_move = state["can_move"].as_bool().unwrap_or(true);
-    ui.horizontal(|ui| {
-        let colour = if can_move {
-            t.success_text_color
-        } else {
-            t.error_fg_color
-        };
-        ui.bullet(colour);
-        let text = if can_move {
-            "Upright and able to walk".to_owned()
-        } else {
+    let (colour, text) = if can_move {
+        (theme::SUCCESS, "Upright and able to walk".to_owned())
+    } else {
+        (
+            theme::ERROR,
             format!(
                 "Cannot walk: {}",
                 state["cannot_move_reason"].as_str().unwrap_or("it says so")
-            )
-        };
-        ui.label(RichText::new(text).color(colour));
+            ),
+        )
+    };
+    theme::status_card(ui, colour, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(text).strong().color(colour));
     });
-    if let Some(tilt) = state["tilt_deg"].as_f64().filter(|t| t.is_finite()) {
-        ui.label(subdued(format!("Tilted {tilt:.0}° from upright")));
-    }
+    ui.add_space(6.0);
+    let mut facts: Vec<(&str, String)> = Vec::new();
     if let Some((x, y, yaw)) = status.pose {
         let room = status
             .rooms
@@ -277,47 +273,62 @@ fn state_section(ui: &mut egui::Ui, status: &Status) {
                 kind.map_or_else(|| format!(" · in {id}"), |k| format!(" · in {id} ({k})"))
             })
             .unwrap_or_default();
-        ui.label(subdued(format!(
-            "At x {x:.2}, y {y:.2}, facing {:.0}°{room}",
-            yaw.to_degrees()
-        )));
+        facts.push((
+            "Where",
+            format!("x {x:.2}, y {y:.2}, facing {:.0}°{room}", yaw.to_degrees()),
+        ));
     }
-    for hand in ["left", "right"] {
+    if let Some(tilt) = state["tilt_deg"].as_f64().filter(|t| t.is_finite()) {
+        facts.push(("Tilt", format!("{tilt:.0}° from upright")));
+    }
+    for (hand, key) in [("left", "Left hand"), ("right", "Right hand")] {
         let held = held_by(state, hand);
         let text = if held.is_empty() {
-            format!("{} hand free", crate::chat::capitalise(hand))
+            "free".to_owned()
         } else {
             let name = status
                 .names
                 .get(&held)
                 .map_or_else(String::new, |n| format!(" ({n})"));
-            format!("{} hand holds {held}{name}", crate::chat::capitalise(hand))
+            format!("holds {held}{name}")
         };
-        ui.label(subdued(text));
+        facts.push((key, text));
     }
     if let Some(step) = state["mission_step"].as_str().filter(|s| !s.is_empty()) {
-        ui.label(subdued(format!("Running a mission, at {step}")));
+        facts.push(("Mission", format!("running, at {step}")));
     }
     if let Some((motor, celsius)) = status.motors.as_ref().and_then(hottest) {
-        ui.label(subdued(format!("Hottest motor {motor}, {celsius:.0} °C")));
+        facts.push(("Motors", format!("hottest {motor}, {celsius:.0} °C")));
     }
     if let Some(battery) = &status.battery {
         let percent = battery["percentage"].as_f64().filter(|p| p.is_finite());
         let volts = battery["voltage"].as_f64().filter(|v| v.is_finite());
         let text = match (percent, volts) {
-            (Some(p), Some(v)) => format!("Battery {:.0}% · {v:.1} V", p * 100.0),
-            (Some(p), None) => format!("Battery {:.0}%", p * 100.0),
-            (None, Some(v)) => format!("Battery {v:.1} V"),
+            (Some(p), Some(v)) => format!("{:.0}% · {v:.1} V", p * 100.0),
+            (Some(p), None) => format!("{:.0}%", p * 100.0),
+            (None, Some(v)) => format!("{v:.1} V"),
             (None, None) => String::new(),
         };
         if !text.is_empty() {
-            ui.label(subdued(text));
+            facts.push(("Battery", text));
         }
     }
+    egui::Grid::new("robot_facts")
+        .num_columns(2)
+        .spacing([14.0, 6.0])
+        .show(ui, |ui| {
+            for (key, value) in facts {
+                // The keys stay whole; the values wrap in what is left.
+                ui.add(
+                    egui::Label::new(RichText::new(key).size(13.0).color(theme::FAINT)).extend(),
+                );
+                ui.label(RichText::new(value).size(13.5));
+                ui.end_row();
+            }
+        });
 }
 
 fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
-    let t = ui.tokens();
     drive.follow(status.state.as_ref());
     let (on, busy, note) = {
         let l = drive.link();
@@ -328,11 +339,11 @@ fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
         drive.set(false);
     }
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Drive by hand").strong());
+        theme::section(ui, "Drive by hand");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let label = if on { "Stop driving" } else { "Drive" };
             let button = if on {
-                ReButton::new(label).small().primary()
+                ReButton::new(label).small().blue()
             } else {
                 ReButton::new(label).small().secondary()
             };
@@ -352,7 +363,7 @@ fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
         });
     });
     if let Some(note) = note {
-        ui.label(RichText::new(note).small().color(t.warn_fg_color));
+        ui.label(RichText::new(note).size(13.0).color(theme::WARN));
     }
     if !on {
         ui.label(
@@ -360,15 +371,15 @@ fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
                 "The executor takes the base while you drive: no mission runs, and the base \
                  stops when commands pause.",
             )
-            .small()
-            .color(t.text_subdued),
+            .size(13.0)
+            .color(theme::DIM),
         );
         return;
     }
     ui.label(
         RichText::new("Hold W S to walk, A D to turn, Q E to step sideways, or hold a button.")
-            .small()
-            .color(t.text_subdued),
+            .size(13.0)
+            .color(theme::DIM),
     );
     let mut held = keys_held(ui.ctx());
     egui::Grid::new("drive_pad")
@@ -376,7 +387,7 @@ fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
         .show(ui, |ui| {
             let mut pad = |ui: &mut egui::Ui, text: &str, axis: usize, sign: f64| {
                 let pressed = ui
-                    .add(ReButton::new(text).secondary())
+                    .add(ReButton::new(text).small().secondary())
                     .is_pointer_button_down_on();
                 if pressed {
                     held[axis] = sign;
@@ -456,7 +467,7 @@ mod tests {
             .with_size(egui::vec2(360.0, 600.0))
             .build_ui(move |ui| {
                 egui::Frame::new()
-                    .fill(ui.tokens().panel_bg_color)
+                    .fill(theme::BG)
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| tab(ui, &status, Some(&mut drive)));
             });
