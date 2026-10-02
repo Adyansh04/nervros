@@ -10,11 +10,8 @@ use serde_json::Value;
 use super::Picked;
 
 pub(super) const OBJECT: Color32 = Color32::from_rgb(110, 160, 255);
-
 pub(super) const CHECKED: Color32 = Color32::from_rgb(80, 190, 110);
-
 pub(super) const SUSPECT: Color32 = Color32::from_rgb(240, 170, 50);
-
 pub(super) const REMOVED: Color32 = Color32::from_rgb(225, 85, 70);
 
 /// The world as `/api/world` gives it; only what the editor draws and edits.

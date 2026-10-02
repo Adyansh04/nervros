@@ -8,7 +8,8 @@ use nervros_ros::Transform;
 use rerun::RecordingStream;
 use serde_json::Value;
 
-use crate::{f32s, grid, num, put_grid, put_static, xyz};
+use crate::grid::{grid, put_grid};
+use crate::{f32s, num, put_static, xyz};
 
 /// Every layer the viewer draws, in order, each shown or hidden by the operator.
 #[derive(Debug, Default)]

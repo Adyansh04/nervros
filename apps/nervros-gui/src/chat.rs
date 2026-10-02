@@ -39,7 +39,6 @@ use view::user_bubble;
 
 /// Text never runs wider than this, for readable line lengths.
 const MAX_TEXT_WIDTH: f32 = 720.0;
-
 const SUGGESTIONS: [&str; 3] = [
     "What do you see?",
     "Where are you?",

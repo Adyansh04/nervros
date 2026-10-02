@@ -22,9 +22,7 @@ use world::floor_plan;
 
 /// How often the world is read again, for edits made elsewhere (the agent, the web page).
 const POLL: Duration = Duration::from_secs(2);
-
 const HANDLE_PX: f32 = 7.0;
-
 const ROTATE_PX: f32 = 26.0;
 
 /// A box's smallest side, in metres, as the web page keeps it.

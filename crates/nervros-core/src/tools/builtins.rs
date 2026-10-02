@@ -20,10 +20,10 @@ const WORLD_WAIT: Duration = Duration::from_secs(2);
 
 /// A room of the world model.
 struct Room {
-    id: String,
-    name: String,
-    kind: String,
-    outline: Vec<(f64, f64)>,
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) kind: String,
+    pub(super) outline: Vec<(f64, f64)>,
     /// What the camera has seen of it, when the world model says (canopy does).
     seen: Value,
 }

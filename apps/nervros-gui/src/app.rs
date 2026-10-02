@@ -37,9 +37,7 @@ mod world;
 use live::watch;
 
 const EVENT_LOG: usize = 300;
-
 const COMPOSER: &str = "nervros_composer";
-
 const STOP_HINT: &str = "Halts the mission and cancels every goal; the hands keep their grip. \
                          The e-stop on the robot's remote is the real emergency stop.";
 
