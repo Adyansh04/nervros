@@ -237,10 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_camera_fails_its_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nervros.toml");
-        std::fs::write(
-            &path,
+        let profile = Profile::from_toml(
             r#"
             [robot]
             name = "t"
@@ -250,9 +247,9 @@ mod tests {
             [models]
             file = "m.toml"
             "#,
+            std::path::Path::new("nervros.toml"),
         )
         .unwrap();
-        let profile = Profile::load(&path).unwrap();
         let robot = FakeRobot::new().with_topic("/det", serde_json::json!({}));
         let checks = run(&profile, &robot).await;
         let line = |w: &str| checks.iter().find(|c| c.what.contains(w)).unwrap().ok;

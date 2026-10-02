@@ -2,8 +2,8 @@
 //! trait.
 //!
 //! [`RobotPort`] is what the agent core talks to. [`R2rPort`] implements it over r2r (feature
-//! `rcl`, which needs a sourced ROS environment), and [`fake::FakeRobot`] implements it from a
-//! script for tests that run without ROS.
+//! `rcl`, which needs a sourced ROS environment), and `fake::FakeRobot` (feature `test-support`)
+//! implements it from a script for tests that run without ROS.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +15,7 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
+#[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 pub mod image;
 #[cfg(feature = "rcl")]

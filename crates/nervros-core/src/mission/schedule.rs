@@ -705,10 +705,7 @@ mod tests {
     "#;
 
     fn missions(robot: &Arc<FakeRobot>) -> Arc<Missions> {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nervros.toml");
-        std::fs::write(&path, PROFILE).unwrap();
-        let profile = Profile::load(&path).unwrap();
+        let profile = Profile::from_toml(PROFILE, std::path::Path::new("nervros.toml")).unwrap();
         let robot = Arc::clone(robot) as Arc<dyn nervros_ros::RobotPort>;
         Missions::new(&profile, Places::new(&profile, None), robot).unwrap()
     }

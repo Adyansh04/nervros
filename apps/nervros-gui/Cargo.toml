@@ -31,4 +31,5 @@ tokio.workspace = true
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["eframe"] }
+nervros-ros = { path = "../../crates/nervros-ros", default-features = false, features = ["test-support"] }
 tempfile.workspace = true

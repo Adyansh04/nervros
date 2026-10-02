@@ -347,10 +347,7 @@ mod tests {
             [models]
             file = "m.toml"
         "#;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nervros.toml");
-        std::fs::write(&path, text).unwrap();
-        Profile::load(Path::new(&path)).unwrap()
+        Profile::from_toml(text, Path::new("nervros.toml")).unwrap()
     }
 
     fn rooms_msg() -> Value {

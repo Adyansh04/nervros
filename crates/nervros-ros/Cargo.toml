@@ -15,6 +15,8 @@ workspace = true
 default = ["rcl"]
 # The r2r backend: links rcl, so building needs a sourced ROS environment (scripts/ros-env.sh).
 rcl = ["dep:r2r"]
+# `fake::FakeRobot`, for other crates' tests; production builds leave it out.
+test-support = []
 
 [dependencies]
 async-trait.workspace = true

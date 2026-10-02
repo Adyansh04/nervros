@@ -47,10 +47,11 @@ fn profile_with(mission: &str) -> Profile {
         [models]
         file = "m.toml"
     "#;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("nervros.toml");
-    std::fs::write(&path, text.replace("MISSION_EXTRA", mission)).unwrap();
-    Profile::load(Path::new(&path)).unwrap()
+    Profile::from_toml(
+        &text.replace("MISSION_EXTRA", mission),
+        Path::new("nervros.toml"),
+    )
+    .unwrap()
 }
 
 fn robot(run: ScriptedRun) -> FakeRobot {

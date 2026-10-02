@@ -19,58 +19,66 @@ use crate::providers::Role;
 use crate::providers::router::Need;
 use crate::tools::{Assessment, Registry, Risk, Status, Tool, ToolOutcome, ToolSpec};
 
-struct Scripted(MockCompletionModel);
+/// A model every role asks, answering from its script; it streams, holds to a quota and notes
+/// each time it is set aside, as a test sets it.
+struct Scripted {
+    model: MockCompletionModel,
+    streams: bool,
+    /// Requests the quota grants; no limit when `None`.
+    allowed: Option<usize>,
+    /// Requests granted so far.
+    taken: std::sync::atomic::AtomicUsize,
+    /// How long it was set aside, each time.
+    parked: Mutex<Vec<Duration>>,
+}
+
+impl Scripted {
+    fn new(model: MockCompletionModel) -> Self {
+        Self {
+            model,
+            streams: false,
+            allowed: None,
+            taken: std::sync::atomic::AtomicUsize::new(0),
+            parked: Mutex::default(),
+        }
+    }
+}
 
 impl AgentSource for Scripted {
     fn candidates(&self, _role: Role, _need: Need) -> Vec<String> {
         vec!["mock".into()]
     }
     fn builder(&self, _id: &str) -> Result<AgentBuilder, LlmError> {
-        Ok(AgentBuilder::new(self.0.clone()))
+        Ok(AgentBuilder::new(self.model.clone()))
     }
     fn take_request(&self, _id: &str) -> Result<(), String> {
-        Ok(())
-    }
-    fn park(&self, _id: &str, _for: Duration) {}
-}
-
-/// A scripted model whose quota grants `allowed` requests, counting those it grants.
-struct Metered {
-    inner: Scripted,
-    allowed: usize,
-    taken: std::sync::atomic::AtomicUsize,
-}
-
-impl AgentSource for Metered {
-    fn candidates(&self, role: Role, need: Need) -> Vec<String> {
-        self.inner.candidates(role, need)
-    }
-    fn builder(&self, id: &str) -> Result<AgentBuilder, LlmError> {
-        self.inner.builder(id)
-    }
-    fn take_request(&self, _id: &str) -> Result<(), String> {
+        let allowed = self.allowed.unwrap_or(usize::MAX);
         self.taken
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < self.allowed).then_some(n + 1)
+                (n < allowed).then_some(n + 1)
             })
             .map(|_| ())
             .map_err(|_| "its daily limit is used up".to_owned())
     }
-    fn park(&self, _id: &str, _for: Duration) {}
+    fn park(&self, _id: &str, for_how_long: Duration) {
+        lock(&self.parked).push(for_how_long);
+    }
+    fn streams(&self, _id: &str) -> bool {
+        self.streams
+    }
 }
 
-fn metered(allowed: usize) -> Arc<Metered> {
-    Arc::new(Metered {
-        inner: Scripted(MockCompletionModel::new([
+fn metered(allowed: usize) -> Arc<Scripted> {
+    Arc::new(Scripted {
+        allowed: Some(allowed),
+        ..Scripted::new(MockCompletionModel::new([
             MockTurn::tool_call("c1", "find_objects", json!({"query": "cup"})),
             MockTurn::text("The cup is in the kitchen."),
-        ])),
-        allowed,
-        taken: std::sync::atomic::AtomicUsize::new(0),
+        ]))
     })
 }
 
-async fn ask_where_the_cup_is(source: &Arc<Metered>) -> Vec<Event> {
+async fn ask_where_the_cup_is(source: &Arc<Scripted>) -> Vec<Event> {
     let session = Session::start(
         Arc::clone(source) as Arc<dyn AgentSource>,
         registry(Risk::Observe),
@@ -100,31 +108,6 @@ async fn every_request_of_a_turn_counts_against_the_quota() {
     assert_eq!(costed, 2, "each request's cost is logged: {events:?}");
 }
 
-/// Notes each time the router would set the model aside.
-struct Parking {
-    inner: Scripted,
-    streams: bool,
-    parked: Mutex<Vec<Duration>>,
-}
-
-impl AgentSource for Parking {
-    fn candidates(&self, role: Role, need: Need) -> Vec<String> {
-        self.inner.candidates(role, need)
-    }
-    fn builder(&self, id: &str) -> Result<AgentBuilder, LlmError> {
-        self.inner.builder(id)
-    }
-    fn take_request(&self, _id: &str) -> Result<(), String> {
-        Ok(())
-    }
-    fn park(&self, _id: &str, for_how_long: Duration) {
-        lock(&self.parked).push(for_how_long);
-    }
-    fn streams(&self, _id: &str) -> bool {
-        self.streams
-    }
-}
-
 #[tokio::test]
 async fn only_a_real_429_sets_the_model_aside_streamed_or_not() {
     use rig::test_utils::MockStreamEvent;
@@ -144,10 +127,9 @@ async fn only_a_real_429_sets_the_model_aside_streamed_or_not() {
         vec![MockStreamEvent::error("status 400: no")],
     ]);
     for (model, streams, parks) in [(replies, false, 1), (streamed, true, 0)] {
-        let source = Arc::new(Parking {
-            inner: Scripted(model),
+        let source = Arc::new(Scripted {
             streams,
-            parked: Mutex::default(),
+            ..Scripted::new(model)
         });
         let session = Session::start(
             Arc::clone(&source) as Arc<dyn AgentSource>,
@@ -190,7 +172,7 @@ async fn a_synchronous_act_leaves_the_tools_offered_to_check_its_effect() {
     let guard = Arc::new(Guard::new(Policy::default()));
     guard.set_armed(true);
     let session = Session::start(
-        Arc::new(Scripted(model.clone())),
+        Arc::new(Scripted::new(model.clone())),
         registry(Risk::Motion),
         guard,
         None,
@@ -224,7 +206,7 @@ async fn once_a_mission_has_started_the_model_is_offered_no_tools() {
     );
     r.add(Arc::new(Starter(spec))).unwrap();
     let session = Session::start(
-        Arc::new(Scripted(model.clone())),
+        Arc::new(Scripted::new(model.clone())),
         Arc::new(r),
         guard,
         None,
@@ -253,7 +235,7 @@ async fn an_invented_tool_name_gets_the_real_ones_back() {
         MockTurn::text("The cup is in the kitchen."),
     ]);
     let session = Session::start(
-        Arc::new(Scripted(model.clone())),
+        Arc::new(Scripted::new(model.clone())),
         registry(Risk::Observe),
         Arc::new(Guard::new(Policy::default())),
         None,
@@ -342,7 +324,7 @@ async fn a_turn_calls_a_tool_and_replies() {
     ]);
     let guard = Arc::new(Guard::new(Policy::default()));
     let session = Session::start(
-        Arc::new(Scripted(model)),
+        Arc::new(Scripted::new(model)),
         registry(Risk::Observe),
         guard,
         None,
@@ -359,25 +341,6 @@ async fn a_turn_calls_a_tool_and_replies() {
     );
 }
 
-/// A source whose model streams.
-struct Streaming(MockCompletionModel);
-
-impl AgentSource for Streaming {
-    fn candidates(&self, _role: Role, _need: Need) -> Vec<String> {
-        vec!["mock".into()]
-    }
-    fn builder(&self, _id: &str) -> Result<AgentBuilder, LlmError> {
-        Ok(AgentBuilder::new(self.0.clone()))
-    }
-    fn take_request(&self, _id: &str) -> Result<(), String> {
-        Ok(())
-    }
-    fn park(&self, _id: &str, _for: Duration) {}
-    fn streams(&self, _id: &str) -> bool {
-        true
-    }
-}
-
 #[tokio::test]
 async fn a_streamed_reply_arrives_in_pieces_then_whole() {
     use rig::test_utils::MockStreamEvent;
@@ -388,7 +351,10 @@ async fn a_streamed_reply_arrives_in_pieces_then_whole() {
     ]]);
     let guard = Arc::new(Guard::new(Policy::default()));
     let session = Session::start(
-        Arc::new(Streaming(model)),
+        Arc::new(Scripted {
+            streams: true,
+            ..Scripted::new(model)
+        }),
         registry(Risk::Observe),
         guard,
         None,
@@ -421,7 +387,7 @@ async fn the_operator_compacts_and_resumes_a_conversation() {
     };
     let guard = Arc::new(Guard::new(Policy::default()));
     let session = Session::start(
-        Arc::new(Scripted(model)),
+        Arc::new(Scripted::new(model)),
         registry(Risk::Observe),
         guard,
         None,
@@ -487,7 +453,7 @@ async fn a_message_sent_while_a_report_is_answered_runs_after_it() {
         .unwrap();
     let guard = Arc::new(Guard::new(Policy::default()));
     let session = Session::start(
-        Arc::new(Scripted(model)),
+        Arc::new(Scripted::new(model)),
         Arc::new(r),
         guard,
         None,
@@ -542,7 +508,13 @@ async fn a_turn_over_its_time_limit_is_stopped() {
         ..SessionConfig::default()
     };
     let guard = Arc::new(Guard::new(Policy::default()));
-    let session = Session::start(Arc::new(Scripted(model)), Arc::new(r), guard, None, config);
+    let session = Session::start(
+        Arc::new(Scripted::new(model)),
+        Arc::new(r),
+        guard,
+        None,
+        config,
+    );
     let mut rx = session.subscribe();
     session.send(Command::User("go".into()));
     let events = collect_until_finished(&mut rx, |_| None, &session).await;
@@ -569,7 +541,7 @@ async fn a_tool_allowed_for_the_session_stops_asking_unless_it_moves_the_robot()
         let guard = Arc::new(Guard::new(Policy::default()));
         guard.set_armed(true);
         let session = Session::start(
-            Arc::new(Scripted(twice())),
+            Arc::new(Scripted::new(twice())),
             registry(risk),
             guard,
             None,
@@ -614,7 +586,7 @@ async fn a_request_left_waiting_is_kept_for_the_next_session_and_dropped_once_an
         ..SessionConfig::default()
     };
     let session = Session::start(
-        Arc::new(Scripted(twice())),
+        Arc::new(Scripted::new(twice())),
         registry(Risk::WorldEdit),
         guard,
         None,
@@ -656,7 +628,7 @@ async fn act_tools_are_refused_while_disarmed_and_run_after_approval() {
     };
     let guard = Arc::new(Guard::new(Policy::default()));
     let session = Session::start(
-        Arc::new(Scripted(script())),
+        Arc::new(Scripted::new(script())),
         registry(Risk::Motion),
         Arc::clone(&guard),
         None,
@@ -675,7 +647,7 @@ async fn act_tools_are_refused_while_disarmed_and_run_after_approval() {
 
     guard.set_armed(true);
     let session = Session::start(
-        Arc::new(Scripted(script())),
+        Arc::new(Scripted::new(script())),
         registry(Risk::Motion),
         guard,
         None,
@@ -713,7 +685,7 @@ async fn stop_ends_the_turn_and_denies_pending_approvals() {
         ..Policy::default()
     }));
     let session = Session::start(
-        Arc::new(Scripted(model)),
+        Arc::new(Scripted::new(model)),
         registry(Risk::Motion),
         guard,
         None,
@@ -788,7 +760,7 @@ async fn a_stop_closes_what_it_cut_short_and_forgets_the_request() {
     let dir = tempfile::tempdir().unwrap();
     let pending = dir.path().join("pending.json");
     let session = Session::start(
-        Arc::new(Scripted(model)),
+        Arc::new(Scripted::new(model)),
         registry(Risk::Motion),
         guard,
         None,
@@ -839,7 +811,7 @@ async fn disarming_turns_down_a_waiting_approval_however_it_is_answered() {
         ..Policy::default()
     }));
     let session = Session::start(
-        Arc::new(Scripted(model)),
+        Arc::new(Scripted::new(model)),
         registry(Risk::Motion),
         guard,
         None,
@@ -899,7 +871,7 @@ async fn the_model_can_always_stop_the_robot() {
     .unwrap();
     r.add(Arc::clone(&stop)).unwrap();
     let session = Session::start(
-        Arc::new(Scripted(model)),
+        Arc::new(Scripted::new(model)),
         Arc::new(r),
         Arc::clone(&guard),
         Some(stop),
@@ -942,7 +914,7 @@ async fn a_reply_lost_after_acting_keeps_the_request_in_the_history() {
         ..Policy::default()
     }));
     let session = Session::start(
-        Arc::new(Scripted(model.clone())),
+        Arc::new(Scripted::new(model.clone())),
         one_tool(Arc::new(Starter(spec))),
         guard,
         None,
@@ -1003,7 +975,7 @@ async fn an_edit_that_fails_its_checks_keeps_the_request_and_one_that_passes_rep
     );
     r.add(Arc::new(Editable(spec))).unwrap();
     let session = Session::start(
-        Arc::new(Scripted(model.clone())),
+        Arc::new(Scripted::new(model.clone())),
         Arc::new(r),
         guard,
         None,
@@ -1065,7 +1037,7 @@ async fn an_approval_sent_while_an_edit_is_checked_does_not_approve_the_edit() {
     );
     r.add(Arc::new(Editable(spec))).unwrap();
     let session = Session::start(
-        Arc::new(Scripted(model)),
+        Arc::new(Scripted::new(model)),
         Arc::new(r),
         guard,
         None,
@@ -1107,7 +1079,7 @@ async fn the_operator_runs_a_tool_checked_as_their_own_and_approves_it() {
     );
     r.add(Arc::new(Editable(spec))).unwrap();
     let session = Session::start(
-        Arc::new(Scripted(MockCompletionModel::new([]))),
+        Arc::new(Scripted::new(MockCompletionModel::new([]))),
         Arc::new(r),
         Arc::clone(&guard),
         None,
@@ -1183,7 +1155,7 @@ async fn after_three_denials_in_a_row_the_model_is_told_to_stop_asking() {
     let guard = Arc::new(Guard::new(Policy::default()));
     guard.set_armed(true);
     let session = Session::start(
-        Arc::new(Scripted(model.clone())),
+        Arc::new(Scripted::new(model.clone())),
         registry(Risk::Motion),
         guard,
         None,
@@ -1215,7 +1187,7 @@ async fn the_same_failure_three_times_in_a_row_is_called_stuck() {
     let model = MockCompletionModel::new(calls);
     let spec = ToolSpec::new("look", "Looks.", json!({"type": "object"}), Risk::Observe);
     let session = Session::start(
-        Arc::new(Scripted(model.clone())),
+        Arc::new(Scripted::new(model.clone())),
         one_tool(Arc::new(Broken(spec))),
         Arc::new(Guard::new(Policy::default())),
         None,
@@ -1243,7 +1215,7 @@ async fn a_message_sent_mid_turn_reaches_the_model_with_its_next_tool_result() {
     let spec = ToolSpec::new("look", "Looks.", json!({"type": "object"}), Risk::Observe);
     let slow = Slow(spec, Duration::from_millis(300));
     let session = Session::start(
-        Arc::new(Scripted(model.clone())),
+        Arc::new(Scripted::new(model.clone())),
         one_tool(Arc::new(slow)),
         Arc::new(Guard::new(Policy::default())),
         None,
@@ -1298,7 +1270,7 @@ async fn a_profile_rule_refuses_one_value_and_asks_before_another() {
         MockTurn::text("Done."),
     ]);
     let session = Session::start(
-        Arc::new(Scripted(model.clone())),
+        Arc::new(Scripted::new(model.clone())),
         registry(Risk::Observe),
         Arc::new(Guard::new(policy)),
         None,

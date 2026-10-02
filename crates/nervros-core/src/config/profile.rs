@@ -597,7 +597,17 @@ impl Profile {
             path: path.to_path_buf(),
             source,
         })?;
-        let mut profile: Self = toml::from_str(&text).map_err(|source| ProfileError::Parse {
+        Self::from_toml(&text, path)
+    }
+
+    /// A profile from its TOML text, as the file at `path` would load: relative paths in it are
+    /// relative to `path`'s folder.
+    ///
+    /// # Errors
+    ///
+    /// [`ProfileError::Parse`] or a duplicate name.
+    pub fn from_toml(text: &str, path: &Path) -> Result<Self, ProfileError> {
+        let mut profile: Self = toml::from_str(text).map_err(|source| ProfileError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
