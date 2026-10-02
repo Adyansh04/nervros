@@ -1250,8 +1250,11 @@ fn report_text(text: &str) -> String {
     first
         .split(' ')
         .map(|w| {
-            let id = w.len() == 36 && w.chars().filter(|c| *c == '-').count() == 4;
-            if id { &w[..8] } else { w }
+            let id = w.len() == 36 && w.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+            match w.get(..8) {
+                Some(short) if id => short,
+                _ => w,
+            }
         })
         .collect::<Vec<_>>()
         .join(" ")

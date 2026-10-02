@@ -1379,7 +1379,7 @@ impl Gui {
 fn walk_to_target(id: &str, what: &str) -> Value {
     serde_json::json!({
         "intent": format!("walk to {what}"),
-        "steps": [{"skill": "GoToTarget", "args": [{"name": "target", "value": id}]}]
+        "steps": [{"skill": "GoToPlace", "args": [{"name": "place", "value": id}]}]
     })
 }
 

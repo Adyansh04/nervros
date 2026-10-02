@@ -470,7 +470,7 @@ pub enum Verdict {
 #[must_use]
 pub fn verdict(reply: &str) -> Option<Verdict> {
     let answer = reply.rsplit_once("</think>").map_or(reply, |(_, a)| a);
-    let json = &answer[answer.find('{')?..=answer.rfind('}')?];
+    let json = answer.get(answer.find('{')?..=answer.rfind('}')?)?;
     let value: Value = serde_json::from_str(json).ok()?;
     let reason = value["reason"]
         .as_str()
@@ -664,6 +664,11 @@ mod tests {
         );
         assert_eq!(verdict("looks fine to me"), None);
         assert_eq!(verdict("{\"verdict\": \"maybe\"}"), None);
+        assert_eq!(
+            verdict("Reasoning done}\n{\"verdict\": \"ok\", \"reason\": \"fine"),
+            None,
+            "a brace before the only opening one"
+        );
     }
 
     #[test]

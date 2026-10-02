@@ -57,7 +57,9 @@ fn check_message(
     if depth > MAX_DEPTH {
         return Err(format!("{}: nested too deep", at(path)));
     }
-    if value.is_null() {
+    // A whole message left out takes its defaults; a null inside one has no ROS value, and r2r
+    // panics on it while it converts an action goal.
+    if value.is_null() && depth == 0 {
         return Ok(());
     }
     let names = || {
@@ -145,10 +147,25 @@ fn check_scalar(
             let Some(s) = value.as_str() else {
                 return Err(format!("{} must be text", at(path)));
             };
+            // r2r copies text into C strings, which end at the first NUL; it panics on one.
+            if s.contains('\0') {
+                return Err(format!("{} must not contain a NUL character", at(path)));
+            }
+            // ROS bounds a string in bytes and a wide string in UTF-16 units.
+            let len = match ty {
+                FieldType::WString(_) => s.encode_utf16().count(),
+                _ => s.len(),
+            };
             match bound {
-                Some(n) if s.chars().count() > *n => {
-                    Err(format!("{} may have at most {n} characters", at(path)))
-                }
+                Some(n) if len > *n => Err(format!(
+                    "{} may have at most {n} {}",
+                    at(path),
+                    if matches!(ty, FieldType::WString(_)) {
+                        "UTF-16 units"
+                    } else {
+                        "bytes"
+                    }
+                )),
                 _ => Ok(()),
             }
         }
@@ -224,7 +241,7 @@ mod tests {
             ),
             (
                 json!({"target": {"frame": "odometry"}}),
-                "`target.frame` may have at most 4",
+                "`target.frame` may have at most 4 bytes",
             ),
             (
                 json!({"speed": 300}),
@@ -244,6 +261,19 @@ mod tests {
                 "`target.ok` must be true or false",
             ),
             (json!({"target": 7}), "`target` must be an object"),
+            (json!({"target": null}), "`target` must be an object"),
+            (
+                json!({"target": {"position": null}}),
+                "`target.position` must be an object",
+            ),
+            (
+                json!({"target": {"frame": "a\u{0}b"}}),
+                "`target.frame` must not contain a NUL",
+            ),
+            (
+                json!({"target": {"frame": "ééé"}}),
+                "`target.frame` may have at most 4 bytes",
+            ),
             (
                 json!({"target": {"rpy": "flat"}}),
                 "`target.rpy` must be a list",

@@ -63,7 +63,9 @@ pub fn parse_points(text: &str, width: u32, height: u32) -> Vec<Pointed> {
         .skip(1)
         .filter_map(|entry| {
             let after = &entry[entry.find("\"point\"")? + "\"point\"".len()..];
-            let inner = &after[after.find('[')? + 1..after.find(']')?];
+            let open = after.find('[')?;
+            // A `]` of the prose before the point's own `[` is not its end.
+            let inner = &after[open + 1..open + after[open..].find(']')?];
             let mut numbers = inner.split(',').map(|n| n.trim().parse::<f64>().ok());
             let (y, x) = (numbers.next()??, numbers.next()??);
             let label = entry
@@ -270,6 +272,14 @@ mod tests {
             ]
         );
         assert!(parse_points("[]", 800, 600).is_empty());
+    }
+
+    #[test]
+    fn a_bracket_in_the_prose_before_a_point_is_no_end_to_it() {
+        let answer = "[{\"label\": \"handle\", \"point\": null}\n]\nNote: coordinates are [y, x]";
+        assert!(parse_points(answer, 800, 600).is_empty());
+        let answer = "[{\"point\": 536, 270], \"label\": \"box [left]\"}]";
+        assert!(parse_points(answer, 800, 600).is_empty());
     }
 
     #[test]

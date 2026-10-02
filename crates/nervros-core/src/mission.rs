@@ -32,7 +32,7 @@ use tracing::Instrument as _;
 use self::catalog::Catalog;
 use self::check::Observed;
 use self::ledger::{Ledger, MissionRecord, StepRecord};
-use self::plan::{Compiled, Plan, PlannedStep, Thing, World};
+use self::plan::{Author as By, Compiled, Plan, PlannedStep, Thing, World};
 use self::sanity::{Concern, Critic, Verdict};
 use crate::profile::{MissionConfig, Profile};
 use crate::session::{Command, Event, SessionHandle};
@@ -123,15 +123,6 @@ pub struct Missions {
     /// Whether a plan for this request already went back for not matching the operator's words:
     /// once is a hint, twice would argue with a model that may be right.
     questioned: AtomicBool,
-}
-
-/// Who a plan is from. The model's go back once when they may not match the operator's words,
-/// and its failed checks count against its attempts; the operator's own edits only show
-/// their concerns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum By {
-    Model,
-    Operator,
 }
 
 impl crate::session::Pulse for Missions {
@@ -525,7 +516,7 @@ impl Missions {
             Err(e) => return ToolOutcome::failed(e),
         };
         let world = self.world_of(&self.observe().await);
-        let mut compiled = match plan::compile(&plan, &catalog, &world) {
+        let mut compiled = match plan::compile(&plan, &catalog, &world, by) {
             Ok(c) => c,
             Err(problems) => return self.rejected(&json!(problems), &sent, by).await,
         };

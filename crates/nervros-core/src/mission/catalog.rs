@@ -90,9 +90,16 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// The JSON does not have the catalog's shape.
+    /// The JSON does not have the catalog's shape, or a skill has no time to run.
     pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+        let catalog: Self = serde_json::from_str(json)?;
+        match catalog.skills.iter().find(|s| s.max_duration_s <= 0.0) {
+            Some(s) => Err(serde::de::Error::custom(format!(
+                "skill {} has max_duration_s {}; it must be positive",
+                s.name, s.max_duration_s
+            ))),
+            None => Ok(catalog),
+        }
     }
 
     /// A skill by name.

@@ -445,12 +445,29 @@ impl Problem {
     }
 }
 
+/// Who wrote a plan. The model's go back once when they may not match the operator's words, and
+/// its failed checks count against its attempts; the operator's own edits only show their
+/// concerns. The model moves the base only through `GoToPlace`, so it never makes up a pose; the
+/// operator may also send it to a point they picked on the map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Author {
+    /// The model, from the operator's words.
+    Model,
+    /// The operator, in the window.
+    Operator,
+}
+
 /// Compiles a plan.
 ///
 /// # Errors
 ///
 /// Every problem found, not just the first, so the model fixes them in one go.
-pub fn compile(plan: &Plan, catalog: &Catalog, world: &World) -> Result<Compiled, Vec<Problem>> {
+pub fn compile(
+    plan: &Plan,
+    catalog: &Catalog,
+    world: &World,
+    author: Author,
+) -> Result<Compiled, Vec<Problem>> {
     let mut problems = Vec::new();
     if plan.steps.is_empty() {
         problems.push(Problem::new("", "steps", "a plan needs at least one step"));
@@ -477,7 +494,7 @@ pub fn compile(plan: &Plan, catalog: &Catalog, world: &World) -> Result<Compiled
         for (step, added) in walk.iter().map(|w| (w, true)).chain([(planned, false)]) {
             n += 1;
             let id = format!("s{n}");
-            match compile_step(&id, step, catalog, world) {
+            match compile_step(&id, step, catalog, world, author) {
                 Ok((node, timeout_s, spot)) => {
                     if let Some(spot) = spot {
                         sim.at = Some(spot.id);
@@ -536,8 +553,24 @@ fn compile_step(
     step: &Step,
     catalog: &Catalog,
     world: &World,
+    author: Author,
 ) -> Result<(String, f64, Option<Spot>), Vec<Problem>> {
     let mut problems = Vec::new();
+    // The tree is XML read by the executor, and the goal a ROS string: neither takes these.
+    for a in step
+        .args
+        .iter()
+        .filter(|a| a.value.chars().any(char::is_control))
+    {
+        problems.push(Problem::new(
+            id,
+            &a.name,
+            "must be plain text, without control characters",
+        ));
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
     if step.retries > MAX_RETRIES {
         problems.push(Problem::new(
             id,
@@ -557,7 +590,7 @@ fn compile_step(
                 return Err(problems);
             }
         }
-    } else if step.skill == GO_TO_POSE || step.skill == GO_TO_TARGET {
+    } else if (step.skill == GO_TO_POSE || step.skill == GO_TO_TARGET) && author == Author::Model {
         problems.push(Problem::new(
             id,
             "skill",
@@ -588,7 +621,10 @@ fn compile_step(
         return Err(problems);
     };
     let timeout_s = match step.timeout_s {
-        Some(t) if t.is_finite() && t > 0.0 => t.clamp(1.0, skill.max_duration_s),
+        // At least a second, unless the skill itself is quicker.
+        Some(t) if t.is_finite() && t > 0.0 => {
+            t.clamp(skill.max_duration_s.min(1.0), skill.max_duration_s)
+        }
         Some(_) => {
             problems.push(Problem::new(id, "timeout_s", "timeout_s must be positive"));
             skill.max_duration_s
@@ -889,13 +925,13 @@ mod tests {
             {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}},
             {"skill": "PlaceInto", "args": {"container_id": "O31", "phrase": "basket", "arm": "right"}}
         ]));
-        let c = compile(&p, &catalog(), &world()).unwrap();
+        let c = compile(&p, &catalog(), &world(), Author::Model).unwrap();
         assert!(c.xml.contains(r#"target="O31""#), "{}", c.xml);
         // The mug ends in the basket and the hand empty; the pick and place moved the base.
         assert_eq!(c.goal, ["inside(O17, O31)"]);
         let mut two = world();
         two.objects.push(thing("O32", "basket", 1.0, 1.0));
-        let problems = compile(&p, &catalog(), &two).unwrap_err();
+        let problems = compile(&p, &catalog(), &two, Author::Model).unwrap_err();
         assert!(
             problems[0]
                 .message
@@ -924,7 +960,7 @@ mod tests {
             {"skill": "PickObject", "args": {"object_id": "cup_9", "phrase": "cup", "arm": "right"}},
             {"skill": "PlaceInto", "args": {"container_id": "bin_2", "phrase": "bin", "arm": "right"}}
         ]));
-        let c = compile(&p, &catalog(), &w).unwrap();
+        let c = compile(&p, &catalog(), &w, Author::Model).unwrap();
         let summaries: Vec<&str> = c.steps.iter().map(|s| s.summary.as_str()).collect();
         assert_eq!(
             summaries[0], "GoToPlace(place=table_side) (added)",
@@ -944,7 +980,7 @@ mod tests {
             {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}, "retries": 1},
             {"skill": "GoToPlace", "args": {"place": "Charging Dock"}, "optional": true, "timeout_s": 60}
         ]));
-        let c = compile(&p, &catalog(), &world()).unwrap();
+        let c = compile(&p, &catalog(), &world(), Author::Model).unwrap();
         assert!(
             c.xml
                 .contains(r#"<SubTree ID="GoToTarget" name="s1_GoToPlace" target="R2"/>"#)
@@ -965,6 +1001,31 @@ mod tests {
     }
 
     #[test]
+    fn a_control_character_in_an_argument_is_a_problem() {
+        let p = plan(&json!([{"skill": "PickObject",
+            "args": {"object_id": "O17", "phrase": "red\u{0}mug", "arm": "right"}}]));
+        let problems = compile(&p, &catalog(), &world(), Author::Model).unwrap_err();
+        assert_eq!(
+            (problems[0].step.as_str(), problems[0].field.as_str()),
+            ("s2", "phrase")
+        );
+    }
+
+    #[test]
+    fn only_the_operator_sends_the_robot_to_a_pose_of_their_own() {
+        let to_pose = plan(
+            &json!([{"skill": "GoToPose", "args": [{"name": "station", "value": "2.00;1.00;0.500"}]}]),
+        );
+        let refused = compile(&to_pose, &catalog(), &world(), Author::Model).unwrap_err();
+        assert!(refused[0].message.contains("use GoToPlace"), "{refused:?}");
+        let c = compile(&to_pose, &catalog(), &world(), Author::Operator).unwrap();
+        assert!(c.xml.contains(r#"station="2.00;1.00;0.500""#), "{}", c.xml);
+        let to_room =
+            plan(&json!([{"skill": "GoToPlace", "args": [{"name": "place", "value": "R2"}]}]));
+        assert!(compile(&to_room, &catalog(), &world(), Author::Operator).is_ok());
+    }
+
+    #[test]
     fn every_problem_is_reported_at_once() {
         let p = plan(&json!([
             {"skill": "PickObject", "args": {"object_id": "O99", "arm": "middle", "grip": "firm"}},
@@ -973,7 +1034,7 @@ mod tests {
             {"skill": "GoToPlace", "args": {"place": "moon"}},
             {"skill": "TuckForTravel", "retries": 5}
         ]));
-        let problems = compile(&p, &catalog(), &world()).unwrap_err();
+        let problems = compile(&p, &catalog(), &world(), Author::Model).unwrap_err();
         let has =
             |step: &str, field: &str| problems.iter().any(|q| q.step == step && q.field == field);
         assert!(has("s1", "grip") && has("s1", "phrase") && has("s1", "arm"));
@@ -986,7 +1047,7 @@ mod tests {
     #[test]
     fn a_walk_is_added_before_a_skill_that_needs_the_robot_near() {
         let pick = json!({"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}});
-        let c = compile(&plan(&json!([pick])), &catalog(), &world()).unwrap();
+        let c = compile(&plan(&json!([pick])), &catalog(), &world(), Author::Model).unwrap();
         let summaries: Vec<&str> = c.steps.iter().map(|s| s.summary.as_str()).collect();
         assert_eq!(
             summaries,
@@ -1002,13 +1063,16 @@ mod tests {
         assert!(c.xml.contains(r#"name="s2_PickObject""#));
         let walked = plan(&json!([{"skill": "GoToPlace", "args": {"place": "O17"}}, pick]));
         assert_eq!(
-            compile(&walked, &catalog(), &world()).unwrap().steps.len(),
+            compile(&walked, &catalog(), &world(), Author::Model)
+                .unwrap()
+                .steps
+                .len(),
             2
         );
         let mut close = world();
         close.robot = Some((5.2, 1.1));
         assert_eq!(
-            compile(&plan(&json!([pick])), &catalog(), &close)
+            compile(&plan(&json!([pick])), &catalog(), &close, Author::Model)
                 .unwrap()
                 .steps
                 .len(),
@@ -1017,7 +1081,13 @@ mod tests {
         // An object the world model does not know, such as a detector's name for it, cannot be
         // judged or walked to: the plan stands as written and the executor checks it.
         let unknown = json!({"skill": "PickObject", "args": {"object_id": "red_block", "phrase": "red block", "arm": "right"}});
-        let c = compile(&plan(&json!([unknown])), &catalog(), &world()).unwrap();
+        let c = compile(
+            &plan(&json!([unknown])),
+            &catalog(),
+            &world(),
+            Author::Model,
+        )
+        .unwrap();
         assert_eq!(c.steps.len(), 1);
     }
 
@@ -1031,7 +1101,7 @@ mod tests {
                 {"skill": "PlaceInto", "args": {"container_id": "O31", "phrase": "basket", "arm": "right"}}
             ]))
         };
-        let wrong = compile(&steps("left"), &catalog(), &world()).unwrap_err();
+        let wrong = compile(&steps("left"), &catalog(), &world(), Author::Model).unwrap_err();
         assert!(
             wrong
                 .iter()
@@ -1039,7 +1109,7 @@ mod tests {
             "{wrong:?}"
         );
         // After the first place the right hand is empty, so placing again fails too.
-        let twice = compile(&steps("right"), &catalog(), &world()).unwrap_err();
+        let twice = compile(&steps("right"), &catalog(), &world(), Author::Model).unwrap_err();
         assert_eq!(twice.len(), 1, "{twice:?}");
         assert_eq!(twice[0].step, "s6", "a walk is added before each place");
         let mut held = world();
@@ -1049,7 +1119,7 @@ mod tests {
             &json!([{"skill": "PlaceInto", "args": {"container_id": "O31", "phrase": "basket", "arm": "left"}}]),
         );
         assert!(
-            compile(&place, &catalog(), &held).is_ok(),
+            compile(&place, &catalog(), &held, Author::Model).is_ok(),
             "a hand may hold something from before"
         );
     }
@@ -1061,7 +1131,7 @@ mod tests {
             {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}},
             {"skill": "PlaceInto", "args": {"container_id": "O31", "phrase": "basket", "arm": "right"}}
         ]));
-        let c = compile(&p, &catalog(), &world()).unwrap();
+        let c = compile(&p, &catalog(), &world(), Author::Model).unwrap();
         let summaries: Vec<&str> = c.steps.iter().map(|s| s.summary.as_str()).collect();
         assert_eq!(
             summaries[2], "GoToPlace(place=O31) (added)",
@@ -1073,7 +1143,13 @@ mod tests {
             {"skill": "TuckForTravel"},
             {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}}
         ]));
-        assert_eq!(compile(&tuck, &catalog(), &world()).unwrap().steps.len(), 3);
+        assert_eq!(
+            compile(&tuck, &catalog(), &world(), Author::Model)
+                .unwrap()
+                .steps
+                .len(),
+            3
+        );
     }
 
     #[test]
@@ -1086,14 +1162,14 @@ mod tests {
                 &json!([{"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": arm}}]),
             )
         };
-        let problems = compile(&pick("left"), &catalog(), &full).unwrap_err();
+        let problems = compile(&pick("left"), &catalog(), &full, Author::Model).unwrap_err();
         assert!(
             problems[0]
                 .message
                 .contains("left hand empty, but it holds O31"),
             "{problems:?}"
         );
-        assert!(compile(&pick("right"), &catalog(), &full).is_ok());
+        assert!(compile(&pick("right"), &catalog(), &full, Author::Model).is_ok());
     }
 
     #[test]
@@ -1104,7 +1180,7 @@ mod tests {
         let p = plan(
             &json!([{"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "left"}}]),
         );
-        let problems = compile(&p, &catalog(), &held).unwrap_err();
+        let problems = compile(&p, &catalog(), &held, Author::Model).unwrap_err();
         assert!(
             problems[0].message.contains("already in the right hand"),
             "{problems:?}"
@@ -1129,7 +1205,7 @@ mod tests {
             {"skill": "GoToPlace", "args": {"place": "O17"}},
             {"skill": "PickObject", "args": {"object_id": "O17", "arm": "right"}}
         ]));
-        let compiled = compile(&p, &c, &world()).unwrap();
+        let compiled = compile(&p, &c, &world(), Author::Model).unwrap();
         assert!(
             compiled
                 .xml
@@ -1147,7 +1223,7 @@ mod tests {
         p.intent = "a <b> & \"c\"".to_owned();
         let mut near = world();
         near.robot = Some((5.0, 1.0));
-        let c = compile(&p, &catalog(), &near).unwrap();
+        let c = compile(&p, &catalog(), &near, Author::Model).unwrap();
         assert!(
             c.xml
                 .contains("phrase=\"&quot;mug&quot; &amp; &lt;cup&gt;\"")
@@ -1173,7 +1249,7 @@ mod tests {
         let p = plan(
             &json!([{"skill": "PickObject", "args": {"object_id": "red_block", "arm": "left"}}]),
         );
-        let compiled = compile(&p, &c, &world()).unwrap();
+        let compiled = compile(&p, &c, &world(), Author::Model).unwrap();
         assert!(
             compiled
                 .xml
@@ -1190,7 +1266,7 @@ mod tests {
         );
         let mut near = world();
         near.robot = Some((5.0, 1.0));
-        let problems = compile(&p, &catalog(), &near).unwrap_err();
+        let problems = compile(&p, &catalog(), &near, Author::Model).unwrap_err();
         assert!(
             problems[0].message.contains("may not contain { or }"),
             "{problems:?}"
