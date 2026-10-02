@@ -648,6 +648,21 @@ impl History {
         self.0 = fit(cut_old(&self.0, 4), budget);
     }
 
+    /// Records a request whose reply was lost after the tools had acted on it: the request, and
+    /// what was done, as the reply.
+    pub(crate) fn lost_reply(&mut self, request: &str, done: &[String]) {
+        self.0.push(Message::User {
+            content: vec![UserContent::text(request)],
+        });
+        self.0.push(Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::text(format!(
+                "(My reply was lost after I acted: {}.)",
+                done.join("; ")
+            ))],
+        });
+    }
+
     /// Writes it as JSON, for a later session to resume.
     ///
     /// # Errors

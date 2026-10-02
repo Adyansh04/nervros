@@ -34,6 +34,18 @@ pub enum Risk {
     Manipulation,
 }
 
+impl Risk {
+    /// The lane a call of this risk goes in.
+    #[must_use]
+    pub fn lane(self) -> Lane {
+        match self {
+            Self::Observe => Lane::Observe,
+            Self::Annotate => Lane::Edit,
+            Self::WorldEdit | Self::Motion | Self::Manipulation => Lane::Act,
+        }
+    }
+}
+
 /// Observe tools run freely; edit tools need approval when supervised; act tools need the robot
 /// armed too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,16 +104,13 @@ impl ToolSpec {
     /// Its lane.
     #[must_use]
     pub fn lane(&self) -> Lane {
-        match self.risk {
-            Risk::Observe => Lane::Observe,
-            Risk::Annotate => Lane::Edit,
-            _ => Lane::Act,
-        }
+        self.risk.lane()
     }
 }
 
 /// How a call ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     /// Done, with data.
     Succeeded,
@@ -111,6 +120,35 @@ pub enum Status {
     Refused,
     /// Started and running in the background; the data carries its id.
     Accepted,
+    /// Cut short by a stop or the turn's time limit before it returned. Only events carry it:
+    /// no model reads the result of a call that never returned.
+    Stopped,
+}
+
+impl Status {
+    /// Its name, as the model, the log and the window read it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Refused => "refused",
+            Self::Accepted => "accepted",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    /// Whether the call did what it was asked, or started it.
+    #[must_use]
+    pub fn ok(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Accepted)
+    }
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// An image a tool produced, for the GUI and optionally the model.
@@ -178,14 +216,8 @@ impl ToolOutcome {
     /// The JSON the model gets back: status, message and data, capped in size.
     #[must_use]
     pub fn for_model(&self, max_chars: usize) -> Value {
-        let status = match self.status {
-            Status::Succeeded => "succeeded",
-            Status::Failed => "failed",
-            Status::Refused => "refused",
-            Status::Accepted => "accepted",
-        };
         let data = cap(&self.data, max_chars);
-        let mut out = json!({ "status": status, "data": data });
+        let mut out = json!({ "status": self.status.as_str(), "data": data });
         if !self.message.is_empty() {
             out["message"] = Value::String(clip(&self.message, MESSAGE_CHARS));
         }

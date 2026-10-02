@@ -50,7 +50,7 @@ enum Command {
     /// Chat with the robot. Lines starting with `/` are commands: `/arm`, `/disarm`, `/stop`,
     /// `/yes N`, `/allow N` (yes, and no more asking for that tool this session unless it moves
     /// the robot), `/no N`, `/again N` (a request the last session left waiting), `/compact`,
-    /// `/quit`; a line that is exactly `stop` also stops the robot.
+    /// `/quit`; a plain `stop` (or `halt`, `freeze`, `stop!`) also stops the robot.
     #[cfg(feature = "ros")]
     Chat {
         /// Send these messages in order and exit, instead of reading stdin.

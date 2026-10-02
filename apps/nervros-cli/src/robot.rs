@@ -140,6 +140,7 @@ pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<(
 
 use nervros_core::session::{Command as SessionCommand, Event};
 use tokio::io::AsyncBufReadExt as _;
+use tokio::sync::broadcast::error::RecvError;
 
 /// Options of `chat`.
 pub(crate) struct ChatOptions {
@@ -323,13 +324,15 @@ fn parse_line(line: &str) -> Option<SessionCommand> {
         line.strip_prefix(p)
             .and_then(|r| r.trim().parse::<u64>().ok())
     };
+    // A plain order to stop stops the robot without asking the model.
+    if nervros_core::session::is_stop_word(line) {
+        return Some(SessionCommand::StopMission);
+    }
     match line {
         "" => None,
         "/arm" => Some(SessionCommand::Arm),
         "/disarm" => Some(SessionCommand::Disarm),
         "/compact" => Some(SessionCommand::Compact),
-        // An exact stop word stops the robot without asking the model.
-        "/stop" | "stop" | "halt" | "freeze" => Some(SessionCommand::StopMission),
         _ => {
             if let Some(id) = arg("/yes") {
                 Some(SessionCommand::Approve(id))
@@ -426,7 +429,15 @@ async fn say_all(
         // A report's reply can run first: wait for the turn this message starts.
         let mut mine = None;
         loop {
-            let e = events.recv().await.context("the session ended")?;
+            let e = match events.recv().await {
+                Ok(e) => e,
+                // A slow terminal fell behind; the session goes on.
+                Err(RecvError::Lagged(n)) => {
+                    println!("  [{n} events went by unprinted]");
+                    continue;
+                }
+                Err(RecvError::Closed) => anyhow::bail!("the session ended"),
+            };
             if let Event::ApprovalRequested { id, .. } = &e
                 && approve
             {
@@ -460,8 +471,13 @@ async fn interactive(
     blobs: std::path::PathBuf,
 ) -> Result<()> {
     let printer = tokio::spawn(async move {
-        while let Ok(e) = events.recv().await {
-            print_event(&e, &blobs);
+        loop {
+            match events.recv().await {
+                Ok(e) => print_event(&e, &blobs),
+                // A slow terminal fell behind; the session goes on, so the printer does too.
+                Err(RecvError::Lagged(n)) => println!("  [{n} events went by unprinted]"),
+                Err(RecvError::Closed) => break,
+            }
         }
     });
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();

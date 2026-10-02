@@ -439,18 +439,28 @@ impl Gui {
     }
 
     /// The bubble appears when the session starts the turn, so a message it turns away shows
-    /// only as its notice. A `/name` runs that command instead.
+    /// only as its notice. A plain order to stop stops the robot without a model, and a `/name`
+    /// runs that command instead.
     fn say(&mut self, text: &str) {
         self.history.push(text.to_owned());
         self.history_pos = None;
-        if text.starts_with('/') {
-            match palette::slash(&self.commands, text).cloned() {
-                Some(cmd) => self.run(cmd),
-                None => self.chat.items.push(crate::chat::Item::Notice(format!(
-                    "No command {text}; Ctrl+K lists them"
-                ))),
-            }
+        if nervros_core::session::is_stop_word(text) {
+            self.agent.session.send(Command::StopMission);
             return;
+        }
+        if text.starts_with('/') {
+            if let Some(cmd) = palette::slash(&self.commands, text).cloned() {
+                self.run(cmd);
+                return;
+            }
+            // A lone unknown `/word` is a mistyped command; a sentence such as "/scan has no
+            // data" or a ROS name with parts is for the agent.
+            if !text.trim().contains(char::is_whitespace) && text.matches('/').count() == 1 {
+                self.chat.items.push(crate::chat::Item::Notice(format!(
+                    "No command {text}; Ctrl+K lists them"
+                )));
+                return;
+            }
         }
         let (text, shown) = self.attachments.send(text);
         let handle = self.agent.session.handle();

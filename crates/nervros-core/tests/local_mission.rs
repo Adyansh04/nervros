@@ -154,7 +154,7 @@ fn tools_called(events: &[Event]) -> Vec<(String, &'static str)> {
     events
         .iter()
         .filter_map(|e| match e {
-            Event::ToolFinished { tool, status, .. } => Some((tool.clone(), *status)),
+            Event::ToolFinished { tool, status, .. } => Some((tool.clone(), status.as_str())),
             _ => None,
         })
         .collect()

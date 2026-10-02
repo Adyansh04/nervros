@@ -185,7 +185,7 @@ pub async fn say(
                 message,
                 ..
             } => {
-                seen.tools.push((tool, status.to_owned()));
+                seen.tools.push((tool, status.to_string()));
                 seen.said.push(message);
             }
             Event::MissionPlanned { steps, .. } => {

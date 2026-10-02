@@ -237,15 +237,20 @@ impl Missions {
         if self.session.set(session).is_err() {
             return;
         }
-        let me = Arc::clone(self);
+        // Held weakly, so that the missions end with the session.
+        let me = Arc::downgrade(self);
+        let first = Arc::clone(self);
         tokio::spawn(async move {
-            me.start_heartbeat().await;
-            if let Err(e) = me.catalog().await {
+            first.start_heartbeat().await;
+            if let Err(e) = first.catalog().await {
                 tracing::info!(error = %e, "no mission catalog yet");
             }
+            drop(first);
             // The operator speaking resets the retry limits: it is a new request.
             loop {
-                match events.recv().await {
+                let event = events.recv().await;
+                let Some(me) = me.upgrade() else { return };
+                match event {
                     // Said while the agent works, it adds to the request rather than replacing it.
                     Ok(Event::Steer { text, .. }) => {
                         let mut request = lock(&me.request);

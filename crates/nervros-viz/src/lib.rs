@@ -1250,11 +1250,7 @@ async fn agent(
                 ms,
                 ..
             } => {
-                let level = if *status == "succeeded" {
-                    L::INFO
-                } else {
-                    L::WARN
-                };
+                let level = if status.ok() { L::INFO } else { L::WARN };
                 (level, format!("{tool} {status} in {ms} ms: {message}"))
             }
             Event::ApprovalRequested { tool, reason, .. } => {

@@ -12,6 +12,7 @@ use nervros_core::mission::plan::PlannedStep;
 use nervros_core::mission::preview::PreviewStep;
 use nervros_core::mission::sanity::Concern;
 use nervros_core::session::{Command, Event, Unanswered};
+use nervros_core::tools::Status;
 use rerun::external::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _, icons};
 use serde_json::Value;
@@ -46,7 +47,7 @@ pub struct ToolCall {
     call: u64,
     tool: String,
     args: Value,
-    status: Option<&'static str>,
+    status: Option<Status>,
     message: String,
     ms: u64,
 }
@@ -296,7 +297,7 @@ impl Chat {
                     _ => None,
                 });
                 if let Some(t) = found {
-                    t.status = Some(status);
+                    t.status = Some(*status);
                     t.message.clone_from(message);
                     t.ms = *ms;
                 }
@@ -607,14 +608,16 @@ pub fn thousands(n: u64) -> String {
     }
 }
 
-/// Running is blue, success green, failure red and waiting amber, everywhere in the app.
-pub fn status_color(ui: &egui::Ui, status: Option<&str>) -> Color32 {
+/// Running is blue, success green, failure red and waiting amber, everywhere in the app; a
+/// call cut short by a stop is grey.
+pub fn status_color(ui: &egui::Ui, status: Option<Status>) -> Color32 {
     let t = ui.tokens();
     match status {
         None => t.info_text_color,
-        Some("succeeded" | "accepted") => t.success_text_color,
-        Some("refused") => t.warn_fg_color,
-        Some(_) => t.error_fg_color,
+        Some(Status::Succeeded | Status::Accepted) => t.success_text_color,
+        Some(Status::Refused) => t.warn_fg_color,
+        Some(Status::Stopped) => t.text_subdued,
+        Some(Status::Failed) => t.error_fg_color,
     }
 }
 
@@ -706,8 +709,9 @@ fn tool_chip(ui: &mut egui::Ui, t: &ToolCall) {
                     ui.spinner();
                 } else {
                     let icon = match t.status {
-                        Some("succeeded" | "accepted") => &icons::SUCCESS,
-                        Some("refused") => &icons::WARNING,
+                        Some(Status::Succeeded | Status::Accepted) => &icons::SUCCESS,
+                        Some(Status::Refused) => &icons::WARNING,
+                        Some(Status::Stopped) => &icons::PAUSE,
                         _ => &icons::ERROR,
                     };
                     ui.small_icon(icon, Some(color));
@@ -1346,7 +1350,7 @@ pub(crate) mod tests {
             turn: 1,
             call: 1,
             tool: "look".to_owned(),
-            status: "succeeded",
+            status: Status::Succeeded,
             message: "2 marks: 1 shelf, 2 cardboard box".to_owned(),
             ms: 427,
         });
@@ -1371,7 +1375,7 @@ pub(crate) mod tests {
         let chat = sample();
         assert_eq!(chat.items.len(), 4);
         assert!(
-            matches!(&chat.items[1], Item::Tool(t) if t.status == Some("succeeded") && t.ms == 427)
+            matches!(&chat.items[1], Item::Tool(t) if t.status == Some(Status::Succeeded) && t.ms == 427)
         );
         assert_eq!(chat.pending().count(), 1);
         assert_eq!(chat.model.as_deref(), Some("qwen3.5-9b-local"));

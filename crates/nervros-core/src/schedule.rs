@@ -84,26 +84,30 @@ impl Schedules {
         self.list.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Where runs report; also cancels every schedule when the robot is stopped.
+    /// Where runs report; also cancels every schedule as soon as the robot is stopped. Each run
+    /// checks for a stop itself too, so a schedule never outlives one whose events were missed.
     pub fn attach(self: &Arc<Self>, session: SessionHandle) {
         let mut events = session.subscribe();
         if self.session.set(session).is_err() {
             return;
         }
         let me = Arc::downgrade(self);
+        let mut seen = self.guard.stops();
         tokio::spawn(async move {
             loop {
-                let stopped = match events.recv().await {
-                    Ok(Event::Halted { reason }) => reason.contains("robot"),
-                    Ok(Event::ToolFinished { tool, .. }) => tool == "stop",
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => false,
+                match events.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                };
+                }
                 let Some(me) = me.upgrade() else { return };
-                if stopped && me.cancel("all") {
-                    me.say(Event::Notice {
-                        text: "the stop cancelled every schedule".to_owned(),
-                    });
+                let stops = me.guard.stops();
+                if stops != seen {
+                    seen = stops;
+                    if me.cancel("all") {
+                        me.say(Event::Notice {
+                            text: "the stop cancelled every schedule".to_owned(),
+                        });
+                    }
                 }
             }
         });
@@ -174,16 +178,22 @@ impl Schedules {
             left: times,
             times,
         };
-        let (me, counter) = (Arc::clone(self), Arc::clone(&left));
+        // Held weakly between runs, so that the schedules end with the session.
+        let (me, counter) = (Arc::downgrade(self), Arc::clone(&left));
+        let stops = self.guard.stops();
         let span = crate::telemetry::job("schedule", &id, &intent);
         let task = tokio::spawn(async move {
             for run in 1..=times {
                 if run > 1 {
                     tokio::time::sleep(Duration::from_secs(every_min * 60)).await;
                 }
+                let Some(me) = me.upgrade() else { return };
                 // The interval counts from the end of the run before, never overlapping it.
                 while me.missions.busy() {
                     tokio::time::sleep(POLL).await;
+                }
+                if me.guard.stops() != stops {
+                    return;
                 }
                 counter.fetch_sub(1, Ordering::Relaxed);
                 let label = format!("{intent}, run {run} of {times} of schedule {id}");
@@ -226,14 +236,22 @@ impl Schedules {
             left: times,
             times,
         };
-        let (me, counter) = (Arc::clone(self), Arc::clone(&left));
+        // Held weakly between looks, so that the triggers end with the session.
+        let (me, counter) = (Arc::downgrade(self), Arc::clone(&left));
+        let stops = self.guard.stops();
         let span = crate::telemetry::job("trigger", &id, &what);
         let task = tokio::spawn(async move {
             let deadline = Instant::now() + Duration::from_secs(for_min * 60);
-            let mut looker = Looker::new(trigger, &me.missions).await;
+            let Some(first) = me.upgrade() else { return };
+            let mut looker = Looker::new(trigger, &first.missions).await;
+            drop(first);
             let mut run = 0;
             while run < times && Instant::now() < deadline {
                 tokio::time::sleep(looker.period()).await;
+                let Some(me) = me.upgrade() else { return };
+                if me.guard.stops() != stops {
+                    return;
+                }
                 let Some(seen) = looker.look(&me.missions).await else {
                     continue;
                 };
@@ -272,6 +290,15 @@ impl Schedules {
             task,
         });
         info
+    }
+}
+
+impl Drop for Schedules {
+    fn drop(&mut self) {
+        // A run reports into its session, so the schedules end with it.
+        for entry in self.lock().iter() {
+            entry.task.abort();
+        }
     }
 }
 
