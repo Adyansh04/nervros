@@ -276,6 +276,10 @@ fn print_event(e: &Event, logs: &Path) {
         }
         Event::Armed { armed } => println!("  [{}]", if *armed { "armed" } else { "disarmed" }),
         Event::Halted { reason } => println!("  [halted: {reason}]"),
+        Event::Stopped { ok: true, detail } => println!("  [the robot stopped: {detail}]"),
+        Event::Stopped { ok: false, detail } => {
+            println!("  ! the robot did not confirm the stop: {detail}");
+        }
         Event::Notice { text } => println!("  [{text}]"),
         Event::Error { text, .. } => println!("  [error: {text}]"),
         Event::Report { text, .. } => println!("report> {text}"),

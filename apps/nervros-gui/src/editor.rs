@@ -311,6 +311,24 @@ struct Shared {
     busy: bool,
     select: Option<Picked>,
     reachable: Option<bool>,
+    /// Requests sent so far: an answer to an older one than the newest brings an older world.
+    sent: u64,
+}
+
+impl Shared {
+    /// Takes a world the editor sent; one this window cannot read keeps the last and says why,
+    /// rather than leaving an empty canvas that waits for ever.
+    fn take(&mut self, world: Value) -> Result<(), String> {
+        match serde_json::from_value(world) {
+            Ok(w) => {
+                self.world = Some(w);
+                Ok(())
+            }
+            Err(e) => Err(format!(
+                "the editor sent a world this window cannot read: {e}"
+            )),
+        }
+    }
 }
 
 /// The form fields of the selection card.
@@ -439,6 +457,7 @@ impl WorldEditor {
             ctx.clone(),
         );
         let want_map = self.map.is_none() && lock(&self.shared).map.is_none();
+        let asked = lock(&self.shared).sent;
         self.runtime.spawn(async move {
             let world = client.world().await;
             let map = if want_map {
@@ -448,9 +467,13 @@ impl WorldEditor {
             };
             let mut s = lock(&shared);
             match world {
+                // An edit sent since brings a newer world than this read.
+                Ok(_) if s.sent != asked => s.reachable = Some(true),
                 Ok(w) => {
-                    s.world = serde_json::from_value(w).ok();
                     s.reachable = Some(true);
+                    if let Err(why) = s.take(w) {
+                        s.status = Some((why, true));
+                    }
                 }
                 Err(e) => {
                     s.reachable = Some(false);
@@ -471,7 +494,12 @@ impl WorldEditor {
             Arc::clone(&self.shared),
             ctx.clone(),
         );
-        lock(&self.shared).busy = true;
+        let mine = {
+            let mut s = lock(&self.shared);
+            s.busy = true;
+            s.sent += 1;
+            s.sent
+        };
         self.runtime.spawn(async move {
             let answer = match call {
                 Call::Edit(op, message) => client.edit(&op).await.map(|e| {
@@ -492,13 +520,20 @@ impl WorldEditor {
                 Call::Save => client.save().await.map(|(said, w)| (said, w, None)),
             };
             let mut s = lock(&shared);
-            s.busy = false;
+            // Only the newest request's answer sets the world: two edits can end out of order.
+            let newest = s.sent == mine;
+            if newest {
+                s.busy = false;
+            }
             match answer {
-                Ok((message, world, select)) => {
-                    s.world = serde_json::from_value(world).ok();
-                    s.status = Some((message, false));
-                    s.select = select;
-                }
+                Ok((message, world, select)) if newest => match s.take(world) {
+                    Ok(()) => {
+                        s.status = Some((message, false));
+                        s.select = select;
+                    }
+                    Err(why) => s.status = Some((format!("{message}, but {why}"), true)),
+                },
+                Ok(_) => {}
                 Err(e) => s.status = Some((e.to_string(), true)),
             }
             drop(s);

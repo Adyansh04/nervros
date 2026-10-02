@@ -272,6 +272,12 @@ impl RobotPort for FakeRobot {
     }
 
     async fn graph(&self) -> Result<Graph, RosError> {
+        // A scripted graph knows the topics' types; otherwise every topic set has one, untyped.
+        if let Some(graph) = &self.graph {
+            return Ok(Graph {
+                topics: graph.topics.clone(),
+            });
+        }
         let mut topics: Vec<(String, Vec<String>)> = lock(&self.topics)
             .keys()
             .map(|k| (k.clone(), Vec::new()))

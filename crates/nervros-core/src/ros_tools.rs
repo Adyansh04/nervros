@@ -110,7 +110,8 @@ const PARAMS_MAX: usize = 80;
 const ARRAY_ITEMS: usize = 8;
 const TEXT_CHARS: usize = 120;
 // Messages whose JSON is megabytes: counted, never echoed.
-const BULK_TYPES: [&str; 5] = [
+/// Message types too large to read message by message: echoed, watched or plotted.
+pub(crate) const BULK_TYPES: [&str; 5] = [
     "sensor_msgs/msg/Image",
     "sensor_msgs/msg/CompressedImage",
     "sensor_msgs/msg/PointCloud2",
@@ -302,11 +303,11 @@ fn summarize(value: &Value) -> Value {
 fn pick(value: &Value, fields: &[String]) -> Value {
     let mut out = Map::new();
     for f in fields {
-        let mut v = value;
-        for part in f.split('.') {
-            v = &v[part];
-        }
-        out.insert(f.clone(), v.clone());
+        // The same paths `watch` and `plot` take, list indices included.
+        let found = crate::watch::field(value, f)
+            .cloned()
+            .unwrap_or(Value::Null);
+        out.insert(f.clone(), found);
     }
     Value::Object(out)
 }

@@ -350,6 +350,25 @@ fn judge_travel(expect: &Expect, seen: &Seen, problems: &mut Vec<String>) {
     }
 }
 
+/// `wanted`, or `wanted-2`, `wanted-3` and on, whichever no case of the suite in `suite` has:
+/// ids name a case's logs and its row in the report, so two cases never share one.
+#[must_use]
+pub fn unique_id(suite: &str, wanted: &str) -> String {
+    let taken: std::collections::HashSet<String> = toml::from_str::<Suite>(suite)
+        .map(|s| s.cases.into_iter().map(|c| c.id).collect())
+        .unwrap_or_default();
+    let base = if wanted.trim().is_empty() {
+        "case"
+    } else {
+        wanted.trim()
+    };
+    // One more number than there are cases always finds a free one.
+    std::iter::once(base.to_owned())
+        .chain((2..=taken.len() + 2).map(|n| format!("{base}-{n}")))
+        .find(|id| !taken.contains(id))
+        .unwrap_or_else(|| base.to_owned())
+}
+
 /// A case from a session log (NDJSON, one `{"event": ...}` per line): the operator's messages,
 /// the tools that worked, the skills its plans used, how its last mission ended and how many
 /// approvals it asked. A starting point to trim: what the agent did is not always what it should.
@@ -451,6 +470,14 @@ mod tests {
                 && problems.contains("2 approvals"),
             "{problems}"
         );
+    }
+
+    #[test]
+    fn a_case_id_is_made_unique_in_its_suite() {
+        let suite = "[[case]]\nid = \"look\"\nsay = [\"look\"]\n[[case]]\nid = \"look-2\"\nsay = [\"look\"]\n";
+        assert_eq!(unique_id(suite, "look"), "look-3");
+        assert_eq!(unique_id(suite, "walk"), "walk");
+        assert_eq!(unique_id("", "  "), "case");
     }
 
     #[test]

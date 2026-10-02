@@ -133,8 +133,10 @@ enum Closing {
     Open,
     /// Asking the operator what to do with the running mission.
     Asking,
-    /// Stop sent; the window closes once the robot says it stopped, or after a few seconds.
+    /// Stop sent; the window closes once the robot says it stopped.
     Stopping(std::time::Instant),
+    /// The robot did not confirm the stop: the operator decides again, having read why.
+    StopFailed,
     Allowed,
 }
 
@@ -151,24 +153,38 @@ fn on_close(closing: Closing, mission_running: bool) -> (bool, Closing) {
     match closing {
         Closing::Open if mission_running => (true, Closing::Asking),
         Closing::Open | Closing::Allowed => (false, closing),
-        Closing::Asking | Closing::Stopping(_) => (true, closing),
+        Closing::Asking | Closing::Stopping(_) | Closing::StopFailed => (true, closing),
     }
 }
 
-/// How long closing waits for the robot to say it stopped.
-const STOP_BEFORE_CLOSE: Duration = Duration::from_secs(5);
+/// How long closing waits for the robot to say it stopped, past the stop's own timeout.
+const STOP_BEFORE_CLOSE: Duration = Duration::from_secs(8);
 
-/// The question asked when the window is closed with a mission running.
-fn close_dialog(ctx: &egui::Context) -> Option<CloseChoice> {
+/// The question asked when the window is closed with a mission running, or after a stop the robot
+/// did not confirm.
+fn close_dialog(ctx: &egui::Context, failed: bool) -> Option<CloseChoice> {
     let mut choice = None;
     let modal = egui::Modal::new(egui::Id::new("nervros_close")).show(ctx, |ui| {
         ui.set_max_width(380.0);
-        ui.label(RichText::new("A mission is running").strong());
-        ui.add_space(6.0);
-        ui.label(
-            "Closing leaves it running with nobody watching. Stop the robot first, or leave it \
-             to finish.",
-        );
+        if failed {
+            ui.label(
+                RichText::new("The robot did not confirm the stop")
+                    .strong()
+                    .color(ui.tokens().error_fg_color),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                "The mission may still be running. Try the stop again, or close and leave it \
+                 running with nobody watching; the chat says what the robot answered.",
+            );
+        } else {
+            ui.label(RichText::new("A mission is running").strong());
+            ui.add_space(6.0);
+            ui.label(
+                "Closing leaves it running with nobody watching. Stop the robot first, or leave \
+                 it to finish.",
+            );
+        }
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             if ui.button("Stop it and close").clicked() {
@@ -360,21 +376,23 @@ impl Gui {
             }
         }
         match self.closing {
-            Closing::Asking => match close_dialog(ctx) {
-                Some(CloseChoice::StopAndClose) => {
-                    self.agent.session.send(Command::StopMission);
-                    self.closing = Closing::Stopping(std::time::Instant::now());
+            Closing::Asking | Closing::StopFailed => {
+                match close_dialog(ctx, self.closing == Closing::StopFailed) {
+                    Some(CloseChoice::StopAndClose) => {
+                        self.agent.session.send(Command::StopMission);
+                        self.closing = Closing::Stopping(std::time::Instant::now());
+                    }
+                    Some(CloseChoice::LeaveRunning) => {
+                        self.closing = Closing::Allowed;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Some(CloseChoice::Cancel) => self.closing = Closing::Open,
+                    None => {}
                 }
-                Some(CloseChoice::LeaveRunning) => {
-                    self.closing = Closing::Allowed;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                Some(CloseChoice::Cancel) => self.closing = Closing::Open,
-                None => {}
-            },
+            }
+            // No answer at all is no confirmation either.
             Closing::Stopping(since) if since.elapsed() >= STOP_BEFORE_CLOSE => {
-                self.closing = Closing::Allowed;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.closing = Closing::StopFailed;
             }
             Closing::Stopping(_) => ctx.request_repaint_after(Duration::from_millis(200)),
             Closing::Allowed => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -392,10 +410,13 @@ impl Gui {
                 Ok(e) => {
                     self.chat.apply(&e);
                     self.toast(&e);
-                    if let (Closing::Stopping(_), Event::Notice { text }) = (self.closing, &e)
-                        && (text.starts_with("robot stopped") || text.starts_with("stop failed"))
-                    {
-                        self.closing = Closing::Allowed;
+                    // Closed only once the robot confirms the stop; a failed one asks again.
+                    if let (Closing::Stopping(_), Event::Stopped { ok, .. }) = (self.closing, &e) {
+                        self.closing = if *ok {
+                            Closing::Allowed
+                        } else {
+                            Closing::StopFailed
+                        };
                     }
                     if self.event_log.len() == EVENT_LOG {
                         self.event_log.pop_back();
@@ -550,8 +571,13 @@ impl Gui {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
             self.palette.toggle();
         }
+        // Esc in another text field, such as a plan's argument on its card, leaves the field: as
+        // a stop it would also turn down the plan being edited.
+        let elsewhere = ctx
+            .memory(egui::Memory::focused)
+            .is_some_and(|f| f != egui::Id::new(COMPOSER));
         let (esc, stop, tab) = ctx.input_mut(|i| {
-            let esc = working && i.consume_key(Modifiers::NONE, Key::Escape);
+            let esc = working && !elsewhere && i.consume_key(Modifiers::NONE, Key::Escape);
             let stop = i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::S);
             let keys = [
                 Key::Num1,
@@ -835,9 +861,12 @@ impl Gui {
             if !focused {
                 return (false, false, false);
             }
-            let enter = i.consume_key(Modifiers::NONE, Key::Enter);
-            let up = browsing && i.consume_key(Modifiers::NONE, Key::ArrowUp);
-            let down = browsing && i.consume_key(Modifiers::NONE, Key::ArrowDown);
+            // consume_key matches an extra Shift too: Shift+Enter must reach the field as a
+            // new line, and Shift+arrows select.
+            let plain = i.modifiers.is_none();
+            let enter = plain && i.consume_key(Modifiers::NONE, Key::Enter);
+            let up = plain && browsing && i.consume_key(Modifiers::NONE, Key::ArrowUp);
+            let down = plain && browsing && i.consume_key(Modifiers::NONE, Key::ArrowDown);
             (enter, up, down)
         });
         if up {
@@ -1049,6 +1078,7 @@ impl Gui {
                 names: l.object_names.clone(),
                 battery: l.battery.clone(),
                 motors: l.motors.clone(),
+                armed: self.agent.guard.armed(),
             }
         };
         crate::robot::tab(ui, &status, self.drive.as_mut());
@@ -1195,7 +1225,7 @@ impl Gui {
                 Err(e) => self
                     .chat
                     .items
-                    .push(crate::chat::Item::Error(format!("{}: {e}", path.display()))),
+                    .push(crate::chat::Item::error(format!("{}: {e}", path.display()))),
             }
         }
         ui.add_space(12.0);
@@ -1233,7 +1263,7 @@ impl Gui {
         if let Some(id) = forget
             && let Err(e) = self.agent.memory.forget(id)
         {
-            self.chat.items.push(crate::chat::Item::Error(e));
+            self.chat.items.push(crate::chat::Item::error(e));
         }
     }
 

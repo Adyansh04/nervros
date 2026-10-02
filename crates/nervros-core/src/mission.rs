@@ -257,6 +257,14 @@ impl Missions {
         &self.robot
     }
 
+    /// Topics the profile keeps from being read, for the triggers that watch topics.
+    pub(crate) fn read_deny(&self) -> &[String] {
+        self.profile
+            .ros_tools
+            .as_ref()
+            .map_or(&[], |c| c.read_deny.as_slice())
+    }
+
     /// Where finished missions are kept, if anywhere.
     #[must_use]
     pub fn ledger(&self) -> Option<&Arc<Ledger>> {

@@ -264,6 +264,13 @@ pub enum Event {
         /// Why and what was stopped.
         reason: String,
     },
+    /// What the robot answered a stop of the robot from the operator.
+    Stopped {
+        /// Whether it confirmed the stop.
+        ok: bool,
+        /// Its state after the stop, or why the stop failed.
+        detail: String,
+    },
     /// Something the operator should know.
     Notice {
         /// The text.
@@ -1423,12 +1430,15 @@ fn halt(shared: &Arc<Shared>, robot: bool) {
         let shared = Arc::clone(shared);
         tokio::spawn(async move {
             let out = stop.call(json!({"reason": "operator"})).await;
-            let text = if out.status == Status::Succeeded {
-                format!("robot stopped: {}", out.data)
-            } else {
-                format!("stop failed: {}", out.message)
-            };
-            shared.emit(Event::Notice { text });
+            let ok = out.status == Status::Succeeded;
+            shared.emit(Event::Stopped {
+                ok,
+                detail: if ok {
+                    out.data.to_string()
+                } else {
+                    out.message
+                },
+            });
         });
     }
     let reason = if stop.is_some() {

@@ -92,6 +92,27 @@ fn describe(e: &Value) -> Option<String> {
         }
         "notice" => format!("  ! {}", s("text")),
         "error" => format!("  error: {}", s("text")),
+        // What the live printer shows, so a replay leaves out no stop or arming.
+        "halted" => format!("  [halted: {}]", s("reason")),
+        "stopped" if e["ok"].as_bool() == Some(true) => {
+            format!("  [the robot stopped: {}]", s("detail"))
+        }
+        "stopped" => format!("  ! the robot did not confirm the stop: {}", s("detail")),
+        "armed" => format!(
+            "  [{}]",
+            if e["armed"].as_bool() == Some(true) {
+                "armed"
+            } else {
+                "observe only"
+            }
+        ),
+        "approval_edited" => format!("  ? edited: {}", s("reason")),
+        "edit_rejected" => format!("  ? edit rejected: {}", s("message")),
+        "compacted" => format!(
+            "  [condensed from {} to {} tokens]",
+            e["before"].as_u64().unwrap_or_default(),
+            e["after"].as_u64().unwrap_or_default()
+        ),
         _ => return None,
     })
 }

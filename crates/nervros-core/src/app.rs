@@ -283,7 +283,12 @@ fn debug_tools(
     robot: &Arc<dyn RobotPort>,
     registry: &mut Registry,
 ) -> Result<Arc<crate::watch::Watches>, StartError> {
-    let watches = crate::watch::Watches::new(Arc::clone(robot));
+    let read_deny = profile
+        .ros_tools
+        .as_ref()
+        .map(|c| c.read_deny.clone())
+        .unwrap_or_default();
+    let watches = crate::watch::Watches::new(Arc::clone(robot), read_deny);
     for tool in watches.tools() {
         registry.add(tool)?;
     }

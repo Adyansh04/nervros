@@ -1257,6 +1257,13 @@ async fn agent(
                 (L::WARN, format!("approval needed for {tool}: {reason}"))
             }
             Event::Halted { reason } => (L::WARN, format!("halted: {reason}")),
+            Event::Stopped { ok, detail } => (
+                if *ok { L::INFO } else { L::ERROR },
+                format!(
+                    "stop {}: {detail}",
+                    if *ok { "confirmed" } else { "failed" }
+                ),
+            ),
             Event::Notice { text } => (L::WARN, text.clone()),
             Event::Error { text, .. } => (L::ERROR, text.clone()),
             _ => continue,

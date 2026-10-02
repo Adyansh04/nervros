@@ -252,8 +252,14 @@ impl Schedules {
                 if me.guard.stops() != stops {
                     return;
                 }
-                let Some(seen) = looker.look(&me.missions).await else {
-                    continue;
+                let seen = match looker.look(&me.missions).await {
+                    Ok(Some(seen)) => seen,
+                    Ok(None) => continue,
+                    // A trigger on what cannot be read would wait out its hours for nothing.
+                    Err(e) => {
+                        me.report(format!("Trigger {id} ({what}) stopped: {e}."));
+                        return;
+                    }
                 };
                 run += 1;
                 counter.fetch_sub(1, Ordering::Relaxed);
@@ -281,7 +287,7 @@ impl Schedules {
                 while me.missions.busy() {
                     tokio::time::sleep(POLL).await;
                 }
-                looker.settle(&me.missions).await;
+                let _ = looker.settle(&me.missions).await;
             }
         }.instrument(span));
         self.lock().push(Entry {
@@ -338,7 +344,13 @@ impl Trigger {
         }
         if when.get("topic").is_some() {
             let condition = Condition::parse(when)?;
-            let (topic, ty) = topic_of(missions.robot().as_ref(), when).await?;
+            let (topic, ty) = topic_of(
+                missions.robot().as_ref(),
+                when,
+                missions.read_deny(),
+                condition.reads_messages(),
+            )
+            .await?;
             return Ok(Self::Topic {
                 topic,
                 ty,
@@ -377,7 +389,8 @@ impl Looker {
             was: false,
             known: BTreeSet::new(),
         };
-        looker.settle(missions).await;
+        // A topic it cannot read shows at the first look.
+        let _ = looker.settle(missions).await;
         looker
     }
 
@@ -389,7 +402,11 @@ impl Looker {
     }
 
     /// Takes in what holds now without firing.
-    async fn settle(&mut self, missions: &Missions) {
+    ///
+    /// # Errors
+    ///
+    /// The topic cannot be read.
+    async fn settle(&mut self, missions: &Missions) -> Result<(), String> {
         match &self.trigger {
             Trigger::Topic {
                 topic,
@@ -397,7 +414,7 @@ impl Looker {
                 condition,
             } => {
                 self.was = holds(missions.robot().as_ref(), topic, ty, condition)
-                    .await
+                    .await?
                     .is_some();
             }
             Trigger::Object { phrase, room } => {
@@ -408,26 +425,31 @@ impl Looker {
                 ));
             }
         }
+        Ok(())
     }
 
     /// What newly holds, if anything.
-    async fn look(&mut self, missions: &Missions) -> Option<String> {
+    ///
+    /// # Errors
+    ///
+    /// The topic cannot be read.
+    async fn look(&mut self, missions: &Missions) -> Result<Option<String>, String> {
         match &self.trigger {
             Trigger::Topic {
                 topic,
                 ty,
                 condition,
             } => {
-                let seen = holds(missions.robot().as_ref(), topic, ty, condition).await;
+                let seen = holds(missions.robot().as_ref(), topic, ty, condition).await?;
                 let fired = !self.was && seen.is_some();
                 self.was = seen.is_some();
-                seen.filter(|_| fired)
+                Ok(seen.filter(|_| fired))
             }
             Trigger::Object { phrase, room } => {
                 let now = objects(&missions.observe().await.objects, phrase, room.as_deref());
                 let new: Vec<String> = now.difference(&self.known).cloned().collect();
                 self.known.extend(now);
-                (!new.is_empty()).then(|| format!("{} appeared", new.join(" and ")))
+                Ok((!new.is_empty()).then(|| format!("{} appeared", new.join(" and "))))
             }
         }
     }
@@ -727,15 +749,19 @@ mod tests {
             condition,
         };
         let mut looker = Looker::new(trigger, &missions).await;
-        assert_eq!(looker.look(&missions).await, None, "open already when set");
+        assert_eq!(
+            looker.look(&missions).await,
+            Ok(None),
+            "open already when set"
+        );
         robot.set_topic("/door", json!({"data": false}));
-        assert_eq!(looker.look(&missions).await, None);
+        assert_eq!(looker.look(&missions).await, Ok(None));
         robot.set_topic("/door", json!({"data": true}));
         assert_eq!(
-            looker.look(&missions).await.as_deref(),
+            looker.look(&missions).await.unwrap().as_deref(),
             Some("data is true")
         );
-        assert_eq!(looker.look(&missions).await, None, "once per opening");
+        assert_eq!(looker.look(&missions).await, Ok(None), "once per opening");
     }
 
     #[tokio::test]
@@ -751,7 +777,11 @@ mod tests {
         };
         assert_eq!(trigger.describe(), "a cup appears in R2");
         let mut looker = Looker::new(trigger, &missions).await;
-        assert_eq!(looker.look(&missions).await, None, "O1 was there already");
+        assert_eq!(
+            looker.look(&missions).await,
+            Ok(None),
+            "O1 was there already"
+        );
         robot.set_topic(
             "/objects",
             json!({"objects": [
@@ -763,15 +793,18 @@ mod tests {
         );
         assert_eq!(
             looker.look(&missions).await,
-            None,
+            Ok(None),
             "another room, not a cup, removed"
         );
         robot.set_topic(
             "/objects",
             json!({"objects": [object("O1", "white cup", "R2", 0), object("O5", "cup", "R2", 0)]}),
         );
-        assert_eq!(looker.look(&missions).await.as_deref(), Some("O5 appeared"));
-        assert_eq!(looker.look(&missions).await, None);
+        assert_eq!(
+            looker.look(&missions).await.unwrap().as_deref(),
+            Some("O5 appeared")
+        );
+        assert_eq!(looker.look(&missions).await, Ok(None));
     }
 
     #[tokio::test]

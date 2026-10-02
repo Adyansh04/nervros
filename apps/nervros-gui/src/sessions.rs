@@ -90,11 +90,13 @@ pub fn save_as_case(log: &Path) -> Result<(String, PathBuf), String> {
         .say
         .first()
         .ok_or("the session has no operator message")?;
-    case.id = slug(first);
-    let toml = nervros_core::evalcase::to_toml(&case).map_err(|e| e.to_string())?;
     let suite = nervros_core::app::state_dir()
         .join("evals")
         .join("saved.toml");
+    // Saved twice, or two sessions that began alike, still make two cases.
+    let saved = std::fs::read_to_string(&suite).unwrap_or_default();
+    case.id = nervros_core::evalcase::unique_id(&saved, &slug(first));
+    let toml = nervros_core::evalcase::to_toml(&case).map_err(|e| e.to_string())?;
     if let Some(dir) = suite.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }

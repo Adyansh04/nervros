@@ -90,7 +90,13 @@ impl Approval {
 #[derive(Clone)]
 pub enum Item {
     /// The operator's message.
-    User(String),
+    User {
+        /// What they said.
+        text: String,
+        /// It started a turn of its own, so the conversation keeps it as the operator's: a
+        /// message said while the agent worked goes into a tool result instead.
+        turn: bool,
+    },
     /// The agent's text.
     Reply {
         /// Markdown.
@@ -116,8 +122,13 @@ pub enum Item {
     Approval(Approval),
     /// Something the operator should know.
     Notice(String),
-    /// A failed turn.
-    Error(String),
+    /// A failure.
+    Error {
+        /// What went wrong.
+        text: String,
+        /// The message whose turn failed, to send again.
+        retry: Option<String>,
+    },
     /// A report from the robot, which the agent then answers.
     Report(String),
     /// A plan, and the mission that runs it.
@@ -174,14 +185,34 @@ pub struct Chat {
     pub spent: Spent,
     /// The reply as it streams in, until it arrives whole or a tool call takes over.
     pub draft: Option<String>,
-    last_user: Option<String>,
+    /// What the operator said to start each turn, for the Retry of a turn that failed.
+    asked: HashMap<u64, String>,
+}
+
+impl Item {
+    /// A failure with nothing to retry.
+    #[must_use]
+    pub fn error(text: impl Into<String>) -> Self {
+        Self::Error {
+            text: text.into(),
+            retry: None,
+        }
+    }
 }
 
 impl Chat {
-    /// Adds the operator's message.
-    fn push_user(&mut self, text: String) {
-        self.last_user = Some(text.clone());
-        self.items.push(Item::User(text));
+    /// Adds the operator's message. A message said mid-turn that the session sends again as a
+    /// turn of its own is the same bubble, now a turn's.
+    fn push_user(&mut self, text: String, turn: bool) {
+        if turn
+            && let Some(Item::User { text: said, turn }) = self.items.last_mut()
+            && !*turn
+            && *said == text
+        {
+            *turn = true;
+            return;
+        }
+        self.items.push(Item::User { text, turn });
     }
 
     /// The pending approvals, oldest first.
@@ -229,10 +260,26 @@ impl Chat {
                 "Observe only: the agent cannot act".to_owned()
             })),
             Event::Halted { reason } => self.items.push(Item::Notice(format!("Stopped: {reason}"))),
+            Event::Stopped { ok: true, detail } => {
+                self.items
+                    .push(Item::Notice(format!("The robot stopped: {detail}")));
+            }
+            Event::Stopped { ok: false, detail } => {
+                self.items.push(Item::error(format!(
+                    "The robot did not confirm the stop: {detail}"
+                )));
+            }
             Event::Notice { text } => self.items.push(Item::Notice(text.clone())),
-            Event::Error { text, .. } => self.items.push(Item::Error(text.clone())),
+            Event::Error { turn, text } => self.items.push(Item::Error {
+                text: text.clone(),
+                retry: self.asked.get(turn).cloned(),
+            }),
             // Said while the agent works: the model reads it with its next step.
-            Event::User { text, .. } | Event::Steer { text, .. } => self.push_user(text.clone()),
+            Event::User { turn, text } => {
+                self.asked.insert(*turn, text.clone());
+                self.push_user(text.clone(), true);
+            }
+            Event::Steer { text, .. } => self.push_user(text.clone(), false),
             Event::Report { text, .. } => self.items.push(Item::Report(text.clone())),
             Event::ToolStarted { .. }
             | Event::ToolFinished { .. }
@@ -405,7 +452,7 @@ impl Chat {
                 ));
                 for (operator, text) in exchanges {
                     if *operator {
-                        self.push_user(text.clone());
+                        self.push_user(text.clone(), true);
                     } else {
                         self.items.push(Item::Reply {
                             text: text.clone(),
@@ -540,18 +587,22 @@ impl Chat {
         }
         let width = ui.available_width().min(MAX_TEXT_WIDTH);
         ui.spacing_mut().item_spacing.y = 8.0;
+        // "Condense up to here" counts what the conversation keeps as the operator's.
         let mut later = self
             .items
             .iter()
-            .filter(|i| matches!(i, Item::User(_)))
+            .filter(|i| matches!(i, Item::User { turn: true, .. }))
             .count();
         for item in &self.items {
             ui.scope(|ui| {
                 ui.set_max_width(width);
                 match item {
-                    Item::User(text) => {
-                        later -= 1;
-                        user_bubble(ui, text, later, actions);
+                    Item::User { text, turn } => {
+                        let keep = turn.then(|| {
+                            later -= 1;
+                            later
+                        });
+                        user_bubble(ui, text, keep, actions);
                     }
                     Item::Reply { text, model } => reply(ui, text, model),
                     Item::Tool(t) => tool_chip(ui, t),
@@ -572,7 +623,7 @@ impl Chat {
                         approval_card(ui, a, self.plan_for(a), approval_ttl, actions);
                     }
                     Item::Notice(text) => notice(ui, text),
-                    Item::Error(text) => error_card(ui, text, self.last_user.as_deref(), actions),
+                    Item::Error { text, retry } => error_card(ui, text, retry.as_deref(), actions),
                     Item::Report(text) => report(ui, text),
                     Item::Plan(p) => plan_card(ui, p, actions),
                     Item::Unanswered(u, done) => unanswered_card(ui, u, done, actions),
@@ -654,7 +705,9 @@ fn empty_state(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
 
 /// The operator's message, with "condense up to here" on a right click; `later` is how many of
 /// their messages came after it.
-fn user_bubble(ui: &mut egui::Ui, text: &str, later: usize, actions: &mut Vec<Action>) {
+/// A message of the operator's; `later` is how many turns of theirs came after it, for a message
+/// that started one.
+fn user_bubble(ui: &mut egui::Ui, text: &str, later: Option<usize>, actions: &mut Vec<Action>) {
     ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
         let bubble = Frame::new()
             .fill(ui.tokens().selection_bg_fill)
@@ -666,6 +719,9 @@ fn user_bubble(ui: &mut egui::Ui, text: &str, later: usize, actions: &mut Vec<Ac
             })
             .response
             .interact(egui::Sense::click());
+        let Some(later) = later else {
+            return;
+        };
         bubble.context_menu(|ui| {
             if ui
                 .button("Condense up to here")
@@ -682,7 +738,9 @@ fn user_bubble(ui: &mut egui::Ui, text: &str, later: usize, actions: &mut Vec<Ac
 }
 
 fn reply(ui: &mut egui::Ui, text: &str, model: &str) {
-    ui.markdown_ui(text);
+    // An image in a reply would be fetched from wherever it points, a URL prompt injection can
+    // write: shown as a link, it goes nowhere unless clicked.
+    ui.markdown_ui(&text.replace("![", "["));
     ui.label(RichText::new(model).small().color(ui.tokens().text_subdued));
 }
 
@@ -1272,17 +1330,17 @@ fn notice(ui: &mut egui::Ui, text: &str) {
     });
 }
 
-fn error_card(ui: &mut egui::Ui, text: &str, last_user: Option<&str>, actions: &mut Vec<Action>) {
+fn error_card(ui: &mut egui::Ui, text: &str, retry: Option<&str>, actions: &mut Vec<Action>) {
     let t = ui.tokens();
     card(ui, t.error_fg_color).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.small_icon(&icons::ERROR, Some(t.error_fg_color));
             ui.add(egui::Label::new(RichText::new(text).color(t.error_fg_color)).wrap());
         });
-        if let Some(last) = last_user
+        if let Some(again) = retry
             && ui.add(ReButton::new("Retry").small().secondary()).clicked()
         {
-            actions.push(Action::Say(last.to_owned()));
+            actions.push(Action::Say(again.to_owned()));
         }
     });
 }
@@ -1338,7 +1396,7 @@ pub(crate) mod tests {
 
     pub(crate) fn sample() -> Chat {
         let mut chat = Chat::default();
-        chat.push_user("What do you see right now?".to_owned());
+        chat.push_user("What do you see right now?".to_owned(), true);
         chat.apply(&Event::TurnStarted { turn: 1 });
         chat.apply(&Event::ToolStarted {
             turn: 1,
@@ -1849,7 +1907,10 @@ pub(crate) mod tests {
     #[test]
     fn snapshot_error_and_image() {
         let mut chat = Chat::default();
-        chat.push_user("Look again".to_owned());
+        chat.apply(&Event::User {
+            turn: 2,
+            text: "Look again".to_owned(),
+        });
         let mut jpeg = Vec::new();
         let img = image::RgbImage::from_pixel(96, 54, image::Rgb([60, 90, 140]));
         image::codecs::jpeg::JpegEncoder::new(&mut jpeg)

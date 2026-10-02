@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use nervros_ros::RobotPort;
+use nervros_ros::{RobotPort, RosError};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
@@ -19,8 +19,9 @@ use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
 /// How often a value or a message is looked at.
 const PERIOD: Duration = Duration::from_millis(500);
-/// The window a rate is measured over.
+/// The shortest window a rate is measured over; a slow rate gets the two periods it needs.
 const RATE_WINDOW: Duration = Duration::from_secs(2);
+const MAX_RATE_WINDOW: Duration = Duration::from_secs(30);
 const DEFAULT_FOR_S: u64 = 1800;
 const MAX_FOR_S: u64 = 7200;
 const MAX_WATCHES: usize = 8;
@@ -43,6 +44,12 @@ pub(crate) enum Condition {
 }
 
 impl Condition {
+    /// Whether a look reads whole messages, which a camera or a map makes too large, rather
+    /// than only counting them.
+    pub(crate) fn reads_messages(&self) -> bool {
+        !matches!(self, Self::RateBelow(_))
+    }
+
     pub(crate) fn parse(args: &Value) -> Result<Self, String> {
         match args["condition"].as_str().unwrap_or_default() {
             "rate_below" => args["hz"]
@@ -61,6 +68,9 @@ impl Condition {
                 }
                 if args["value"].is_null() {
                     return Err("value needs `value` to compare with".to_owned());
+                }
+                if !matches!(op, "==" | "!=") && number(&args["value"]).is_none() {
+                    return Err(format!("`{op}` compares numbers: give `value` as a number"));
                 }
                 Ok(Self::Value {
                     field: field.trim().to_owned(),
@@ -113,16 +123,24 @@ fn kind(v: &Value, path: &str) -> String {
     }
 }
 
+/// A number, or text that reads as one: a model often quotes the value it compares with.
+fn number(v: &Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str()?.trim().parse().ok())
+}
+
 /// Whether `found op wanted` holds: numbers as numbers, anything else by equality.
 fn compare(found: &Value, op: &str, wanted: &Value) -> bool {
-    if let (Some(a), Some(b)) = (found.as_f64(), wanted.as_f64()) {
+    if let (Some(a), Some(b)) = (found.as_f64(), number(wanted)) {
+        // A float32 field arrives as the nearest double, 0.2 as 0.20000000298: equal within a
+        // millionth of the larger.
+        let same = (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0);
         return match op {
-            "<" => a < b,
-            "<=" => a <= b,
-            ">" => a > b,
-            ">=" => a >= b,
-            "!=" => (a - b).abs() > f64::EPSILON,
-            _ => (a - b).abs() <= f64::EPSILON,
+            "<" => a < b && !same,
+            "<=" => a < b || same,
+            ">" => a > b && !same,
+            ">=" => a > b || same,
+            "!=" => !same,
+            _ => same,
         };
     }
     let (a, b) = (
@@ -141,59 +159,76 @@ fn compare(found: &Value, op: &str, wanted: &Value) -> bool {
 }
 
 /// One look: `Some(what was seen)` when the condition holds.
+///
+/// # Errors
+///
+/// The topic cannot be read at all, such as a type this build does not know: a look that could
+/// not subscribe says so, rather than reading as silence.
 pub(crate) async fn holds(
     robot: &dyn RobotPort,
     topic: &str,
     ty: &str,
     condition: &Condition,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     match condition {
         Condition::RateBelow(hz) => {
+            let window = RATE_WINDOW.max(Duration::from_secs_f64(2.0 / hz).min(MAX_RATE_WINDOW));
             let arrivals = robot
-                .sample_sizes(topic, ty, RATE_WINDOW, 100_000)
+                .sample_sizes(topic, ty, window, 100_000)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| e.to_string())?;
             #[expect(clippy::cast_precision_loss, reason = "a count of messages")]
-            let rate = arrivals.len() as f64 / RATE_WINDOW.as_secs_f64();
-            (rate < *hz).then(|| format!("{rate:.1} Hz"))
+            let rate = arrivals.len() as f64 / window.as_secs_f64();
+            Ok((rate < *hz).then(|| format!("{rate:.1} Hz")))
         }
         Condition::Value {
             field: path,
             op,
             value,
         } => {
-            let msg = robot.latest(topic, ty, PERIOD).await.ok()?;
-            let found = field(&msg, path)?;
-            compare(found, op, value).then(|| format!("{path} is {found}"))
+            let msg = match robot.latest(topic, ty, PERIOD).await {
+                Ok(msg) => msg,
+                Err(RosError::NoData(_)) => return Ok(None),
+                Err(e) => return Err(e.to_string()),
+            };
+            Ok(field(&msg, path)
+                .filter(|found| compare(found, op, value))
+                .map(|found| format!("{path} is {found}")))
         }
         Condition::Text(text) => {
             // Every message in the window, not the newest: a log line is gone by the next look.
             let msgs = robot
                 .sample_messages(topic, ty, 1000, RATE_WINDOW)
                 .await
-                .ok()?;
-            msgs.iter()
+                .map_err(|e| e.to_string())?;
+            Ok(msgs
+                .iter()
                 .map(Value::to_string)
                 .find(|body| body.to_lowercase().contains(text))
                 .map(|body| {
                     let excerpt: String = body.chars().take(200).collect();
                     format!("it said {excerpt}")
-                })
+                }))
         }
     }
 }
 
-/// The topic the arguments name, and its type from the graph.
+/// The topic the arguments name, and its type from the graph: one the profile lets the agent
+/// read, and small enough to read message by message when `whole` messages are read.
 pub(crate) async fn topic_of(
     robot: &dyn RobotPort,
     args: &Value,
+    read_deny: &[String],
+    whole: bool,
 ) -> Result<(String, String), String> {
-    let topic = args["topic"]
-        .as_str()
-        .map(str::trim)
-        .filter(|t| t.starts_with('/'))
-        .ok_or("`topic` is an absolute topic name, such as /scan")?
-        .to_owned();
+    let topic = crate::guard::canonical_ros_name(args["topic"].as_str().unwrap_or_default())
+        .map_err(|e| format!("`topic`: {e}, such as /scan"))?;
+    if read_deny
+        .iter()
+        .any(|p| crate::guard::glob_match(p, &topic))
+    {
+        return Err(format!("the profile keeps {topic} from being read"));
+    }
     let graph = robot.graph().await.map_err(|e| e.to_string())?;
     let ty = graph
         .topics
@@ -208,6 +243,11 @@ pub(crate) async fn topic_of(
                 crate::ros_tools::missing("topic", &topic, names)
             )
         })?;
+    if whole && crate::ros_tools::BULK_TYPES.contains(&ty.as_str()) {
+        return Err(format!(
+            "{topic} carries {ty}, too large to read message by message; watch its rate, or look"
+        ));
+    }
     Ok((topic, ty))
 }
 
@@ -221,17 +261,21 @@ struct Entry {
 /// The running watches, and the session they report into.
 pub struct Watches {
     robot: Arc<dyn RobotPort>,
+    /// Topics the profile keeps from being read.
+    read_deny: Vec<String>,
     session: OnceLock<SessionHandle>,
     running: Mutex<Vec<Entry>>,
     next: AtomicU64,
 }
 
 impl Watches {
-    /// No watches yet; [`Self::attach`] connects them to the session.
+    /// No watches yet; [`Self::attach`] connects them to the session. `read_deny` is the
+    /// profile's, as `topic_sample` keeps it.
     #[must_use]
-    pub fn new(robot: Arc<dyn RobotPort>) -> Arc<Self> {
+    pub fn new(robot: Arc<dyn RobotPort>, read_deny: Vec<String>) -> Arc<Self> {
         Arc::new(Self {
             robot,
+            read_deny,
             session: OnceLock::new(),
             running: Mutex::new(Vec::new()),
             next: AtomicU64::new(1),
@@ -266,13 +310,13 @@ impl Watches {
         ]
     }
 
-    async fn topic(&self, args: &Value) -> Result<(String, String), String> {
-        topic_of(self.robot.as_ref(), args).await
+    async fn topic(&self, args: &Value, whole: bool) -> Result<(String, String), String> {
+        topic_of(self.robot.as_ref(), args, &self.read_deny, whole).await
     }
 
     async fn start(self: &Arc<Self>, args: &Value) -> Result<ToolOutcome, String> {
         let condition = Condition::parse(args)?;
-        let (topic, ty) = self.topic(args).await?;
+        let (topic, ty) = self.topic(args, condition.reads_messages()).await?;
         let for_s = args["for_s"]
             .as_u64()
             .unwrap_or(DEFAULT_FOR_S)
@@ -297,7 +341,18 @@ impl Watches {
                 let mut was = false;
                 while Instant::now() < deadline {
                     let looked = Instant::now();
-                    let seen = holds(robot.as_ref(), &topic, &ty, &condition).await;
+                    let seen = match holds(robot.as_ref(), &topic, &ty, &condition).await {
+                        Ok(seen) => seen,
+                        // Watching what cannot be read would report silence for hours.
+                        Err(e) => {
+                            if let Some(s) = &session {
+                                s.send(Command::Report(format!(
+                                    "Watch {task_id} ({task_what}) stopped: it cannot read {topic} ({e})."
+                                )));
+                            }
+                            return;
+                        }
+                    };
                     if let Some(seen) = &seen
                         && !was
                     {
@@ -342,7 +397,7 @@ impl Watches {
             .filter(|f| !f.is_empty())
             .ok_or("`field` is a dotted path to a number, such as twist.twist.linear.x")?
             .to_owned();
-        let (topic, ty) = self.topic(args).await?;
+        let (topic, ty) = self.topic(args, true).await?;
         let msg = self
             .robot
             .latest(&topic, &ty, Duration::from_secs(2))
@@ -567,7 +622,7 @@ mod tests {
             FakeRobot::new()
                 .with_topic("/odom", json!({"pose": {"pose": {"position": {"x": 6.0}}}})),
         );
-        let watches = Watches::new(robot);
+        let watches = Watches::new(robot, vec!["/secret*".to_owned()]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (events, _) = tokio::sync::broadcast::channel(8);
         watches.attach(SessionHandle::for_tests(&tx, events));
@@ -612,7 +667,7 @@ mod tests {
             json!({"twist": {"twist": {"linear": {"x": 0.4}}}, "child_frame_id": "pelvis",
                    "data": vec![0; 40_000]}),
         ));
-        let watches = Watches::new(robot);
+        let watches = Watches::new(robot, vec!["/secret*".to_owned()]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (events, mut seen) = tokio::sync::broadcast::channel(8);
         watches.attach(SessionHandle::for_tests(&tx, events));
@@ -653,6 +708,46 @@ mod tests {
             &Condition::Text("error".into()),
         )
         .await;
-        assert!(seen.unwrap().contains("Lidar ERROR"));
+        assert!(seen.unwrap().unwrap().contains("Lidar ERROR"));
+    }
+
+    #[test]
+    fn a_float32_equals_its_decimal_and_a_quoted_number_compares() {
+        let f32_tenth = json!(f64::from(0.2_f32));
+        assert!(compare(&f32_tenth, "==", &json!(0.2)));
+        assert!(!compare(&f32_tenth, "!=", &json!(0.2)));
+        assert!(compare(&json!(6), ">", &json!("5")));
+        assert!(!compare(&json!(5.0), ">", &json!(5)));
+        assert!(compare(&json!(5.0), ">=", &json!(5)));
+        assert!(
+            Condition::parse(&json!({"condition": "value", "field": "x", "op": ">", "value": "a"}))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_topic_too_large_or_kept_from_reading_is_refused() {
+        let typed = |name: &str, ty: &str| (name.to_owned(), vec![ty.to_owned()]);
+        let robot: Arc<dyn RobotPort> =
+            Arc::new(FakeRobot::new().with_graph(nervros_ros::GraphDetail {
+                topics: vec![
+                    typed("/camera", "sensor_msgs/msg/Image"),
+                    typed("/secret_stuff", "std_msgs/msg/String"),
+                ],
+                ..nervros_ros::GraphDetail::default()
+            }));
+        let watches = Watches::new(Arc::clone(&robot), vec!["/secret*".to_owned()]);
+        let image = |condition: &str| {
+            json!({"topic": "/camera", "condition": condition, "contains": "a",
+                   "field": "width", "op": ">", "value": 0, "hz": 5})
+        };
+        let text = watches.start(&image("text")).await;
+        assert!(text.unwrap_err().contains("too large"));
+        let secret = watches
+            .start(&json!({"topic": "/secret_stuff", "condition": "text", "contains": "a"}))
+            .await;
+        assert!(secret.unwrap_err().contains("keeps /secret_stuff"));
+        let rate = watches.start(&image("rate_below")).await;
+        assert!(rate.is_ok(), "a camera's rate is cheap to watch: {rate:?}");
     }
 }

@@ -296,7 +296,7 @@ app, and the agent never asks first in the chat. `check_only` only checks a plan
 | `preview` | none | The `PreviewMission` service: the viewer draws where a plan's walks end and the paths to them beside its approval card, and the card marks a step the preview cannot reach. |
 | `heartbeat` | none | Where the agent publishes `nervros_interfaces/msg/Heartbeat` while a mission runs, from the session's own loop: the executor stops a mission whose agent is gone, crashed or hung. Without it a mission runs on alone. |
 | `heartbeat_timeout_s` | `2.0` | How long a mission may go without a heartbeat; the executor clamps it to its own limit. |
-| `teleop` | none | The `Teleop` service: Drive in the Robot tab hands the base to the operator while no mission runs. |
+| `teleop` | none | The `Teleop` service: Drive in the Robot tab hands the base to the operator while no mission runs and the robot is armed; disarming hands it back. W S walk, A D turn, Q E step sideways. |
 | `teleop_cmd` | none | Where the hand-driving `geometry_msgs/msg/Twist` commands go; the executor caps their speed and stops the base when they pause. |
 
 Before a plan reaches the operator it is checked against their words: a left turn planned as a

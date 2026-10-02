@@ -715,14 +715,15 @@ impl History {
         Ok(Self(serde_json::from_slice(&std::fs::read(path)?)?))
     }
 
-    /// The operator's messages and the replies, in order, for showing a resumed conversation.
+    /// The operator's messages and the replies, in order, for showing a resumed conversation; a
+    /// robot's report or a summary comes as text of the robot's, not as the operator's words.
     #[must_use]
     pub fn exchanges(&self) -> Vec<(bool, String)> {
         self.0
             .iter()
             .filter_map(|m| match m {
                 Message::User { content } if is_user_text(m) => Some((
-                    true,
+                    is_operator(m),
                     content
                         .iter()
                         .filter_map(|c| match c {
@@ -1289,7 +1290,10 @@ mod tests {
         let mut summarised = history.clone();
         summarised.summarised(n, "the operator asked for ten things");
         let first = summarised.exchanges();
-        assert!(first[0].0 && first[0].1.contains("ten things"), "{first:?}");
+        assert!(
+            !first[0].0 && first[0].1.contains("ten things"),
+            "a summary is not the operator's words: {first:?}"
+        );
         assert!(summarised.size() <= 2600, "{}", summarised.size());
         let mut squeezed = history;
         squeezed.squeeze(2500);
