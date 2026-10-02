@@ -22,8 +22,6 @@ provider = "local"
 model = "qwen3.5-9b"
 vision = true
 tools = true
-tool_choice = true
-structured = "json_schema"
 privacy = { local = true }
 
 [[model]]
@@ -32,8 +30,6 @@ provider = "openrouter"
 model = "qwen/qwen3.8-27b:free"
 vision = true
 tools = true
-tool_choice = true
-structured = "json_schema"
 limits = { rpm = 20, pool = "openrouter_free" }
 
 [[model]]

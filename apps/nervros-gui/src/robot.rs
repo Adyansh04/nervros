@@ -18,8 +18,6 @@ use serde_json::{Value, json};
 /// How often a held command is sent; the executor stops the base after 0.4 s without one.
 const SEND_EVERY: Duration = Duration::from_millis(100);
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Full speed forward, sideways and turning; the executor clamps to its own limits.
-const SPEED: [f64; 3] = [0.5, 0.3, 0.8];
 
 /// Where the robot stands on the map: x, y and heading in radians.
 pub type Pose = (f64, f64, f64);
@@ -51,24 +49,11 @@ pub fn room_at(rooms: &Value, x: f64, y: f64) -> Option<&Value> {
             .iter()
             .filter_map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)))
             .collect();
-        inside(&points, x, y)
+        nervros_core::builtins::inside((x, y), &points)
     })
 }
 
 /// Whether a polygon holds a point, by counting the edges a ray to the right crosses.
-fn inside(polygon: &[(f64, f64)], x: f64, y: f64) -> bool {
-    let mut inside = false;
-    let mut j = polygon.len().wrapping_sub(1);
-    for (i, &(xi, yi)) in polygon.iter().enumerate() {
-        let (xj, yj) = polygon[j];
-        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
-}
-
 /// The hottest motor in a diagnostics message, as `(name, °C)`; none when all read zero, as in
 /// the simulator.
 pub fn hottest(diagnostics: &Value) -> Option<(String, f64)> {
@@ -105,6 +90,8 @@ pub struct Drive {
     robot: Arc<dyn RobotPort>,
     service: String,
     topic: String,
+    /// Full speed forward, sideways and turning.
+    speed: [f64; 3],
     runtime: tokio::runtime::Handle,
     link: Arc<Mutex<Link>>,
     sent: Option<Instant>,
@@ -123,6 +110,7 @@ impl Drive {
             robot,
             service: mission.teleop.clone()?,
             topic: mission.teleop_cmd.clone()?,
+            speed: mission.teleop_speed,
             runtime,
             link: Arc::default(),
             sent: None,
@@ -201,7 +189,7 @@ impl Drive {
             return;
         }
         let scale = if self.slow { 0.5 } else { 1.0 };
-        let [x, y, yaw] = [0, 1, 2].map(|i| held[i] * SPEED[i] * scale);
+        let [x, y, yaw] = [0, 1, 2].map(|i| held[i] * self.speed[i] * scale);
         commands.send(json!({
             "linear": {"x": x, "y": y, "z": 0.0},
             "angular": {"x": 0.0, "y": 0.0, "z": yaw}
@@ -297,13 +285,13 @@ fn state_section(ui: &mut egui::Ui, status: &Status) {
     for hand in ["left", "right"] {
         let held = held_by(state, hand);
         let text = if held.is_empty() {
-            format!("{} hand free", capitalised(hand))
+            format!("{} hand free", crate::chat::capitalise(hand))
         } else {
             let name = status
                 .names
                 .get(&held)
                 .map_or_else(String::new, |n| format!(" ({n})"));
-            format!("{} hand holds {held}{name}", capitalised(hand))
+            format!("{} hand holds {held}{name}", crate::chat::capitalise(hand))
         };
         ui.label(subdued(text));
     }
@@ -326,12 +314,6 @@ fn state_section(ui: &mut egui::Ui, status: &Status) {
             ui.label(subdued(text));
         }
     }
-}
-
-fn capitalised(word: &str) -> String {
-    let mut c = word.chars();
-    c.next()
-        .map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
 fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
@@ -462,6 +444,7 @@ mod tests {
             robot: Arc::new(nervros_ros::fake::FakeRobot::new()),
             service: "/x/teleop".to_owned(),
             topic: "/x/teleop_cmd".to_owned(),
+            speed: [0.5, 0.3, 0.8],
             runtime: runtime.handle().clone(),
             link: Arc::default(),
             sent: None,

@@ -32,6 +32,7 @@ struct Toast {
 pub struct Toasts(Vec<Toast>);
 
 impl Toasts {
+    /// Shows `text` for a while; a failure stays longer.
     pub fn add(&mut self, kind: Kind, text: impl Into<String>) {
         let shown = if kind == Kind::Failure {
             FAILURE_SHOWN

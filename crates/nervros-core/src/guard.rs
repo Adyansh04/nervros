@@ -6,12 +6,13 @@
 //! Refusals carry a message the model can read and act on.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::lock;
 use crate::tools::{Lane, Resource, ToolSpec};
 
 /// How much the agent may do without asking.
@@ -283,10 +284,6 @@ struct State {
 pub struct Guard {
     policy: Policy,
     state: Arc<Mutex<State>>,
-}
-
-fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
-    state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// `*` matches any run of characters, including none; everything else matches itself.

@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use crate::{Array, FieldType, Message, Part, Registry, TypeName};
+use crate::{Array, Error, FieldType, Message, Part, Registry, Result, TypeName};
 
 /// ROS types are not recursive; this only stops a malicious nesting.
 const MAX_DEPTH: usize = 32;
@@ -16,27 +16,25 @@ const MAX_DEPTH: usize = 32;
 ///
 /// # Errors
 ///
-/// The first problem, as `path: what is wrong`.
-pub fn validate(
-    registry: &Registry,
-    ty: &TypeName,
-    part: Part,
-    value: &Value,
-) -> Result<(), String> {
+/// [`Error::UnknownType`] or [`Error::NoSuchPart`] for an interface the registry lacks, and
+/// [`Error::Invalid`] with the first problem in the value.
+pub fn validate(registry: &Registry, ty: &TypeName, part: Part, value: &Value) -> Result<()> {
     let message = message_of(registry, ty, part)?;
-    check_message(registry, message, value, "", 0)
+    check_message(registry, message, value, "", 0).map_err(Error::Invalid)
 }
 
-fn message_of<'a>(
-    registry: &'a Registry,
-    ty: &TypeName,
-    part: Part,
-) -> Result<&'a Message, String> {
+fn message_of<'a>(registry: &'a Registry, ty: &TypeName, part: Part) -> Result<&'a Message> {
     registry
         .get(ty)
-        .ok_or_else(|| format!("unknown interface `{ty}`"))?
+        .ok_or_else(|| Error::UnknownType {
+            name: ty.clone(),
+            used_by: None,
+        })?
         .part(part)
-        .ok_or_else(|| format!("`{ty}` has no {} part", format!("{part:?}").to_lowercase()))
+        .ok_or_else(|| Error::NoSuchPart {
+            ty: ty.clone(),
+            part,
+        })
 }
 
 fn at(path: &str) -> String {
@@ -170,7 +168,7 @@ fn check_scalar(
             }
         }
         FieldType::Nested(inner) => {
-            let message = message_of(registry, inner, Part::Message)?;
+            let message = message_of(registry, inner, Part::Message).map_err(|e| e.to_string())?;
             check_message(registry, message, value, path, depth + 1)
         }
         integer => {
@@ -216,7 +214,7 @@ mod tests {
 
     fn go(value: &Value) -> Result<(), String> {
         let ty: TypeName = "demo_msgs/srv/Go".parse().unwrap();
-        validate(&registry(), &ty, Part::Request, value)
+        validate(&registry(), &ty, Part::Request, value).map_err(|e| e.to_string())
     }
 
     #[test]
@@ -288,16 +286,17 @@ mod tests {
     #[test]
     fn an_unknown_type_or_part_says_so() {
         let ty: TypeName = "demo_msgs/srv/Missing".parse().unwrap();
-        assert!(
-            validate(&registry(), &ty, Part::Request, &json!({}))
-                .unwrap_err()
-                .contains("unknown")
-        );
+        assert!(matches!(
+            validate(&registry(), &ty, Part::Request, &json!({})),
+            Err(Error::UnknownType { .. })
+        ));
         let ty: TypeName = "demo_msgs/srv/Go".parse().unwrap();
-        assert!(
-            validate(&registry(), &ty, Part::Goal, &json!({}))
-                .unwrap_err()
-                .contains("no goal")
-        );
+        assert!(matches!(
+            validate(&registry(), &ty, Part::Goal, &json!({})),
+            Err(Error::NoSuchPart {
+                part: Part::Goal,
+                ..
+            })
+        ));
     }
 }

@@ -270,7 +270,7 @@ fn pose(robot: &Arc<dyn RobotPort>, profile: &Profile) -> Option<(f64, f64, f64)
     let t = robot
         .transform(&profile.ros.map_frame, &profile.ros.base_frame)
         .ok()?;
-    Some((t.translation[0], t.translation[1], t.yaw()))
+    Some(t.planar())
 }
 
 /// What every trial shares.
@@ -293,16 +293,7 @@ async fn truth_pose(robot: &Arc<dyn RobotPort>, truth: &Truth) -> Option<(f64, f
         )
         .await
         .ok()?;
-    let (p, q) = (
-        &odom["pose"]["pose"]["position"],
-        &odom["pose"]["pose"]["orientation"],
-    );
-    let n = |v: &Value| v.as_f64();
-    let t = Transform {
-        translation: [n(&p["x"])?, n(&p["y"])?, 0.0],
-        rotation: [n(&q["x"])?, n(&q["y"])?, n(&q["z"])?, n(&q["w"])?],
-    };
-    Some((t.translation[0], t.translation[1], t.yaw()))
+    Transform::from_pose(&odom["pose"]["pose"]).map(|t| t.planar())
 }
 
 /// How far the base went from `a` to `b`, metres, and how far it turned, degrees, left positive.
@@ -573,9 +564,7 @@ fn case_row(out: &mut String, id: &str, arms: &[Option<&String>], trials: &[Tria
 
 /// Where a run's report goes when `--out` is not given.
 pub(crate) fn default_out() -> PathBuf {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let stamp = nervros_core::unix_secs(std::time::SystemTime::now());
     nervros_core::app::state_dir()
         .join("evals")
         .join(format!("eval-{stamp}"))

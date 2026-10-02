@@ -82,30 +82,6 @@ impl ProviderConfig {
     }
 }
 
-/// Whether a model can be forced into a JSON schema.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Structured {
-    /// Plain text only.
-    #[default]
-    None,
-    /// JSON Schema constrained output.
-    JsonSchema,
-}
-
-/// How an image produced by a tool reaches this model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImageInToolResult {
-    /// Inside the tool result.
-    Native,
-    /// As a follow-up user message, for chat-completion endpoints that take text-only tool results.
-    #[default]
-    FollowUp,
-    /// Not at all.
-    None,
-}
-
 /// Request limits of one model. A missing field means unlimited.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -133,10 +109,6 @@ pub struct Privacy {
 /// One model on one provider.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each is a capability the models file states"
-)]
 pub struct ModelConfig {
     /// Referenced by roles.
     pub id: String,
@@ -150,15 +122,6 @@ pub struct ModelConfig {
     /// Calls tools.
     #[serde(default)]
     pub tools: bool,
-    /// Honours a forced tool choice.
-    #[serde(default)]
-    pub tool_choice: bool,
-    /// Constrained output support.
-    #[serde(default)]
-    pub structured: Structured,
-    /// How tool images reach it.
-    #[serde(default)]
-    pub image_in_tool_result: ImageInToolResult,
     /// Request limits.
     #[serde(default)]
     pub limits: Limits,

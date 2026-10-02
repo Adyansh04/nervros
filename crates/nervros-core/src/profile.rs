@@ -379,6 +379,62 @@ pub struct MissionConfig {
     pub teleop: Option<String>,
     /// Where the hand-driving `geometry_msgs/msg/Twist` commands go while it is on.
     pub teleop_cmd: Option<String>,
+    /// Full hand-driving speed forward (m/s), sideways (m/s) and turning (rad/s); the executor
+    /// clamps to its own limits.
+    #[serde(default = "default_teleop_speed")]
+    pub teleop_speed: [f64; 3],
+    /// The skills whose arguments a plan is checked against the operator's words with.
+    #[serde(default)]
+    pub checks: PlanChecks,
+}
+
+/// The executor's skills the plan checks know: names, units and signs are the robot's own, so
+/// each check runs only for a skill named here.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanChecks {
+    /// A turn on the spot, checked for side and angle.
+    pub turn: Option<TurnSkill>,
+    /// A straight walk, checked for direction and distance.
+    pub walk: Option<WalkSkill>,
+    /// The argument that names an arm, `left` or `right`, checked against the hand asked for.
+    pub arm: Option<String>,
+}
+
+/// A turn on the spot.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnSkill {
+    /// Its name in the catalog.
+    pub skill: String,
+    /// The argument with the angle in degrees.
+    pub degrees: String,
+    /// Positive degrees turn left (counterclockwise from above, as in ROS); `false` for a robot
+    /// whose positive turns are to the right.
+    #[serde(default = "yes")]
+    pub positive_left: bool,
+}
+
+/// A straight walk.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalkSkill {
+    /// Its name in the catalog.
+    pub skill: String,
+    /// The argument with the distance in metres.
+    pub metres: String,
+    /// The argument with the way, `forward` or `backward`.
+    pub direction: String,
+    /// The longest walk one step makes, in metres: a longer one takes more steps.
+    pub max_m: f64,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_teleop_speed() -> [f64; 3] {
+    [0.5, 0.3, 0.8]
 }
 
 fn default_replans() -> u32 {

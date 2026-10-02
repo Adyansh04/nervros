@@ -5,8 +5,8 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ impl Memory {
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<Note>> {
-        self.notes.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.notes)
     }
 
     /// Every note, oldest first.
@@ -97,9 +97,7 @@ impl Memory {
         let note = Note {
             id: notes.iter().map(|n| n.id).max().unwrap_or(0) + 1,
             text: text.to_owned(),
-            at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs()),
+            at: crate::unix_secs(SystemTime::now()),
         };
         notes.push(note.clone());
         self.save(&notes)?;

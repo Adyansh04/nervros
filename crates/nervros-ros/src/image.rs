@@ -138,6 +138,31 @@ fn depth_grey(metres: f32) -> u8 {
     v
 }
 
+/// The JPEG quality of every image the agent keeps or sends.
+pub const JPEG_QUALITY: u8 = 85;
+
+/// `img` scaled so its longest side is at most `edge` pixels.
+#[must_use]
+pub fn capped(img: &RgbImage, edge: u32) -> RgbImage {
+    let (w, h) = img.dimensions();
+    let longest = w.max(h);
+    if longest <= edge {
+        return img.clone();
+    }
+    // side * edge / longest <= edge, so it fits a u32.
+    let scaled = |side: u32| {
+        u32::try_from(u64::from(side) * u64::from(edge) / u64::from(longest))
+            .unwrap_or(edge)
+            .max(1)
+    };
+    image::imageops::resize(
+        img,
+        scaled(w),
+        scaled(h),
+        image::imageops::FilterType::Triangle,
+    )
+}
+
 /// Encodes an RGB image as JPEG.
 ///
 /// # Errors
@@ -155,6 +180,14 @@ pub fn encode_jpeg(image: &RgbImage, quality: u8) -> Result<Vec<u8>, FrameError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capped_image_keeps_its_shape() {
+        let wide = RgbImage::new(1280, 720);
+        assert_eq!(capped(&wide, 768).dimensions(), (768, 432));
+        let small = RgbImage::new(64, 48);
+        assert_eq!(capped(&small, 768).dimensions(), (64, 48));
+    }
 
     fn frame(encoding: &str, w: u32, h: u32, step: u32, data: Vec<u8>) -> Frame {
         Frame {

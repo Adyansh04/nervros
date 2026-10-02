@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use nervros_ros::RobotPort;
@@ -42,7 +42,7 @@ impl Places {
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<PlaceConfig>> {
-        self.tagged.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.tagged)
     }
 
     /// The profile's places, then the remembered ones.

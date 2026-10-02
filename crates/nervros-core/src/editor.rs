@@ -12,9 +12,9 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Value, json};
 
 use crate::llm::{ImageFormat, ImageInput};
-use crate::look::{Eyes, Snapshot, SnapshotStore};
+use crate::look::{Eyes, SnapshotStore};
 use crate::profile::EditorConfig;
-use crate::tools::{ImageArtifact, Risk, Tool, ToolOutcome, ToolSpec};
+use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
 /// The ops `edit_world` passes on, as the editor names them.
 pub const OPS: [&str; 13] = [
@@ -388,22 +388,11 @@ impl InspectObject {
         let mut images = Vec::new();
         match self.editor.crop(id).await.map_err(|e| e.to_string())? {
             Some(jpeg) => {
-                let (width, height) =
+                let size =
                     image::load_from_memory(&jpeg).map_or((0, 0), |i| (i.width(), i.height()));
-                let artifact = ImageArtifact {
-                    snapshot: self.snapshots.next_id(),
-                    jpeg: Arc::new(jpeg.clone()),
-                    width,
-                    height,
-                    marks: Vec::new(),
-                };
-                self.snapshots.put(Snapshot {
-                    id: artifact.snapshot.clone(),
-                    stamp_s: 0.0,
-                    marks: Vec::new(),
-                    image: artifact.clone(),
-                });
-                data["snapshot"] = json!(artifact.snapshot);
+                // A view canopy kept from some earlier moment: no frame stamp to give it.
+                let snapshot = self.snapshots.store(jpeg.clone(), size, 0.0, Vec::new());
+                data["snapshot"] = json!(snapshot.id);
                 if let (Some(eyes), Some(q)) = (&self.eyes, args["question"].as_str()) {
                     let prompt = format!(
                         "{q}\n\nThis is the camera's best view of O{id}, which the world model \
@@ -422,7 +411,7 @@ impl InspectObject {
                         Err(why) => data["not_seen"] = json!(why),
                     }
                 }
-                images.push(artifact);
+                images.push(snapshot.image.clone());
             }
             None => data["view"] = json!("canopy kept no view of it"),
         }

@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -81,7 +81,7 @@ impl Schedules {
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<Entry>> {
-        self.list.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.list)
     }
 
     /// Where runs report; also cancels every schedule as soon as the robot is stopped. Each run

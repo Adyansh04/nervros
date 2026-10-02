@@ -46,9 +46,7 @@ fn main() -> Result<()> {
     let profile = Profile::load(&args.profile).context("loading the profile")?;
     let robot = nervros_core::app::connect(&profile)?;
     let state = nervros_core::app::state_dir();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let stamp = nervros_core::unix_secs(std::time::SystemTime::now());
     let files = nervros_core::app::StartOptions {
         history: Some(
             state

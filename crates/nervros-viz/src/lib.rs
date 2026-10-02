@@ -1119,8 +1119,7 @@ fn draw_objects(
         if unchanged {
             continue;
         }
-        let q = &o["pose"]["orientation"];
-        let w = q["w"].as_f64().unwrap_or(1.0);
+        let pose = layers::pose(&o["pose"]);
         let label = o["label"].as_str().unwrap_or_default();
         let name = object_name(o);
         let alpha = if o["state"].as_u64() == Some(STALE) {
@@ -1132,15 +1131,10 @@ fn draw_objects(
             rec,
             &format!("{path}/{id}"),
             &rerun::Boxes3D::from_centers_and_half_sizes(
-                [xyz(&o["pose"]["position"])],
+                [f32s(pose.translation)],
                 [xyz(&o["size"]).map(|v| v / 2.0)],
             )
-            .with_quaternions([rerun::Quaternion::from_xyzw(f32s([
-                num(&q["x"]),
-                num(&q["y"]),
-                num(&q["z"]),
-                w,
-            ]))])
+            .with_quaternions([rerun::Quaternion::from_xyzw(f32s(pose.rotation))])
             .with_labels([format!("{id} {name}")])
             .with_show_labels(false)
             .with_colors([object_colour(label, alpha)]),

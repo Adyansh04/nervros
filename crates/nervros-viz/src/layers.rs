@@ -136,7 +136,9 @@ fn quaternion(t: &Transform) -> rerun::Quaternion {
     rerun::Quaternion::from_xyzw(f32s(t.rotation))
 }
 
-fn pose(p: &Value) -> Transform {
+/// Lenient where [`Transform::from_pose`] is strict: a marker may leave fields out, and a missing
+/// orientation draws as none.
+pub(crate) fn pose(p: &Value) -> Transform {
     let q = &p["orientation"];
     let w = q["w"].as_f64().unwrap_or(1.0);
     Transform {

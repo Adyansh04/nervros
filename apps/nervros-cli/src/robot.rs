@@ -355,9 +355,7 @@ fn parse_line(line: &str) -> Option<SessionCommand> {
 pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions) -> Result<()> {
     let profile = Profile::load(profile_path).context("loading the profile")?;
     let robot = nervros_core::app::connect(&profile)?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let stamp = nervros_core::unix_secs(std::time::SystemTime::now());
     let logs_dir = state.join("logs");
     let resume = match options.resume.as_deref() {
         None => None,

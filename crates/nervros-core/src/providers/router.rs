@@ -5,11 +5,11 @@
 //! resort. The caller tries the candidates in order and reports what happened.
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use super::ledger::{Ledger, Refused, ResetZone};
-use super::{ModelConfig, ModelsConfig, ProviderKind, Role, Structured};
+use super::{ModelConfig, ModelsConfig, ProviderKind, Role};
 
 /// What a call needs from a model.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -18,8 +18,6 @@ pub struct Need {
     pub vision: bool,
     /// Tools are offered.
     pub tools: bool,
-    /// The answer must follow a JSON schema.
-    pub structured: bool,
 }
 
 /// Where camera images may go, as the profile's `[privacy] mode` says.
@@ -40,8 +38,6 @@ pub enum Skip {
     NoVision,
     /// The call offers tools and the model calls none.
     NoTools,
-    /// The call needs structured output.
-    NoStructured,
     /// The privacy mode forbids it.
     Privacy,
     /// A limit or a 429 blocks it.
@@ -87,7 +83,7 @@ impl Router {
 
     fn ledger(&self) -> MutexGuard<'_, Ledger> {
         // A panic while holding the lock leaves counts that are still valid numbers.
-        self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.ledger)
     }
 
     fn zone(&self, model: &ModelConfig) -> ResetZone {
@@ -108,9 +104,6 @@ impl Router {
         }
         if need.tools && !model.tools {
             return Some(Skip::NoTools);
-        }
-        if need.structured && model.structured == Structured::None {
-            return Some(Skip::NoStructured);
         }
         let private = match self.privacy {
             PrivacyMode::Sim => true,
@@ -247,7 +240,6 @@ mod tests {
         model = "qwen/qwen3.8-27b:free"
         vision = true
         tools = true
-        structured = "json_schema"
         limits = { rpm = 20, pool = "or_free" }
 
         [[model]]
@@ -264,7 +256,6 @@ mod tests {
         model = "qwen3.5-9b"
         vision = true
         tools = true
-        structured = "json_schema"
         privacy = { local = true }
 
         [pools]

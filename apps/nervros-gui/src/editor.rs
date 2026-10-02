@@ -220,16 +220,8 @@ fn reshape(origin: Shape2, grip: Grip, from: [f64; 2], at: [f64; 2]) -> Shape2 {
 }
 
 fn in_polygon(polygon: &[[f64; 2]], [x, y]: [f64; 2]) -> bool {
-    let mut hit = false;
-    let mut j = polygon.len().wrapping_sub(1);
-    for (i, &[xi, yi]) in polygon.iter().enumerate() {
-        let [xj, yj] = polygon[j];
-        if (yi > y) != (yj > y) && x < xi + (y - yi) * (xj - xi) / (yj - yi) {
-            hit = !hit;
-        }
-        j = i;
-    }
-    hit
+    let points: Vec<(f64, f64)> = polygon.iter().map(|&[a, b]| (a, b)).collect();
+    nervros_core::builtins::inside((x, y), &points)
 }
 
 /// The walls' angle, which canopy lays boxes along: the most common yaw, a quarter turn apart.
@@ -395,16 +387,8 @@ fn floor_plan(png: &[u8]) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::from_rgba_unmultiplied(size, &rgba))
 }
 
-fn jpeg(bytes: &[u8]) -> Option<egui::ColorImage> {
-    let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let size = [rgba.width(), rgba.height()].map(|v| usize::try_from(v).unwrap_or(0));
-    Some(egui::ColorImage::from_rgba_unmultiplied(
-        size,
-        rgba.as_raw(),
-    ))
-}
-
 impl WorldEditor {
+    /// An editor for the world model behind `client`, its calls run on `runtime`.
     pub(crate) fn new(client: Arc<EditorClient>, runtime: tokio::runtime::Handle) -> Self {
         Self {
             client,
@@ -436,6 +420,7 @@ impl WorldEditor {
         shared.reachable = Some(true);
     }
 
+    /// Selects what a click in the viewer would.
     #[cfg(test)]
     pub(crate) fn select(&mut self, picked: Picked) {
         self.selected = Some(picked);
@@ -569,7 +554,12 @@ impl WorldEditor {
                     ctx.clone(),
                 );
                 self.runtime.spawn(async move {
-                    let image = client.crop(id).await.ok().flatten().and_then(|b| jpeg(&b));
+                    let image = client
+                        .crop(id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|b| crate::chat::decode(&b));
                     lock(&shared).crops.insert(id, image.map(Arc::new));
                     ctx.request_repaint();
                 });

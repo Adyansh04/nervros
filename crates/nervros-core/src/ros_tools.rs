@@ -109,7 +109,6 @@ const PARAMS_MAX: usize = 80;
 // An echo shows this much of each array and string.
 const ARRAY_ITEMS: usize = 8;
 const TEXT_CHARS: usize = 120;
-// Messages whose JSON is megabytes: counted, never echoed.
 /// Message types too large to read message by message: echoed, watched or plotted.
 pub(crate) const BULK_TYPES: [&str; 5] = [
     "sensor_msgs/msg/Image",
@@ -243,14 +242,9 @@ fn actions(graph: &GraphDetail) -> Vec<(String, String)> {
         .collect()
 }
 
-// The lint fires only when ROS is compiled in, so `expect` would fail the core-only build.
-#[allow(
-    clippy::result_large_err,
-    reason = "the error is the tool's answer, returned once per call"
-)]
-fn name_arg(args: &Value, key: &str) -> Result<String, ToolOutcome> {
-    let raw = args[key].as_str().unwrap_or_default();
-    canonical_ros_name(raw).map_err(ToolOutcome::refused)
+/// The ROS name under `key`, or the refusal to answer with.
+fn name_arg(args: &Value, key: &str) -> Result<String, String> {
+    canonical_ros_name(args[key].as_str().unwrap_or_default())
 }
 
 fn seconds(args: &Value, key: &str, default: f64, max: Duration) -> Duration {
@@ -326,8 +320,6 @@ fn qos_matches(publisher: &Endpoint, sub: &Endpoint) -> bool {
         !(sub.qos.durability == "transient_local" && publisher.qos.durability == "volatile");
     reliable_ok && durable_ok
 }
-
-// --- ros_graph -------------------------------------------------------------------------------
 
 struct RosGraph {
     spec: ToolSpec,
@@ -508,8 +500,6 @@ impl Tool for RosGraph {
     }
 }
 
-// --- topic_sample ----------------------------------------------------------------------------
-
 struct TopicSample {
     spec: ToolSpec,
     ctx: Arc<Ctx>,
@@ -556,7 +546,7 @@ impl Tool for TopicSample {
     async fn call(&self, args: Value) -> ToolOutcome {
         let topic = match name_arg(&args, "topic") {
             Ok(t) => t,
-            Err(out) => return out,
+            Err(why) => return ToolOutcome::refused(why),
         };
         if self
             .ctx
@@ -646,8 +636,6 @@ impl Tool for TopicSample {
     }
 }
 
-// --- interface_show --------------------------------------------------------------------------
-
 struct InterfaceShow {
     spec: ToolSpec,
     ctx: Arc<Ctx>,
@@ -670,8 +658,6 @@ impl Tool for InterfaceShow {
         }
     }
 }
-
-// --- tf --------------------------------------------------------------------------------------
 
 struct Tf {
     spec: ToolSpec,
@@ -715,8 +701,6 @@ impl Tool for Tf {
         }
     }
 }
-
-// --- params ----------------------------------------------------------------------------------
 
 struct Params {
     spec: ToolSpec,
@@ -843,7 +827,7 @@ impl Tool for Params {
     async fn call(&self, args: Value) -> ToolOutcome {
         let node = match name_arg(&args, "node") {
             Ok(n) => n,
-            Err(out) => return out,
+            Err(why) => return ToolOutcome::refused(why),
         };
         let mut names: Vec<String> = args["names"]
             .as_array()
@@ -929,8 +913,6 @@ impl Tool for Params {
     }
 }
 
-// --- log_tail --------------------------------------------------------------------------------
-
 struct LogTail {
     spec: ToolSpec,
     ctx: Arc<Ctx>,
@@ -1004,8 +986,6 @@ impl Tool for LogTail {
     }
 }
 
-// --- service_call ----------------------------------------------------------------------------
-
 struct ServiceCall {
     spec: ToolSpec,
     ctx: Arc<Ctx>,
@@ -1050,7 +1030,7 @@ impl ServiceCall {
     }
 
     async fn prepare(&self, args: &Value) -> Result<Prepared, ToolOutcome> {
-        let service = name_arg(args, "service")?;
+        let service = name_arg(args, "service").map_err(ToolOutcome::refused)?;
         let listed = self
             .ctx
             .config
@@ -1135,8 +1115,6 @@ impl Tool for ServiceCall {
     }
 }
 
-// --- action_goal -----------------------------------------------------------------------------
-
 struct ActionGoal {
     spec: ToolSpec,
     ctx: Arc<Ctx>,
@@ -1163,7 +1141,7 @@ impl ActionGoal {
     }
 
     async fn prepare(&self, args: &Value) -> Result<Prepared, ToolOutcome> {
-        let action = name_arg(args, "action")?;
+        let action = name_arg(args, "action").map_err(ToolOutcome::refused)?;
         if !self
             .ctx
             .config
@@ -1336,8 +1314,6 @@ impl Tool for ActionGoal {
     }
 }
 
-// --- param_set -------------------------------------------------------------------------------
-
 struct ParamSet {
     spec: ToolSpec,
     ctx: Arc<Ctx>,
@@ -1354,7 +1330,7 @@ struct ParamChange {
 
 impl ParamSet {
     async fn prepare(&self, args: &Value) -> Result<ParamChange, ToolOutcome> {
-        let node = name_arg(args, "node")?;
+        let node = name_arg(args, "node").map_err(ToolOutcome::refused)?;
         let name = args["name"].as_str().unwrap_or_default().to_owned();
         let key = format!("{node}:{name}");
         if name.is_empty()
@@ -1465,8 +1441,6 @@ impl Tool for ParamSet {
     }
 }
 
-// --- topic_publish ---------------------------------------------------------------------------
-
 struct TopicPublish {
     spec: ToolSpec,
     ctx: Arc<Ctx>,
@@ -1474,7 +1448,7 @@ struct TopicPublish {
 
 impl TopicPublish {
     async fn prepare(&self, args: &Value) -> Result<Prepared, ToolOutcome> {
-        let topic = name_arg(args, "topic")?;
+        let topic = name_arg(args, "topic").map_err(ToolOutcome::refused)?;
         if !self
             .ctx
             .config

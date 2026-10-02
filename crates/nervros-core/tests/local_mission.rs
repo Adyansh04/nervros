@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use nervros_core::mission::Outcome;
 use nervros_core::session::{Command, Event};
 use nervros_ros::fake::{FakeRobot, ScriptedRun};
 use nervros_ros::{GoalResult, GoalStatus, RobotPort, Transform};
@@ -171,11 +172,13 @@ async fn walks_to_a_room() {
             .any(|(t, s)| t == "run_mission" && *s == "accepted"),
         "{calls:?}"
     );
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, Event::MissionFinished { outcome, .. } if outcome == "success"))
-    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::MissionFinished {
+            outcome: Outcome::Success,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]

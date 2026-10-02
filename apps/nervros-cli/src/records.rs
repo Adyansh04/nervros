@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use nervros_core::mission::ledger::{self, Ledger};
+use nervros_core::mission::ledger::Ledger;
 use nervros_core::profile::Profile;
 use serde_json::Value;
 
@@ -129,7 +129,7 @@ fn open_ledger(profile: &Path) -> Result<std::sync::Arc<Ledger>> {
 /// The latest missions, or one in full by its id.
 pub fn missions(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
     let ledger = open_ledger(profile)?;
-    let now = ledger::now_s();
+    let now = nervros_core::now_s();
     let list = match id {
         Some(id) => ledger.mission(id)?,
         None => ledger.recent(limit)?,
@@ -174,7 +174,7 @@ pub fn missions(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
 /// The requests no skill could do, newest first.
 pub fn gaps(profile: &Path, limit: usize) -> Result<()> {
     let ledger = open_ledger(profile)?;
-    let now = ledger::now_s();
+    let now = nervros_core::now_s();
     for g in ledger.gaps(limit)? {
         let nearest = if g.nearest.is_empty() {
             String::new()
@@ -200,18 +200,13 @@ pub fn case(which: &str, id: &str, append: Option<&Path>) -> Result<()> {
     if case.say.is_empty() {
         bail!("{} has no operator messages", path.display());
     }
-    let text = nervros_core::evalcase::to_toml(&case)?;
     match append {
         Some(suite) => {
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(suite)
-                .with_context(|| format!("opening {}", suite.display()))?;
-            write!(file, "\n# From {}\n{text}", path.display())?;
+            let id = nervros_core::evalcase::append(suite, case, &path)
+                .with_context(|| format!("appending to {}", suite.display()))?;
             println!("appended case {id} to {}", suite.display());
         }
-        None => print!("{text}"),
+        None => print!("{}", nervros_core::evalcase::to_toml(&case)?),
     }
     Ok(())
 }

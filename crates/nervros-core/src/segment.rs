@@ -15,20 +15,15 @@ use image::{Rgb, RgbImage};
 use nervros_ros::{Frame, RobotPort};
 use serde_json::{Value, json};
 
-use crate::llm::{ImageFormat, ImageInput};
+use crate::llm::ImageInput;
 use crate::look::{
-    Camera, Cameras, Instance, PALETTE, Snapshot, SnapshotStore, badge, capped, parse_detections,
-    tint,
+    Camera, Cameras, Instance, PALETTE, SnapshotStore, badge, parse_detections, tint,
 };
 use crate::profile::{SegmentBackend, SegmentConfig};
-use crate::tools::{ImageArtifact, Risk, Tool, ToolOutcome, ToolSpec};
+use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
 /// The type of `[segment] service`.
 pub const SERVICE_TYPE: &str = "canopy_msgs/srv/Segment";
-
-/// The longest side of the frame the model gets. Outlines come back normalised, so a larger frame
-/// would cost tokens and add no precision the outline keeps.
-const MODEL_EDGE_PX: u32 = 768;
 
 /// A vision model that outlines what a prompt names.
 #[async_trait]
@@ -454,18 +449,12 @@ impl SegmentTool {
         let (img, drawn, jpeg) = tokio::task::spawn_blocking(move || {
             let img = source.to_rgb().map_err(|e| e.to_string())?;
             let drawn = draw(&img, &outlined, view);
-            let jpeg = nervros_ros::image::encode_jpeg(&drawn, 85).map_err(|e| e.to_string())?;
-            Ok::<_, String>((img, drawn, jpeg))
+            let jpeg = nervros_ros::image::encode_jpeg(&drawn, nervros_ros::image::JPEG_QUALITY)
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((img, drawn.dimensions(), jpeg))
         })
         .await
         .map_err(|e| e.to_string())??;
-        let image = ImageArtifact {
-            snapshot: self.snapshots.next_id(),
-            jpeg: Arc::new(jpeg),
-            width: drawn.width(),
-            height: drawn.height(),
-            marks: regions.iter().map(|r| r.label.clone()).collect(),
-        };
         let listed: Vec<Value> = regions
             .iter()
             .enumerate()
@@ -479,12 +468,7 @@ impl SegmentTool {
                 entry
             })
             .collect();
-        let snapshot = self.snapshots.put(Snapshot {
-            id: image.snapshot.clone(),
-            stamp_s: frame.stamp_s,
-            marks: regions,
-            image: image.clone(),
-        });
+        let snapshot = self.snapshots.store(jpeg, drawn, frame.stamp_s, regions);
         let mut out = ToolOutcome::ok(json!({"snapshot": snapshot.id, "camera": camera.name,
             "prompt": prompt, "by": by, "regions": listed}));
         out.message = if listed.is_empty() {
@@ -495,7 +479,7 @@ impl SegmentTool {
                 listed.len()
             )
         };
-        out.images.push(image);
+        out.images.push(snapshot.image.clone());
         Ok(out)
     }
 
@@ -510,12 +494,7 @@ impl SegmentTool {
             .ok_or("no vision model is set up to segment")?;
         let frame = camera.newest()?;
         let img = frame.to_rgb().map_err(|e| e.to_string())?;
-        let small = capped(&img, MODEL_EDGE_PX);
-        let bytes = nervros_ros::image::encode_jpeg(&small, 85).map_err(|e| e.to_string())?;
-        let image = ImageInput {
-            bytes,
-            format: ImageFormat::Jpeg,
-        };
+        let image = ImageInput::jpeg(&img)?;
         let (answer, model) = outliner.outline(&outline_prompt(prompt), image).await?;
         tracing::debug!(%model, %answer, "segment outlines");
         let regions = parse_outlines(&answer, img.width(), img.height())?;

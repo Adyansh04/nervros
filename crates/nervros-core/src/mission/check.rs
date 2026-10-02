@@ -173,12 +173,7 @@ pub fn last_seen(step: &PlannedStep, seen: &Observed, now_s: f64) -> Option<Stri
 /// The world model's object a step is about, by its id, name or phrase arguments.
 #[must_use]
 pub fn step_object<'a>(step: &PlannedStep, seen: &'a Observed) -> Option<&'a Value> {
-    let arg = |name: &str| {
-        step.args
-            .iter()
-            .find(|a| a.name == name)
-            .map(|a| a.value.as_str())
-    };
+    let arg = |name: &str| super::plan::arg(&step.args, name);
     let keys: Vec<&str> = ["object_id", "container_id", "target", "place"]
         .iter()
         .filter_map(|k| arg(k))

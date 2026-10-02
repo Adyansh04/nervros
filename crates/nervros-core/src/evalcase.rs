@@ -193,7 +193,7 @@ pub async fn say(
             }
             Event::MissionStarted { .. } => open += 1,
             Event::MissionFinished { outcome, .. } => {
-                seen.missions.push(outcome);
+                seen.missions.push(outcome.as_str().to_owned());
                 open = open.saturating_sub(1);
                 awaiting_report = true;
             }
@@ -433,6 +433,33 @@ pub fn to_toml(case: &Case) -> Result<String, toml::ser::Error> {
     })
 }
 
+/// Adds `case` to the suite file `suite`, making it and its folder when missing, under a line
+/// naming the session log it came from. Returns the id it was saved under: [`unique_id`] of its
+/// own.
+///
+/// # Errors
+///
+/// The suite could not be written.
+pub fn append(
+    suite: &std::path::Path,
+    mut case: Case,
+    log: &std::path::Path,
+) -> std::io::Result<String> {
+    use std::io::Write as _;
+    let saved = std::fs::read_to_string(suite).unwrap_or_default();
+    case.id = unique_id(&saved, &case.id);
+    let text = to_toml(&case).map_err(std::io::Error::other)?;
+    if let Some(dir) = suite.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(suite)?;
+    write!(file, "\n# From {}\n{text}", log.display())?;
+    Ok(case.id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +531,18 @@ mod tests {
         assert!(text.starts_with("[[case]]"), "{text}");
         let back: Suite = toml::from_str(&text).unwrap();
         assert_eq!(back.cases, [case]);
+    }
+
+    #[test]
+    fn a_case_appended_twice_is_kept_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let suite = dir.path().join("evals").join("saved.toml");
+        let log = r#"{"seq":1,"ts":1.0,"event":{"kind":"user","turn":1,"text":"Turn left."}}"#;
+        let case = from_log(log, "turn");
+        let from = std::path::Path::new("session-1.ndjson");
+        assert_eq!(append(&suite, case.clone(), from).unwrap(), "turn");
+        assert_eq!(append(&suite, case, from).unwrap(), "turn-2");
+        let saved: Suite = toml::from_str(&std::fs::read_to_string(&suite).unwrap()).unwrap();
+        assert_eq!(saved.cases.len(), 2);
     }
 }

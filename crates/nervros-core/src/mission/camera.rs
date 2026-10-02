@@ -12,7 +12,7 @@ use nervros_ros::Frame;
 use super::check::{Observed, Verdict, object};
 use super::plan::predicate;
 use crate::llm::{ImageFormat, ImageInput};
-use crate::look::{Cameras, Eyes, Snapshot, SnapshotStore};
+use crate::look::{Cameras, Eyes, SnapshotStore};
 use crate::tools::ImageArtifact;
 
 /// The height both frames are scaled to, side by side.
@@ -83,7 +83,8 @@ impl Vision {
         let Ok(picture) = picture(before, &after) else {
             return Checked::default();
         };
-        let Ok(jpeg) = nervros_ros::image::encode_jpeg(&picture, 85) else {
+        let Ok(jpeg) = nervros_ros::image::encode_jpeg(&picture, nervros_ros::image::JPEG_QUALITY)
+        else {
             return Checked::default();
         };
         let mut lines = Vec::new();
@@ -128,22 +129,12 @@ impl Vision {
             };
             lines.push(line);
         }
-        let artifact = ImageArtifact {
-            snapshot: self.snapshots.next_id(),
-            jpeg: Arc::new(jpeg),
-            width: picture.width(),
-            height: picture.height(),
-            marks: Vec::new(),
-        };
-        self.snapshots.put(Snapshot {
-            id: artifact.snapshot.clone(),
-            stamp_s: after.stamp_s,
-            marks: Vec::new(),
-            image: artifact.clone(),
-        });
+        let snapshot = self
+            .snapshots
+            .store(jpeg, picture.dimensions(), after.stamp_s, Vec::new());
         Checked {
             lines,
-            image: Some(artifact),
+            image: Some(snapshot.image.clone()),
         }
     }
 }

@@ -21,11 +21,12 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use nervros_ros::{Frame, Goal, GoalResult, Publisher, RobotPort, RosError};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::Instrument as _;
 
@@ -34,6 +35,7 @@ use self::check::Observed;
 use self::ledger::{Ledger, MissionRecord, StepRecord};
 use self::plan::{Author as By, Compiled, Plan, PlannedStep, Thing, World};
 use self::sanity::{Concern, Critic, Verdict};
+use crate::lock;
 use crate::profile::{MissionConfig, Profile};
 use crate::session::{Command, Event, SessionHandle};
 use crate::tools::{Assessment, Risk, Status, Tool, ToolOutcome, ToolSpec};
@@ -59,16 +61,59 @@ const LOST_AFTER: u32 = 6;
 const EXECUTE: &str = "nervros_interfaces/action/ExecuteMission";
 const STATE: &str = "nervros_interfaces/msg/RobotState";
 const HEARTBEAT: &str = "nervros_interfaces/msg/Heartbeat";
-const OUTCOMES: [&str; 6] = [
-    "success", "failure", STOPPED, "timeout", "rejected", "error",
-];
-/// The executor's outcome for a mission a stop ended.
-const STOPPED: &str = "canceled";
 const STATUSES: [&str; 5] = ["idle", "running", "success", "failure", "skipped"];
 
 /// The executor sends its state at least once a second: an older one says how things were, not
 /// how they are.
 pub const STATE_FRESH: Duration = Duration::from_secs(3);
+
+/// How a mission ended, in the order of the executor's `outcome` codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Outcome {
+    /// Every step succeeded.
+    Success,
+    /// A step failed.
+    Failure,
+    /// A stop ended it: the operator's, the deadman's or the robot's own.
+    Canceled,
+    /// It ran past its time limit.
+    Timeout,
+    /// The executor refused the plan.
+    Rejected,
+    /// The executor or the link to it failed.
+    Error,
+}
+
+impl Outcome {
+    const BY_CODE: [Self; 6] = [
+        Self::Success,
+        Self::Failure,
+        Self::Canceled,
+        Self::Timeout,
+        Self::Rejected,
+        Self::Error,
+    ];
+
+    /// Its name, as the model, the log and the ledger read it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Canceled => "canceled",
+            Self::Timeout => "timeout",
+            Self::Rejected => "rejected",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// What a hand holds when the executor cannot say: after a pick that was cut off, it trusts the
 /// hand again only once a place with it succeeds.
@@ -86,10 +131,6 @@ pub fn held_by(state: &Value, arm: &str) -> String {
     } else {
         held.to_owned()
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The mission in flight.
@@ -138,8 +179,6 @@ pub struct Missions {
     /// Where the session's pulse goes: the executor's deadman, fed while the loop that serves
     /// Stop runs.
     heartbeat: Mutex<Option<Publisher>>,
-    /// Whether it does: a mission that asked for a deadman without one would be stopped at once.
-    heartbeat_live: AtomicBool,
     /// Who this agent is in its heartbeats, so the executor counts only its own.
     client: String,
     /// Where finished missions are kept, for track records, recall and replay.
@@ -205,7 +244,6 @@ impl Missions {
             last: Mutex::default(),
             session: OnceLock::new(),
             heartbeat: Mutex::default(),
-            heartbeat_live: AtomicBool::new(false),
             client: format!("nervros {}", std::process::id()),
             ledger: OnceLock::new(),
             request: Mutex::default(),
@@ -334,7 +372,6 @@ impl Missions {
         match self.robot.publisher(topic, HEARTBEAT).await {
             Ok(publisher) => {
                 *lock(&self.heartbeat) = Some(publisher);
-                self.heartbeat_live.store(true, Ordering::SeqCst);
             }
             Err(e) => self.emit(Event::Notice {
                 text: format!(
@@ -652,7 +689,7 @@ impl Missions {
         by: By,
     ) -> (bool, Vec<Concern>) {
         let request = self.request();
-        let found = sanity::check(&request, &compiled.steps);
+        let found = sanity::check(&request, &compiled.steps, &self.config.checks);
         if !found.is_empty() {
             return (true, found);
         }
@@ -973,7 +1010,8 @@ impl Missions {
             "tree_xml": compiled.xml,
             "tree_sha256": compiled.sha256,
             "max_duration_s": 0.0,
-            "heartbeat_timeout_s": if self.heartbeat_live.load(Ordering::SeqCst) {
+            // A mission that asked for a deadman with no beats coming would be stopped at once.
+            "heartbeat_timeout_s": if lock(&self.heartbeat).is_some() {
                 self.config.heartbeat_timeout_s
             } else {
                 0.0
@@ -1057,7 +1095,7 @@ impl Missions {
         held: Option<crate::guard::ResourceLock>,
     ) {
         let started = Instant::now();
-        let started_s = ledger::now_s();
+        let started_s = crate::now_s();
         let mut times = StepTimes::default();
         let result = self.outcome_of(&id, goal, &mut times).await;
         let elapsed = started.elapsed().as_secs_f64();
@@ -1065,15 +1103,15 @@ impl Missions {
         drop(held);
         self.release(&id);
         tracing::Span::current().record("nervros.outcome", outcome.as_str());
-        let how = match outcome.as_str() {
-            "success" => "succeeded".to_owned(),
-            STOPPED => "was stopped".to_owned(),
+        let how = match outcome {
+            Outcome::Success => "succeeded".to_owned(),
+            Outcome::Canceled => "was stopped".to_owned(),
             _ => format!("failed at {step}: {reason}"),
         };
         *lock(&self.last) = Some((compiled.sha256.clone(), how));
         self.emit(Event::MissionFinished {
             id: id.clone(),
-            outcome: outcome.clone(),
+            outcome,
             failed_step: step.clone(),
             reason: reason.clone(),
             elapsed_s: elapsed,
@@ -1084,8 +1122,8 @@ impl Missions {
             intent: compiled.plan.intent.clone(),
             request: lock(&self.request).clone(),
             started: started_s,
-            ended: ledger::now_s(),
-            outcome: outcome.clone(),
+            ended: crate::now_s(),
+            outcome: outcome.as_str().to_owned(),
             failed_step: step.clone(),
             reason: reason.clone(),
             steps: compiled
@@ -1099,14 +1137,14 @@ impl Missions {
         let object = compiled
             .steps
             .iter()
-            .find(|s| s.id == step && outcome != "success")
+            .find(|s| s.id == step && outcome != Outcome::Success)
             .and_then(|s| check::step_object(s, &seen))
             .and_then(|o| o["id"].as_str());
         let story = match object {
             Some(id) => self.object_story(id).await,
             None => Vec::new(),
         };
-        let camera = match self.vision.get().filter(|_| outcome == "success") {
+        let camera = match self.vision.get().filter(|_| outcome == Outcome::Success) {
             Some(vision) => {
                 let verdicts = check::check(&compiled.goal, &seen);
                 vision.check(&verdicts, &seen, before.as_ref()).await
@@ -1114,18 +1152,12 @@ impl Missions {
             None => camera::Checked::default(),
         };
         if let Some(image) = &camera.image {
-            self.emit(Event::Snapshot {
-                id: image.snapshot.clone(),
-                jpeg: Arc::clone(&image.jpeg),
-                width: image.width,
-                height: image.height,
-                marks: Vec::new(),
-            });
+            self.emit(image.into());
         }
         let report = self.report(
             &id,
             &compiled,
-            (&outcome, &step, &reason),
+            (outcome, &step, &reason),
             elapsed,
             (&seen, &story, &camera.lines),
         );
@@ -1187,7 +1219,7 @@ impl Missions {
         &self,
         id: &str,
         compiled: &Compiled,
-        (outcome, step, reason): (&str, &str, &str),
+        (outcome, step, reason): (Outcome, &str, &str),
         elapsed: f64,
         (seen, story, camera): (&Observed, &[String], &[String]),
     ) -> String {
@@ -1198,7 +1230,7 @@ impl Missions {
         let mut next = "";
         // Failures count per request, not in a row: a detour that works between two blocked
         // walks does not start the count again, and the operator's next message does.
-        if outcome == STOPPED {
+        if outcome == Outcome::Canceled {
             // A stop is the operator's, the deadman's or the robot's own: not a failure to fix.
             let at = compiled
                 .steps
@@ -1212,7 +1244,7 @@ impl Missions {
             };
             let _ = write!(report, " It was stopped{at}{why}.");
             next = "Do not run it again unless the operator asks. Tell them where things stand.";
-        } else if outcome == "success" {
+        } else if outcome == Outcome::Success {
             let verdicts = check::check(&compiled.goal, seen);
             if !verdicts.is_empty() {
                 let lines: Vec<String> = verdicts
@@ -1240,7 +1272,7 @@ impl Missions {
             let failed = compiled.steps.iter().find(|s| s.id == step);
             let what = failed.map_or_else(String::new, |s| format!(" {}", s.summary));
             let _ = write!(report, " Failed at {step}{what}: {reason}.");
-            if let Some(line) = failed.and_then(|s| check::last_seen(s, seen, ledger::now_s())) {
+            if let Some(line) = failed.and_then(|s| check::last_seen(s, seen, crate::now_s())) {
                 let _ = write!(report, " The world model: {line}.");
             }
             if !story.is_empty() {
@@ -1294,7 +1326,7 @@ impl Missions {
         {
             Ok(reply) => check::story(
                 reply["events"].as_array().map_or(&[][..], Vec::as_slice),
-                ledger::now_s(),
+                crate::now_s(),
             ),
             Err(e) => {
                 tracing::info!(error = %e, "no object history");
@@ -1445,23 +1477,22 @@ impl Missions {
 }
 
 /// `(outcome, failed step, reason)` from the executor's result.
-fn summarise(result: Result<GoalResult, RosError>) -> (String, String, String) {
+fn summarise(result: Result<GoalResult, RosError>) -> (Outcome, String, String) {
     match result {
         Ok(r) => {
             let code = r.result["outcome"]
                 .as_u64()
                 .and_then(|c| usize::try_from(c).ok());
             let fallback = match r.status {
-                nervros_ros::GoalStatus::Succeeded => "success",
-                nervros_ros::GoalStatus::Aborted => "failure",
-                nervros_ros::GoalStatus::Canceled => STOPPED,
-                nervros_ros::GoalStatus::Unknown => "error",
+                nervros_ros::GoalStatus::Succeeded => Outcome::Success,
+                nervros_ros::GoalStatus::Aborted => Outcome::Failure,
+                nervros_ros::GoalStatus::Canceled => Outcome::Canceled,
+                nervros_ros::GoalStatus::Unknown => Outcome::Error,
             };
             let outcome = code
-                .and_then(|c| OUTCOMES.get(c))
+                .and_then(|c| Outcome::BY_CODE.get(c))
                 .copied()
-                .unwrap_or(fallback)
-                .to_owned();
+                .unwrap_or(fallback);
             let text = |k: &str| r.result[k].as_str().unwrap_or_default().to_owned();
             // A rejected mission says why in its diagnostics, not in the failure reason.
             let mut reason = text("failure_reason");
@@ -1470,7 +1501,7 @@ fn summarise(result: Result<GoalResult, RosError>) -> (String, String, String) {
             }
             (outcome, text("failed_step_id"), reason)
         }
-        Err(e) => ("error".to_owned(), String::new(), e.to_string()),
+        Err(e) => (Outcome::Error, String::new(), e.to_string()),
     }
 }
 
@@ -1743,6 +1774,7 @@ mod tests {
             stop = "/x/stop"
             state = "/x/state"
             max_replans = 1
+            checks = { turn = { skill = "TurnInPlace", degrees = "degrees" }, arm = "arm" }
             MISSION_EXTRA
             [[place]]
             name = "dock"
@@ -2088,11 +2120,13 @@ mod tests {
             _ => None,
         });
         assert_eq!(last, Some("success"), "the reset to idle is not reported");
-        assert!(
-            seen.iter().any(
-                |e| matches!(e, Event::MissionFinished { outcome, .. } if outcome == "success")
-            )
-        );
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            Event::MissionFinished {
+                outcome: Outcome::Success,
+                ..
+            }
+        )));
     }
 
     #[tokio::test]
@@ -2232,7 +2266,7 @@ mod tests {
             }),
             ..ScriptedRun::default()
         };
-        let now = ledger::now_s();
+        let now = crate::now_s();
         let history = move |req: &Value| {
             assert_eq!(req["query"], "O18", "the failed step's object");
             let at = |ago: f64| json!({"sec": (now - ago).floor(), "nanosec": 0});

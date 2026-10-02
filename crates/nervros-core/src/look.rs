@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -18,13 +18,10 @@ use image::{Rgb, RgbImage};
 use nervros_ros::{Frame, RobotPort};
 use serde_json::{Value, json};
 
-use crate::llm::{ImageFormat, ImageInput};
+use crate::llm::ImageInput;
 use crate::profile::{CameraConfig, LookConfig};
 use crate::tools::{ImageArtifact, Risk, Tool, ToolOutcome, ToolSpec};
 
-/// The longest side of the frame a vision model gets: enough to read a label across a room, and
-/// a fraction of the tokens a full 1280 px frame costs.
-const MODEL_EDGE_PX: u32 = 768;
 /// A close-up's long side at least.
 const CLOSE_UP_PX: u32 = 384;
 
@@ -41,27 +38,6 @@ pub trait Eyes: Send + Sync {
     ///
     /// Why no model answered.
     async fn see(&self, prompt: &str, image: ImageInput) -> Result<(String, String), String>;
-}
-
-/// The frame scaled so its longest side is at most `edge` pixels.
-pub(crate) fn capped(img: &RgbImage, edge: u32) -> RgbImage {
-    let (w, h) = img.dimensions();
-    let longest = w.max(h);
-    if longest <= edge {
-        return img.clone();
-    }
-    // side * edge / longest <= edge, so it fits a u32.
-    let scaled = |side: u32| {
-        u32::try_from(u64::from(side) * u64::from(edge) / u64::from(longest))
-            .unwrap_or(edge)
-            .max(1)
-    };
-    image::imageops::resize(
-        img,
-        scaled(w),
-        scaled(h),
-        image::imageops::FilterType::Triangle,
-    )
 }
 
 /// Frames kept for matching detection stamps: 4 s at 10 Hz, 1.3 s at 30 Hz.
@@ -377,20 +353,40 @@ pub struct SnapshotStore {
     kept: Mutex<VecDeque<Arc<Snapshot>>>,
 }
 
-pub(crate) fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 impl SnapshotStore {
     /// A fresh id.
     pub fn next_id(&self) -> String {
         format!("s{}", self.next.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
+    /// Keeps a JPEG and the marks drawn on it as a new snapshot; its `image` is what a tool
+    /// hands the window.
+    pub fn store(
+        &self,
+        jpeg: Vec<u8>,
+        (width, height): (u32, u32),
+        stamp_s: f64,
+        marks: Vec<Instance>,
+    ) -> Arc<Snapshot> {
+        let id = self.next_id();
+        self.put(Snapshot {
+            image: ImageArtifact {
+                snapshot: id.clone(),
+                jpeg: Arc::new(jpeg),
+                width,
+                height,
+                marks: marks.iter().map(|m| m.label.clone()).collect(),
+            },
+            id,
+            stamp_s,
+            marks,
+        })
+    }
+
     /// Stores a snapshot, dropping the oldest past the limit.
-    pub fn put(&self, snapshot: Snapshot) -> Arc<Snapshot> {
+    fn put(&self, snapshot: Snapshot) -> Arc<Snapshot> {
         let snapshot = Arc::new(snapshot);
-        let mut kept = guard(&self.kept);
+        let mut kept = crate::lock(&self.kept);
         kept.push_back(Arc::clone(&snapshot));
         while kept.len() > SNAPSHOTS_KEPT {
             kept.pop_front();
@@ -401,7 +397,7 @@ impl SnapshotStore {
     /// A snapshot by id, if still kept.
     #[must_use]
     pub fn get(&self, id: &str) -> Option<Arc<Snapshot>> {
-        guard(&self.kept).iter().find(|s| s.id == id).cloned()
+        crate::lock(&self.kept).iter().find(|s| s.id == id).cloned()
     }
 }
 
@@ -411,7 +407,7 @@ pub(crate) struct History(Mutex<(VecDeque<Arc<Frame>>, Option<Instant>)>);
 
 impl History {
     fn push(&self, f: Arc<Frame>) {
-        let mut h = guard(&self.0);
+        let mut h = crate::lock(&self.0);
         h.0.push_back(f);
         while h.0.len() > FRAME_HISTORY {
             h.0.pop_front();
@@ -421,7 +417,7 @@ impl History {
 
     /// The kept frame with the stamp `stamp_s`, give or take `within` seconds.
     pub(crate) fn closest(&self, stamp_s: f64, within: f64) -> Option<Arc<Frame>> {
-        guard(&self.0)
+        crate::lock(&self.0)
             .0
             .iter()
             .min_by(|a, b| {
@@ -434,16 +430,16 @@ impl History {
     }
 
     pub(crate) fn newest(&self) -> Option<Arc<Frame>> {
-        guard(&self.0).0.back().cloned()
+        crate::lock(&self.0).0.back().cloned()
     }
 
     /// How long since a frame arrived, once one has.
     fn quiet_for(&self) -> Option<Duration> {
-        guard(&self.0).1.map(|t| t.elapsed())
+        crate::lock(&self.0).1.map(|t| t.elapsed())
     }
 
     pub(crate) fn recent(&self) -> Vec<Arc<Frame>> {
-        guard(&self.0).0.iter().cloned().collect()
+        crate::lock(&self.0).0.iter().cloned().collect()
     }
 }
 
@@ -630,19 +626,12 @@ impl LookTool {
         let (img, jpeg) = tokio::task::spawn_blocking(move || {
             let mut img = source.to_rgb().map_err(|e| e.to_string())?;
             draw_marks(&mut img, &marks_drawn);
-            let jpeg = nervros_ros::image::encode_jpeg(&img, 85).map_err(|e| e.to_string())?;
+            let jpeg = nervros_ros::image::encode_jpeg(&img, nervros_ros::image::JPEG_QUALITY)
+                .map_err(|e| e.to_string())?;
             Ok::<_, String>((img, jpeg))
         })
         .await
         .map_err(|e| e.to_string())??;
-        let id = self.snapshots.next_id();
-        let image = ImageArtifact {
-            snapshot: id.clone(),
-            jpeg: Arc::new(jpeg),
-            width: img.width(),
-            height: img.height(),
-            marks: dets.instances.iter().map(|i| i.label.clone()).collect(),
-        };
         let marks = marks_json(&dets.instances);
         let seen = self
             .see(
@@ -652,12 +641,9 @@ impl LookTool {
                 camera.config.about.as_deref(),
             )
             .await;
-        let snapshot = self.snapshots.put(Snapshot {
-            id: id.clone(),
-            stamp_s: frame.stamp_s,
-            marks: dets.instances,
-            image: image.clone(),
-        });
+        let snapshot = self
+            .snapshots
+            .store(jpeg, img.dimensions(), frame.stamp_s, dets.instances);
         let mut data = json!({"snapshot": snapshot.id, "camera": camera.name,
             "age_s": (age * 10.0).round() / 10.0, "marks": marks});
         if let Some(why) = left_out {
@@ -673,7 +659,7 @@ impl LookTool {
         }
         let mut out = ToolOutcome::ok(data);
         out.message = format!("{} marks; the user sees the marked image", marks.len());
-        out.images.push(image);
+        out.images.push(snapshot.image.clone());
         Ok(out)
     }
 
@@ -772,9 +758,9 @@ impl LookTool {
         what: &str,
     ) -> Option<Result<(String, String), String>> {
         let eyes = self.eyes.as_ref()?;
-        let bytes = match nervros_ros::image::encode_jpeg(crop, 90) {
-            Ok(b) => b,
-            Err(e) => return Some(Err(e.to_string())),
+        let image = match ImageInput::jpeg(crop) {
+            Ok(image) => image,
+            Err(e) => return Some(Err(e)),
         };
         let question = question.map(str::trim).filter(|q| !q.is_empty());
         let prompt = format!(
@@ -782,10 +768,6 @@ impl LookTool {
              box drawn around it. Say so when something cannot be seen.",
             question.unwrap_or(DEFAULT_QUESTION)
         );
-        let image = ImageInput {
-            bytes,
-            format: ImageFormat::Jpeg,
-        };
         Some(eyes.see(&prompt, image).await)
     }
 
@@ -798,10 +780,9 @@ impl LookTool {
         about: Option<&str>,
     ) -> Option<Result<(String, String), String>> {
         let eyes = self.eyes.as_ref()?;
-        let small = capped(marked, MODEL_EDGE_PX);
-        let bytes = match nervros_ros::image::encode_jpeg(&small, 80) {
-            Ok(b) => b,
-            Err(e) => return Some(Err(e.to_string())),
+        let image = match ImageInput::jpeg(marked) {
+            Ok(image) => image,
+            Err(e) => return Some(Err(e)),
         };
         let question = question.map(str::trim).filter(|q| !q.is_empty());
         let marks = if instances.is_empty() {
@@ -824,10 +805,6 @@ impl LookTool {
             "{}\n\n{marks} Say so when something cannot be seen.{about}",
             question.unwrap_or(DEFAULT_QUESTION)
         );
-        let image = ImageInput {
-            bytes,
-            format: ImageFormat::Jpeg,
-        };
         Some(eyes.see(&prompt, image).await)
     }
 }
@@ -1012,14 +989,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_model_gets_a_frame_no_longer_than_768_px() {
-        let wide = RgbImage::new(1280, 720);
-        assert_eq!(capped(&wide, MODEL_EDGE_PX).dimensions(), (768, 432));
-        let small = RgbImage::new(64, 48);
-        assert_eq!(capped(&small, MODEL_EDGE_PX).dimensions(), (64, 48));
-    }
-
     struct FakeEyes {
         answer: Result<String, String>,
         asked: Mutex<Vec<(String, usize)>>,
@@ -1029,7 +998,7 @@ mod tests {
     impl Eyes for FakeEyes {
         async fn see(&self, prompt: &str, image: ImageInput) -> Result<(String, String), String> {
             assert_eq!(&image.bytes[..2], &[0xFF, 0xD8], "a JPEG");
-            guard(&self.asked).push((prompt.to_owned(), image.bytes.len()));
+            crate::lock(&self.asked).push((prompt.to_owned(), image.bytes.len()));
             self.answer.clone().map(|a| (a, "fake-vlm".to_owned()))
         }
     }
@@ -1070,7 +1039,7 @@ mod tests {
             "<world>Mark 1 is a dustbin by the wall.</world>"
         );
         assert_eq!(out.data["seen_by"], "fake-vlm");
-        let asked = guard(&eyes.asked);
+        let asked = crate::lock(&eyes.asked);
         assert!(
             asked[0].0.starts_with("Is there a dustbin?"),
             "{}",
@@ -1136,13 +1105,13 @@ mod tests {
         );
         assert_eq!(again.data["marks"][1]["label"], "cup");
         assert!(again.images.is_empty(), "the operator already sees it");
-        let second = guard(&eyes.asked)[1].0.clone();
+        let second = crate::lock(&eyes.asked)[1].0.clone();
         assert!(second.starts_with("What is mark 2?"), "{second}");
         let closer = look
             .call(json!({"snapshot": id, "mark": 2, "question": "What colour is it?"}))
             .await;
         assert_eq!(closer.data["close_up"], 2);
-        let third = guard(&eyes.asked)[2].0.clone();
+        let third = crate::lock(&eyes.asked)[2].0.clone();
         assert!(third.contains("close-up of mark 2 (cup)"), "{third}");
         let no_mark = look.call(json!({"snapshot": id, "mark": 9})).await;
         assert!(
@@ -1181,7 +1150,7 @@ mod tests {
         );
         tokio::task::yield_now().await;
         let _ = look.call(json!({})).await;
-        let asked = guard(&eyes.asked);
+        let asked = crate::lock(&eyes.asked);
         assert!(asked[0].0.contains("marked nothing"), "{}", asked[0].0);
         assert!(!asked[0].0.contains("numbered"), "{}", asked[0].0);
         assert!(

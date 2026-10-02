@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -288,7 +288,7 @@ impl Watches {
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<Entry>> {
-        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.running)
     }
 
     /// The `watch` and `watches` tools.

@@ -4,7 +4,7 @@
 //! write it. Its calls block for a few milliseconds; async callers run them on the blocking pool.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension as _, Row, params};
 use serde::Serialize;
@@ -152,23 +152,15 @@ impl std::fmt::Debug for Ledger {
     }
 }
 
-/// Seconds since the Unix epoch, as the ledger stores times.
-#[must_use]
-pub fn now_s() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64())
-}
-
 /// What a step acts on or goes to, for its track record: `PickObject` on `mug_4` is one record,
 /// whichever mission it was part of.
 #[must_use]
 pub fn target_of(args: &[StepArg]) -> String {
     ["place", "object_id", "container_id", "target", "direction"]
         .iter()
-        .find_map(|key| args.iter().find(|a| a.name == *key))
-        .map(|a| a.value.clone())
+        .find_map(|key| super::plan::arg(args, key))
         .unwrap_or_default()
+        .to_owned()
 }
 
 impl Ledger {
@@ -200,7 +192,7 @@ impl Ledger {
     }
 
     fn db(&self) -> MutexGuard<'_, Connection> {
-        self.db.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.db)
     }
 
     /// Records a mission and its steps, replacing any record with its id.
@@ -342,7 +334,7 @@ impl Ledger {
     pub fn save_template(&self, name: &str, intent: &str, steps: &Value) -> rusqlite::Result<()> {
         self.db().execute(
             "INSERT OR REPLACE INTO templates VALUES (?1, ?2, ?3, ?4, 0)",
-            params![name, intent, steps.to_string(), now_s()],
+            params![name, intent, steps.to_string(), crate::now_s()],
         )?;
         Ok(())
     }
@@ -403,7 +395,7 @@ impl Ledger {
     pub fn note_gap(&self, request: &str, reason: &str, nearest: &str) -> rusqlite::Result<()> {
         self.db().execute(
             "INSERT INTO gaps VALUES (?1, ?2, ?3, ?4)",
-            params![now_s(), request, reason, nearest],
+            params![crate::now_s(), request, reason, nearest],
         )?;
         Ok(())
     }

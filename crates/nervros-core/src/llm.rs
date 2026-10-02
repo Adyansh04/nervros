@@ -31,6 +31,10 @@ pub use rig::agent::tool::DynamicTool;
 /// How long a model stays parked after a 429 that gave no retry time.
 const DEFAULT_PARK: Duration = Duration::from_mins(1);
 
+/// The longest side of a frame a vision model gets: enough to read a label across a room, and
+/// a fraction of the tokens a full 1280 px frame costs.
+pub const MODEL_EDGE_PX: u32 = 768;
+
 /// An image attached to a prompt.
 #[derive(Debug, Clone)]
 pub struct ImageInput {
@@ -38,6 +42,23 @@ pub struct ImageInput {
     pub bytes: Vec<u8>,
     /// JPEG or PNG.
     pub format: ImageFormat,
+}
+
+impl ImageInput {
+    /// `img` as a JPEG, its longest side cut to [`MODEL_EDGE_PX`].
+    ///
+    /// # Errors
+    ///
+    /// The encoder failed.
+    pub fn jpeg(img: &image::RgbImage) -> Result<Self, String> {
+        let small = nervros_ros::image::capped(img, MODEL_EDGE_PX);
+        let bytes = nervros_ros::image::encode_jpeg(&small, nervros_ros::image::JPEG_QUALITY)
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            bytes,
+            format: ImageFormat::Jpeg,
+        })
+    }
 }
 
 /// Encodings the providers all accept.
@@ -439,18 +460,6 @@ impl std::fmt::Debug for LoopTool {
 pub struct History(Vec<Message>);
 
 impl History {
-    /// Number of messages.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Whether it is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     /// Drops the oldest messages beyond `max`, starting at a user message so no tool result is
     /// left without its call.
     pub fn trim(&mut self, max: usize) {

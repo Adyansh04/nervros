@@ -71,6 +71,12 @@ pub struct StepArg {
     pub value: String,
 }
 
+/// The value of argument `name`, trimmed as every reader takes it: ` O17` is `O17`.
+#[must_use]
+pub fn arg<'a>(args: &'a [StepArg], name: &str) -> Option<&'a str> {
+    args.iter().find(|a| a.name == name).map(|a| a.value.trim())
+}
+
 // Small models often send `{"arm": "right"}` for the list form; both mean the same.
 fn args_list_or_map<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<StepArg>, D::Error> {
     #[derive(Deserialize)]
@@ -163,12 +169,7 @@ impl Sim {
     /// `near(x)`, `holding(arm, x)` and `hand_empty(arm)`, where `x` names an argument or, as a
     /// capital letter, any object; other predicates are left to the executor.
     fn run(&mut self, id: &str, step: &Step, skill: &Skill, world: &World) -> Vec<Problem> {
-        let value = |name: &str| {
-            step.args
-                .iter()
-                .find(|a| a.name == name)
-                .map(|a| a.value.trim().to_owned())
-        };
+        let value = |name: &str| arg(&step.args, name).map(str::to_owned);
         let mut problems = Vec::new();
         let mut problem = |field: &str, text: String| {
             problems.push(Problem::new(id, field, format!("{} {text}", skill.name)));
@@ -235,12 +236,7 @@ impl Sim {
 
     /// Applies what a skill does, as `run` checked it may.
     fn apply(&mut self, id: &str, step: &Step, skill: &Skill) -> Vec<Problem> {
-        let value = |name: &str| {
-            step.args
-                .iter()
-                .find(|a| a.name == name)
-                .map(|a| a.value.trim().to_owned())
-        };
+        let value = |name: &str| arg(&step.args, name).map(str::to_owned);
         let mut problems = Vec::new();
         for effect in &skill.effects {
             let Some((name, args)) = predicate(effect) else {
@@ -325,13 +321,7 @@ impl Sim {
                 return None;
             };
             let [x] = args.as_slice() else { return None };
-            let target = step
-                .args
-                .iter()
-                .find(|a| a.name == *x)?
-                .value
-                .trim()
-                .to_owned();
+            let target = arg(&step.args, x)?.to_owned();
             if self.near(&target, world) {
                 return None;
             }
@@ -694,11 +684,8 @@ fn ports_for(
     let mut ports = Vec::new();
     for arg in &skill.args {
         let derived;
-        let value = match (
-            step.args.iter().find(|a| a.name == arg.name),
-            &arg.default_from,
-        ) {
-            (Some(given), _) => given.value.trim(),
+        let value = match (self::arg(&step.args, &arg.name), &arg.default_from) {
+            (Some(given), _) => given,
             (None, Some(rule)) => {
                 if let Some(v) = derive(rule, step, world) {
                     derived = v;
@@ -767,7 +754,7 @@ fn derive(rule: &str, step: &Step, world: &World) -> Option<String> {
         return None;
     };
     let from = args.first()?;
-    let id = step.args.iter().find(|a| a.name == *from)?.value.trim();
+    let id = arg(&step.args, from)?;
     let label = world
         .objects
         .iter()
@@ -786,12 +773,7 @@ fn go_to_place<'c>(
     catalog: &'c Catalog,
     world: &World,
 ) -> Result<Resolved<'c>, Problem> {
-    let Some(place) = step
-        .args
-        .iter()
-        .find(|a| a.name == "place")
-        .map(|a| a.value.trim())
-    else {
+    let Some(place) = arg(&step.args, "place") else {
         return Err(Problem::new(id, "place", "GoToPlace needs `place`"));
     };
     let same = |a: &str| a.eq_ignore_ascii_case(place);

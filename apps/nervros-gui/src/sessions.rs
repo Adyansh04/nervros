@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use nervros_core::llm::History;
 
@@ -115,30 +115,20 @@ pub fn log_of(history: &Path) -> PathBuf {
 ///
 /// The log cannot be read, holds no operator message, or the suite cannot be written.
 pub fn save_as_case(log: &Path) -> Result<(String, PathBuf), String> {
-    use std::io::Write as _;
     let text = std::fs::read_to_string(log).map_err(|e| format!("{}: {e}", log.display()))?;
     let mut case = nervros_core::evalcase::from_log(&text, "");
     let first = case
         .say
         .first()
         .ok_or("the session has no operator message")?;
+    case.id = slug(first);
     let suite = nervros_core::app::state_dir()
         .join("evals")
         .join("saved.toml");
     // Saved twice, or two sessions that began alike, still make two cases.
-    let saved = std::fs::read_to_string(&suite).unwrap_or_default();
-    case.id = nervros_core::evalcase::unique_id(&saved, &slug(first));
-    let toml = nervros_core::evalcase::to_toml(&case).map_err(|e| e.to_string())?;
-    if let Some(dir) = suite.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&suite)
+    let id = nervros_core::evalcase::append(&suite, case, log)
         .map_err(|e| format!("{}: {e}", suite.display()))?;
-    write!(file, "\n# From {}\n{toml}", log.display()).map_err(|e| e.to_string())?;
-    Ok((case.id, suite))
+    Ok((id, suite))
 }
 
 /// A case id from the operator's words: "turn-left-90-degrees".
@@ -154,10 +144,7 @@ fn slug(text: &str) -> String {
 
 /// "5 min ago", "3 h ago", "2 days ago", from seconds since the Unix epoch.
 pub fn ago(stamp: u64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
+    let now = nervros_core::unix_secs(SystemTime::now());
     let mins = now.saturating_sub(stamp) / 60;
     match mins {
         0 => "just now".to_owned(),

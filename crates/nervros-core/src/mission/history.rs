@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use super::Missions;
 use super::check::{describe_seen, find_object, how_long};
-use super::ledger::{self, Ledger, MissionRecord};
+use super::ledger::{Ledger, MissionRecord};
 use crate::tools::{Assessment, Risk, Tool, ToolOutcome, ToolSpec};
 
 /// How many missions `recall` lists.
@@ -122,7 +122,7 @@ impl Tool for Recall {
 
     async fn call(&self, args: Value) -> ToolOutcome {
         let query = args["query"].as_str().unwrap_or_default().trim().to_owned();
-        let now_s = ledger::now_s();
+        let now_s = crate::now_s();
         match args["about"].as_str() {
             Some("object") => {
                 if query.is_empty() {

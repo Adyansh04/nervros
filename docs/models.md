@@ -44,8 +44,6 @@ provider = "openrouter"
 model = "qwen/qwen3.8-27b:free"  # the provider's own name
 vision = true
 tools = true
-tool_choice = true
-structured = "json_schema"
 limits = { rpm = 20, pool = "openrouter_free" }
 privacy = { trains = false }
 ```
@@ -54,8 +52,6 @@ privacy = { trains = false }
 |---|---|---|
 | `vision` | `false` | Takes images. A turn with an image skips models without it. |
 | `tools` | `false` | Calls tools. The agent needs it for anything but plain text. |
-| `tool_choice` | `false` | Honours a forced tool choice. |
-| `structured` | `none` | `json_schema` when the model can be held to a JSON Schema. |
 | `limits.rpm`, `limits.rpd` | none | Requests per minute and per day for this model. |
 | `limits.pool` | none | A shared daily quota, from `[pools]`, such as OpenRouter's free requests across all its free models. |
 | `privacy.local` | `false` | Runs on this machine; see the profile's `[privacy]`. |

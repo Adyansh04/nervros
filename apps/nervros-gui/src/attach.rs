@@ -3,9 +3,8 @@
 //! in the message as `[image sN]`.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use nervros_core::look::{Snapshot, SnapshotStore};
+use nervros_core::look::SnapshotStore;
 use nervros_core::session::Event;
 use nervros_core::tools::ImageArtifact;
 use rerun::external::egui::{self, RichText};
@@ -29,6 +28,7 @@ pub struct Attachments {
 }
 
 impl Attachments {
+    /// None waiting; each one added is kept in `snapshots`.
     pub fn new(snapshots: Arc<SnapshotStore>) -> Self {
         Self {
             snapshots,
@@ -70,36 +70,18 @@ impl Attachments {
     }
 
     fn add(&mut self, ctx: &egui::Context, img: &image::DynamicImage) {
-        let rgb = if img.width().max(img.height()) > EDGE_PX {
-            img.resize(EDGE_PX, EDGE_PX, image::imageops::FilterType::Triangle)
-        } else {
-            img.clone()
-        }
-        .to_rgb8();
-        let jpeg = match nervros_ros::image::encode_jpeg(&rgb, 85) {
+        let rgb = nervros_ros::image::capped(&img.to_rgb8(), EDGE_PX);
+        let jpeg = match nervros_ros::image::encode_jpeg(&rgb, nervros_ros::image::JPEG_QUALITY) {
             Ok(j) => j,
             Err(e) => {
                 self.problem = Some(e.to_string());
                 return;
             }
         };
-        let id = self.snapshots.next_id();
-        let artifact = ImageArtifact {
-            snapshot: id.clone(),
-            jpeg: Arc::new(jpeg),
-            width: rgb.width(),
-            height: rgb.height(),
-            marks: Vec::new(),
-        };
-        let stamp_s = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs_f64());
-        self.snapshots.put(Snapshot {
-            id: id.clone(),
-            stamp_s,
-            marks: Vec::new(),
-            image: artifact.clone(),
-        });
+        let snapshot =
+            self.snapshots
+                .store(jpeg, rgb.dimensions(), nervros_core::now_s(), Vec::new());
+        let (id, artifact) = (snapshot.id.clone(), snapshot.image.clone());
         let size = [rgb.width(), rgb.height()].map(|v| usize::try_from(v).unwrap_or(0));
         let pixels = egui::ColorImage::from_rgb(size, rgb.as_raw());
         let texture = ctx.load_texture(&id, pixels, egui::TextureOptions::LINEAR);
@@ -160,13 +142,7 @@ impl Attachments {
         let events = self
             .waiting
             .drain(..)
-            .map(|a| Event::Snapshot {
-                id: a.artifact.snapshot,
-                jpeg: a.artifact.jpeg,
-                width: a.artifact.width,
-                height: a.artifact.height,
-                marks: Vec::new(),
-            })
+            .map(|a| Event::from(&a.artifact))
             .collect();
         (format!("{text} {}", names.join(" ")), events)
     }

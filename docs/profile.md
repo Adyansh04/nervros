@@ -298,10 +298,23 @@ app, and the agent never asks first in the chat. `check_only` only checks a plan
 | `heartbeat_timeout_s` | `2.0` | How long a mission may go without a heartbeat; the executor clamps it to its own limit. |
 | `teleop` | none | The `Teleop` service: Drive in the Robot tab hands the base to the operator while no mission runs and the robot is armed; disarming hands it back. W S walk, A D turn, Q E step sideways. |
 | `teleop_cmd` | none | Where the hand-driving `geometry_msgs/msg/Twist` commands go; the executor caps their speed and stops the base when they pause. |
+| `teleop_speed` | `[0.5, 0.3, 0.8]` | Full hand-driving speed forward and sideways (m/s) and turning (rad/s); Slow in the Robot tab halves it. |
+| `checks` | none | The skills the plan checks know; see below. |
 
 Before a plan reaches the operator it is checked against their words: a left turn planned as a
 right one, a walk the wrong way or of another length, the other hand. Such a plan goes back to the
-model once, and comes to the operator with its concerns and their fixes. A request that names what
+model once, and comes to the operator with its concerns and their fixes. Skill names, units and
+signs are the executor's, so these rules check only the skills `[mission.checks]` names:
+
+```toml
+[mission.checks]
+turn = { skill = "TurnInPlace", degrees = "degrees" }  # positive_left = false if + turns right
+walk = { skill = "WalkStraight", metres = "distance_m", direction = "direction", max_m = 2.0 }
+arm = "arm"                                            # the argument valued left or right
+```
+
+`max_m` is the longest walk one step makes: a longer request needs more steps, so no single-step
+fix is offered. A request that names what
 to handle only as "it", said first in a session, is refused with word to ask; a request with a
 clock ("every 10 minutes") goes to `schedule`. With a `plan_check` model in the models file, a
 second model judges the plan from the operator's words too; with a `plan` model other than the

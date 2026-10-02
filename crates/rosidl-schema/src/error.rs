@@ -140,6 +140,9 @@ pub enum Error {
     /// `$ref`s nested deeper than [`flatten_refs`](crate::flatten_refs) follows.
     #[error("$ref nesting is deeper than {0}")]
     RefDepth(usize),
+    /// A value that does not fit its interface, as `where: what is wrong`.
+    #[error("{0}")]
+    Invalid(String),
 }
 
 impl Error {

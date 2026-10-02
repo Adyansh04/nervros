@@ -4,10 +4,11 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use std::fmt::Write as _;
 
+use nervros_core::mission::Outcome;
 use nervros_core::mission::plan::PlannedStep;
 use nervros_core::mission::preview::PreviewStep;
 use nervros_core::mission::sanity::Concern;
@@ -149,7 +150,7 @@ pub struct PlanCard {
     /// Per step: its status and the node running inside it.
     progress: HashMap<String, (String, String)>,
     /// `(outcome, failed step, reason, seconds)` once it ended.
-    finished: Option<(String, String, String, f64)>,
+    finished: Option<(Outcome, String, String, f64)>,
     /// Where each step would take the robot, once the executor has said.
     preview: Vec<PreviewStep>,
     /// Ways it may not do what the operator asked.
@@ -536,12 +537,7 @@ impl Chat {
                 elapsed_s,
             } => {
                 if let Some(p) = self.plan_mut(|p| p.mission.as_ref() == Some(id)) {
-                    p.finished = Some((
-                        outcome.clone(),
-                        failed_step.clone(),
-                        reason.clone(),
-                        *elapsed_s,
-                    ));
+                    p.finished = Some((*outcome, failed_step.clone(), reason.clone(), *elapsed_s));
                 }
             }
             _ => {}
@@ -856,7 +852,7 @@ fn image_card(
             });
         }
         ui.horizontal(|ui| {
-            let taken = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let taken = nervros_core::unix_secs(at);
             let caption = format!("Snapshot {id} · {} · {w}×{h}", crate::sessions::ago(taken));
             let caption = RichText::new(caption);
             ui.label(caption.small().color(ui.tokens().text_subdued));
@@ -880,7 +876,7 @@ fn image_card(
 }
 
 /// A JPEG as egui pixels, or `None` if it does not decode.
-fn decode(jpeg: &[u8]) -> Option<egui::ColorImage> {
+pub(crate) fn decode(jpeg: &[u8]) -> Option<egui::ColorImage> {
     // A JPEG has no alpha: straight to RGB, one pass fewer.
     let rgb = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
         .ok()?
@@ -1263,7 +1259,7 @@ fn minutes(seconds: f64) -> String {
 pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
     let t = ui.tokens();
     let stroke = match &p.finished {
-        Some((outcome, ..)) if outcome == "success" => t.success_text_color,
+        Some((Outcome::Success, ..)) => t.success_text_color,
         Some(_) => t.error_fg_color,
         None if p.mission.is_some() => t.info_text_color,
         None => t.widget_noninteractive_bg_stroke,
@@ -1285,7 +1281,7 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
         }
         ui.horizontal(|ui| {
             let state = match (&p.finished, p.started) {
-                (Some((outcome, .., secs)), _) if outcome == "success" => {
+                (Some((Outcome::Success, .., secs)), _) => {
                     RichText::new(format!("Done in {}", minutes(*secs))).color(t.success_text_color)
                 }
                 (Some((outcome, step, reason, _)), _) => {
@@ -1294,7 +1290,7 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
                     } else {
                         format!(" at {step}")
                     };
-                    RichText::new(format!("{}{at}: {reason}", capitalise(outcome)))
+                    RichText::new(format!("{}{at}: {reason}", capitalise(outcome.as_str())))
                         .color(t.error_fg_color)
                 }
                 (None, Some(since)) => {
@@ -1326,7 +1322,8 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
     });
 }
 
-fn capitalise(word: &str) -> String {
+/// `word` with its first letter in capitals.
+pub fn capitalise(word: &str) -> String {
     let mut c = word.chars();
     c.next()
         .map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
@@ -1865,7 +1862,7 @@ pub(crate) mod tests {
         }
         chat.apply(&Event::MissionFinished {
             id: "m1".to_owned(),
-            outcome: "failure".to_owned(),
+            outcome: Outcome::Failure,
             failed_step: "s2".to_owned(),
             reason: "the grasp slipped".to_owned(),
             elapsed_s: 94.0,

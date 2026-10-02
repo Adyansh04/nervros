@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ use tracing::Instrument as _;
 
 use crate::guard::{Decision, Guard, Refusal, RuleAction};
 use crate::llm::{self, AgentSource, History, LoopTool};
+use crate::lock;
 use crate::mission::plan::PlannedStep;
 use crate::mission::sanity::Concern;
 use crate::providers::Role;
@@ -336,8 +337,8 @@ pub enum Event {
     MissionFinished {
         /// Mission id.
         id: String,
-        /// `success`, `failure`, `canceled`, `timeout`, `rejected` or `error`.
-        outcome: String,
+        /// How it ended.
+        outcome: crate::mission::Outcome,
         /// The step that failed, or empty.
         failed_step: String,
         /// The skill's own text.
@@ -345,6 +346,18 @@ pub enum Event {
         /// How long it ran.
         elapsed_s: f64,
     },
+}
+
+impl From<&crate::tools::ImageArtifact> for Event {
+    fn from(image: &crate::tools::ImageArtifact) -> Self {
+        Self::Snapshot {
+            id: image.snapshot.clone(),
+            jpeg: Arc::clone(&image.jpeg),
+            width: image.width,
+            height: image.height,
+            marks: image.marks.clone(),
+        }
+    }
 }
 
 /// Session settings.
@@ -563,10 +576,6 @@ struct Shared {
     /// The conversation to write next, for the writer that keeps the disk off this loop.
     to_save: Option<tokio::sync::watch::Sender<Option<History>>>,
     config: SessionConfig,
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The stronger of two rules: a refusal over a request to ask.
@@ -994,13 +1003,7 @@ impl Shared {
             flags.started.store(true, Ordering::SeqCst);
         }
         for image in &outcome.images {
-            self.emit(Event::Snapshot {
-                id: image.snapshot.clone(),
-                jpeg: Arc::clone(&image.jpeg),
-                width: image.width,
-                height: image.height,
-                marks: image.marks.clone(),
-            });
+            self.emit(image.into());
         }
     }
 

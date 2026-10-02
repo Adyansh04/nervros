@@ -11,15 +11,11 @@ use image::{Rgb, RgbImage};
 use nervros_ros::RobotPort;
 use serde_json::{Value, json};
 
-use crate::llm::{ImageFormat, ImageInput};
-use crate::look::{
-    Cameras, Instance, Snapshot, SnapshotStore, capped, draw_marks, marks_json, parse_detections,
-};
+use crate::llm::ImageInput;
+use crate::look::{Cameras, Instance, SnapshotStore, draw_marks, marks_json, parse_detections};
 use crate::segment::{Outliner, inside};
-use crate::tools::{ImageArtifact, Risk, Tool, ToolOutcome, ToolSpec};
+use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
-/// The longest side of the frame the model gets; points come back normalised.
-const MODEL_EDGE_PX: u32 = 768;
 /// Detections this far in time from the frame are of another moment.
 const SAME_MOMENT: Duration = Duration::from_millis(500);
 /// A point this near a mark's box centre, and inside no mark, is on that mark, px.
@@ -185,11 +181,7 @@ impl PointTool {
             }
             None => Vec::new(),
         };
-        let small = capped(&img, MODEL_EDGE_PX);
-        let image = ImageInput {
-            bytes: nervros_ros::image::encode_jpeg(&small, 85).map_err(|e| e.to_string())?,
-            format: ImageFormat::Jpeg,
-        };
+        let image = ImageInput::jpeg(&img)?;
         let (answer, model) = self.pointer.outline(&point_prompt(what), image).await?;
         tracing::debug!(%model, %answer, "points");
         let points = parse_points(&answer, img.width(), img.height());
@@ -208,21 +200,12 @@ impl PointTool {
                 entry
             })
             .collect();
-        let jpeg = nervros_ros::image::encode_jpeg(&drawn, 85).map_err(|e| e.to_string())?;
-        let image = ImageArtifact {
-            snapshot: self.snapshots.next_id(),
-            jpeg: Arc::new(jpeg),
-            width: drawn.width(),
-            height: drawn.height(),
-            marks: marks.iter().map(|m| m.label.clone()).collect(),
-        };
+        let jpeg = nervros_ros::image::encode_jpeg(&drawn, nervros_ros::image::JPEG_QUALITY)
+            .map_err(|e| e.to_string())?;
         let marks_listed = marks_json(&marks);
-        let snapshot = self.snapshots.put(Snapshot {
-            id: image.snapshot.clone(),
-            stamp_s: frame.stamp_s,
-            marks,
-            image: image.clone(),
-        });
+        let snapshot = self
+            .snapshots
+            .store(jpeg, drawn.dimensions(), frame.stamp_s, marks);
         let mut out = ToolOutcome::ok(json!({"snapshot": snapshot.id, "camera": camera.name,
             "points": listed, "marks": marks_listed, "by": model}));
         out.message = if listed.is_empty() {
@@ -230,7 +213,7 @@ impl PointTool {
         } else {
             format!("{} point(s); the user sees them as rings", listed.len())
         };
-        out.images.push(image);
+        out.images.push(snapshot.image.clone());
         Ok(out)
     }
 }

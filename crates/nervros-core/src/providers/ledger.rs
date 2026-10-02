@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,12 +18,6 @@ pub enum ResetZone {
     Pacific,
 }
 
-/// Seconds since the Unix epoch, saturating at zero for clocks before 1970.
-#[must_use]
-pub fn unix_secs(now: SystemTime) -> u64 {
-    now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
 /// The day number a timestamp falls in, for a reset zone.
 #[must_use]
 pub fn day_index(now: SystemTime, zone: ResetZone) -> u64 {
@@ -33,7 +27,7 @@ pub fn day_index(now: SystemTime, zone: ResetZone) -> u64 {
         ResetZone::Utc => 0,
         ResetZone::Pacific => 8 * 3600,
     };
-    unix_secs(now).saturating_sub(offset) / 86_400
+    crate::unix_secs(now).saturating_sub(offset) / 86_400
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -153,7 +147,7 @@ impl Ledger {
         now: SystemTime,
         zone: ResetZone,
     ) -> Result<(), Refused> {
-        let t = unix_secs(now);
+        let t = crate::unix_secs(now);
         if let Some(&until) = self.parked_until.get(model)
             && until > t
         {
@@ -197,7 +191,7 @@ impl Ledger {
                 entry.count = entry.count.saturating_add(1);
             }
         }
-        let t = unix_secs(now);
+        let t = crate::unix_secs(now);
         let q = self.minute.entry(model.to_owned()).or_default();
         q.push_back(t);
         while q.front().is_some_and(|&s| s + 60 <= t) {
@@ -208,7 +202,7 @@ impl Ledger {
     /// Parks a model after a 429 for `for_how_long`.
     pub fn park(&mut self, model: &str, now: SystemTime, for_how_long: Duration) {
         self.parked_until
-            .insert(model.to_owned(), unix_secs(now + for_how_long));
+            .insert(model.to_owned(), crate::unix_secs(now + for_how_long));
     }
 
     /// Replaces today's count for a pool with the provider's own figure, such as OpenRouter's
@@ -232,7 +226,7 @@ mod tests {
     use crate::providers::Limits;
 
     fn at(secs: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(secs)
+        std::time::UNIX_EPOCH + Duration::from_secs(secs)
     }
 
     #[test]

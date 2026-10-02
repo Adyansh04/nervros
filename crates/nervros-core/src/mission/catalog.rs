@@ -40,12 +40,6 @@ pub struct Skill {
     /// `base`, `left_arm`, `right_arm`.
     #[serde(default)]
     pub resources: Vec<String>,
-    /// Whether running it twice is harmless.
-    #[serde(default)]
-    pub idempotent: bool,
-    /// `motion` or `manipulation`.
-    #[serde(default)]
-    pub risk: String,
     /// Its own timeout; a step may ask for less, never more.
     pub max_duration_s: f64,
     /// The `SubTree` ID in the executor's library.

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nervros_core::app::Agent;
 use nervros_core::doctor::Check;
-use nervros_core::mission::held_by;
+use nervros_core::mission::{Outcome, held_by};
 use nervros_core::providers::router::{Need, Router};
 use nervros_core::providers::{ModelConfig, Role};
 use nervros_core::session::{Command, Event};
@@ -91,6 +91,7 @@ impl Picked {
 /// Shared between the window and the tasks that fill it.
 type SharedLive = Arc<Mutex<Live>>;
 
+/// The side panel's tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
     Mission,
@@ -450,9 +451,9 @@ impl Gui {
         };
         self.records.stale();
         let what = self.chat.intent_of_mission(id).unwrap_or("the mission");
-        let (kind, text) = match outcome.as_str() {
-            "success" => (Kind::Success, format!("Done: {what} in {elapsed_s:.0} s")),
-            "canceled" => (Kind::Info, format!("Stopped: {what}")),
+        let (kind, text) = match outcome {
+            Outcome::Success => (Kind::Success, format!("Done: {what} in {elapsed_s:.0} s")),
+            Outcome::Canceled => (Kind::Info, format!("Stopped: {what}")),
             _ if failed_step.is_empty() => (Kind::Failure, format!("{outcome}: {what}: {reason}")),
             _ => (
                 Kind::Failure,
@@ -724,7 +725,7 @@ impl Gui {
         let (model, quota) = self.model_status();
         chip(ui, t.info_text_color, format!("{model} · {quota}"));
         if let Some(at) = self.viewing {
-            let secs = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let secs = nervros_core::unix_secs(at);
             let back = ReButton::new(format!(
                 "Viewing {} · back to live",
                 crate::sessions::ago(secs)
@@ -1698,10 +1699,7 @@ fn watch_robot(agent: &Agent, live: &SharedLive, ctx: &egui::Context) {
                     .ok(),
                 None => None,
             };
-            let pose = robot
-                .transform(&map, &base)
-                .ok()
-                .map(|t| (t.translation[0], t.translation[1], t.yaw()));
+            let pose = robot.transform(&map, &base).ok().map(|t| t.planar());
             let changed = {
                 let mut l = live.lock().unwrap_or_else(PoisonError::into_inner);
                 let changed = l.executor != executor || l.pose != pose;

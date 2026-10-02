@@ -99,6 +99,7 @@ impl SchemaSource for RosidlSchemas {
             .parse()
             .map_err(|e| format!("bad type `{ros_type}`: {e}"))?;
         rosidl_schema::validate(&self.registry, &ty, rosidl_part(part), value)
+            .map_err(|e| e.to_string())
     }
 
     fn show(&self, ros_type: &str) -> Option<String> {

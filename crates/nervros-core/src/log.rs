@@ -5,7 +5,6 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -51,9 +50,7 @@ pub fn spawn(
             {
                 tracing::warn!(error = %e, "could not write a snapshot");
             }
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0.0, |d| d.as_secs_f64());
+            let ts = crate::now_s();
             let line = json!({"seq": seq, "ts": ts, "event": event});
             if let Err(e) = writeln!(file, "{line}") {
                 tracing::warn!(error = %e, "could not write the log");

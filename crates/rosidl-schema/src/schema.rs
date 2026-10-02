@@ -366,7 +366,7 @@ fn primitive_schema(ty: &FieldType, over: Option<&FieldOverride>) -> Map<String,
 }
 
 /// A float as an integer, saturating at the ends of the range.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "the cast saturates, which is what a bound needs"
 )]
