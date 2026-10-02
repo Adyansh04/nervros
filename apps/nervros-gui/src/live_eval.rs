@@ -10,8 +10,12 @@
 //! ```
 //!
 //! `NERVROS_GUI_EVAL_PROMPTS` gives the prompts, one per line, in place of the defaults.
+//! `NERVROS_GUI_EVAL_VIDEO=1` also records each prompt as an MP4 at 20 frames a second, through
+//! `ffmpeg`, rendered offscreen as the PNGs are.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use egui_kittest::Harness;
@@ -30,79 +34,192 @@ const PROMPTS: [&str; 4] = [
 const PER_PROMPT: Duration = Duration::from_mins(4);
 /// Settled means quiet this long: a mission's report starts a turn of its own a moment after.
 const QUIET: Duration = Duration::from_secs(4);
+/// Frames a second, of the window's steps and of the videos.
+const FPS: u32 = 20;
 
-/// Frames while the agent's tasks run on the runtime's own threads.
-fn wait(harness: &mut Harness<'_, Gui>, for_: Duration) {
-    let until = Instant::now() + for_;
-    while Instant::now() < until {
-        harness.run_steps(1);
-        std::thread::sleep(Duration::from_millis(50));
+/// A video of the window through `ffmpeg`, kept in step with the clock: a frame that renders late
+/// is written again rather than slowing the video down.
+struct Video {
+    ffmpeg: Child,
+    started: Instant,
+    frames: u64,
+}
+
+impl Video {
+    fn start(path: &Path, (width, height): (u32, u32)) -> Option<Self> {
+        let ffmpeg = Command::new("ffmpeg")
+            .args([
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+            ])
+            .args([
+                "-s",
+                &format!("{width}x{height}"),
+                "-r",
+                &FPS.to_string(),
+                "-i",
+                "-",
+            ])
+            // Small files: the window scaled to 1280 wide, H.264 that browsers and GitHub play.
+            .args([
+                "-vf",
+                "scale=1280:-2:flags=lanczos",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "slow",
+            ])
+            .args([
+                "-crf",
+                "26",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+            ])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn();
+        match ffmpeg {
+            Ok(ffmpeg) => Some(Self {
+                ffmpeg,
+                started: Instant::now(),
+                frames: 0,
+            }),
+            Err(e) => {
+                eprintln!("no video: ffmpeg did not start: {e}");
+                None
+            }
+        }
+    }
+
+    fn frame(&mut self, image: &image::RgbaImage) {
+        let ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let due = ms.saturating_mul(u64::from(FPS)) / 1000 + 1;
+        let stdin = self.ffmpeg.stdin.as_mut().expect("ffmpeg's input");
+        while self.frames < due {
+            stdin
+                .write_all(image.as_raw())
+                .expect("ffmpeg takes the frame");
+            self.frames += 1;
+        }
+    }
+
+    fn finish(mut self) {
+        drop(self.ffmpeg.stdin.take());
+        let _ = self.ffmpeg.wait();
     }
 }
 
-fn save(harness: &mut Harness<'_, Gui>, out: &Path, name: &str) {
-    match harness.render() {
-        Ok(image) => {
-            let path = out.join(format!("{name}.png"));
-            image
-                .save(&path)
-                .unwrap_or_else(|e| eprintln!("{}: {e}", path.display()));
-            eprintln!("saved {}", path.display());
-        }
-        Err(e) => eprintln!("{name}: not rendered: {e}"),
-    }
+/// The window being driven, where its pictures go, and the video being recorded, if any.
+struct Run<'a> {
+    harness: Harness<'a, Gui>,
+    out: PathBuf,
+    record: bool,
+    video: Option<Video>,
 }
 
-/// Approves what waits, saving the card first; true when something was approved.
-fn approve(harness: &mut Harness<'_, Gui>, out: &Path, n: usize) -> bool {
-    if harness.state().chat.pending().count() == 0 {
-        return false;
-    }
-    save(harness, out, &format!("{n}-approval"));
-    let button = harness.query_all_by_label("Approve").next();
-    match button {
-        Some(b) => {
-            b.click();
-            harness.run_steps(2);
-            true
+impl Run<'_> {
+    /// Frames while the agent's tasks run on the runtime's own threads, each one recorded when a
+    /// video runs.
+    fn wait(&mut self, for_: Duration) {
+        let period = Duration::from_secs(1) / FPS;
+        let until = Instant::now() + for_;
+        while Instant::now() < until {
+            let tick = Instant::now();
+            self.harness.run_steps(1);
+            if let Some(video) = &mut self.video
+                && let Ok(image) = self.harness.render()
+            {
+                video.frame(&image);
+            }
+            std::thread::sleep(period.saturating_sub(tick.elapsed()));
         }
-        None => false,
     }
-}
 
-/// Sends `prompt` and steps until the session is quiet: no turn, no approval waiting and no
-/// mission running.
-fn converse(harness: &mut Harness<'_, Gui>, out: &Path, n: usize, prompt: &str) {
-    eprintln!("== {n}: {prompt}");
-    harness.state_mut().input = prompt.to_owned();
-    harness.run_steps(1);
-    harness.get_by_label("Send").click();
-    harness.run_steps(2);
-    wait(harness, Duration::from_secs(2));
-    save(harness, out, &format!("{n}-sent"));
-    let (began, mut quiet_since, mut saw_mission) = (Instant::now(), None, false);
-    while began.elapsed() < PER_PROMPT {
-        wait(harness, Duration::from_millis(250));
-        approve(harness, out, n);
-        let running = harness.state().mission_running();
-        if running && !saw_mission {
-            saw_mission = true;
-            wait(harness, Duration::from_secs(3));
-            save(harness, out, &format!("{n}-running"));
-        }
-        let gui = harness.state();
-        let busy = gui.chat.turn.is_some() || gui.chat.pending().count() > 0 || running;
-        match (busy, quiet_since) {
-            (true, _) => quiet_since = None,
-            (false, None) => quiet_since = Some(Instant::now()),
-            (false, Some(t)) if t.elapsed() >= QUIET => break,
-            (false, Some(_)) => {}
+    fn save(&mut self, name: &str) {
+        match self.harness.render() {
+            Ok(image) => {
+                let path = self.out.join(format!("{name}.png"));
+                image
+                    .save(&path)
+                    .unwrap_or_else(|e| eprintln!("{}: {e}", path.display()));
+                eprintln!("saved {}", path.display());
+            }
+            Err(e) => eprintln!("{name}: not rendered: {e}"),
         }
     }
-    if began.elapsed() >= PER_PROMPT {
-        eprintln!("   not settled in {} s", PER_PROMPT.as_secs());
+
+    /// Approves what waits, saving the card first; true when something was approved.
+    fn approve(&mut self, n: usize) -> bool {
+        if self.harness.state().chat.pending().count() == 0 {
+            return false;
+        }
+        // The card stays a moment in the video, as an operator would read it.
+        if self.video.is_some() {
+            self.wait(Duration::from_secs(2));
+        }
+        self.save(&format!("{n}-approval"));
+        let button = self.harness.query_all_by_label("Approve").next();
+        match button {
+            Some(b) => {
+                b.click();
+                self.harness.run_steps(2);
+                true
+            }
+            None => false,
+        }
     }
-    save(harness, out, &format!("{n}-done"));
+
+    /// Sends `prompt` and steps until the session is quiet: no turn, no approval waiting and no
+    /// mission running.
+    fn converse(&mut self, n: usize, prompt: &str) {
+        eprintln!("== {n}: {prompt}");
+        if self.record {
+            let size = self
+                .harness
+                .render()
+                .map_or((1600, 960), |i| i.dimensions());
+            self.video = Video::start(&self.out.join(format!("{n}.mp4")), size);
+        }
+        self.harness.state_mut().input = prompt.to_owned();
+        self.wait(Duration::from_secs(1));
+        self.harness.get_by_label("Send").click();
+        self.harness.run_steps(2);
+        self.wait(Duration::from_secs(2));
+        self.save(&format!("{n}-sent"));
+        let (began, mut quiet_since, mut saw_mission) = (Instant::now(), None, false);
+        while began.elapsed() < PER_PROMPT {
+            self.wait(Duration::from_millis(250));
+            self.approve(n);
+            let running = self.harness.state().mission_running();
+            if running && !saw_mission {
+                saw_mission = true;
+                self.wait(Duration::from_secs(3));
+                self.save(&format!("{n}-running"));
+            }
+            let gui = self.harness.state();
+            let busy = gui.chat.turn.is_some() || gui.chat.pending().count() > 0 || running;
+            match (busy, quiet_since) {
+                (true, _) => quiet_since = None,
+                (false, None) => quiet_since = Some(Instant::now()),
+                (false, Some(t)) if t.elapsed() >= QUIET => break,
+                (false, Some(_)) => {}
+            }
+        }
+        if began.elapsed() >= PER_PROMPT {
+            eprintln!("   not settled in {} s", PER_PROMPT.as_secs());
+        }
+        self.save(&format!("{n}-done"));
+        if let Some(video) = self.video.take() {
+            video.finish();
+        }
+    }
 }
 
 #[test]
@@ -122,6 +239,7 @@ fn live_eval() {
                 .collect()
         },
     );
+    let record = std::env::var_os("NERVROS_GUI_EVAL_VIDEO").is_some_and(|v| v == "1");
     let runtime = tokio::runtime::Runtime::new().expect("tokio");
     let _entered = runtime.enter();
     let profile = nervros_core::profile::Profile::load(&profile_path).expect("the profile");
@@ -146,7 +264,7 @@ fn live_eval() {
     );
     agent.session.send(nervros_core::session::Command::Arm);
     let handle = runtime.handle().clone();
-    let mut harness = Harness::builder()
+    let harness = Harness::builder()
         .wgpu()
         .with_size(egui::vec2(1600.0, 960.0))
         .build_eframe(|cc| {
@@ -158,16 +276,22 @@ fn live_eval() {
             let token = re_viewer::MainThreadToken::i_promise_i_am_only_using_this_for_a_test();
             Gui::start(token, cc, agent, events, feed, handle, log).expect("the window")
         });
+    let mut run = Run {
+        harness,
+        out,
+        record,
+        video: None,
+    };
     // The map, the camera and the world model need a moment to arrive.
-    wait(&mut harness, Duration::from_secs(10));
-    save(&mut harness, &out, "0-start");
+    run.wait(Duration::from_secs(10));
+    run.save("0-start");
     for (i, prompt) in prompts.iter().enumerate() {
-        converse(&mut harness, &out, i + 1, prompt);
+        run.converse(i + 1, prompt);
     }
     for (tab, name) in Tab::ALL {
-        harness.state_mut().tab = tab;
-        wait(&mut harness, Duration::from_secs(1));
-        save(&mut harness, &out, &format!("tab-{}", name.to_lowercase()));
+        run.harness.state_mut().tab = tab;
+        run.wait(Duration::from_secs(1));
+        run.save(&format!("tab-{}", name.to_lowercase()));
     }
     drop(rec);
 }
