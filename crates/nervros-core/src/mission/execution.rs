@@ -107,9 +107,11 @@ impl Missions {
         });
         let before = self.vision.get().and_then(camera::Vision::frame);
         let span = crate::telemetry::job("mission", &id, &compiled.plan.intent);
+        // What the operator asked for this mission: they may say more while it runs.
+        let request = self.request();
         tokio::spawn(
             Arc::clone(self)
-                .watch(id.clone(), compiled, goal, before, held)
+                .watch(id.clone(), compiled, goal, (before, held), request)
                 .instrument(span),
         );
         Ok(id)
@@ -162,8 +164,8 @@ impl Missions {
         id: String,
         compiled: Compiled,
         goal: Goal,
-        before: Option<Arc<Frame>>,
-        held: Option<crate::guard::ResourceLock>,
+        (before, held): (Option<Arc<Frame>>, Option<crate::guard::ResourceLock>),
+        request: String,
     ) {
         let started = Instant::now();
         let started_s = crate::now_s();
@@ -191,7 +193,7 @@ impl Missions {
             id: id.clone(),
             hash: compiled.sha256.clone(),
             intent: compiled.plan.intent.clone(),
-            request: lock(&self.request).clone(),
+            request,
             started: started_s,
             ended: crate::now_s(),
             outcome: outcome.as_str().to_owned(),

@@ -108,6 +108,7 @@ async fn a_mission_is_kept_recalled_saved_by_name_and_run_again_and_gaps_are_log
             status: GoalStatus::Succeeded,
             result: json!({"outcome": 0, "failed_step_id": "", "failure_reason": ""}),
         }),
+        step: Duration::from_millis(300),
         ..ScriptedRun::default()
     };
     let robot: Arc<dyn RobotPort> = Arc::new(robot(run()));
@@ -132,6 +133,12 @@ async fn a_mission_is_kept_recalled_saved_by_name_and_run_again_and_gaps_are_log
         missions.run(&json!({"hash": hash})).await.status,
         Status::Accepted
     );
+    // Said while it runs: the mission is still kept under what started it.
+    let _ = events.send(Event::User {
+        turn: 2,
+        text: "is it done yet?".to_owned(),
+    });
+    eventually(|| missions.request().contains("done yet")).await;
     eventually(|| ledger.recent(1).is_ok_and(|r| !r.is_empty())).await;
     let kept = &ledger.recent(1).unwrap()[0];
     assert_eq!(
