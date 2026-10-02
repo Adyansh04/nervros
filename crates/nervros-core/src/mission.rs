@@ -16,6 +16,7 @@ pub mod ledger;
 pub mod plan;
 pub mod preview;
 pub mod sanity;
+pub(crate) mod schedule;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

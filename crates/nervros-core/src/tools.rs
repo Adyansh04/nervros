@@ -4,6 +4,19 @@
 //! builtins (`look`, `list_places`, `robot_state`, `stop`) are written once. Every tool has a spec
 //! (name, description, JSON Schema, risk) and returns an outcome whose message the model can read.
 
+pub mod builtins;
+pub mod editor;
+pub mod look;
+pub mod mcp;
+pub(crate) mod memory;
+pub(crate) mod places;
+pub(crate) mod point;
+pub mod ros_tools;
+pub mod segment;
+pub mod skills;
+pub mod vision;
+pub mod watch;
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;

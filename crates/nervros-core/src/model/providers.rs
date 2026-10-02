@@ -361,7 +361,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// The example profile's models file, shared by the provider tests.
-    pub(crate) const EXAMPLE: &str = include_str!("../../../profiles/example/models.toml");
+    pub(crate) const EXAMPLE: &str = include_str!("../../../../profiles/example/models.toml");
 
     #[test]
     fn the_example_file_is_valid() {
