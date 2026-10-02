@@ -309,25 +309,29 @@ impl Ledger {
         Ok(out)
     }
 
-    /// The mission whose id starts with `id`.
+    /// The missions whose ids start with `id`, newest first: one when it says enough.
     ///
     /// # Errors
     ///
     /// The read failed.
-    pub fn mission(&self, id: &str) -> rusqlite::Result<Option<MissionRecord>> {
+    pub fn mission(&self, id: &str) -> rusqlite::Result<Vec<MissionRecord>> {
         let db = self.db();
-        let found = db
-            .query_row(
-                "SELECT * FROM missions WHERE id LIKE ?1 || '%' ORDER BY started DESC LIMIT 1",
-                [id],
-                mission_of,
-            )
-            .optional()?;
-        let Some(mut found) = found else {
-            return Ok(None);
-        };
-        found.steps = steps_of(&db, &found.id)?;
-        Ok(Some(found))
+        // The prefix is text, not a pattern: `%` and `_` in it match only themselves.
+        let prefix = id
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let mut found: Vec<MissionRecord> = db
+            .prepare(
+                "SELECT * FROM missions WHERE id LIKE ?1 || '%' ESCAPE '\\' \
+                 ORDER BY started DESC LIMIT 10",
+            )?
+            .query_map([prefix], mission_of)?
+            .collect::<rusqlite::Result<_>>()?;
+        for m in &mut found {
+            m.steps = steps_of(&db, &m.id)?;
+        }
+        Ok(found)
     }
 
     /// Saves a plan under `name`, replacing one of that name.
@@ -568,9 +572,18 @@ mod tests {
         );
         assert_eq!(recent[0].steps.len(), 2);
         assert_eq!(recent[0].steps[1].args, json!({"object_id": "mug_4"}));
-        let started = ledger.mission("0190a").unwrap().unwrap().started;
+        let started = ledger.mission("0190a").unwrap()[0].started;
         assert!((started - 100.0).abs() < 1e-9);
-        assert_eq!(ledger.mission("zzz").unwrap(), None);
+        assert!(ledger.mission("zzz").unwrap().is_empty());
+        assert_eq!(
+            ledger.mission("0190").unwrap().len(),
+            2,
+            "both, not the newest alone"
+        );
+        assert!(
+            ledger.mission("%").unwrap().is_empty(),
+            "text, not a pattern"
+        );
     }
 
     #[test]

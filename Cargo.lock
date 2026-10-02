@@ -9240,7 +9240,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "r2r"
 version = "0.9.7"
-source = "git+https://github.com/Adyansh04/r2r?branch=nervros#121dfe3f5e23588bd8f15107f3320a8aabea44a8"
+source = "git+https://github.com/Adyansh04/r2r?branch=nervros#1e8ed746e91a6d459c0e177b1b6fac7768ea7f3e"
 dependencies = [
  "force-send-sync",
  "futures",
@@ -9267,7 +9267,7 @@ dependencies = [
 [[package]]
 name = "r2r_actions"
 version = "0.9.7"
-source = "git+https://github.com/Adyansh04/r2r?branch=nervros#121dfe3f5e23588bd8f15107f3320a8aabea44a8"
+source = "git+https://github.com/Adyansh04/r2r?branch=nervros#1e8ed746e91a6d459c0e177b1b6fac7768ea7f3e"
 dependencies = [
  "bindgen",
  "r2r_common",
@@ -9278,7 +9278,7 @@ dependencies = [
 [[package]]
 name = "r2r_common"
 version = "0.9.7"
-source = "git+https://github.com/Adyansh04/r2r?branch=nervros#121dfe3f5e23588bd8f15107f3320a8aabea44a8"
+source = "git+https://github.com/Adyansh04/r2r?branch=nervros#1e8ed746e91a6d459c0e177b1b6fac7768ea7f3e"
 dependencies = [
  "bindgen",
  "os_str_bytes",
@@ -9289,7 +9289,7 @@ dependencies = [
 [[package]]
 name = "r2r_macros"
 version = "0.9.7"
-source = "git+https://github.com/Adyansh04/r2r?branch=nervros#121dfe3f5e23588bd8f15107f3320a8aabea44a8"
+source = "git+https://github.com/Adyansh04/r2r?branch=nervros#1e8ed746e91a6d459c0e177b1b6fac7768ea7f3e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9299,7 +9299,7 @@ dependencies = [
 [[package]]
 name = "r2r_msg_gen"
 version = "0.9.7"
-source = "git+https://github.com/Adyansh04/r2r?branch=nervros#121dfe3f5e23588bd8f15107f3320a8aabea44a8"
+source = "git+https://github.com/Adyansh04/r2r?branch=nervros#1e8ed746e91a6d459c0e177b1b6fac7768ea7f3e"
 dependencies = [
  "bindgen",
  "force-send-sync",
@@ -9316,7 +9316,7 @@ dependencies = [
 [[package]]
 name = "r2r_rcl"
 version = "0.9.7"
-source = "git+https://github.com/Adyansh04/r2r?branch=nervros#121dfe3f5e23588bd8f15107f3320a8aabea44a8"
+source = "git+https://github.com/Adyansh04/r2r?branch=nervros#1e8ed746e91a6d459c0e177b1b6fac7768ea7f3e"
 dependencies = [
  "bindgen",
  "paste",
@@ -13867,7 +13867,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",

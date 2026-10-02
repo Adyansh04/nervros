@@ -548,9 +548,6 @@ impl Tool for ScheduleTool {
             Some("add") => {}
             _ => return Some(Err(ToolOutcome::failed("`action` is add, list or cancel"))),
         }
-        if args.get("hash").is_some() {
-            return None;
-        }
         let intent = args["intent"].as_str().unwrap_or("a schedule");
         let every = args["every_min"]
             .as_u64()
@@ -569,9 +566,16 @@ impl Tool for ScheduleTool {
             },
             None => None,
         };
-        let (hash, steps, _) = match self.schedules.missions.check(intent, &args["steps"]).await {
-            Ok(checked) => checked,
-            Err(problems) => return Some(Err(problems)),
+        // A plan checked before goes by its hash, past none of the checks above.
+        let (hash, steps) = match args["hash"].as_str() {
+            Some(hash) => match self.schedules.missions.find(hash) {
+                Ok(c) => (c.sha256, c.steps.len()),
+                Err(e) => return Some(Err(ToolOutcome::refused(e))),
+            },
+            None => match self.schedules.missions.check(intent, &args["steps"]).await {
+                Ok((hash, steps, _)) => (hash, steps),
+                Err(problems) => return Some(Err(problems)),
+            },
         };
         if let Some(trigger) = trigger {
             let for_min = args["for_min"]

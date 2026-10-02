@@ -377,6 +377,8 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
     let agent =
         nervros_core::app::start_with(profile_path, robot, &state.join("quota.json"), files)
             .context("starting the agent")?;
+    // At once: start-up notices, such as a heartbeat that could not start, come right away.
+    let mut events = agent.session.subscribe();
     let (log_path, _log) = nervros_core::log::spawn(
         &logs_dir,
         &format!("session-{stamp}"),
@@ -400,7 +402,6 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
             n + 1
         );
     }
-    let mut events = agent.session.subscribe();
     if options.arm {
         agent.session.send(SessionCommand::Arm);
     }

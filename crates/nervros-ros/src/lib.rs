@@ -273,8 +273,22 @@ pub trait RobotPort: Send + Sync {
         timeout: Duration,
     ) -> Result<Goal, RosError>;
 
-    /// The newest message on a topic as JSON, waiting up to `wait` for the first one.
+    /// The newest message on a topic as JSON, waiting up to `wait` for the first one, however
+    /// old it is: a latched map is as good as ever.
     async fn latest(&self, topic: &str, msg_type: &str, wait: Duration) -> Result<Value, RosError>;
+
+    /// As [`RobotPort::latest`], but only a message that arrived within `max_age`, waiting up to
+    /// `wait` for one: what a publisher said before it went quiet is not its state now.
+    /// A port that keeps no arrival times answers as `latest` does.
+    async fn latest_fresh(
+        &self,
+        topic: &str,
+        msg_type: &str,
+        wait: Duration,
+        _max_age: Duration,
+    ) -> Result<Value, RosError> {
+        self.latest(topic, msg_type, wait).await
+    }
 
     /// The newest frame of an image topic (`sensor_msgs/msg/Image`), kept up to date.
     ///

@@ -46,7 +46,8 @@ pub struct Agent {
     pub missions: Option<Arc<Missions>>,
     /// What the MCP servers brought, for the doctor.
     pub mcp: Vec<crate::doctor::Check>,
-    /// What the operator should hear as the session starts, before anything subscribes to it.
+    /// What the operator should hear as the session starts, before anything subscribes to it: a
+    /// provider without its key, an MCP server that did not connect.
     pub notices: Vec<String>,
     /// Requests the last session ended waiting on the operator for, to offer again.
     pub unanswered: Vec<crate::session::Unanswered>,
@@ -527,6 +528,11 @@ pub fn start_with(
     }
     watches.attach(session.handle());
     say_orphan(&profile, &robot, session.handle());
+    let notices = llm
+        .missing_keys()
+        .into_iter()
+        .chain(mcp.iter().filter(|c| !c.ok).map(|c| c.what.clone()))
+        .collect();
     Ok(Agent {
         session,
         profile,
@@ -539,11 +545,7 @@ pub fn start_with(
         memory,
         schedules,
         missions,
-        notices: mcp
-            .iter()
-            .filter(|c| !c.ok)
-            .map(|c| c.what.clone())
-            .collect(),
+        notices,
         mcp,
         unanswered,
     })

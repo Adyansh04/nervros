@@ -222,16 +222,20 @@ impl Tool for RobotState {
             }
             Err(e) => out["pose_error"] = Value::String(e.to_string()),
         }
-        if let Some(topic) = &self.executor_state
-            && let Ok(state) = self
+        if let Some(topic) = &self.executor_state {
+            let state = self
                 .robot
-                .latest(
+                .latest_fresh(
                     topic,
                     "nervros_interfaces/msg/RobotState",
                     Duration::from_secs(1),
+                    crate::mission::STATE_FRESH,
                 )
-                .await
-        {
+                .await;
+            let Ok(state) = state else {
+                out["executor"] = json!("not heard from lately: its state is unknown");
+                return ToolOutcome::ok(out);
+            };
             let field = |k: &str| state[k].clone();
             out["executor"] = json!({
                 "mission": field("mission_id"),

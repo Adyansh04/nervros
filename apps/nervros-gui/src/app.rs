@@ -238,6 +238,7 @@ impl Gui {
         main_thread: re_viewer::MainThreadToken,
         cc: &eframe::CreationContext<'_>,
         agent: Agent,
+        events: tokio::sync::broadcast::Receiver<Event>,
         feed: ViewerFeed,
         runtime: tokio::runtime::Handle,
         log_path: PathBuf,
@@ -298,7 +299,6 @@ impl Gui {
         viewer.add_log_receiver(feed.input);
         let live = Arc::new(Mutex::new(Live::default()));
         let recheck = watch(&agent, &live, &cc.egui_ctx);
-        let events = agent.session.subscribe();
         let mut chat = Chat::default();
         chat.items
             .extend(agent.notices.iter().cloned().map(crate::chat::Item::Notice));
@@ -1652,12 +1652,14 @@ fn watch_robot(agent: &Agent, live: &SharedLive, ctx: &egui::Context) {
         );
         loop {
             tick.tick().await;
+            // An executor that has gone quiet shows as gone, not as its last word.
             let executor = match &state {
                 Some(topic) => robot
-                    .latest(
+                    .latest_fresh(
                         topic,
                         "nervros_interfaces/msg/RobotState",
                         Duration::from_secs(1),
+                        nervros_core::mission::STATE_FRESH,
                     )
                     .await
                     .ok(),
@@ -1667,12 +1669,17 @@ fn watch_robot(agent: &Agent, live: &SharedLive, ctx: &egui::Context) {
                 .transform(&map, &base)
                 .ok()
                 .map(|t| (t.translation[0], t.translation[1], t.yaw()));
-            {
+            let changed = {
                 let mut l = live.lock().unwrap_or_else(PoisonError::into_inner);
+                let changed = l.executor != executor || l.pose != pose;
                 l.executor = executor;
                 l.pose = pose;
+                changed
+            };
+            // An idle window sleeps.
+            if changed {
+                wake.request_repaint();
             }
-            wake.request_repaint();
         }
     });
 }
@@ -1996,7 +2003,8 @@ mod tests {
                 };
                 let log = PathBuf::from("session.ndjson");
                 let token = re_viewer::MainThreadToken::i_promise_i_am_only_using_this_for_a_test();
-                let mut gui = Gui::start(token, cc, agent, feed, handle, log).unwrap();
+                let events = agent.session.subscribe();
+                let mut gui = Gui::start(token, cc, agent, events, feed, handle, log).unwrap();
                 gui.chat = crate::chat::tests::sample();
                 gui
             });

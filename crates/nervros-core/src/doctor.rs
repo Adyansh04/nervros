@@ -150,7 +150,12 @@ impl HealthCheck {
         if let Some(m) = &self.profile.mission {
             let state = self
                 .robot
-                .latest(&m.state, "nervros_interfaces/msg/RobotState", RATE_WINDOW)
+                .latest_fresh(
+                    &m.state,
+                    "nervros_interfaces/msg/RobotState",
+                    RATE_WINDOW,
+                    crate::mission::STATE_FRESH,
+                )
                 .await;
             out.push(match state {
                 Ok(s) => {

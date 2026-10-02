@@ -110,14 +110,15 @@ pub fn missions(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
     let ledger = open_ledger(profile)?;
     let now = ledger::now_s();
     let list = match id {
-        Some(id) => ledger.mission(id)?.into_iter().collect(),
+        Some(id) => ledger.mission(id)?,
         None => ledger.recent(limit)?,
     };
     for m in &list {
         let ago = (now - m.started) / 60.0;
         println!(
             "{} {:.0} min ago: {} ({}, {:.0} s)",
-            &m.id[..m.id.len().min(8)],
+            // A version 7 id begins with its millisecond: this much tells missions apart.
+            &m.id[..m.id.len().min(13)],
             ago,
             m.intent,
             m.outcome,

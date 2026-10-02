@@ -6,10 +6,11 @@
 //! the spinning thread.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -60,7 +61,9 @@ enum Cmd {
     SubscribeJson {
         topic: String,
         ty: String,
-        tx: watch::Sender<Option<Value>>,
+        tx: watch::Sender<Option<Sample>>,
+        /// Whether the topic had no publisher, so that the `QoS` may miss a latched message.
+        reply: oneshot::Sender<Result<bool, RosError>>,
     },
     SubscribeImage {
         topic: String,
@@ -103,14 +106,36 @@ enum Cmd {
 
 type Key = (String, String);
 
+/// A message as it arrived.
+#[derive(Debug, Clone)]
+struct Sample {
+    at: Instant,
+    value: Arc<Value>,
+}
+
+/// A topic read as JSON, kept subscribed for the next read.
+struct Topic {
+    ty: String,
+    rx: watch::Receiver<Option<Sample>>,
+    /// Subscribed while nothing published it, with a `QoS` that misses a latched message.
+    blind: bool,
+    since: Instant,
+}
+
+/// A blind subscription that has had nothing this long is made again, with the `QoS` of the
+/// publishers that may have come since.
+const RESUBSCRIBE: Duration = Duration::from_secs(2);
+
 /// A running r2r node.
 pub struct R2rPort {
     cmd: std_mpsc::Sender<Cmd>,
     clients: Mutex<HashMap<Key, Arc<r2r::ClientUntyped>>>,
     actions: Mutex<HashMap<Key, r2r::ActionClientUntyped>>,
-    json: Mutex<HashMap<String, watch::Receiver<Option<Value>>>>,
+    json: Mutex<HashMap<String, Topic>>,
     images: Mutex<HashMap<String, watch::Receiver<Option<Arc<Frame>>>>>,
     tf: Arc<Mutex<TfBuffer>>,
+    /// Set to end the spin loop: kept publishers hold the command channel open.
+    stopping: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -140,9 +165,20 @@ impl R2rPort {
         let (cmd_tx, cmd_rx) = std_mpsc::channel();
         let (ready_tx, ready_rx) = std_mpsc::channel();
         let tf_thread = Arc::clone(&tf);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stopping);
         let thread = std::thread::Builder::new()
             .name("nervros-ros-spin".to_owned())
-            .spawn(move || spin(&config, &runtime, &tf_thread, &cmd_rx, &ready_tx))
+            .spawn(move || {
+                spin(
+                    &config,
+                    &runtime,
+                    &tf_thread,
+                    &cmd_rx,
+                    &ready_tx,
+                    &stop_thread,
+                );
+            })
             .map_err(mw)?;
         ready_rx.recv().map_err(mw)??;
         Ok(Self {
@@ -152,6 +188,7 @@ impl R2rPort {
             json: Mutex::default(),
             images: Mutex::default(),
             tf,
+            stopping,
             thread: Some(thread),
         })
     }
@@ -178,6 +215,67 @@ impl R2rPort {
         Ok(client)
     }
 
+    /// The subscription for reading `topic` as JSON: kept from an earlier read of the same type,
+    /// or made now, and made again when it began before anything published and still has nothing.
+    async fn subscription(
+        &self,
+        topic: &str,
+        ty: &str,
+    ) -> Result<watch::Receiver<Option<Sample>>, RosError> {
+        let kept = lock(&self.json)
+            .get(topic)
+            .filter(|t| {
+                t.ty == ty
+                    && !(t.blind && t.rx.borrow().is_none() && t.since.elapsed() >= RESUBSCRIBE)
+            })
+            .map(|t| t.rx.clone());
+        if let Some(rx) = kept {
+            return Ok(rx);
+        }
+        let (tx, rx) = watch::channel(None);
+        let (reply, made) = oneshot::channel();
+        self.send(Cmd::SubscribeJson {
+            topic: topic.to_owned(),
+            ty: ty.to_owned(),
+            tx,
+            reply,
+        })?;
+        let blind = made.await.map_err(mw)??;
+        lock(&self.json).insert(
+            topic.to_owned(),
+            Topic {
+                ty: ty.to_owned(),
+                rx: rx.clone(),
+                blind,
+                since: Instant::now(),
+            },
+        );
+        Ok(rx)
+    }
+
+    /// The newest message on `topic`, waiting up to `wait` for one, and for one no older than
+    /// `max_age` when given.
+    async fn newest(
+        &self,
+        topic: &str,
+        ty: &str,
+        wait: Duration,
+        max_age: Option<Duration>,
+    ) -> Result<Value, RosError> {
+        let mut rx = self.subscription(topic, ty).await?;
+        let fresh = |s: &Option<Sample>| {
+            s.as_ref()
+                .is_some_and(|s| max_age.is_none_or(|max| s.at.elapsed() <= max))
+        };
+        match tokio::time::timeout(wait, rx.wait_for(fresh)).await {
+            Ok(Ok(s)) => s
+                .as_ref()
+                .map(|s| Value::clone(&s.value))
+                .ok_or_else(|| RosError::NoData(topic.to_owned())),
+            _ => Err(RosError::NoData(topic.to_owned())),
+        }
+    }
+
     async fn action_client(
         &self,
         name: &str,
@@ -201,9 +299,8 @@ impl R2rPort {
 
 impl Drop for R2rPort {
     fn drop(&mut self) {
-        // Dropping the sender ends the spin loop; the thread exits within one spin period.
-        let (tx, _) = std_mpsc::channel();
-        drop(std::mem::replace(&mut self.cmd, tx));
+        // The thread exits within one spin period, whoever still holds the command channel.
+        self.stopping.store(true, Ordering::SeqCst);
         if let Some(t) = self.thread.take()
             && t.join().is_err()
         {
@@ -225,6 +322,7 @@ fn spin(
     tf: &Arc<Mutex<TfBuffer>>,
     cmds: &std_mpsc::Receiver<Cmd>,
     ready: &std_mpsc::Sender<Result<(), RosError>>,
+    stopping: &AtomicBool,
 ) {
     let node = r2r::Context::create()
         .and_then(|ctx| r2r::Node::create(ctx, &config.node_name, &config.namespace));
@@ -241,7 +339,7 @@ fn spin(
     if ready.send(Ok(())).is_err() {
         return;
     }
-    loop {
+    while !stopping.load(Ordering::SeqCst) {
         loop {
             match cmds.try_recv() {
                 Ok(cmd) => handle(&mut node, runtime, cmd),
@@ -462,50 +560,88 @@ fn handle(node: &mut r2r::Node, runtime: &tokio::runtime::Handle, cmd: Cmd) {
         Cmd::Graph { reply } => {
             let _ = reply.send(node.get_topic_names_and_types());
         }
-        Cmd::SubscribeJson { topic, ty, tx } => {
-            let qos = auto_qos(node, &topic, 1);
-            match node.subscribe_untyped(&topic, &ty, qos) {
-                Ok(mut stream) => {
-                    runtime.spawn(async move {
-                        while let Some(msg) = stream.next().await {
-                            match msg {
-                                Ok(v) => {
-                                    tx.send_replace(Some(v));
-                                }
-                                Err(e) => {
-                                    tracing::warn!(%topic, error = %e, "could not decode a message");
-                                }
-                            }
-                        }
-                    });
-                }
-                Err(e) => tracing::warn!(%topic, %ty, error = %e, "subscription failed"),
+        Cmd::SubscribeJson {
+            topic,
+            ty,
+            tx,
+            reply,
+        } => {
+            let _ = reply.send(subscribe_json(node, runtime, topic, &ty, tx));
+        }
+        Cmd::SubscribeImage { topic, tx } => subscribe_image(node, runtime, &topic, tx),
+    }
+}
+
+/// Subscribes to `topic` as JSON for [`R2rPort::latest`]; whether nothing published it yet.
+fn subscribe_json(
+    node: &mut r2r::Node,
+    runtime: &tokio::runtime::Handle,
+    topic: String,
+    ty: &str,
+    tx: watch::Sender<Option<Sample>>,
+) -> Result<bool, RosError> {
+    let blind = node
+        .get_publishers_info_by_topic(&topic, false)
+        .map_or(true, |p| p.is_empty());
+    let qos = auto_qos(node, &topic, 1);
+    let mut stream = node
+        .subscribe_untyped(&topic, ty, qos)
+        .map_err(|e| type_error(ty, &e))?;
+    // Ends, and so frees the subscription, once nobody reads the topic.
+    runtime.spawn(async move {
+        loop {
+            tokio::select! {
+                () = tx.closed() => break,
+                msg = stream.next() => match msg {
+                    Some(Ok(v)) => {
+                        tx.send_replace(Some(Sample {
+                            at: Instant::now(),
+                            value: Arc::new(v),
+                        }));
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(%topic, error = %e, "could not decode a message");
+                    }
+                    None => break,
+                },
             }
         }
-        Cmd::SubscribeImage { topic, tx } => {
-            let qos = auto_qos(node, &topic, 1);
-            match node.subscribe::<r2r::sensor_msgs::msg::Image>(&topic, qos) {
-                Ok(mut stream) => {
-                    runtime.spawn(async move {
-                        while let Some(img) = stream.next().await {
-                            let stamp = f64::from(img.header.stamp.sec)
-                                + f64::from(img.header.stamp.nanosec) * 1e-9;
-                            tx.send_replace(Some(Arc::new(Frame {
-                                stamp_s: stamp,
-                                frame_id: img.header.frame_id,
-                                width: img.width,
-                                height: img.height,
-                                encoding: img.encoding,
-                                step: img.step,
-                                is_bigendian: img.is_bigendian != 0,
-                                data: Bytes::from(img.data),
-                            })));
-                        }
-                    });
+    });
+    Ok(blind)
+}
+
+/// Subscribes to an image topic for [`R2rPort::frames`]; a failure drops `tx`, which the next
+/// call notices.
+fn subscribe_image(
+    node: &mut r2r::Node,
+    runtime: &tokio::runtime::Handle,
+    topic: &str,
+    tx: watch::Sender<Option<Arc<Frame>>>,
+) {
+    let qos = auto_qos(node, topic, 1);
+    match node.subscribe::<r2r::sensor_msgs::msg::Image>(topic, qos) {
+        Ok(mut stream) => {
+            runtime.spawn(async move {
+                while let Some(img) = stream.next().await {
+                    if tx.is_closed() {
+                        break;
+                    }
+                    let stamp = f64::from(img.header.stamp.sec)
+                        + f64::from(img.header.stamp.nanosec) * 1e-9;
+                    tx.send_replace(Some(Arc::new(Frame {
+                        stamp_s: stamp,
+                        frame_id: img.header.frame_id,
+                        width: img.width,
+                        height: img.height,
+                        encoding: img.encoding,
+                        step: img.step,
+                        is_bigendian: img.is_bigendian != 0,
+                        data: Bytes::from(img.data),
+                    })));
                 }
-                Err(e) => tracing::warn!(%topic, error = %e, "image subscription failed"),
-            }
+            });
         }
+        Err(e) => tracing::warn!(%topic, error = %e, "image subscription failed"),
     }
 }
 
@@ -573,13 +709,27 @@ impl RobotPort for R2rPort {
                 name: action.to_owned(),
                 message: e.to_string(),
             })?;
-        let (handle, result, mut feedback) = match tokio::time::timeout(timeout, pending).await {
+        // The goal is out. Should the server accept it after the caller gave up, on a timeout or
+        // a stop, nobody would watch or cancel it: the wait is a task of its own, which cancels
+        // such a goal.
+        let (accepted_tx, accepted) = oneshot::channel();
+        let name = action.to_owned();
+        tokio::spawn(async move {
+            if let Err(Ok((late, _, _))) = accepted_tx.send(pending.await) {
+                tracing::warn!(action = %name, goal = %late.uuid, "accepted after its caller gave up; cancelling");
+                if let Ok(cancel) = late.cancel() {
+                    let _ = cancel.await;
+                }
+            }
+        });
+        let (handle, result, mut feedback) = match tokio::time::timeout(timeout, accepted).await {
             Err(_) => return Err(RosError::Timeout(action.to_owned())),
-            Ok(Err(r2r::Error::RCL_RET_ACTION_GOAL_REJECTED)) => {
+            Ok(Err(_)) => return Err(mw("the goal's answer was lost")),
+            Ok(Ok(Err(r2r::Error::RCL_RET_ACTION_GOAL_REJECTED))) => {
                 return Err(RosError::Rejected(action.to_owned()));
             }
-            Ok(Err(e)) => return Err(mw(e)),
-            Ok(Ok(parts)) => parts,
+            Ok(Ok(Err(e))) => return Err(mw(e)),
+            Ok(Ok(Ok(parts))) => parts,
         };
         let (fb_tx, fb_rx) = mpsc::channel(64);
         tokio::spawn(async move {
@@ -617,27 +767,25 @@ impl RobotPort for R2rPort {
     }
 
     async fn latest(&self, topic: &str, ty: &str, wait: Duration) -> Result<Value, RosError> {
-        let existing = lock(&self.json).get(topic).cloned();
-        let mut rx = if let Some(rx) = existing {
-            rx
-        } else {
-            let (tx, rx) = watch::channel(None);
-            self.send(Cmd::SubscribeJson {
-                topic: topic.to_owned(),
-                ty: ty.to_owned(),
-                tx,
-            })?;
-            lock(&self.json).insert(topic.to_owned(), rx.clone());
-            rx
-        };
-        match tokio::time::timeout(wait, rx.wait_for(Option::is_some)).await {
-            Ok(Ok(v)) => v.clone().ok_or_else(|| RosError::NoData(topic.to_owned())),
-            _ => Err(RosError::NoData(topic.to_owned())),
-        }
+        self.newest(topic, ty, wait, None).await
+    }
+
+    async fn latest_fresh(
+        &self,
+        topic: &str,
+        ty: &str,
+        wait: Duration,
+        max_age: Duration,
+    ) -> Result<Value, RosError> {
+        self.newest(topic, ty, wait, Some(max_age)).await
     }
 
     fn frames(&self, topic: &str) -> Result<watch::Receiver<Option<Arc<Frame>>>, RosError> {
-        if let Some(rx) = lock(&self.images).get(topic) {
+        // A subscription that could not be made has dropped its sender: try it again.
+        if let Some(rx) = lock(&self.images)
+            .get(topic)
+            .filter(|rx| rx.has_changed().is_ok())
+        {
             return Ok(rx.clone());
         }
         let (tx, rx) = watch::channel(None);

@@ -177,6 +177,18 @@ impl Llm {
         }
     }
 
+    /// Why each provider whose key could not be read is left out, for the operator at start.
+    #[must_use]
+    pub fn missing_keys(&self) -> Vec<String> {
+        let mut why: Vec<String> = self
+            .missing_keys
+            .values()
+            .map(|e| format!("{e}: its models are left out"))
+            .collect();
+        why.sort();
+        why
+    }
+
     /// The router, for quota display and pool updates.
     #[must_use]
     pub fn router(&self) -> &Router {

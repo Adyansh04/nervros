@@ -50,3 +50,5 @@ rig = { workspace = true, features = ["test-utils"] }
 rmcp = { workspace = true, features = ["server", "macros"] }
 bytes.workspace = true
 tempfile.workspace = true
+# Paused time, for what waits tens of seconds.
+tokio = { workspace = true, features = ["test-util"] }

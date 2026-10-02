@@ -49,13 +49,24 @@ const MAX_PLAN_ATTEMPTS: u32 = 4;
 const CRITIC_TIMEOUT: Duration = Duration::from_secs(30);
 /// A hash may be shortened to this many characters when it stays unique.
 const MIN_HASH_PREFIX: usize = 8;
+/// How often the executor is checked on while a mission runs.
+const LIVENESS: Duration = Duration::from_secs(5);
+/// Checks in a row without the executor saying it runs the mission before it is given up as
+/// lost: a crashed executor sends no result, and its mission would hold the slot for good.
+const LOST_AFTER: u32 = 6;
 const EXECUTE: &str = "nervros_interfaces/action/ExecuteMission";
 const STATE: &str = "nervros_interfaces/msg/RobotState";
 const HEARTBEAT: &str = "nervros_interfaces/msg/Heartbeat";
 const OUTCOMES: [&str; 6] = [
-    "success", "failure", "canceled", "timeout", "rejected", "error",
+    "success", "failure", STOPPED, "timeout", "rejected", "error",
 ];
+/// The executor's outcome for a mission a stop ended.
+const STOPPED: &str = "canceled";
 const STATUSES: [&str; 5] = ["idle", "running", "success", "failure", "skipped"];
+
+/// The executor sends its state at least once a second: an older one says how things were, not
+/// how they are.
+pub const STATE_FRESH: Duration = Duration::from_secs(3);
 
 /// What a hand holds when the executor cannot say: after a pick that was cut off, it trusts the
 /// hand again only once a place with it succeeds.
@@ -82,6 +93,22 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The mission in flight.
 struct Running {
     id: String,
+}
+
+/// The mission slot, from the moment a launch claims it until the executor takes the goal. Dropped
+/// any earlier, by a failure or a stop, it frees the slot again.
+struct Claim<'a> {
+    missions: &'a Missions,
+    id: String,
+    kept: bool,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.missions.release(&self.id);
+        }
+    }
 }
 
 /// Plans, the running mission and the counters that stop endless retries.
@@ -334,7 +361,12 @@ impl Missions {
         }
         let state = self
             .robot
-            .latest(&self.config.state, STATE, Duration::from_secs(1))
+            .latest_fresh(
+                &self.config.state,
+                STATE,
+                Duration::from_secs(1),
+                STATE_FRESH,
+            )
             .await
             .ok()?;
         if state["can_move"].as_bool() != Some(false) {
@@ -773,7 +805,15 @@ impl Missions {
                 r.id
             ));
         }
-        if let Some(refusal) = self.unchanged(&compiled.sha256) {
+        // The operator's own "Run again" is theirs to make; only the model's goes back.
+        let by = if args["by"] == "operator" {
+            By::Operator
+        } else {
+            By::Model
+        };
+        if by == By::Model
+            && let Some(refusal) = self.unchanged(&compiled.sha256)
+        {
             return refusal;
         }
         match self.launch(compiled).await {
@@ -837,9 +877,33 @@ impl Missions {
         )))
     }
 
-    /// Sends a checked plan to the executor and watches it; its id.
+    /// Frees the mission slot, if mission `id` still holds it.
+    fn release(&self, id: &str) {
+        let mut running = lock(&self.running);
+        if running.as_ref().is_some_and(|r| r.id == id) {
+            *running = None;
+        }
+    }
+
+    /// Sends a checked plan to the executor and watches it; its id. The slot is claimed before the
+    /// goal goes out, so two launches at once cannot both pass.
     async fn launch(self: &Arc<Self>, compiled: Compiled) -> Result<String, String> {
         let id = uuid::Uuid::now_v7().to_string();
+        {
+            let mut running = lock(&self.running);
+            if let Some(r) = running.as_ref() {
+                return Err(format!(
+                    "mission {} is still running; wait for its report or stop it",
+                    r.id
+                ));
+            }
+            *running = Some(Running { id: id.clone() });
+        }
+        let mut claim = Claim {
+            missions: self,
+            id: id.clone(),
+            kept: false,
+        };
         let goal = json!({
             "mission_id": id,
             "tree_xml": compiled.xml,
@@ -858,7 +922,7 @@ impl Missions {
             .send_goal(&self.config.execute, EXECUTE, goal, SERVICE_TIMEOUT)
             .await
             .map_err(|e| format!("the executor did not start the mission: {e}"))?;
-        *lock(&self.running) = Some(Running { id: id.clone() });
+        claim.kept = true;
         self.emit(Event::MissionStarted {
             id: id.clone(),
             hash: compiled.sha256.clone(),
@@ -930,30 +994,15 @@ impl Missions {
         let started = Instant::now();
         let started_s = ledger::now_s();
         let mut times = StepTimes::default();
-        let Goal {
-            mut feedback,
-            result,
-            ..
-        } = goal;
-        tokio::pin!(result);
-        let result = loop {
-            tokio::select! {
-                Some(fb) = feedback.recv() => self.progress(&id, &fb, &mut times),
-                r = &mut result => break r,
-            }
-        };
+        let result = self.outcome_of(&id, goal, &mut times).await;
         let elapsed = started.elapsed().as_secs_f64();
-        let (outcome, step, reason) = summarise(
-            result
-                .map_err(|_| RosError::Middleware("the goal was dropped".into()))
-                .and_then(|r| r),
-        );
-        *lock(&self.running) = None;
+        let (outcome, step, reason) = summarise(result);
+        self.release(&id);
         tracing::Span::current().record("nervros.outcome", outcome.as_str());
-        let how = if outcome == "success" {
-            "succeeded".to_owned()
-        } else {
-            format!("failed at {step}: {reason}")
+        let how = match outcome.as_str() {
+            "success" => "succeeded".to_owned(),
+            STOPPED => "was stopped".to_owned(),
+            _ => format!("failed at {step}: {reason}"),
         };
         *lock(&self.last) = Some((compiled.sha256.clone(), how));
         self.emit(Event::MissionFinished {
@@ -1019,6 +1068,53 @@ impl Missions {
         }
     }
 
+    /// How mission `id` ends: its result, or an error once the executor no longer says it runs it.
+    /// Its steps' progress goes out as it comes, into `times` too.
+    async fn outcome_of(
+        &self,
+        id: &str,
+        goal: Goal,
+        times: &mut StepTimes,
+    ) -> Result<GoalResult, RosError> {
+        let Goal {
+            mut feedback,
+            result,
+            ..
+        } = goal;
+        tokio::pin!(result);
+        let mut alive = tokio::time::interval(LIVENESS);
+        alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        alive.tick().await;
+        let mut unheard = 0;
+        let result = loop {
+            tokio::select! {
+                Some(fb) = feedback.recv() => self.progress(id, &fb, times),
+                r = &mut result => {
+                    break r
+                        .map_err(|_| RosError::Middleware("the goal was dropped".into()))
+                        .and_then(|r| r);
+                }
+                _ = alive.tick() => {
+                    unheard = if self.executor_runs(id).await { 0 } else { unheard + 1 };
+                    if unheard >= LOST_AFTER {
+                        break Err(RosError::Middleware(format!(
+                            "the executor has not said it runs this mission for {} s: it may have \
+                             restarted, or the link to it is down",
+                            LIVENESS.as_secs() * u64::from(LOST_AFTER)
+                        )));
+                    }
+                }
+            }
+        };
+        // The executor's last word on the steps can come just behind its result.
+        while let Ok(Some(fb)) =
+            tokio::time::timeout(Duration::from_millis(50), feedback.recv()).await
+        {
+            self.progress(id, &fb, times);
+        }
+        result
+    }
+
     /// What the model reads when a mission ends: how it went, the goal checks or why it failed
     /// and where its object was last seen, and what the hands hold now.
     fn report(
@@ -1036,7 +1132,21 @@ impl Missions {
         let mut next = "";
         // Failures count per request, not in a row: a detour that works between two blocked
         // walks does not start the count again, and the operator's next message does.
-        if outcome == "success" {
+        if outcome == STOPPED {
+            // A stop is the operator's, the deadman's or the robot's own: not a failure to fix.
+            let at = compiled
+                .steps
+                .iter()
+                .find(|s| s.id == step)
+                .map_or_else(String::new, |s| format!(" during {} {}", s.id, s.summary));
+            let why = if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" ({reason})")
+            };
+            let _ = write!(report, " It was stopped{at}{why}.");
+            next = "Do not run it again unless the operator asks. Tell them where things stand.";
+        } else if outcome == "success" {
             let verdicts = check::check(&compiled.goal, seen);
             if !verdicts.is_empty() {
                 let lines: Vec<String> = verdicts
@@ -1225,6 +1335,19 @@ impl Missions {
         }
     }
 
+    /// Whether the executor says, freshly, that it runs mission `id`.
+    async fn executor_runs(&self, id: &str) -> bool {
+        self.robot
+            .latest_fresh(
+                &self.config.state,
+                STATE,
+                Duration::from_secs(1),
+                STATE_FRESH,
+            )
+            .await
+            .is_ok_and(|s| s["mission_id"].as_str() == Some(id))
+    }
+
     pub(crate) async fn observe(&self) -> Observed {
         let world = self.profile.world.as_ref();
         let rooms = self.latest(world.and_then(|w| w.rooms.as_ref())).await;
@@ -1257,10 +1380,17 @@ fn summarise(result: Result<GoalResult, RosError>) -> (String, String, String) {
             let code = r.result["outcome"]
                 .as_u64()
                 .and_then(|c| usize::try_from(c).ok());
-            let outcome = code.and_then(|c| OUTCOMES.get(c)).map_or_else(
-                || format!("{:?}", r.status).to_lowercase(),
-                |o| (*o).to_owned(),
-            );
+            let fallback = match r.status {
+                nervros_ros::GoalStatus::Succeeded => "success",
+                nervros_ros::GoalStatus::Aborted => "failure",
+                nervros_ros::GoalStatus::Canceled => STOPPED,
+                nervros_ros::GoalStatus::Unknown => "error",
+            };
+            let outcome = code
+                .and_then(|c| OUTCOMES.get(c))
+                .copied()
+                .unwrap_or(fallback)
+                .to_owned();
             let text = |k: &str| r.result[k].as_str().unwrap_or_default().to_owned();
             // A rejected mission says why in its diagnostics, not in the failure reason.
             let mut reason = text("failure_reason");
@@ -1318,10 +1448,12 @@ impl StepTimes {
             ),
             seconds,
             outcome: outcome.to_owned(),
-            reason: if outcome == "failure" {
-                reason.to_owned()
-            } else {
-                String::new()
+            // The mission's reason is the failed step's; an optional step that failed before it
+            // has none of its own.
+            reason: match outcome {
+                "failure" if step.id == failed => reason.to_owned(),
+                "failure" => "failed; the mission went on".to_owned(),
+                _ => String::new(),
             },
         }
     }
@@ -1351,9 +1483,7 @@ impl Tool for RunMission {
     /// one is shown, approved and run by its hash.
     async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
         if args.get("steps").is_none() && args.get("template").is_none() {
-            // A plan by its hash that just failed is refused before anyone is asked to approve it.
-            let hash = self.0.find(args["hash"].as_str()?).ok()?.sha256;
-            return self.0.unchanged(&hash).map(Err);
+            return self.by_hash(args);
         }
         if args["check_only"].as_bool() == Some(true) {
             return Some(Ok(Assessment {
@@ -1400,6 +1530,49 @@ impl Tool for RunMission {
 }
 
 impl RunMission {
+    /// A run of a plan checked before, by its hash: refused before anyone is asked when there is
+    /// no such plan, when it just ran unchanged, or when the operator asked for it again and
+    /// again, which is a schedule's to do.
+    fn by_hash(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
+        let refused = |why: String| Some(Err(ToolOutcome::refused(why)));
+        if args["check_only"].as_bool() == Some(true) {
+            return refused(
+                "a plan with a hash is checked already; give check_only the steps instead".into(),
+            );
+        }
+        let Some(hash) = args["hash"].as_str() else {
+            return refused(
+                "give run_mission the plan's steps, or the hash of a plan checked in this session"
+                    .into(),
+            );
+        };
+        let compiled = match self.0.find(hash) {
+            Ok(c) => c,
+            Err(e) => return refused(e),
+        };
+        if let Some(refusal) = self.0.unchanged(&compiled.sha256) {
+            return Some(Err(refusal));
+        }
+        if let Some(r) = sanity::repeat(&lock(&self.0.request)) {
+            return refused(format!(
+                "the operator asked for it every {} min: give the steps to schedule, which runs \
+                 it now and then on time",
+                r.every_min
+            ));
+        }
+        let minutes = (compiled.worst_case_s / 60.0).ceil();
+        Some(Ok(Assessment {
+            risk: Risk::Manipulation,
+            resources: Vec::new(),
+            reason: format!(
+                "runs \"{}\": {} step(s), at most {minutes} min",
+                compiled.plan.intent,
+                compiled.steps.len()
+            ),
+            args: Some(json!({"hash": compiled.sha256})),
+        }))
+    }
+
     /// A plan checked and ready for the operator: run by its hash once approved, with its
     /// preview on the way.
     async fn approvable(&self, args: Value, by: By) -> Result<Assessment, ToolOutcome> {
@@ -1428,11 +1601,16 @@ impl RunMission {
         let missions = Arc::clone(&self.0);
         let previewed = hash.clone();
         tokio::spawn(async move { missions.preview(&previewed).await });
+        // Marked as the operator's only here: a model's call by hash has its arguments replaced.
+        let args = match by {
+            By::Operator => json!({"hash": hash, "by": "operator"}),
+            By::Model => json!({"hash": hash}),
+        };
         Ok(Assessment {
             risk: Risk::Manipulation,
             resources: Vec::new(),
             reason,
-            args: Some(json!({"hash": hash})),
+            args: Some(args),
         })
     }
 }
@@ -1626,6 +1804,113 @@ mod tests {
             .await;
         eventually(|| ledger.gaps(1).is_ok_and(|g| !g.is_empty())).await;
         assert_eq!(ledger.gaps(1).unwrap()[0].nearest, "PlaceInto");
+    }
+
+    fn ended(outcome: u64, step: &str, reason: &str) -> ScriptedRun {
+        ScriptedRun {
+            result: Ok(GoalResult {
+                status: GoalStatus::Succeeded,
+                result: json!({"outcome": outcome, "failed_step_id": step, "failure_reason": reason}),
+            }),
+            ..ScriptedRun::default()
+        }
+    }
+
+    async fn report_from(commands: &mut tokio::sync::mpsc::UnboundedReceiver<Command>) -> String {
+        match tokio::time::timeout(Duration::from_mins(1), commands.recv()).await {
+            Ok(Some(Command::Report(text))) => text,
+            other => panic!("no report: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_launches_at_once_start_one_mission() {
+        let robot: Arc<dyn RobotPort> =
+            Arc::new(robot(ended(0, "", "")).with_latency(Duration::from_millis(200)));
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+        let hash = missions.plan(steps(), By::Model).await.data["hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let args = json!({"hash": hash});
+        let (a, b) = tokio::join!(missions.run(&args), missions.run(&args));
+        let started = [a.status, b.status]
+            .iter()
+            .filter(|s| **s == Status::Accepted)
+            .count();
+        assert_eq!(started, 1, "{} / {}", a.message, b.message);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mission_the_executor_no_longer_runs_is_given_up() {
+        let forever = ScriptedRun {
+            step: Duration::from_hours(1),
+            ..ended(0, "", "")
+        };
+        let robot: Arc<dyn RobotPort> = Arc::new(
+            robot(forever).with_topic("/x/state", json!({"mission_id": "", "holding_right": ""})),
+        );
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        missions.attach(SessionHandle::for_tests(&tx, events));
+        let hash = missions.plan(steps(), By::Model).await.data["hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            missions.run(&json!({"hash": hash})).await.status,
+            Status::Accepted
+        );
+        let text = report_from(&mut commands).await;
+        assert!(text.contains("ended: error"), "{text}");
+        assert!(!missions.busy(), "the slot is free for the next mission");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_mission_is_reported_as_stopped_and_an_operator_may_run_it_again() {
+        let robot: Arc<dyn RobotPort> = Arc::new(robot(ended(2, "s1", "stopped: operator")));
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        missions.attach(SessionHandle::for_tests(&tx, events));
+        let hash = missions.plan(steps(), By::Model).await.data["hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            missions.run(&json!({"hash": hash})).await.status,
+            Status::Accepted
+        );
+        let text = report_from(&mut commands).await;
+        assert!(text.contains("It was stopped during s1"), "{text}");
+        assert!(!text.contains("Find out why"), "{text}");
+        assert_eq!(
+            missions.run_failures.load(Ordering::SeqCst),
+            0,
+            "not a failure"
+        );
+        let model = missions.run(&json!({"hash": hash})).await;
+        assert_eq!(
+            model.status,
+            Status::Refused,
+            "the model does not repeat it on its own"
+        );
+        let operator = missions.run(&json!({"hash": hash, "by": "operator"})).await;
+        assert_eq!(operator.status, Status::Accepted, "{}", operator.message);
+    }
+
+    #[tokio::test]
+    async fn a_run_by_a_hash_that_cannot_run_is_refused_before_anyone_is_asked() {
+        let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+        let [run] = missions.tools();
+        for args in [json!({}), json!({"hash": "0123456789abcdef"})] {
+            assert!(
+                matches!(run.assess(&args).await, Some(Err(out)) if out.status == Status::Refused),
+                "{args}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1905,7 +2190,18 @@ mod tests {
         );
         let checked = tool.call(only).await;
         assert_eq!(checked.data["hash"], hash);
-        assert!(tool.assess(&json!({"hash": hash})).await.is_none());
+        // By its hash, it asks with what it runs, and with nothing else the model sent.
+        let by_hash = tool
+            .assess(&json!({"hash": &hash[..12], "by": "operator"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            by_hash.reason.starts_with("runs \"fetch the mug\""),
+            "{}",
+            by_hash.reason
+        );
+        assert_eq!(by_hash.args, Some(json!({"hash": hash})));
     }
 
     /// Says the same about every plan.

@@ -60,6 +60,8 @@ fn main() -> Result<()> {
     let agent =
         nervros_core::app::start_with(&args.profile, robot, &state.join("quota.json"), files)
             .context("starting the agent")?;
+    // At once: start-up notices, such as a heartbeat that could not start, come before the window.
+    let events = agent.session.subscribe();
     let (log_path, _log) = nervros_core::log::spawn(
         &state.join("logs"),
         &format!("session-{stamp}"),
@@ -92,7 +94,7 @@ fn main() -> Result<()> {
                 bridge,
                 memory_limit,
             };
-            let gui = app::Gui::start(main_thread, cc, agent, feed, handle, log_path)?;
+            let gui = app::Gui::start(main_thread, cc, agent, events, feed, handle, log_path)?;
             Ok(Box::new(gui))
         }),
     )
