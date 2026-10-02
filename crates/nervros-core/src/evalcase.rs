@@ -150,6 +150,38 @@ pub struct Seen {
     pub model_ms: u64,
 }
 
+/// One message's exchange with the session: over once its turn has finished and every mission it
+/// started has ended and been reported, since a mission outlives the turn that started it.
+#[derive(Debug, Default)]
+pub struct Exchange {
+    mine: Option<u64>,
+    open: u32,
+    awaiting_report: bool,
+}
+
+impl Exchange {
+    /// Notes `e`; `true` once the exchange that `text` began is over. A report's reply can run
+    /// first, so only the turn `text` itself started counts.
+    pub fn over(&mut self, text: &str, e: &Event) -> bool {
+        match e {
+            Event::MissionStarted { .. } => self.open += 1,
+            Event::MissionFinished { .. } => {
+                self.open = self.open.saturating_sub(1);
+                self.awaiting_report = true;
+            }
+            Event::Report { .. } => self.awaiting_report = false,
+            Event::User { turn, text: sent } if sent == text => self.mine = Some(*turn),
+            Event::TurnFinished { turn } => {
+                return self.mine.is_some_and(|m| *turn >= m)
+                    && self.open == 0
+                    && !self.awaiting_report;
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
 /// Sends one message and waits for its turn, the missions it starts and their reports, granting
 /// each approval asked when `approve`, else denying it; `true` when `deadline` passed first.
 pub async fn say(
@@ -161,7 +193,7 @@ pub async fn say(
     seen: &mut Seen,
 ) -> bool {
     session.send(Command::User(text.to_owned()));
-    let (mut mine, mut open, mut awaiting_report) = (None, 0u32, false);
+    let mut exchange = Exchange::default();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         let e = match tokio::time::timeout(left, events.recv()).await {
@@ -170,6 +202,9 @@ pub async fn say(
             Ok(Err(broadcast::error::RecvError::Closed)) => return false,
             Ok(Ok(e)) => e,
         };
+        if exchange.over(text, &e) {
+            return false;
+        }
         match e {
             Event::ApprovalRequested { id, .. } => {
                 seen.approvals += 1;
@@ -191,13 +226,9 @@ pub async fn say(
             Event::MissionPlanned { steps, .. } => {
                 seen.skills.extend(steps.into_iter().map(|s| s.summary));
             }
-            Event::MissionStarted { .. } => open += 1,
             Event::MissionFinished { outcome, .. } => {
                 seen.missions.push(outcome.as_str().to_owned());
-                open = open.saturating_sub(1);
-                awaiting_report = true;
             }
-            Event::Report { .. } => awaiting_report = false,
             Event::Reply { text, .. } => seen.replies.push(text),
             Event::Error { text, .. } => seen.errors.push(text),
             Event::Notice { text } => seen.notices.push(text),
@@ -214,12 +245,6 @@ pub async fn say(
                 seen.cached_tokens += cached_tokens;
                 seen.output_tokens += output_tokens;
                 seen.model_ms += ms;
-            }
-            Event::User { turn, text: sent } if sent == text => mine = Some(turn),
-            Event::TurnFinished { turn }
-                if mine.is_some_and(|m| turn >= m) && open == 0 && !awaiting_report =>
-            {
-                return false;
             }
             _ => {}
         }

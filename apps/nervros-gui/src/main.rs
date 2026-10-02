@@ -15,7 +15,6 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
-use nervros_core::profile::Profile;
 use rerun::external::{eframe, re_crash_handler, re_memory, re_viewer};
 
 // Lets the viewer see its own memory use and prune its store at the limit.
@@ -43,29 +42,13 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new().context("starting tokio")?;
     let _entered = runtime.enter();
-    let profile = Profile::load(&args.profile).context("loading the profile")?;
-    let robot = nervros_core::app::connect(&profile)?;
-    let state = nervros_core::app::state_dir();
-    let stamp = nervros_core::unix_secs(std::time::SystemTime::now());
-    let files = nervros_core::app::StartOptions {
-        history: Some(
-            state
-                .join("logs")
-                .join(format!("session-{stamp}.history.json")),
-        ),
-        ..Default::default()
-    };
-    let agent =
-        nervros_core::app::start_with(&args.profile, robot, &state.join("quota.json"), files)
-            .context("starting the agent")?;
-    // At once: start-up notices, such as a heartbeat that could not start, come before the window.
-    let events = agent.session.subscribe();
-    let (log_path, _log) = nervros_core::log::spawn(
-        &state.join("logs"),
-        &format!("session-{stamp}"),
-        agent.session.subscribe(),
-    )
-    .context("opening the session log")?;
+    let nervros_core::app::LoggedSession {
+        agent,
+        events,
+        log_path,
+        ..
+    } = nervros_core::app::start_logged(&args.profile, &nervros_core::app::state_dir(), None)
+        .context("starting the agent")?;
     let (rec, viewer_input) = nervros_viz::in_process().context("creating the recording")?;
     let bridge = nervros_viz::spawn(
         &rec,

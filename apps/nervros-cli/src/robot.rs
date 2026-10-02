@@ -353,15 +353,11 @@ fn parse_line(line: &str) -> Option<SessionCommand> {
 }
 
 pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions) -> Result<()> {
-    let profile = Profile::load(profile_path).context("loading the profile")?;
-    let robot = nervros_core::app::connect(&profile)?;
-    let stamp = nervros_core::unix_secs(std::time::SystemTime::now());
-    let logs_dir = state.join("logs");
     let resume = match options.resume.as_deref() {
         None => None,
         Some(which) => {
             let path = if which == "last" {
-                newest_history(&logs_dir).context("no saved conversation to resume")?
+                newest_history(&state.join("logs")).context("no saved conversation to resume")?
             } else {
                 std::path::PathBuf::from(which)
             };
@@ -372,23 +368,14 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
             )
         }
     };
-    let files = nervros_core::app::StartOptions {
-        history: Some(logs_dir.join(format!("session-{stamp}.history.json"))),
-        resume,
-        ..Default::default()
-    };
-    let agent =
-        nervros_core::app::start_with(profile_path, robot, &state.join("quota.json"), files)
-            .context("starting the agent")?;
-    // At once: start-up notices, such as a heartbeat that could not start, come right away.
-    let mut events = agent.session.subscribe();
-    let (log_path, _log) = nervros_core::log::spawn(
-        &logs_dir,
-        &format!("session-{stamp}"),
-        agent.session.subscribe(),
-    )
-    .context("opening the session log")?;
-    let blobs = logs_dir.join(format!("session-{stamp}"));
+    let nervros_core::app::LoggedSession {
+        agent,
+        mut events,
+        log_path,
+        blobs,
+        ..
+    } = nervros_core::app::start_logged(profile_path, state, resume)
+        .context("starting the agent")?;
     eprintln!(
         "NervROS: {} with tools {}; log {}",
         agent.profile.robot.name,
@@ -425,13 +412,10 @@ async fn say_all(
     approve: bool,
     blobs: &Path,
 ) -> Result<()> {
-    // Missions outlive the turn that started them: wait for their reports too.
-    let (mut open, mut awaiting_report) = (0u32, false);
     for text in say {
         println!("you> {text}");
         agent.session.send(SessionCommand::User(text.clone()));
-        // A report's reply can run first: wait for the turn this message starts.
-        let mut mine = None;
+        let mut exchange = nervros_core::evalcase::Exchange::default();
         loop {
             let e = match events.recv().await {
                 Ok(e) => e,
@@ -448,20 +432,8 @@ async fn say_all(
                 agent.session.send(SessionCommand::Approve(*id));
             }
             print_event(&e, blobs);
-            match e {
-                Event::MissionStarted { .. } => open += 1,
-                Event::MissionFinished { .. } => {
-                    open = open.saturating_sub(1);
-                    awaiting_report = true;
-                }
-                Event::Report { .. } => awaiting_report = false,
-                Event::User { turn, text: sent } if sent == text => mine = Some(turn),
-                Event::TurnFinished { turn }
-                    if mine.is_some_and(|m| turn >= m) && open == 0 && !awaiting_report =>
-                {
-                    break;
-                }
-                _ => {}
+            if exchange.over(&text, &e) {
+                break;
             }
         }
     }

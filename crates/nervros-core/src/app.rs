@@ -90,6 +90,9 @@ pub enum StartError {
     /// A `[[policy.rule]]` that could never apply.
     #[error("{0}")]
     Rule(String),
+    /// The session log.
+    #[error("opening the session log: {0}")]
+    Log(std::io::Error),
 }
 
 /// Where the quota ledger and session logs live: `$XDG_STATE_HOME/nervros`, else
@@ -312,6 +315,55 @@ pub struct StartOptions {
     /// What the session talks to in place of `models.toml`'s models, such as a scripted model
     /// for a scenario; the profile's other roles (plan checks, vision) keep theirs.
     pub source: Option<Arc<dyn crate::llm::AgentSource>>,
+}
+
+/// A session for the window or the terminal: its conversation saved after every turn and its
+/// events logged, as `session-<secs>` files in `<state>/logs`.
+#[cfg(feature = "rcl")]
+pub struct LoggedSession {
+    /// The agent.
+    pub agent: Agent,
+    /// Subscribed at start, so start-up notices reach the caller too.
+    pub events: tokio::sync::broadcast::Receiver<crate::session::Event>,
+    /// The NDJSON event log.
+    pub log_path: PathBuf,
+    /// Where the log keeps the session's images.
+    pub blobs: PathBuf,
+    /// The log's writer, which ends with the session.
+    pub log: tokio::task::JoinHandle<()>,
+}
+
+/// Starts a session on the profile's robot, with the quota ledger, conversation and log under
+/// `state`, carrying on `resume` when given. Must run inside a tokio runtime.
+///
+/// # Errors
+///
+/// Anything in [`StartError`].
+#[cfg(feature = "rcl")]
+pub fn start_logged(
+    profile_path: &Path,
+    state: &Path,
+    resume: Option<crate::llm::History>,
+) -> Result<LoggedSession, StartError> {
+    let robot = connect(&Profile::load(profile_path)?)?;
+    let logs = state.join("logs");
+    let name = format!("session-{}", crate::unix_secs(std::time::SystemTime::now()));
+    let files = StartOptions {
+        history: Some(logs.join(format!("{name}.history.json"))),
+        resume,
+        ..StartOptions::default()
+    };
+    let agent = start_with(profile_path, robot, &state.join("quota.json"), files)?;
+    let events = agent.session.subscribe();
+    let (log_path, log) =
+        crate::log::spawn(&logs, &name, agent.session.subscribe()).map_err(StartError::Log)?;
+    Ok(LoggedSession {
+        agent,
+        events,
+        log_path,
+        blobs: logs.join(name),
+        log,
+    })
 }
 
 /// Starts an agent with a fresh conversation that is not saved. Must run inside a tokio runtime.
