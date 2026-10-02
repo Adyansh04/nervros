@@ -9,6 +9,8 @@ mod palette;
 mod plan_edit;
 mod robot;
 mod sessions;
+#[cfg(test)]
+mod testkit;
 mod toasts;
 
 use std::path::PathBuf;

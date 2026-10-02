@@ -460,10 +460,10 @@ mod tests {
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| tab(ui, &status, Some(&mut drive)));
             });
-        crate::chat::style_for_tests(&harness.ctx);
+        crate::testkit::style_for_tests(&harness.ctx);
         harness.run_steps(3);
         harness.fit_contents();
-        crate::chat::compare(&mut harness, name, &egui_kittest::SnapshotOptions::new());
+        crate::testkit::compare(&mut harness, name, &egui_kittest::SnapshotOptions::new());
     }
 
     #[test]

@@ -234,9 +234,9 @@ mod tests {
                 };
                 let _ = palette.show(ui.ctx(), &mut provider);
             });
-        crate::chat::style_for_tests(&harness.ctx);
+        crate::testkit::style_for_tests(&harness.ctx);
         harness.run_steps(2);
-        crate::chat::compare(
+        crate::testkit::compare(
             &mut harness,
             "palette",
             &egui_kittest::SnapshotOptions::new(),

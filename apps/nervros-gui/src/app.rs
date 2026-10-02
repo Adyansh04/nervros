@@ -841,10 +841,10 @@ mod tests {
                         let _ = world_view(ui, &rooms, Some(13));
                     });
             });
-        crate::chat::style_for_tests(&harness.ctx);
+        crate::testkit::style_for_tests(&harness.ctx);
         harness.run();
         harness.fit_contents();
-        crate::chat::compare(&mut harness, "world", &SnapshotOptions::new());
+        crate::testkit::compare(&mut harness, "world", &SnapshotOptions::new());
     }
 
     #[test]
@@ -869,10 +869,10 @@ mod tests {
                     .inner_margin(Margin::same(12))
                     .show(ui, |ui| layers_view(ui, &layers));
             });
-        crate::chat::style_for_tests(&harness.ctx);
+        crate::testkit::style_for_tests(&harness.ctx);
         harness.run();
         harness.fit_contents();
-        crate::chat::compare(&mut harness, "layers", &SnapshotOptions::new());
+        crate::testkit::compare(&mut harness, "layers", &SnapshotOptions::new());
     }
 
     #[test]
@@ -927,16 +927,16 @@ mod tests {
         harness.run_steps(8);
         // The status bar's memory and frame-time figures differ on every run.
         let options = SnapshotOptions::new().max_failed_pixels(1500);
-        crate::chat::compare(&mut harness, "window", &options);
+        crate::testkit::compare(&mut harness, "window", &options);
         // Reset layout lays the panes out the same way again.
         harness.get_by_label("Reset layout").click();
         harness.run_steps(2);
         harness.input_mut().events.push(egui::Event::PointerGone);
         harness.run_steps(8);
-        crate::chat::compare(&mut harness, "window", &options);
+        crate::testkit::compare(&mut harness, "window", &options);
         // The Agent tab: sessions to resume, what it remembers, the models.
         harness.state_mut().tab = Tab::Agent;
         harness.run_steps(4);
-        crate::chat::compare(&mut harness, "window_agent", &options);
+        crate::testkit::compare(&mut harness, "window_agent", &options);
     }
 }

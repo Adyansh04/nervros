@@ -1868,9 +1868,9 @@ mod tests {
                     .show(ui, |ui| editor.panel(ui));
                 egui::CentralPanel::no_frame().show(ui, |ui| editor.canvas(ui));
             });
-        crate::chat::style_for_tests(&harness.ctx);
+        crate::testkit::style_for_tests(&harness.ctx);
         harness.run_steps(4);
-        crate::chat::compare(
+        crate::testkit::compare(
             &mut harness,
             "editor",
             &egui_kittest::SnapshotOptions::new(),
