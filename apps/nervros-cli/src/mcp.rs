@@ -25,8 +25,17 @@ pub async fn run(
         Some("pin") => Some(server.context("pin needs the server's id")?),
         Some(other) => bail!("`{other}`: the action is pin, or none to list"),
     };
+    let home = profile.privacy.mode == nervros_core::providers::router::PrivacyMode::Home;
     for config in &profile.mcp_servers {
         if pinning.is_some_and(|id| id != config.id) {
+            continue;
+        }
+        // As a session does: a server that reaches the internet stays off in the home mode.
+        if config.open_world && home {
+            println!(
+                "{}: reaches the internet, so it is off in the home privacy mode",
+                config.id
+            );
             continue;
         }
         let connected = McpServer::connect(config, |p| profile.resolve(p), &lock).await;

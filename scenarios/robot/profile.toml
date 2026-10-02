@@ -21,6 +21,11 @@ catalog = "/x/get_catalog"
 stop = "/x/stop_all"
 state = "/x/robot_state"
 
+[mission.checks]
+turn = { skill = "TurnInPlace", degrees = "degrees" }
+walk = { skill = "WalkStraight", metres = "distance_m", direction = "direction", max_m = 2.0 }
+arm = "arm"
+
 [[place]]
 name = "dock"
 pose = { x = 0.5, y = 0.5 }

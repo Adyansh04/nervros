@@ -1,6 +1,7 @@
 //! Where a plan would take the robot, from the executor's `PreviewMission`: drawn in the viewer
 //! beside the approval card, so the operator approves a picture of the walk, not only its words.
 
+use nervros_ros::Transform;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -46,7 +47,7 @@ fn step(s: &Value) -> PreviewStep {
         .as_str()
         .unwrap_or_default()
         .is_empty())
-    .then(|| pose(&s["goal"]["pose"]))
+    .then(|| Transform::from_pose(&s["goal"]["pose"]).map(|t| t.planar()))
     .flatten();
     let path: Vec<(f64, f64)> = s["path"]["poses"]
         .as_array()
@@ -66,19 +67,6 @@ fn step(s: &Value) -> PreviewStep {
         path: thin(path),
         note: s["note"].as_str().unwrap_or_default().to_owned(),
     }
-}
-
-/// `(x, y, yaw)` of a `geometry_msgs/Pose`.
-fn pose(p: &Value) -> Option<(f64, f64, f64)> {
-    let (at, q) = (&p["position"], &p["orientation"]);
-    let (qx, qy, qz, qw) = (
-        q["x"].as_f64()?,
-        q["y"].as_f64()?,
-        q["z"].as_f64()?,
-        q["w"].as_f64()?,
-    );
-    let yaw = (2.0 * (qw * qz + qx * qy)).atan2(1.0 - 2.0 * (qy * qy + qz * qz));
-    Some((at["x"].as_f64()?, at["y"].as_f64()?, yaw))
 }
 
 /// At most [`MAX_POINTS`], evenly spread, always keeping both ends.

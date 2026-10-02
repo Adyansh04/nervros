@@ -68,6 +68,24 @@ impl Transform {
         let [x, y, z, w] = self.rotation;
         (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z))
     }
+
+    /// `(x, y, yaw)`: where a robot on the floor is and which way it faces.
+    #[must_use]
+    pub fn planar(&self) -> (f64, f64, f64) {
+        (self.translation[0], self.translation[1], self.yaw())
+    }
+
+    /// A `geometry_msgs/Pose` as JSON; `None` when x, y or the rotation is missing. A missing z
+    /// is 0: plans and goals often leave it out.
+    #[must_use]
+    pub fn from_pose(pose: &serde_json::Value) -> Option<Self> {
+        let (p, q) = (&pose["position"], &pose["orientation"]);
+        let n = |v: &serde_json::Value| v.as_f64();
+        Some(Self {
+            translation: [n(&p["x"])?, n(&p["y"])?, n(&p["z"]).unwrap_or(0.0)],
+            rotation: [n(&q["x"])?, n(&q["y"])?, n(&q["z"])?, n(&q["w"])?],
+        })
+    }
 }
 
 fn mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
@@ -86,12 +104,20 @@ fn rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
     [p[0], p[1], p[2]]
 }
 
+/// One child's link: its parent, its pose there, when it last arrived and whether it came from
+/// `/tf_static`.
+#[derive(Debug, Clone)]
+struct Link {
+    parent: String,
+    transform: Transform,
+    at: Instant,
+    is_static: bool,
+}
+
 /// The newest transform of each child frame relative to its parent.
 #[derive(Debug, Default)]
 pub struct TfBuffer {
-    parents: HashMap<String, (String, Transform)>,
-    // When each child's link last arrived, and whether it came from /tf_static.
-    seen: HashMap<String, (Instant, bool)>,
+    links: HashMap<String, Link>,
 }
 
 /// TF allows at most this many hops; a longer walk means a loop in bad data.
@@ -112,29 +138,28 @@ impl TfBuffer {
         is_static: bool,
     ) {
         let strip = |f: &str| f.trim_start_matches('/').to_owned();
-        self.parents
-            .insert(strip(child), (strip(parent), transform));
-        self.seen.insert(strip(child), (Instant::now(), is_static));
+        self.links.insert(
+            strip(child),
+            Link {
+                parent: strip(parent),
+                transform,
+                at: Instant::now(),
+                is_static,
+            },
+        );
     }
 
     /// Every link, parent first, sorted by child.
     #[must_use]
     pub fn links(&self) -> Vec<TfLink> {
         let mut out: Vec<TfLink> = self
-            .parents
+            .links
             .iter()
-            .map(|(child, (parent, _))| {
-                let (at, is_static) = self
-                    .seen
-                    .get(child)
-                    .copied()
-                    .unwrap_or((Instant::now(), false));
-                TfLink {
-                    parent: parent.clone(),
-                    child: child.clone(),
-                    is_static,
-                    age: at.elapsed(),
-                }
+            .map(|(child, link)| TfLink {
+                parent: link.parent.clone(),
+                child: child.clone(),
+                is_static: link.is_static,
+                age: link.at.elapsed(),
             })
             .collect();
         out.sort_by(|a, b| a.child.cmp(&b.child));
@@ -146,12 +171,12 @@ impl TfBuffer {
         let mut out = vec![(frame.to_owned(), Transform::IDENTITY)];
         let mut current = frame.to_owned();
         let mut up = Transform::IDENTITY;
-        while let Some((parent, t)) = self.parents.get(&current) {
+        while let Some(link) = self.links.get(&current) {
             if out.len() > MAX_DEPTH {
                 break;
             }
-            up = t.compose(&up);
-            current.clone_from(parent);
+            up = link.transform.compose(&up);
+            current.clone_from(&link.parent);
             out.push((current.clone(), up));
         }
         out

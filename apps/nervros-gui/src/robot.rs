@@ -18,8 +18,6 @@ use serde_json::{Value, json};
 /// How often a held command is sent; the executor stops the base after 0.4 s without one.
 const SEND_EVERY: Duration = Duration::from_millis(100);
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Full speed forward, sideways and turning; the executor clamps to its own limits.
-const SPEED: [f64; 3] = [0.5, 0.3, 0.8];
 
 /// Where the robot stands on the map: x, y and heading in radians.
 pub type Pose = (f64, f64, f64);
@@ -38,6 +36,8 @@ pub struct Status {
     pub battery: Option<Value>,
     /// `diagnostic_msgs/msg/DiagnosticArray` with motor temperatures.
     pub motors: Option<Value>,
+    /// Whether the robot is armed: driving by hand is motion, which Observe only keeps off.
+    pub armed: bool,
 }
 
 /// The room whose outline holds `(x, y)`.
@@ -49,24 +49,11 @@ pub fn room_at(rooms: &Value, x: f64, y: f64) -> Option<&Value> {
             .iter()
             .filter_map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)))
             .collect();
-        inside(&points, x, y)
+        nervros_core::builtins::inside((x, y), &points)
     })
 }
 
 /// Whether a polygon holds a point, by counting the edges a ray to the right crosses.
-fn inside(polygon: &[(f64, f64)], x: f64, y: f64) -> bool {
-    let mut inside = false;
-    let mut j = polygon.len().wrapping_sub(1);
-    for (i, &(xi, yi)) in polygon.iter().enumerate() {
-        let (xj, yj) = polygon[j];
-        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
-}
-
 /// The hottest motor in a diagnostics message, as `(name, °C)`; none when all read zero, as in
 /// the simulator.
 pub fn hottest(diagnostics: &Value) -> Option<(String, f64)> {
@@ -94,6 +81,8 @@ struct Link {
     busy: bool,
     note: Option<String>,
     commands: Option<Publisher>,
+    /// When the executor last handed the base over: its state takes a moment to say so.
+    since: Option<Instant>,
 }
 
 /// Driving the base by hand through the executor's `Teleop` service.
@@ -101,6 +90,8 @@ pub struct Drive {
     robot: Arc<dyn RobotPort>,
     service: String,
     topic: String,
+    /// Full speed forward, sideways and turning.
+    speed: [f64; 3],
     runtime: tokio::runtime::Handle,
     link: Arc<Mutex<Link>>,
     sent: Option<Instant>,
@@ -119,6 +110,7 @@ impl Drive {
             robot,
             service: mission.teleop.clone()?,
             topic: mission.teleop_cmd.clone()?,
+            speed: mission.teleop_speed,
             runtime,
             link: Arc::default(),
             sent: None,
@@ -164,6 +156,7 @@ impl Drive {
                     l.on = on;
                     l.commands = commands;
                     l.note = None;
+                    l.since = on.then(Instant::now);
                 }
                 Ok(r) => l.note = r["message"].as_str().map(str::to_owned),
                 Err(e) => l.note = Some(e.to_string()),
@@ -171,10 +164,14 @@ impl Drive {
         });
     }
 
-    /// Ends driving on this side when the executor has, as after its idle limit or a stop.
+    /// Ends driving on this side when the executor has, as after its idle limit or a stop; a
+    /// state polled before it took the base over does not count.
     fn follow(&self, state: Option<&Value>) {
         let mut l = self.link();
-        if l.on && !l.busy && state.and_then(|s| s["teleop"].as_bool()) == Some(false) {
+        let settled = l
+            .since
+            .is_none_or(|t| t.elapsed() > nervros_core::mission::STATE_FRESH);
+        if l.on && !l.busy && settled && state.and_then(|s| s["teleop"].as_bool()) == Some(false) {
             l.on = false;
             l.commands = None;
             l.note = Some("the executor ended driving: idle, a stop or a mission".to_owned());
@@ -192,7 +189,7 @@ impl Drive {
             return;
         }
         let scale = if self.slow { 0.5 } else { 1.0 };
-        let [x, y, yaw] = [0, 1, 2].map(|i| held[i] * SPEED[i] * scale);
+        let [x, y, yaw] = [0, 1, 2].map(|i| held[i] * self.speed[i] * scale);
         commands.send(json!({
             "linear": {"x": x, "y": y, "z": 0.0},
             "angular": {"x": 0.0, "y": 0.0, "z": yaw}
@@ -203,21 +200,21 @@ impl Drive {
     }
 }
 
-/// The keys held now as a command: W and S forward and back, A and D turn, Q and E sideways;
-/// the arrows as W, S, A and D. None while a text field has the keyboard.
+/// The keys held now as a command: W and S forward and back, A and D turn, Q and E sideways.
+/// Not the arrows, which the viewer takes to step its time cursor. None while a text field has
+/// the keyboard.
 fn keys_held(ctx: &egui::Context) -> [f64; 3] {
     if ctx.egui_wants_keyboard_input() {
         return [0.0; 3];
     }
     ctx.input(|i| {
-        let axis = |plus: &[Key], minus: &[Key]| {
-            let down = |keys: &[Key]| keys.iter().any(|k| i.key_down(*k));
-            f64::from(i8::from(down(plus)) - i8::from(down(minus)))
+        let axis = |plus: Key, minus: Key| {
+            f64::from(i8::from(i.key_down(plus)) - i8::from(i.key_down(minus)))
         };
         [
-            axis(&[Key::W, Key::ArrowUp], &[Key::S, Key::ArrowDown]),
-            axis(&[Key::Q], &[Key::E]),
-            axis(&[Key::A, Key::ArrowLeft], &[Key::D, Key::ArrowRight]),
+            axis(Key::W, Key::S),
+            axis(Key::Q, Key::E),
+            axis(Key::A, Key::D),
         ]
     })
 }
@@ -288,13 +285,13 @@ fn state_section(ui: &mut egui::Ui, status: &Status) {
     for hand in ["left", "right"] {
         let held = held_by(state, hand);
         let text = if held.is_empty() {
-            format!("{} hand free", capitalised(hand))
+            format!("{} hand free", crate::chat::capitalise(hand))
         } else {
             let name = status
                 .names
                 .get(&held)
                 .map_or_else(String::new, |n| format!(" ({n})"));
-            format!("{} hand holds {held}{name}", capitalised(hand))
+            format!("{} hand holds {held}{name}", crate::chat::capitalise(hand))
         };
         ui.label(subdued(text));
     }
@@ -319,12 +316,6 @@ fn state_section(ui: &mut egui::Ui, status: &Status) {
     }
 }
 
-fn capitalised(word: &str) -> String {
-    let mut c = word.chars();
-    c.next()
-        .map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
-}
-
 fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
     let t = ui.tokens();
     drive.follow(status.state.as_ref());
@@ -332,6 +323,10 @@ fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
         let l = drive.link();
         (l.on, l.busy, l.note.clone())
     };
+    // Disarming hands the base back at once.
+    if on && !busy && !status.armed {
+        drive.set(false);
+    }
     ui.horizontal(|ui| {
         ui.label(RichText::new("Drive by hand").strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -341,7 +336,10 @@ fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
             } else {
                 ReButton::new(label).small().secondary()
             };
-            if ui.add_enabled(!busy, button).clicked() {
+            let response = ui
+                .add_enabled(!busy && (on || status.armed), button)
+                .on_disabled_hover_text("Arm the robot in the top bar to drive it");
+            if response.clicked() {
                 drive.set(!on);
             }
             let slow = ReButton::new("Slow")
@@ -436,6 +434,7 @@ mod tests {
             battery: Some(json!({"percentage": 0.87, "voltage": 52.1})),
             motors: Some(json!({"status": [{"name": "left_knee",
                 "values": [{"key": "winding_temperature_C", "value": "48"}]}]})),
+            armed: true,
         }
     }
 
@@ -445,6 +444,7 @@ mod tests {
             robot: Arc::new(nervros_ros::fake::FakeRobot::new()),
             service: "/x/teleop".to_owned(),
             topic: "/x/teleop_cmd".to_owned(),
+            speed: [0.5, 0.3, 0.8],
             runtime: runtime.handle().clone(),
             link: Arc::default(),
             sent: None,
@@ -460,10 +460,10 @@ mod tests {
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| tab(ui, &status, Some(&mut drive)));
             });
-        crate::chat::style_for_tests(&harness.ctx);
+        crate::testkit::style_for_tests(&harness.ctx);
         harness.run_steps(3);
         harness.fit_contents();
-        crate::chat::compare(&mut harness, name, &egui_kittest::SnapshotOptions::new());
+        crate::testkit::compare(&mut harness, name, &egui_kittest::SnapshotOptions::new());
     }
 
     #[test]

@@ -134,6 +134,7 @@ fn live_eval() {
     let agent =
         nervros_core::app::start_with(&profile_path, robot, &state.join("quota.json"), options)
             .expect("the agent");
+    let events = agent.session.subscribe();
     let (log, _log) =
         nervros_core::log::spawn(&out, "session", agent.session.subscribe()).expect("the log");
     let (rec, input) = nervros_viz::in_process().expect("the recording");
@@ -155,7 +156,7 @@ fn live_eval() {
                 memory_limit: re_memory::MemoryLimit::from_bytes(4 << 30),
             };
             let token = re_viewer::MainThreadToken::i_promise_i_am_only_using_this_for_a_test();
-            Gui::start(token, cc, agent, feed, handle, log).expect("the window")
+            Gui::start(token, cc, agent, events, feed, handle, log).expect("the window")
         });
     // The map, the camera and the world model need a moment to arrive.
     wait(&mut harness, Duration::from_secs(10));

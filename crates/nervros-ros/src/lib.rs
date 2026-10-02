@@ -2,17 +2,20 @@
 //! trait.
 //!
 //! [`RobotPort`] is what the agent core talks to. [`R2rPort`] implements it over r2r (feature
-//! `rcl`, which needs a sourced ROS environment), and [`fake::FakeRobot`] implements it from a
-//! script for tests that run without ROS.
+//! `rcl`, which needs a sourced ROS environment), and `fake::FakeRobot` (feature `test-support`)
+//! implements it from a script for tests that run without ROS.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt as _;
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
+#[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 pub mod image;
 #[cfg(feature = "rcl")]
@@ -273,8 +276,33 @@ pub trait RobotPort: Send + Sync {
         timeout: Duration,
     ) -> Result<Goal, RosError>;
 
-    /// The newest message on a topic as JSON, waiting up to `wait` for the first one.
+    /// The newest message on a topic as JSON, waiting up to `wait` for the first one, however
+    /// old it is: a latched map is as good as ever.
     async fn latest(&self, topic: &str, msg_type: &str, wait: Duration) -> Result<Value, RosError>;
+
+    /// As [`RobotPort::latest`], shared rather than copied: a reader that polls a large message,
+    /// such as a map, tells a new one by pointer and copies nothing.
+    async fn latest_shared(
+        &self,
+        topic: &str,
+        msg_type: &str,
+        wait: Duration,
+    ) -> Result<Arc<Value>, RosError> {
+        self.latest(topic, msg_type, wait).await.map(Arc::new)
+    }
+
+    /// As [`RobotPort::latest`], but only a message that arrived within `max_age`, waiting up to
+    /// `wait` for one: what a publisher said before it went quiet is not its state now.
+    /// A port that keeps no arrival times answers as `latest` does.
+    async fn latest_fresh(
+        &self,
+        topic: &str,
+        msg_type: &str,
+        wait: Duration,
+        _max_age: Duration,
+    ) -> Result<Value, RosError> {
+        self.latest(topic, msg_type, wait).await
+    }
 
     /// The newest frame of an image topic (`sensor_msgs/msg/Image`), kept up to date.
     ///
@@ -311,27 +339,65 @@ pub trait RobotPort: Send + Sync {
         unsupported("listing a node's topics and services")
     }
 
-    /// Arrival times since the start and serialized sizes of a topic's messages over `window`,
-    /// at most `max` of them, subscribing best effort as `ros2 topic hz` does.
-    async fn sample_sizes(
+    /// The serialized size of each message on a topic from now until the stream is dropped,
+    /// subscribing best effort as `ros2 topic hz` does: one subscription for a reader that keeps
+    /// counting.
+    async fn arrivals(
         &self,
         _topic: &str,
         _msg_type: &str,
-        _window: Duration,
-        _max: usize,
+    ) -> Result<BoxStream<'static, usize>, RosError> {
+        unsupported("following a topic")
+    }
+
+    /// Each message on a topic from now until the stream is dropped, as JSON.
+    async fn messages(
+        &self,
+        _topic: &str,
+        _msg_type: &str,
+    ) -> Result<BoxStream<'static, Result<Value, RosError>>, RosError> {
+        unsupported("following a topic")
+    }
+
+    /// Arrival times since the start and serialized sizes of a topic's messages over `window`,
+    /// at most `max` of them.
+    async fn sample_sizes(
+        &self,
+        topic: &str,
+        msg_type: &str,
+        window: Duration,
+        max: usize,
     ) -> Result<Vec<(Duration, usize)>, RosError> {
-        unsupported("sampling a topic")
+        let mut sizes = self.arrivals(topic, msg_type).await?;
+        let start = tokio::time::Instant::now();
+        let mut out = Vec::new();
+        while out.len() < max {
+            match tokio::time::timeout_at(start + window, sizes.next()).await {
+                Ok(Some(size)) => out.push((start.elapsed(), size)),
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 
     /// Up to `count` messages from a new subscription, as JSON, waiting up to `timeout`.
     async fn sample_messages(
         &self,
-        _topic: &str,
-        _msg_type: &str,
-        _count: usize,
-        _timeout: Duration,
+        topic: &str,
+        msg_type: &str,
+        count: usize,
+        timeout: Duration,
     ) -> Result<Vec<Value>, RosError> {
-        unsupported("echoing a topic")
+        let mut messages = self.messages(topic, msg_type).await?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut out = Vec::new();
+        while out.len() < count {
+            match tokio::time::timeout_at(deadline, messages.next()).await {
+                Ok(Some(message)) => out.push(message?),
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 
     /// Publishes `message` `count` times, `period` apart, and returns how many subscribers were

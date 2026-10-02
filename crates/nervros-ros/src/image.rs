@@ -4,7 +4,7 @@
 //! `32FC1` metres) becomes a grey image with near bright and far dark.
 
 use bytes::Bytes;
-use image::{ImageBuffer, Rgb, RgbImage};
+use image::RgbImage;
 
 /// One image message.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,59 +56,68 @@ impl Frame {
         &self.data[start..start + self.step as usize]
     }
 
-    /// Converts to RGB.
+    fn u16_at(&self, p: &[u8]) -> u16 {
+        let raw = [p[0], p[1]];
+        if self.is_bigendian {
+            u16::from_be_bytes(raw)
+        } else {
+            u16::from_le_bytes(raw)
+        }
+    }
+
+    fn f32_at(&self, p: &[u8]) -> f32 {
+        let raw = [p[0], p[1], p[2], p[3]];
+        if self.is_bigendian {
+            f32::from_be_bytes(raw)
+        } else {
+            f32::from_le_bytes(raw)
+        }
+    }
+
+    /// Converts to RGB. `mono16` is a 16-bit brightness, shown by its high byte; only `16UC1`
+    /// (millimetres) and `32FC1` (metres) are depth.
     ///
     /// # Errors
     ///
     /// Unsupported encodings and truncated buffers.
     pub fn to_rgb(&self) -> Result<RgbImage, FrameError> {
+        type Pixel = fn(&Frame, &[u8]) -> [u8; 3];
         let (w, h) = (self.width, self.height);
-        let bytes_per_pixel = match self.encoding.as_str() {
-            "rgb8" | "bgr8" => 3,
-            "rgba8" | "bgra8" | "32FC1" => 4,
-            "mono8" | "8UC1" => 1,
-            "16UC1" | "mono16" => 2,
+        // Decided once a frame, not once a pixel.
+        let (bytes_per_pixel, pixel): (usize, Pixel) = match self.encoding.as_str() {
+            "rgb8" => (3, |_, p| [p[0], p[1], p[2]]),
+            "rgba8" => (4, |_, p| [p[0], p[1], p[2]]),
+            "bgr8" => (3, |_, p| [p[2], p[1], p[0]]),
+            "bgra8" => (4, |_, p| [p[2], p[1], p[0]]),
+            "mono8" | "8UC1" => (1, |_, p| [p[0]; 3]),
+            "mono16" => (2, |f, p| [f.u16_at(p).to_be_bytes()[0]; 3]),
+            "16UC1" => (2, |f, p| [depth_grey(f32::from(f.u16_at(p)) / 1000.0); 3]),
+            "32FC1" => (4, |f, p| [depth_grey(f.f32_at(p)); 3]),
             other => return Err(FrameError::Encoding(other.to_owned())),
         };
+        let row_bytes = w as usize * bytes_per_pixel;
         let want = self.step as usize * h as usize;
-        if self.data.len() < want || (self.step as usize) < w as usize * bytes_per_pixel {
+        if self.data.len() < want || (self.step as usize) < row_bytes {
             return Err(FrameError::Short {
                 got: self.data.len(),
                 want,
             });
         }
-        let mut out: RgbImage = ImageBuffer::new(w, h);
+        let short = || FrameError::Short {
+            got: self.data.len(),
+            want,
+        };
+        // Already what the encoder takes: one copy and no pass over the pixels.
+        if self.encoding == "rgb8" && self.step as usize == row_bytes {
+            return RgbImage::from_raw(w, h, self.data[..want].to_vec()).ok_or_else(short);
+        }
+        let mut out = Vec::with_capacity(w as usize * h as usize * 3);
         for y in 0..h {
-            let row = self.row(y);
-            for x in 0..w {
-                let i = x as usize * bytes_per_pixel;
-                let px = match self.encoding.as_str() {
-                    "rgb8" | "rgba8" => [row[i], row[i + 1], row[i + 2]],
-                    "bgr8" | "bgra8" => [row[i + 2], row[i + 1], row[i]],
-                    "mono8" | "8UC1" => [row[i]; 3],
-                    "16UC1" | "mono16" => {
-                        let raw = [row[i], row[i + 1]];
-                        let mm = if self.is_bigendian {
-                            u16::from_be_bytes(raw)
-                        } else {
-                            u16::from_le_bytes(raw)
-                        };
-                        [depth_grey(f32::from(mm) / 1000.0); 3]
-                    }
-                    _ => {
-                        let raw = [row[i], row[i + 1], row[i + 2], row[i + 3]];
-                        let m = if self.is_bigendian {
-                            f32::from_be_bytes(raw)
-                        } else {
-                            f32::from_le_bytes(raw)
-                        };
-                        [depth_grey(m); 3]
-                    }
-                };
-                out.put_pixel(x, y, Rgb(px));
+            for p in self.row(y)[..row_bytes].chunks_exact(bytes_per_pixel) {
+                out.extend_from_slice(&pixel(self, p));
             }
         }
-        Ok(out)
+        RgbImage::from_raw(w, h, out).ok_or_else(short)
     }
 }
 
@@ -129,6 +138,31 @@ fn depth_grey(metres: f32) -> u8 {
     v
 }
 
+/// The JPEG quality of every image the agent keeps or sends.
+pub const JPEG_QUALITY: u8 = 85;
+
+/// `img` scaled so its longest side is at most `edge` pixels.
+#[must_use]
+pub fn capped(img: &RgbImage, edge: u32) -> RgbImage {
+    let (w, h) = img.dimensions();
+    let longest = w.max(h);
+    if longest <= edge {
+        return img.clone();
+    }
+    // side * edge / longest <= edge, so it fits a u32.
+    let scaled = |side: u32| {
+        u32::try_from(u64::from(side) * u64::from(edge) / u64::from(longest))
+            .unwrap_or(edge)
+            .max(1)
+    };
+    image::imageops::resize(
+        img,
+        scaled(w),
+        scaled(h),
+        image::imageops::FilterType::Triangle,
+    )
+}
+
 /// Encodes an RGB image as JPEG.
 ///
 /// # Errors
@@ -146,6 +180,14 @@ pub fn encode_jpeg(image: &RgbImage, quality: u8) -> Result<Vec<u8>, FrameError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capped_image_keeps_its_shape() {
+        let wide = RgbImage::new(1280, 720);
+        assert_eq!(capped(&wide, 768).dimensions(), (768, 432));
+        let small = RgbImage::new(64, 48);
+        assert_eq!(capped(&small, 768).dimensions(), (64, 48));
+    }
 
     fn frame(encoding: &str, w: u32, h: u32, step: u32, data: Vec<u8>) -> Frame {
         Frame {
@@ -199,5 +241,15 @@ mod tests {
         let rgb = frame("rgb8", 4, 4, 12, vec![200; 48]).to_rgb().unwrap();
         let jpeg = encode_jpeg(&rgb, 85).unwrap();
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn mono16_is_brightness_and_plain_rgb8_is_copied() {
+        let bright = frame("mono16", 1, 1, 2, vec![0x00, 0xC8]);
+        assert_eq!(bright.to_rgb().unwrap().get_pixel(0, 0).0, [200; 3]);
+        let rgb = frame("rgb8", 2, 1, 6, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(rgb.to_rgb().unwrap().into_raw(), [1, 2, 3, 4, 5, 6]);
+        let padded = frame("bgr8", 1, 2, 4, vec![1, 2, 3, 0, 4, 5, 6, 0]);
+        assert_eq!(padded.to_rgb().unwrap().into_raw(), [3, 2, 1, 6, 5, 4]);
     }
 }

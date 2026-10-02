@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use super::catalog::Catalog;
 use super::plan::{PlannedStep, StepArg};
+use crate::profile::{PlanChecks, TurnSkill, WalkSkill};
 
 /// A way the plan may not match the request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -74,49 +75,57 @@ struct Asked {
     arm: Option<Side>,
 }
 
-/// The concerns about `steps` for `request`: turns, then walks, then hands, so a later fix to
-/// the same argument settles more of the request. None when the plan matches or the words say
-/// nothing checkable.
+/// The concerns about `steps` for `request`, for the skills `skills` names: turns, then walks,
+/// then hands, so a later fix to the same argument settles more of the request. None when the
+/// plan matches or the words say nothing checkable.
 #[must_use]
-pub fn check(request: &str, steps: &[PlannedStep]) -> Vec<Concern> {
+pub fn check(request: &str, steps: &[PlannedStep], skills: &PlanChecks) -> Vec<Concern> {
     let asked = read(request);
     let mut out = Vec::new();
-    turns(&asked, steps, &mut out);
-    walks(&asked, steps, &mut out);
-    if let Some(side) = asked.arm {
-        hands(side, steps, &mut out);
+    if let Some(turn) = &skills.turn {
+        turns(&asked, turn, steps, &mut out);
+    }
+    if let Some(walk) = &skills.walk {
+        walks(&asked, walk, steps, &mut out);
+    }
+    if let (Some(side), Some(arm)) = (asked.arm, &skills.arm) {
+        hands(side, arm, steps, &mut out);
     }
     out
 }
 
 fn arg<'a>(step: &'a PlannedStep, name: &str) -> Option<&'a str> {
-    step.args
-        .iter()
-        .find(|a| a.name == name)
-        .map(|a| a.value.trim())
+    super::plan::arg(&step.args, name)
 }
 
 fn number(step: &PlannedStep, name: &str) -> Option<f64> {
     arg(step, name)?.parse().ok()
 }
 
-fn turns(asked: &Asked, steps: &[PlannedStep], out: &mut Vec<Concern>) {
+fn turns(asked: &Asked, skill: &TurnSkill, steps: &[PlannedStep], out: &mut Vec<Concern>) {
+    let arg = skill.degrees.as_str();
     let turns: Vec<(&PlannedStep, f64)> = steps
         .iter()
-        .filter(|s| s.skill == "TurnInPlace")
-        .filter_map(|s| Some((s, number(s, "degrees")?)))
+        .filter(|s| s.skill == skill.skill)
+        .filter_map(|s| Some((s, number(s, arg)?)))
         .collect();
+    let positive = if skill.positive_left {
+        Side::Left
+    } else {
+        Side::Right
+    };
     if let Some(side) = asked.turn {
         for &(s, degrees) in &turns {
-            if degrees != 0.0 && (degrees > 0.0) != (side == Side::Left) {
+            if degrees != 0.0 && (degrees > 0.0) != (side == positive) {
                 out.push(Concern::new(
                     &s.id,
                     format!(
-                        "the operator said turn {}, but degrees={degrees} turns the other way \
-                         (positive degrees turn left)",
-                        side.name()
+                        "the operator said turn {}, but {arg}={degrees} turns the other way \
+                         (positive {arg} turn {})",
+                        side.name(),
+                        positive.name()
                     ),
-                    Some(("degrees", (-degrees).to_string())),
+                    Some((arg, (-degrees).to_string())),
                 ));
             }
         }
@@ -131,11 +140,8 @@ fn turns(asked: &Asked, steps: &[PlannedStep], out: &mut Vec<Concern>) {
     // One turn of at most half a turn can simply be set; more takes another step.
     let fix = match turns.as_slice() {
         [(s, degrees)] if want <= 180.0 => {
-            let left = asked.turn.map_or(*degrees > 0.0, |side| side == Side::Left);
-            Some((
-                *s,
-                ("degrees", (if left { want } else { -want }).to_string()),
-            ))
+            let positive = asked.turn.map_or(*degrees > 0.0, |side| side == positive);
+            Some((*s, (arg, (if positive { want } else { -want }).to_string())))
         }
         _ => None,
     };
@@ -146,13 +152,13 @@ fn turns(asked: &Asked, steps: &[PlannedStep], out: &mut Vec<Concern>) {
     ));
 }
 
-fn walks(asked: &Asked, steps: &[PlannedStep], out: &mut Vec<Concern>) {
+fn walks(asked: &Asked, skill: &WalkSkill, steps: &[PlannedStep], out: &mut Vec<Concern>) {
     let walks: Vec<(&PlannedStep, bool, f64)> = steps
         .iter()
-        .filter(|s| s.skill == "WalkStraight")
+        .filter(|s| s.skill == skill.skill)
         .filter_map(|s| {
-            let backward = arg(s, "direction")? == "backward";
-            Some((s, backward, number(s, "distance_m")?))
+            let backward = arg(s, &skill.direction)? == "backward";
+            Some((s, backward, number(s, &skill.metres)?))
         })
         .collect();
     if let Some(backward) = asked.backward {
@@ -166,7 +172,7 @@ fn walks(asked: &Asked, steps: &[PlannedStep], out: &mut Vec<Concern>) {
                         way(backward),
                         way(walks_backward)
                     ),
-                    Some(("direction", way(backward).to_owned())),
+                    Some((skill.direction.as_str(), way(backward).to_owned())),
                 ));
             }
         }
@@ -178,9 +184,10 @@ fn walks(asked: &Asked, steps: &[PlannedStep], out: &mut Vec<Concern>) {
     if (total - want).abs() <= (want * 0.25).max(0.15) {
         return;
     }
-    // The skill walks at most 2 m a step.
     let fix = match walks.as_slice() {
-        [(s, ..)] if (0.1..=2.0).contains(&want) => Some((*s, ("distance_m", want.to_string()))),
+        [(s, ..)] if (0.1..=skill.max_m).contains(&want) => {
+            Some((*s, (skill.metres.as_str(), want.to_string())))
+        }
         _ => None,
     };
     out.push(Concern::new(
@@ -190,9 +197,9 @@ fn walks(asked: &Asked, steps: &[PlannedStep], out: &mut Vec<Concern>) {
     ));
 }
 
-fn hands(side: Side, steps: &[PlannedStep], out: &mut Vec<Concern>) {
+fn hands(side: Side, name: &str, steps: &[PlannedStep], out: &mut Vec<Concern>) {
     for s in steps {
-        if let Some(arm) = arg(s, "arm")
+        if let Some(arm) = arg(s, name)
             && arm != side.name()
         {
             out.push(Concern::new(
@@ -201,7 +208,7 @@ fn hands(side: Side, steps: &[PlannedStep], out: &mut Vec<Concern>) {
                     "the operator said the {} hand, but this step uses the {arm}",
                     side.name()
                 ),
-                Some(("arm", side.name().to_owned())),
+                Some((name, side.name().to_owned())),
             ));
         }
     }
@@ -470,7 +477,7 @@ pub enum Verdict {
 #[must_use]
 pub fn verdict(reply: &str) -> Option<Verdict> {
     let answer = reply.rsplit_once("</think>").map_or(reply, |(_, a)| a);
-    let json = &answer[answer.find('{')?..=answer.rfind('}')?];
+    let json = answer.get(answer.find('{')?..=answer.rfind('}')?)?;
     let value: Value = serde_json::from_str(json).ok()?;
     let reason = value["reason"]
         .as_str()
@@ -519,6 +526,49 @@ mod tests {
             "WalkStraight",
             &[("direction", direction), ("distance_m", metres)],
         )
+    }
+
+    /// The G1 executor's skills, as its profile names them.
+    fn g1() -> PlanChecks {
+        PlanChecks {
+            turn: Some(TurnSkill {
+                skill: "TurnInPlace".into(),
+                degrees: "degrees".into(),
+                positive_left: true,
+            }),
+            walk: Some(WalkSkill {
+                skill: "WalkStraight".into(),
+                metres: "distance_m".into(),
+                direction: "direction".into(),
+                max_m: 2.0,
+            }),
+            arm: Some("arm".into()),
+        }
+    }
+
+    fn check(request: &str, steps: &[PlannedStep]) -> Vec<Concern> {
+        super::check(request, steps, &g1())
+    }
+
+    #[test]
+    fn the_checks_follow_the_robots_own_skills() {
+        let clockwise = PlanChecks {
+            turn: Some(TurnSkill {
+                skill: "Rotate".into(),
+                degrees: "angle".into(),
+                positive_left: false,
+            }),
+            ..PlanChecks::default()
+        };
+        let rotate = |angle: &str| step("s1", "Rotate", &[("angle", angle)]);
+        let left = "Turn left 90 degrees.";
+        assert!(super::check(left, &[rotate("-90")], &clockwise).is_empty());
+        assert_eq!(
+            fixes(&super::check(left, &[rotate("90")], &clockwise)),
+            [("s1".into(), "angle".into(), "-90".into())]
+        );
+        // A robot whose profile names no skills gets no rule checks, not wrong ones.
+        assert!(super::check(left, &[turn("-90")], &PlanChecks::default()).is_empty());
     }
 
     fn fixes(concerns: &[Concern]) -> Vec<(String, String, String)> {
@@ -664,6 +714,11 @@ mod tests {
         );
         assert_eq!(verdict("looks fine to me"), None);
         assert_eq!(verdict("{\"verdict\": \"maybe\"}"), None);
+        assert_eq!(
+            verdict("Reasoning done}\n{\"verdict\": \"ok\", \"reason\": \"fine"),
+            None,
+            "a brace before the only opening one"
+        );
     }
 
     #[test]

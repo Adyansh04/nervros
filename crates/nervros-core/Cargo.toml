@@ -45,8 +45,11 @@ opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
+nervros-ros = { path = "../nervros-ros", default-features = false, features = ["test-support"] }
 rig = { workspace = true, features = ["test-utils"] }
 # An in-process MCP server for the client's tests.
 rmcp = { workspace = true, features = ["server", "macros"] }
 bytes.workspace = true
 tempfile.workspace = true
+# Paused time, for what waits tens of seconds.
+tokio = { workspace = true, features = ["test-util"] }

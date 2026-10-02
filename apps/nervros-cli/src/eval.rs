@@ -114,10 +114,22 @@ pub(crate) async fn run(
         out,
     };
     let mut trials = Vec::new();
-    let cases = suite
+    let cases: Vec<&Case> = suite
         .cases
         .iter()
-        .filter(|c| options.only.as_deref().is_none_or(|o| c.id.contains(o)));
+        .filter(|c| options.only.as_deref().is_none_or(|o| c.id.contains(o)))
+        .collect();
+    // A run that tests nothing must not pass.
+    if cases.is_empty() {
+        anyhow::bail!(
+            "no case of {} to run{}",
+            suite_path.display(),
+            options
+                .only
+                .as_deref()
+                .map_or_else(String::new, |o| format!(" has an id with `{o}`"))
+        );
+    }
     for case in cases {
         for trial in 1..=options.repeat {
             for model in &arms {
@@ -258,7 +270,7 @@ fn pose(robot: &Arc<dyn RobotPort>, profile: &Profile) -> Option<(f64, f64, f64)
     let t = robot
         .transform(&profile.ros.map_frame, &profile.ros.base_frame)
         .ok()?;
-    Some((t.translation[0], t.translation[1], t.yaw()))
+    Some(t.planar())
 }
 
 /// What every trial shares.
@@ -281,16 +293,7 @@ async fn truth_pose(robot: &Arc<dyn RobotPort>, truth: &Truth) -> Option<(f64, f
         )
         .await
         .ok()?;
-    let (p, q) = (
-        &odom["pose"]["pose"]["position"],
-        &odom["pose"]["pose"]["orientation"],
-    );
-    let n = |v: &Value| v.as_f64();
-    let t = Transform {
-        translation: [n(&p["x"])?, n(&p["y"])?, 0.0],
-        rotation: [n(&q["x"])?, n(&q["y"])?, n(&q["z"])?, n(&q["w"])?],
-    };
-    Some((t.translation[0], t.translation[1], t.yaw()))
+    Transform::from_pose(&odom["pose"]["pose"]).map(|t| t.planar())
 }
 
 /// How far the base went from `a` to `b`, metres, and how far it turned, degrees, left positive.
@@ -377,10 +380,14 @@ fn notes(seen: &Seen) -> Vec<String> {
 
 /// The chance that `k` trials drawn from `n`, `c` of which passed, all pass: C(c,k)/C(n,k), an
 /// unbiased estimate of pass^k.
-fn pass_hat(c: usize, n: usize, k: usize) -> f64 {
-    (0..k.min(n))
-        .map(|i| real(c.saturating_sub(i)) / real(n - i))
-        .product()
+/// The unbiased pass^k, `C(c, k) / C(n, k)`; none with fewer than `k` trials, which cannot say
+/// it.
+fn pass_hat(c: usize, n: usize, k: usize) -> Option<f64> {
+    (n >= k).then(|| {
+        (0..k)
+            .map(|i| real(c.saturating_sub(i)) / real(n - i))
+            .product()
+    })
 }
 
 /// The 95 % Wilson interval of `c` passes in `n`.
@@ -492,7 +499,7 @@ fn summary_row(out: &mut String, model: &str, mine: &[&Trial], cases: &[&str], k
         .filter_map(|id| {
             let runs: Vec<&&Trial> = mine.iter().filter(|t| t.case == *id).collect();
             let passed = runs.iter().filter(|t| t.passed).count();
-            (!runs.is_empty()).then(|| pass_hat(passed, runs.len(), k))
+            pass_hat(passed, runs.len(), k)
         })
         .collect();
     let mean = |f: &dyn Fn(&Seen) -> u64| {
@@ -557,9 +564,7 @@ fn case_row(out: &mut String, id: &str, arms: &[Option<&String>], trials: &[Tria
 
 /// Where a run's report goes when `--out` is not given.
 pub(crate) fn default_out() -> PathBuf {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let stamp = nervros_core::unix_secs(std::time::SystemTime::now());
     nervros_core::app::state_dir()
         .join("evals")
         .join(format!("eval-{stamp}"))
@@ -592,13 +597,12 @@ mod tests {
 
     #[test]
     fn pass_hat_k_is_unbiased_and_the_interval_holds_the_rate() {
-        assert!((pass_hat(3, 3, 3) - 1.0).abs() < 1e-12);
-        assert!(
-            (pass_hat(2, 4, 2) - 1.0 / 6.0).abs() < 1e-12,
-            "C(2,2)/C(4,2)"
-        );
-        assert!(pass_hat(1, 3, 2).abs() < 1e-12);
-        assert!((pass_hat(2, 4, 1) - 0.5).abs() < 1e-12);
+        let hat = |c, n, k| pass_hat(c, n, k).unwrap();
+        assert!((hat(3, 3, 3) - 1.0).abs() < 1e-12);
+        assert!((hat(2, 4, 2) - 1.0 / 6.0).abs() < 1e-12, "C(2,2)/C(4,2)");
+        assert!(hat(1, 3, 2).abs() < 1e-12);
+        assert!((hat(2, 4, 1) - 0.5).abs() < 1e-12);
+        assert_eq!(pass_hat(2, 2, 3), None, "two trials cannot say pass^3");
         let (lo, hi) = wilson(8, 10);
         assert!(
             (lo - 0.490).abs() < 0.005 && (hi - 0.943).abs() < 0.005,

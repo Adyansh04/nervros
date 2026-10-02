@@ -40,12 +40,6 @@ pub struct Skill {
     /// `base`, `left_arm`, `right_arm`.
     #[serde(default)]
     pub resources: Vec<String>,
-    /// Whether running it twice is harmless.
-    #[serde(default)]
-    pub idempotent: bool,
-    /// `motion` or `manipulation`.
-    #[serde(default)]
-    pub risk: String,
     /// Its own timeout; a step may ask for less, never more.
     pub max_duration_s: f64,
     /// The `SubTree` ID in the executor's library.
@@ -90,9 +84,16 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// The JSON does not have the catalog's shape.
+    /// The JSON does not have the catalog's shape, or a skill has no time to run.
     pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+        let catalog: Self = serde_json::from_str(json)?;
+        match catalog.skills.iter().find(|s| s.max_duration_s <= 0.0) {
+            Some(s) => Err(serde::de::Error::custom(format!(
+                "skill {} has max_duration_s {}; it must be positive",
+                s.name, s.max_duration_s
+            ))),
+            None => Ok(catalog),
+        }
     }
 
     /// A skill by name.

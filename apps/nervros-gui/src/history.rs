@@ -326,10 +326,10 @@ mod tests {
                         show(ui, &mut history, Some(&ledger), &mut Vec::new());
                     });
             });
-        crate::chat::style_for_tests(&harness.ctx);
+        crate::testkit::style_for_tests(&harness.ctx);
         harness.run_steps(2);
         harness.fit_contents();
-        crate::chat::compare(
+        crate::testkit::compare(
             &mut harness,
             "history",
             &egui_kittest::SnapshotOptions::new(),

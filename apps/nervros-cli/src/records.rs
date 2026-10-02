@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use nervros_core::mission::ledger::{self, Ledger};
+use nervros_core::mission::ledger::Ledger;
 use nervros_core::profile::Profile;
 use serde_json::Value;
 
@@ -92,6 +92,27 @@ fn describe(e: &Value) -> Option<String> {
         }
         "notice" => format!("  ! {}", s("text")),
         "error" => format!("  error: {}", s("text")),
+        // What the live printer shows, so a replay leaves out no stop or arming.
+        "halted" => format!("  [halted: {}]", s("reason")),
+        "stopped" if e["ok"].as_bool() == Some(true) => {
+            format!("  [the robot stopped: {}]", s("detail"))
+        }
+        "stopped" => format!("  ! the robot did not confirm the stop: {}", s("detail")),
+        "armed" => format!(
+            "  [{}]",
+            if e["armed"].as_bool() == Some(true) {
+                "armed"
+            } else {
+                "observe only"
+            }
+        ),
+        "approval_edited" => format!("  ? edited: {}", s("reason")),
+        "edit_rejected" => format!("  ? edit rejected: {}", s("message")),
+        "compacted" => format!(
+            "  [condensed from {} to {} tokens]",
+            e["before"].as_u64().unwrap_or_default(),
+            e["after"].as_u64().unwrap_or_default()
+        ),
         _ => return None,
     })
 }
@@ -108,16 +129,17 @@ fn open_ledger(profile: &Path) -> Result<std::sync::Arc<Ledger>> {
 /// The latest missions, or one in full by its id.
 pub fn missions(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
     let ledger = open_ledger(profile)?;
-    let now = ledger::now_s();
+    let now = nervros_core::now_s();
     let list = match id {
-        Some(id) => ledger.mission(id)?.into_iter().collect(),
+        Some(id) => ledger.mission(id)?,
         None => ledger.recent(limit)?,
     };
     for m in &list {
         let ago = (now - m.started) / 60.0;
         println!(
             "{} {:.0} min ago: {} ({}, {:.0} s)",
-            &m.id[..m.id.len().min(8)],
+            // A version 7 id begins with its millisecond: this much tells missions apart.
+            &m.id[..m.id.len().min(13)],
             ago,
             m.intent,
             m.outcome,
@@ -152,7 +174,7 @@ pub fn missions(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
 /// The requests no skill could do, newest first.
 pub fn gaps(profile: &Path, limit: usize) -> Result<()> {
     let ledger = open_ledger(profile)?;
-    let now = ledger::now_s();
+    let now = nervros_core::now_s();
     for g in ledger.gaps(limit)? {
         let nearest = if g.nearest.is_empty() {
             String::new()
@@ -178,18 +200,13 @@ pub fn case(which: &str, id: &str, append: Option<&Path>) -> Result<()> {
     if case.say.is_empty() {
         bail!("{} has no operator messages", path.display());
     }
-    let text = nervros_core::evalcase::to_toml(&case)?;
     match append {
         Some(suite) => {
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(suite)
-                .with_context(|| format!("opening {}", suite.display()))?;
-            write!(file, "\n# From {}\n{text}", path.display())?;
+            let id = nervros_core::evalcase::append(suite, case, &path)
+                .with_context(|| format!("appending to {}", suite.display()))?;
             println!("appended case {id} to {}", suite.display());
         }
-        None => print!("{text}"),
+        None => print!("{}", nervros_core::evalcase::to_toml(&case)?),
     }
     Ok(())
 }

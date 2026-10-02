@@ -37,22 +37,34 @@ pub async fn run(profile: &Profile, robot: &dyn RobotPort) -> Vec<Check> {
         }
     };
     let has_topic = |t: &str| graph.topics.iter().any(|(name, _)| name == t);
-    match crate::schemas::RosidlSchemas::load(profile) {
-        Ok(s) => report(
-            !s.is_empty() || profile.tools.is_empty(),
-            format!("{} interface definitions loaded", s.len()),
+    // Hundreds of files to parse: off the threads that serve the stop.
+    let owned = profile.clone();
+    let loaded = tokio::task::spawn_blocking(move || {
+        crate::schemas::RosidlSchemas::load(&owned).map(|s| s.len())
+    })
+    .await;
+    match loaded {
+        Ok(Ok(n)) => report(
+            n > 0 || profile.tools.is_empty(),
+            format!("{n} interface definitions loaded"),
         ),
+        Ok(Err(e)) => report(false, format!("interface files: {e}")),
         Err(e) => report(false, format!("interface files: {e}")),
     }
-    for t in &profile.tools {
-        let ok = match t.kind {
+    // A robot that is down answers no service: waited for together, that is one wait, not one
+    // per service.
+    let tools = futures::future::join_all(profile.tools.iter().map(|t| async move {
+        match t.kind {
             ToolKind::Service => {
                 robot
                     .service_available(&t.ros_name, &t.ros_type, SERVICE_WAIT)
                     .await
             }
             ToolKind::Topic => has_topic(&t.ros_name),
-        };
+        }
+    }))
+    .await;
+    for (t, ok) in profile.tools.iter().zip(tools) {
         report(
             ok,
             format!("tool {} -> {} ({})", t.name, t.ros_name, t.ros_type),
@@ -66,7 +78,7 @@ pub async fn run(profile: &Profile, robot: &dyn RobotPort) -> Vec<Check> {
         );
     }
     if let Some(m) = &profile.mission {
-        for (what, name, ty) in [
+        let services = [
             (
                 "validate",
                 &m.validate,
@@ -74,8 +86,14 @@ pub async fn run(profile: &Profile, robot: &dyn RobotPort) -> Vec<Check> {
             ),
             ("catalog", &m.catalog, "nervros_interfaces/srv/GetCatalog"),
             ("stop", &m.stop, "nervros_interfaces/srv/StopAll"),
-        ] {
-            let ok = robot.service_available(name, ty, SERVICE_WAIT).await;
+        ];
+        let answered = futures::future::join_all(
+            services
+                .iter()
+                .map(|(_, name, ty)| robot.service_available(name, ty, SERVICE_WAIT)),
+        )
+        .await;
+        for ((what, name, _), ok) in services.iter().zip(answered) {
             report(ok, format!("mission {what} {name}"));
         }
     }
@@ -115,19 +133,21 @@ impl HealthCheck {
 
     async fn checks(&self) -> Vec<Check> {
         let mut out = run(&self.profile, self.robot.as_ref()).await;
-        for (name, camera) in self
+        let cameras: Vec<_> = self
             .profile
             .look
             .iter()
             .flat_map(crate::profile::LookConfig::all_cameras)
-        {
-            let frames = self
-                .robot
+            .collect();
+        // Each camera's window at once.
+        let rates = futures::future::join_all(cameras.iter().map(|(_, camera)| {
+            self.robot
                 .sample_sizes(&camera.image, "sensor_msgs/msg/Image", RATE_WINDOW, 1000)
-                .await
-                .unwrap_or_default();
+        }))
+        .await;
+        for ((name, camera), frames) in cameras.iter().zip(rates) {
             #[expect(clippy::cast_precision_loss, reason = "a count of frames")]
-            let hz = frames.len() as f64 / RATE_WINDOW.as_secs_f64();
+            let hz = frames.unwrap_or_default().len() as f64 / RATE_WINDOW.as_secs_f64();
             out.push(Check {
                 ok: hz >= MIN_CAMERA_HZ,
                 what: format!("camera {name} ({}) at {hz:.0} Hz", camera.image),
@@ -150,7 +170,12 @@ impl HealthCheck {
         if let Some(m) = &self.profile.mission {
             let state = self
                 .robot
-                .latest(&m.state, "nervros_interfaces/msg/RobotState", RATE_WINDOW)
+                .latest_fresh(
+                    &m.state,
+                    "nervros_interfaces/msg/RobotState",
+                    RATE_WINDOW,
+                    crate::mission::STATE_FRESH,
+                )
                 .await;
             out.push(match state {
                 Ok(s) => {
@@ -212,10 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_camera_fails_its_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nervros.toml");
-        std::fs::write(
-            &path,
+        let profile = Profile::from_toml(
             r#"
             [robot]
             name = "t"
@@ -225,9 +247,9 @@ mod tests {
             [models]
             file = "m.toml"
             "#,
+            std::path::Path::new("nervros.toml"),
         )
         .unwrap();
-        let profile = Profile::load(&path).unwrap();
         let robot = FakeRobot::new().with_topic("/det", serde_json::json!({}));
         let checks = run(&profile, &robot).await;
         let line = |w: &str| checks.iter().find(|c| c.what.contains(w)).unwrap().ok;

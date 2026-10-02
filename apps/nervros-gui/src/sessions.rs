@@ -1,7 +1,8 @@
 //! Earlier sessions whose conversations were saved, for the Agent tab to resume.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use nervros_core::llm::History;
 
@@ -21,9 +22,53 @@ pub struct SessionInfo {
     pub messages: usize,
 }
 
-/// The saved conversations under `logs`, newest first, without the running session's own.
-#[must_use]
-pub fn list(logs: &Path, current_log: &Path) -> Vec<SessionInfo> {
+/// The saved conversations seen so far, each with the time its file was written: a file is read
+/// again only once it changes, so listing them every few seconds costs a folder listing.
+#[derive(Default)]
+pub struct Listing {
+    read: HashMap<PathBuf, (SystemTime, Option<SessionInfo>)>,
+}
+
+impl Listing {
+    /// The saved conversations under `logs`, newest first, without the running session's own.
+    pub fn list(&mut self, logs: &Path, current_log: &Path) -> Vec<SessionInfo> {
+        let mut out = Vec::new();
+        for (stamp, path) in newest(logs, current_log) {
+            let written = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            let fresh = self.read.get(&path).filter(|(at, _)| *at == written);
+            let info = if let Some((_, info)) = fresh {
+                info.clone()
+            } else {
+                let info = read(stamp, &path);
+                self.read.insert(path, (written, info.clone()));
+                info
+            };
+            out.extend(info.map(|i| SessionInfo {
+                when: ago(stamp),
+                ..i
+            }));
+        }
+        out
+    }
+}
+
+/// One saved conversation, read whole.
+fn read(stamp: u64, path: &Path) -> Option<SessionInfo> {
+    let history = History::load(path).ok()?;
+    let exchanges = history.exchanges();
+    let first = exchanges.iter().find(|(operator, _)| *operator)?.1.clone();
+    Some(SessionInfo {
+        when: ago(stamp),
+        first: shorten(&first, 48),
+        messages: exchanges.len(),
+        path: path.to_path_buf(),
+    })
+}
+
+/// The newest saved conversations' files and stamps, without the running session's own.
+fn newest(logs: &Path, current_log: &Path) -> Vec<(u64, PathBuf)> {
     let own = current_log.with_extension("history.json");
     let mut found: Vec<(u64, PathBuf)> = std::fs::read_dir(logs)
         .map(|d| {
@@ -41,21 +86,8 @@ pub fn list(logs: &Path, current_log: &Path) -> Vec<SessionInfo> {
         })
         .unwrap_or_default();
     found.sort_by_key(|(stamp, _)| std::cmp::Reverse(*stamp));
+    found.truncate(LISTED);
     found
-        .into_iter()
-        .take(LISTED)
-        .filter_map(|(stamp, path)| {
-            let history = History::load(&path).ok()?;
-            let exchanges = history.exchanges();
-            let first = exchanges.iter().find(|(operator, _)| *operator)?.1.clone();
-            Some(SessionInfo {
-                when: ago(stamp),
-                first: shorten(&first, 48),
-                messages: exchanges.len(),
-                path,
-            })
-        })
-        .collect()
 }
 
 fn shorten(text: &str, max: usize) -> String {
@@ -83,7 +115,6 @@ pub fn log_of(history: &Path) -> PathBuf {
 ///
 /// The log cannot be read, holds no operator message, or the suite cannot be written.
 pub fn save_as_case(log: &Path) -> Result<(String, PathBuf), String> {
-    use std::io::Write as _;
     let text = std::fs::read_to_string(log).map_err(|e| format!("{}: {e}", log.display()))?;
     let mut case = nervros_core::evalcase::from_log(&text, "");
     let first = case
@@ -91,20 +122,13 @@ pub fn save_as_case(log: &Path) -> Result<(String, PathBuf), String> {
         .first()
         .ok_or("the session has no operator message")?;
     case.id = slug(first);
-    let toml = nervros_core::evalcase::to_toml(&case).map_err(|e| e.to_string())?;
     let suite = nervros_core::app::state_dir()
         .join("evals")
         .join("saved.toml");
-    if let Some(dir) = suite.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&suite)
+    // Saved twice, or two sessions that began alike, still make two cases.
+    let id = nervros_core::evalcase::append(&suite, case, log)
         .map_err(|e| format!("{}: {e}", suite.display()))?;
-    write!(file, "\n# From {}\n{toml}", log.display()).map_err(|e| e.to_string())?;
-    Ok((case.id, suite))
+    Ok((id, suite))
 }
 
 /// A case id from the operator's words: "turn-left-90-degrees".
@@ -120,10 +144,7 @@ fn slug(text: &str) -> String {
 
 /// "5 min ago", "3 h ago", "2 days ago", from seconds since the Unix epoch.
 pub fn ago(stamp: u64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
+    let now = nervros_core::unix_secs(SystemTime::now());
     let mins = now.saturating_sub(stamp) / 60;
     match mins {
         0 => "just now".to_owned(),

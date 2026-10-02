@@ -32,6 +32,7 @@ struct Toast {
 pub struct Toasts(Vec<Toast>);
 
 impl Toasts {
+    /// Shows `text` for a while; a failure stays longer.
     pub fn add(&mut self, kind: Kind, text: impl Into<String>) {
         let shown = if kind == Kind::Failure {
             FAILURE_SHOWN
@@ -126,9 +127,9 @@ mod tests {
             .wgpu()
             .with_size(egui::vec2(440.0, 260.0))
             .build_ui(move |ui| toasts.show(ui.ctx()));
-        crate::chat::style_for_tests(&harness.ctx);
+        crate::testkit::style_for_tests(&harness.ctx);
         harness.run_steps(2);
-        crate::chat::compare(
+        crate::testkit::compare(
             &mut harness,
             "toasts",
             &egui_kittest::SnapshotOptions::new(),

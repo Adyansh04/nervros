@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use nervros_core::look::{Cameras, LookTool, SnapshotStore};
+use nervros_core::look::LookTool;
 use nervros_core::profile::Profile;
 use nervros_core::segment::SegmentTool;
 use nervros_core::tools::{Status, Tool};
+use nervros_core::vision::{Cameras, SnapshotStore};
 
 pub(crate) async fn look(profile_path: &Path, camera: Option<String>, out: &Path) -> Result<()> {
     let profile = Profile::load(profile_path).context("loading the profile")?;
@@ -34,8 +35,6 @@ pub(crate) async fn segment(
     out: &Path,
 ) -> Result<()> {
     use nervros_core::llm::Llm;
-    use nervros_core::providers::ModelsConfig;
-    use nervros_core::providers::router::{PrivacyMode, Router};
 
     let profile = Profile::load(profile_path).context("loading the profile")?;
     let look = profile
@@ -46,15 +45,7 @@ pub(crate) async fn segment(
         .segment
         .clone()
         .context("the profile has no [segment] section")?;
-    let models = ModelsConfig::load(&profile.resolve(&profile.models.file))
-        .context("loading the models file")?;
-    let ledger = nervros_core::app::state_dir().join("quota.json");
-    let privacy = match profile.privacy.mode {
-        nervros_core::profile::PrivacyModeConfig::Sim => PrivacyMode::Sim,
-        nervros_core::profile::PrivacyModeConfig::Home => PrivacyMode::Home,
-    };
-    let router =
-        Router::with_ledger_file(models, &ledger, privacy).context("loading the quota ledger")?;
+    let router = nervros_core::app::router(&profile).context("loading the models")?;
     let llm = Arc::new(Llm::new(router));
     let robot = nervros_core::app::connect(&profile)?;
     let cameras = Cameras::start(&look, &robot).context("subscribing to the cameras")?;
@@ -117,6 +108,17 @@ pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<(
         .iter()
         .find(|t| t.spec().name == name)
         .with_context(|| format!("no ROS tool `{name}`; there are {}", names.join(", ")))?;
+    // The profile's rules hold here as in a session.
+    if let Some(rule) = guard.rule(name, &args) {
+        bail!(
+            "`{name}` with these arguments {} by the profile: {}",
+            match rule.then {
+                nervros_core::guard::RuleAction::Deny => "is refused",
+                nervros_core::guard::RuleAction::Ask => "needs the operator's approval",
+            },
+            rule.reason
+        );
+    }
     // Discovery needs a moment after the node starts.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let risk = match tool.assess(&args).await {
@@ -140,6 +142,7 @@ pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<(
 
 use nervros_core::session::{Command as SessionCommand, Event};
 use tokio::io::AsyncBufReadExt as _;
+use tokio::sync::broadcast::error::RecvError;
 
 /// Options of `chat`.
 pub(crate) struct ChatOptions {
@@ -274,6 +277,10 @@ fn print_event(e: &Event, logs: &Path) {
         }
         Event::Armed { armed } => println!("  [{}]", if *armed { "armed" } else { "disarmed" }),
         Event::Halted { reason } => println!("  [halted: {reason}]"),
+        Event::Stopped { ok: true, detail } => println!("  [the robot stopped: {detail}]"),
+        Event::Stopped { ok: false, detail } => {
+            println!("  ! the robot did not confirm the stop: {detail}");
+        }
         Event::Notice { text } => println!("  [{text}]"),
         Event::Error { text, .. } => println!("  [error: {text}]"),
         Event::Report { text, .. } => println!("report> {text}"),
@@ -323,13 +330,15 @@ fn parse_line(line: &str) -> Option<SessionCommand> {
         line.strip_prefix(p)
             .and_then(|r| r.trim().parse::<u64>().ok())
     };
+    // A plain order to stop stops the robot without asking the model.
+    if nervros_core::session::is_stop_word(line) {
+        return Some(SessionCommand::StopMission);
+    }
     match line {
         "" => None,
         "/arm" => Some(SessionCommand::Arm),
         "/disarm" => Some(SessionCommand::Disarm),
         "/compact" => Some(SessionCommand::Compact),
-        // An exact stop word stops the robot without asking the model.
-        "/stop" | "stop" | "halt" | "freeze" => Some(SessionCommand::StopMission),
         _ => {
             if let Some(id) = arg("/yes") {
                 Some(SessionCommand::Approve(id))
@@ -345,17 +354,11 @@ fn parse_line(line: &str) -> Option<SessionCommand> {
 }
 
 pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions) -> Result<()> {
-    let profile = Profile::load(profile_path).context("loading the profile")?;
-    let robot = nervros_core::app::connect(&profile)?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let logs_dir = state.join("logs");
     let resume = match options.resume.as_deref() {
         None => None,
         Some(which) => {
             let path = if which == "last" {
-                newest_history(&logs_dir).context("no saved conversation to resume")?
+                newest_history(&state.join("logs")).context("no saved conversation to resume")?
             } else {
                 std::path::PathBuf::from(which)
             };
@@ -366,21 +369,14 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
             )
         }
     };
-    let files = nervros_core::app::StartOptions {
-        history: Some(logs_dir.join(format!("session-{stamp}.history.json"))),
-        resume,
-        ..Default::default()
-    };
-    let agent =
-        nervros_core::app::start_with(profile_path, robot, &state.join("quota.json"), files)
-            .context("starting the agent")?;
-    let (log_path, _log) = nervros_core::log::spawn(
-        &logs_dir,
-        &format!("session-{stamp}"),
-        agent.session.subscribe(),
-    )
-    .context("opening the session log")?;
-    let blobs = logs_dir.join(format!("session-{stamp}"));
+    let nervros_core::app::LoggedSession {
+        agent,
+        mut events,
+        log_path,
+        blobs,
+        ..
+    } = nervros_core::app::start_logged(profile_path, state, resume)
+        .context("starting the agent")?;
     eprintln!(
         "NervROS: {} with tools {}; log {}",
         agent.profile.robot.name,
@@ -397,7 +393,6 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
             n + 1
         );
     }
-    let mut events = agent.session.subscribe();
     if options.arm {
         agent.session.send(SessionCommand::Arm);
     }
@@ -418,35 +413,28 @@ async fn say_all(
     approve: bool,
     blobs: &Path,
 ) -> Result<()> {
-    // Missions outlive the turn that started them: wait for their reports too.
-    let (mut open, mut awaiting_report) = (0u32, false);
     for text in say {
         println!("you> {text}");
         agent.session.send(SessionCommand::User(text.clone()));
-        // A report's reply can run first: wait for the turn this message starts.
-        let mut mine = None;
+        let mut exchange = nervros_core::evalcase::Exchange::default();
         loop {
-            let e = events.recv().await.context("the session ended")?;
+            let e = match events.recv().await {
+                Ok(e) => e,
+                // A slow terminal fell behind; the session goes on.
+                Err(RecvError::Lagged(n)) => {
+                    println!("  [{n} events went by unprinted]");
+                    continue;
+                }
+                Err(RecvError::Closed) => anyhow::bail!("the session ended"),
+            };
             if let Event::ApprovalRequested { id, .. } = &e
                 && approve
             {
                 agent.session.send(SessionCommand::Approve(*id));
             }
             print_event(&e, blobs);
-            match e {
-                Event::MissionStarted { .. } => open += 1,
-                Event::MissionFinished { .. } => {
-                    open = open.saturating_sub(1);
-                    awaiting_report = true;
-                }
-                Event::Report { .. } => awaiting_report = false,
-                Event::User { turn, text: sent } if sent == text => mine = Some(turn),
-                Event::TurnFinished { turn }
-                    if mine.is_some_and(|m| turn >= m) && open == 0 && !awaiting_report =>
-                {
-                    break;
-                }
-                _ => {}
+            if exchange.over(&text, &e) {
+                break;
             }
         }
     }
@@ -460,8 +448,13 @@ async fn interactive(
     blobs: std::path::PathBuf,
 ) -> Result<()> {
     let printer = tokio::spawn(async move {
-        while let Ok(e) = events.recv().await {
-            print_event(&e, &blobs);
+        loop {
+            match events.recv().await {
+                Ok(e) => print_event(&e, &blobs),
+                // A slow terminal fell behind; the session goes on, so the printer does too.
+                Err(RecvError::Lagged(n)) => println!("  [{n} events went by unprinted]"),
+                Err(RecvError::Closed) => break,
+            }
         }
     });
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
