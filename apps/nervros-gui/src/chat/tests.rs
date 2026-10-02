@@ -93,6 +93,10 @@ fn a_report_shows_what_happened_with_short_ids() {
         report_text(text),
         "Mission 01a0f95c (turn left) ended: failure after 2 s. Failed at s1."
     );
+    assert_eq!(
+        report_text("Camera check: the camera agrees: <world>the mug is in the tray</world>."),
+        "Camera check: the camera agrees: the mug is in the tray."
+    );
 }
 
 #[test]

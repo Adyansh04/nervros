@@ -23,10 +23,13 @@ pub(super) fn report(ui: &mut egui::Ui, text: &str) {
 }
 
 /// A robot report as the operator reads it: what happened, with mission ids cut to their first
-/// eight characters; the line after it tells the model what to do next.
+/// eight characters and without the marks that tell the model what came from the world; the
+/// line after it tells the model what to do next.
 pub(super) fn report_text(text: &str) -> String {
     let first = text.lines().next().unwrap_or(text);
     first
+        .replace("<world>", "")
+        .replace("</world>", "")
         .split(' ')
         .map(|w| {
             let id = w.len() == 36 && w.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
