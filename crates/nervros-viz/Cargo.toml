@@ -20,4 +20,5 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+nervros-ros = { path = "../nervros-ros", default-features = false, features = ["test-support"] }
 tempfile.workspace = true

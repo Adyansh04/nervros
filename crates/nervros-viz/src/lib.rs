@@ -175,7 +175,7 @@ mod tests {
     use crate::grid::{coverage_colour, grid, occupancy, seen, seen_colour};
     use crate::objects::object_colour;
     use crate::rooms::area;
-    use crate::tasks::{ModelFrame, load_model, moved, pinhole};
+    use crate::tasks::{ModelFrame, load_model, moved, pinhole, pose_model};
 
     #[test]
     fn a_urdf_gives_the_frames_tf_moves() {
@@ -209,6 +209,51 @@ mod tests {
         };
         assert_eq!(frames, [root, shoulder], "the fixed joint stays at rest");
         assert!(load_model(&rec, &dir.path().join("missing.urdf"), "base_footprint").is_err());
+    }
+
+    #[test]
+    fn each_pose_names_the_frames_it_moves() {
+        // A row without frame names moves the entity's own frame: the model then kept its rest
+        // pose with the pelvis on the floor.
+        use rerun::external::re_chunk::Chunk;
+        use rerun::external::re_log_types::LogMsg;
+        let lift = Transform {
+            translation: [0.0, 0.0, 0.73],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        };
+        let robot =
+            nervros_ros::fake::FakeRobot::new().with_transform("base_footprint", "pelvis", lift);
+        let pelvis = ModelFrame {
+            entity: "world/robot/model/joints/root".into(),
+            tf: ("base_footprint".into(), "pelvis".into()),
+            parent: ROBOT_FRAME.into(),
+        };
+        let (rec, storage) = RecordingStreamBuilder::new("test").memory().unwrap();
+        pose_model(&rec, &robot, &[pelvis], &mut [None]);
+        rec.flush_blocking().unwrap();
+        let rows: Vec<Chunk> = storage
+            .take()
+            .into_iter()
+            .filter_map(|m| match m {
+                LogMsg::ArrowMsg(_, arrow) => Chunk::from_arrow_msg(&arrow).ok(),
+                _ => None,
+            })
+            .filter(|c| c.entity_path().to_string() == "/world/robot/model/joints/root")
+            .collect();
+        assert!(!rows.is_empty(), "the root was posed");
+        for chunk in rows {
+            let has =
+                |d: rerun::ComponentDescriptor| chunk.components().get_array(d.component).is_some();
+            assert!(has(rerun::Transform3D::descriptor_translation()));
+            assert!(
+                has(rerun::Transform3D::descriptor_child_frame()),
+                "names the pelvis"
+            );
+            assert!(
+                has(rerun::Transform3D::descriptor_parent_frame()),
+                "and the robot it hangs from"
+            );
+        }
     }
 
     #[test]

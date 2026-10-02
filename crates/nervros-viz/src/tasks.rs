@@ -216,7 +216,7 @@ pub(super) async fn robot_model(
 }
 
 /// Logs each model frame TF has and that moved since it was last logged.
-fn pose_model(
+pub(super) fn pose_model(
     rec: &RecordingStream,
     robot: &dyn RobotPort,
     frames: &[ModelFrame],
@@ -229,22 +229,16 @@ fn pose_model(
         if last.as_ref().is_some_and(|l| !moved(l, &t)) {
             continue;
         }
-        // The frames' names never change: logged once, not with every pose.
-        if last.is_none() {
-            put_static(
-                rec,
-                &frame.entity,
-                &rerun::Transform3D::update_fields()
-                    .with_parent_frame(frame.parent.as_str())
-                    .with_child_frame(frame.tf.1.as_str()),
-            );
-        }
+        // The frames' names go in every row: the viewer gives a row without them to the entity's
+        // own frame, which left the model at its rest pose with the pelvis on the floor.
         put(
             rec,
             &frame.entity,
             &rerun::Transform3D::update_fields()
                 .with_translation(f32s(t.translation))
-                .with_rotation(rerun::Quaternion::from_xyzw(f32s(t.rotation))),
+                .with_rotation(rerun::Quaternion::from_xyzw(f32s(t.rotation)))
+                .with_parent_frame(frame.parent.as_str())
+                .with_child_frame(frame.tf.1.as_str()),
         );
         *last = Some(t);
     }
