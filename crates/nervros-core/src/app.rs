@@ -12,7 +12,7 @@ use crate::guard::Guard;
 use crate::llm::Llm;
 use crate::look::{Cameras, LookTool, SnapshotStore};
 use crate::mission::Missions;
-use crate::profile::{PrivacyModeConfig, Profile};
+use crate::profile::Profile;
 use crate::providers::ModelsConfig;
 use crate::providers::router::{PrivacyMode, Router};
 use crate::schemas::RosidlSchemas;
@@ -72,9 +72,6 @@ pub enum StartError {
     /// The models file.
     #[error(transparent)]
     Models(#[from] crate::providers::ConfigError),
-    /// The quota ledger.
-    #[error("quota ledger: {0}")]
-    Ledger(std::io::Error),
     /// Interface files.
     #[error("interface files: {0}")]
     Schemas(#[from] rosidl_schema::Error),
@@ -90,6 +87,9 @@ pub enum StartError {
     /// The ROS node.
     #[error("starting the ROS node: {0}")]
     Ros(nervros_ros::RosError),
+    /// A `[[policy.rule]]` that could never apply.
+    #[error("{0}")]
+    Rule(String),
 }
 
 /// Where the quota ledger and session logs live: `$XDG_STATE_HOME/nervros`, else
@@ -325,16 +325,21 @@ pub fn start(
 /// Missions, when the profile has a `[mission]` section: kept in the robot's ledger, checked by
 /// `critic` too when a model has the `plan_check` role, helped by `advisor` when the `plan` role
 /// has models of its own, and their ends seen through the camera with `vision`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one optional part of the missions"
+)]
 fn missions(
     profile: &Profile,
     places: Arc<crate::places::Places>,
     robot: &Arc<dyn RobotPort>,
+    guard: &Arc<Guard>,
     ledger: &Path,
     critic: Option<Arc<dyn crate::mission::sanity::Critic>>,
     advisor: Option<Arc<dyn crate::mission::advice::Advisor>>,
     vision: Option<crate::mission::camera::Vision>,
 ) -> Option<Arc<Missions>> {
-    let mut m = Missions::new(profile, places, Arc::clone(robot))?;
+    let mut m = Missions::new(profile, places, Arc::clone(robot))?.with_guard(Arc::clone(guard));
     if let Some(l) = mission_ledger(profile, ledger) {
         m = m.with_ledger(l);
     }
@@ -378,6 +383,21 @@ struct ModelLayer {
     advisor: Option<Arc<dyn crate::mission::advice::Advisor>>,
 }
 
+/// The profile's models behind a router that keeps its privacy mode and the shared quota ledger,
+/// for what calls models outside a session, such as the CLI's `ask`.
+///
+/// # Errors
+///
+/// The models file cannot be read.
+pub fn router(profile: &Profile) -> Result<Router, StartError> {
+    let models = ModelsConfig::load(&profile.resolve(&profile.models.file))?;
+    Ok(Router::with_ledger_file(
+        models,
+        &state_dir().join("quota.json"),
+        profile.privacy.mode,
+    ))
+}
+
 /// The profile's models behind one router, the routine role on `model` alone when one is given.
 fn model_layer(
     profile: &Profile,
@@ -395,15 +415,14 @@ fn model_layer(
             .into());
         }
         models.roles.routine = vec![id];
+        // An eval's arm: no other model may answer for it.
+        models.roles.routine_only = true;
     }
-    let privacy = match profile.privacy.mode {
-        PrivacyModeConfig::Sim => PrivacyMode::Sim,
-        PrivacyModeConfig::Home => PrivacyMode::Home,
-    };
+    let privacy = profile.privacy.mode;
     let checks_plans = !models.roles.plan_check.is_empty();
     // An advisor that is the planner itself would only repeat it.
     let advises = !models.roles.plan.is_empty() && models.roles.plan != models.roles.routine;
-    let router = Router::with_ledger_file(models, ledger, privacy).map_err(StartError::Ledger)?;
+    let router = Router::with_ledger_file(models, ledger, privacy);
     let llm = Arc::new(Llm::new(router));
     Ok(ModelLayer {
         critic: checks_plans.then(|| Arc::clone(&llm) as Arc<dyn crate::mission::sanity::Critic>),
@@ -489,12 +508,14 @@ pub fn start_with(
         &profile,
         places,
         &robot,
+        &guard,
         ledger,
         models.critic,
         models.advisor,
         seeing.vision,
     );
     let schedules = mission_tools(missions.as_ref(), &guard, &mut registry)?;
+    check_rules(&profile, &registry)?;
     let tools = registry.iter().map(|t| t.spec().name.clone()).collect();
     let config = SessionConfig {
         preamble: system_prompt(&profile, &skills),
@@ -549,6 +570,31 @@ pub fn start_with(
         mcp,
         unanswered,
     })
+}
+
+/// Each `[[policy.rule]]` names a tool of this agent and an argument it takes: a rule that can
+/// never match refuses nothing, with no sign of it.
+fn check_rules(profile: &Profile, registry: &Registry) -> Result<(), StartError> {
+    for r in profile.policy.rules.iter().filter(|r| r.tool != "*") {
+        let Some(tool) = registry.get(&r.tool) else {
+            return Err(StartError::Rule(format!(
+                "[[policy.rule]] for `{}`: no tool has that name",
+                r.tool
+            )));
+        };
+        let first = r.arg.split('.').next().unwrap_or_default();
+        let spec = tool.spec();
+        let takes = spec.parameters["properties"]
+            .as_object()
+            .is_none_or(|p| first == "*" || p.contains_key(first));
+        if !takes {
+            return Err(StartError::Rule(format!(
+                "[[policy.rule]] for `{}`: it takes no argument `{first}`",
+                r.tool
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The profile's skills, and the `skill` tool to read them when there are any. A folder or file

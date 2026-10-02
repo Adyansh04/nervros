@@ -7,8 +7,8 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use nervros_core::llm::{Ask, ImageFormat, ImageInput, Llm};
 use nervros_core::profile::Profile;
-use nervros_core::providers::router::{PrivacyMode, Router};
-use nervros_core::providers::{ModelsConfig, Role, free_only, openrouter};
+use nervros_core::providers::router::Router;
+use nervros_core::providers::{Role, free_only, openrouter};
 
 #[cfg(feature = "ros")]
 mod eval;
@@ -196,16 +196,11 @@ impl From<RoleArg> for Role {
     }
 }
 
-/// The models file the profile names, the one the app and `chat` use too.
-fn models_file(profile: &Path) -> Result<PathBuf> {
+/// The profile's models, with its privacy mode: a frame from a home robot stays on local models
+/// here as it does in a session.
+fn router(profile: &Path) -> Result<Router> {
     let profile = Profile::load(profile).context("loading the profile")?;
-    Ok(profile.resolve(&profile.models.file))
-}
-
-fn router(models: &Path) -> Result<Router> {
-    let config = ModelsConfig::load(models).context("loading the models file")?;
-    let ledger = nervros_core::app::state_dir().join("quota.json");
-    Router::with_ledger_file(config, &ledger, PrivacyMode::Sim).context("loading the quota ledger")
+    nervros_core::app::router(&profile).context("loading the models")
 }
 
 #[tokio::main]
@@ -213,12 +208,12 @@ async fn main() -> Result<()> {
     let _telemetry = nervros_core::telemetry::init();
     let cli = Cli::parse();
     match cli.command {
-        Command::Models { check } => models(&models_file(&cli.profile)?, check).await,
+        Command::Models { check } => models(&cli.profile, check).await,
         Command::Ask {
             prompt,
             role,
             image,
-        } => ask(&models_file(&cli.profile)?, &prompt, role.into(), image).await,
+        } => ask(&cli.profile, &prompt, role.into(), image).await,
         #[cfg(feature = "ros")]
         Command::Look { camera, out } => robot::look(&cli.profile, camera, &out).await,
         #[cfg(feature = "ros")]
@@ -303,8 +298,8 @@ fn skills(profile: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn models(path: &Path, check: bool) -> Result<()> {
-    let router = router(path)?;
+async fn models(profile: &Path, check: bool) -> Result<()> {
+    let router = router(profile)?;
     let now = SystemTime::now();
     let config = router.config();
     for (name, role) in [
@@ -330,34 +325,36 @@ async fn models(path: &Path, check: bool) -> Result<()> {
         return Ok(());
     }
     let llm = Llm::new(router);
+    let missing = llm.missing_keys();
+    for why in &missing {
+        println!("{why}");
+    }
     let http = reqwest::Client::new();
     for provider in &llm.router().config().providers {
         let Some(base) = provider
             .base_url
             .as_deref()
-            .filter(|u| u.contains("openrouter.ai"))
+            .filter(|_| provider.is_openrouter())
         else {
             continue;
         };
-        let ids: Vec<&str> = llm
+        let models: Vec<_> = llm
             .router()
             .config()
             .models
             .iter()
             .filter(|m| m.provider == provider.id)
-            .map(|m| m.model.as_str())
             .collect();
+        let ids: Vec<&str> = models.iter().map(|m| m.model.as_str()).collect();
         let list = openrouter::fetch_models(&http, base)
             .await
             .context("fetching the price list")?;
-        if provider.free_only {
-            free_only::check_prices(&list, &ids).context("free-only check")?;
-            println!(
-                "{}: free-only check passed for {} models",
-                provider.id,
-                ids.len()
-            );
-        }
+        free_only::check_prices(&list, &ids).context("free-only check")?;
+        println!(
+            "{}: free-only check passed for {} models",
+            provider.id,
+            ids.len()
+        );
         let Some(source) = &provider.key else {
             continue;
         };
@@ -369,11 +366,28 @@ async fn models(path: &Path, check: bool) -> Result<()> {
             "{}: free requests today {} used, {} left of {}",
             provider.id, daily.used, daily.remaining, daily.limit
         );
+        // OpenRouter's own count replaces ours for the pools its models share.
+        let pools: std::collections::BTreeSet<&str> = models
+            .iter()
+            .filter_map(|m| m.limits.pool.as_deref())
+            .collect();
+        for pool in pools {
+            llm.router()
+                .set_pool_used(pool, daily.used, SystemTime::now())
+                .context("saving the quota ledger")?;
+            println!(
+                "  pool {pool}: {} used today, as OpenRouter counts",
+                daily.used
+            );
+        }
+    }
+    if !missing.is_empty() {
+        bail!("{} provider key(s) could not be read", missing.len());
     }
     Ok(())
 }
 
-async fn ask(path: &Path, prompt: &str, role: Role, image: Option<PathBuf>) -> Result<()> {
+async fn ask(profile: &Path, prompt: &str, role: Role, image: Option<PathBuf>) -> Result<()> {
     let image = match image {
         None => None,
         Some(file) => {
@@ -392,7 +406,7 @@ async fn ask(path: &Path, prompt: &str, role: Role, image: Option<PathBuf>) -> R
             Some(ImageInput { bytes, format })
         }
     };
-    let llm = Llm::new(router(path)?);
+    let llm = Llm::new(router(profile)?);
     let answer = llm
         .ask(Ask {
             role,

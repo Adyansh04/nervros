@@ -34,8 +34,6 @@ pub(crate) async fn segment(
     out: &Path,
 ) -> Result<()> {
     use nervros_core::llm::Llm;
-    use nervros_core::providers::ModelsConfig;
-    use nervros_core::providers::router::{PrivacyMode, Router};
 
     let profile = Profile::load(profile_path).context("loading the profile")?;
     let look = profile
@@ -46,15 +44,7 @@ pub(crate) async fn segment(
         .segment
         .clone()
         .context("the profile has no [segment] section")?;
-    let models = ModelsConfig::load(&profile.resolve(&profile.models.file))
-        .context("loading the models file")?;
-    let ledger = nervros_core::app::state_dir().join("quota.json");
-    let privacy = match profile.privacy.mode {
-        nervros_core::profile::PrivacyModeConfig::Sim => PrivacyMode::Sim,
-        nervros_core::profile::PrivacyModeConfig::Home => PrivacyMode::Home,
-    };
-    let router =
-        Router::with_ledger_file(models, &ledger, privacy).context("loading the quota ledger")?;
+    let router = nervros_core::app::router(&profile).context("loading the models")?;
     let llm = Arc::new(Llm::new(router));
     let robot = nervros_core::app::connect(&profile)?;
     let cameras = Cameras::start(&look, &robot).context("subscribing to the cameras")?;
@@ -117,6 +107,17 @@ pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<(
         .iter()
         .find(|t| t.spec().name == name)
         .with_context(|| format!("no ROS tool `{name}`; there are {}", names.join(", ")))?;
+    // The profile's rules hold here as in a session.
+    if let Some(rule) = guard.rule(name, &args) {
+        bail!(
+            "`{name}` with these arguments {} by the profile: {}",
+            match rule.then {
+                nervros_core::guard::RuleAction::Deny => "is refused",
+                nervros_core::guard::RuleAction::Ask => "needs the operator's approval",
+            },
+            rule.reason
+        );
+    }
     // Discovery needs a moment after the node starts.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let risk = match tool.assess(&args).await {

@@ -604,6 +604,14 @@ impl Tool for ScheduleTool {
         }))
     }
 
+    /// What it adds, with the plan's steps as they will run.
+    fn rule_view(&self, args: &Value) -> Option<Value> {
+        let mut view = args.clone();
+        let plan = self.schedules.missions.rule_view(args["hash"].as_str()?)?;
+        view["steps"] = plan["steps"].clone();
+        Some(view)
+    }
+
     async fn call(&self, args: Value) -> ToolOutcome {
         match args["action"].as_str() {
             Some("list") => ToolOutcome::ok(json!({"schedules": self.schedules.list()})),

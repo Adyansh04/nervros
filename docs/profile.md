@@ -107,15 +107,25 @@ then = "deny"                   # or "ask": the operator approves it first, arme
 reason = "the bedroom is private"
 ```
 
-The default `hard_deny` covers what commands motors, velocities or controllers directly:
-`rt/lowcmd`, `/lowcmd`, `/rt/*`, `*cmd_vel*`, `/controller_manager/*`, `*/set_parameters`,
-`*/set_parameters_atomically`, `*/joint_trajectory`, `*/follow_joint_trajectory`, `/servo_node/*`,
-`/apply_planning_scene` and `/clear_octomap`. The default `hard_deny_types` are
+A rule reads the call as it was sent and as it will run, matching whatever the case and the
+spaces around a value. For a plan that means its steps with each argument as `{name, value}`, a
+plan run by its hash or a saved name included, and each walk's `place` both as the model wrote it
+and as it resolved: the rule above holds whether the model wrote `R5`, `bedroom` or `Bedroom `.
+Write a rule on a room or an object with its id. A rule naming a tool the agent does not have, or
+an argument that tool does not take, stops start-up, since it would never apply.
+
+The default `hard_deny` covers what commands motors, velocities or controllers directly, under any
+namespace: `rt/lowcmd`, `*/lowcmd`, `*/rt/*`, `*cmd_vel*`, `*/controller_manager/*`,
+`*/set_parameters`, `*/set_parameters_atomically`, `*/joint_trajectory`,
+`*/follow_joint_trajectory`, `*/servo_node/*`, `*/apply_planning_scene` and `*/clear_octomap`. A
+relative name in a `[[tool]]` is checked as the node resolves it, under `/`. The default
+`hard_deny_types` are
 `geometry_msgs/msg/Twist`, `geometry_msgs/msg/TwistStamped`, `trajectory_msgs/msg/*`,
 `control_msgs/action/*`, `control_msgs/msg/JointJog`, `controller_manager_msgs/srv/*`,
 `lifecycle_msgs/srv/ChangeState` and `rcl_interfaces/srv/SetParameters*` (only `param_set` sets
-parameters). A name from the model must be absolute: `cmd_vel` would otherwise reach `/cmd_vel`
-past a list written for absolute names.
+parameters); a type written `pkg/Name` is checked as every kind it could be. A name from the
+model must be absolute: `cmd_vel` would otherwise reach `/cmd_vel` past a list written for
+absolute names.
 
 ### `[ros_tools]`
 
@@ -134,7 +144,8 @@ without a shell. With the table present, six read tools are always there:
 Four act tools exist only when their list names something. Each call needs the robot armed and,
 when supervised, the operator's approval of the resolved target, type and payload. It is checked
 against the interface, the hard deny lists and the profile's list before anyone is asked, and it
-holds every resource while it runs, so it cannot overlap a mission.
+holds every resource while it runs. A running mission holds them all until it ends, so neither
+can overlap the other: the second is refused as busy.
 
 | Tool | Does |
 |---|---|
@@ -148,7 +159,7 @@ holds every resource while it runs, so it cannot overlap a mission.
 | `hidden` | action internals, `/rosout`, `/parameter_events`, parameter services | Left out of listings unless `all` is asked; not a boundary. |
 | `read_deny` | none | Topics never sampled or echoed. |
 | `param_read_deny` | `*key*`, `*token*`, `*secret*`, `*password*` | Parameter values shown as hidden. |
-| `service_observe` | `*/get_*`, `*/list_*`, `*/describe_*` | Services that only read: `service_call` runs them unarmed and unapproved. |
+| `service_observe` | `get_*`, `list_*`, `describe_*` | Services that only read: `service_call` runs them unarmed and unapproved. A pattern without `/` matches the last part of the name, so `get_*` covers `/map_server/get_map` but not `/arm/get_ready/execute`. |
 | `service_call` | none | Services `service_call` may call. |
 | `action_send` | none | Actions `action_goal` may reach. |
 | `publish` | none | Topics `topic_publish` may publish on. |

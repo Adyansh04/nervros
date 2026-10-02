@@ -147,6 +147,8 @@ pub struct Missions {
     advisor: OnceLock<Arc<dyn advice::Advisor>>,
     /// The camera's view of a mission's end, when the robot has a camera and a vision model.
     vision: OnceLock<camera::Vision>,
+    /// Whose resource locks a running mission holds, so no other act overlaps it.
+    guard: OnceLock<Arc<crate::guard::Guard>>,
     /// Whether a plan for this request already went back for not matching the operator's words:
     /// once is a hint, twice would argue with a model that may be right.
     questioned: AtomicBool,
@@ -204,6 +206,7 @@ impl Missions {
             critic: OnceLock::new(),
             advisor: OnceLock::new(),
             vision: OnceLock::new(),
+            guard: OnceLock::new(),
             questioned: AtomicBool::new(false),
         }))
     }
@@ -229,6 +232,15 @@ impl Missions {
     pub fn with_advisor(self: Arc<Self>, advisor: Arc<dyn advice::Advisor>) -> Arc<Self> {
         // Set once, at start-up.
         let _ = self.advisor.set(advisor);
+        self
+    }
+
+    /// Holds `guard`'s locks on the whole robot while a mission runs: an act tool waits for the
+    /// mission's end, and a mission for the act's.
+    #[must_use]
+    pub fn with_guard(self: Arc<Self>, guard: Arc<crate::guard::Guard>) -> Arc<Self> {
+        // Set once, at start-up.
+        let _ = self.guard.set(guard);
         self
     }
 
@@ -754,14 +766,17 @@ impl Missions {
                 lines.iter().take(2).cloned().collect::<Vec<_>>().join("; ")
             )
         };
+        let mut data = json!({"ok": false, "problems": problems});
+        // In a field of its own: appended to the message, the cut at 600 characters took its end.
         if n == advice::ADVISE_AFTER
             && let Some(advice) = self.advice(plan, problems).await
         {
-            let _ = write!(message, ". A stronger model suggests: {advice}");
+            message.push_str(". A stronger model's advice is in `advice`: follow it");
+            data["advice"] = Value::String(advice);
         }
         ToolOutcome {
             status: Status::Failed,
-            data: json!({"ok": false, "problems": problems}),
+            data,
             message,
             images: Vec::new(),
         }
@@ -877,6 +892,13 @@ impl Missions {
         )))
     }
 
+    /// The plan with hash `hash` as the profile's rules read it: its steps as they will run.
+    pub(crate) fn rule_view(&self, hash: &str) -> Option<Value> {
+        let compiled = self.find(hash).ok()?;
+        let steps: Vec<Value> = compiled.steps.iter().map(PlannedStep::for_rules).collect();
+        Some(json!({"intent": compiled.plan.intent, "steps": steps}))
+    }
+
     /// Frees the mission slot, if mission `id` still holds it.
     fn release(&self, id: &str) {
         let mut running = lock(&self.running);
@@ -903,6 +925,15 @@ impl Missions {
             missions: self,
             id: id.clone(),
             kept: false,
+        };
+        // Held until the mission ends; run_mission itself takes none, as it returns at once.
+        let held = match self.guard.get() {
+            Some(guard) => Some(
+                guard
+                    .lock(&crate::tools::Resource::ALL)
+                    .map_err(|busy| busy.message)?,
+            ),
+            None => None,
         };
         let goal = json!({
             "mission_id": id,
@@ -931,7 +962,7 @@ impl Missions {
         let span = crate::telemetry::job("mission", &id, &compiled.plan.intent);
         tokio::spawn(
             Arc::clone(self)
-                .watch(id.clone(), compiled, goal, before)
+                .watch(id.clone(), compiled, goal, before, held)
                 .instrument(span),
         );
         Ok(id)
@@ -990,6 +1021,7 @@ impl Missions {
         compiled: Compiled,
         goal: Goal,
         before: Option<Arc<Frame>>,
+        held: Option<crate::guard::ResourceLock>,
     ) {
         let started = Instant::now();
         let started_s = ledger::now_s();
@@ -997,6 +1029,7 @@ impl Missions {
         let result = self.outcome_of(&id, goal, &mut times).await;
         let elapsed = started.elapsed().as_secs_f64();
         let (outcome, step, reason) = summarise(result);
+        drop(held);
         self.release(&id);
         tracing::Span::current().record("nervros.outcome", outcome.as_str());
         let how = match outcome.as_str() {
@@ -1509,6 +1542,10 @@ impl Tool for RunMission {
         Some(self.approvable(args, By::Operator).await)
     }
 
+    fn rule_view(&self, args: &Value) -> Option<Value> {
+        self.0.rule_view(args["hash"].as_str()?)
+    }
+
     /// A checked plan's hash dies with the session that checked it; its steps do not.
     fn ask_again(&self, args: &Value) -> Option<Value> {
         let plan = self.0.find(args["hash"].as_str()?).ok()?.plan;
@@ -1839,6 +1876,46 @@ mod tests {
             .filter(|s| **s == Status::Accepted)
             .count();
         assert_eq!(started, 1, "{} / {}", a.message, b.message);
+    }
+
+    #[tokio::test]
+    async fn a_mission_and_another_act_never_overlap() {
+        let slow = ScriptedRun {
+            step: Duration::from_millis(300),
+            ..ended(0, "", "")
+        };
+        let robot: Arc<dyn RobotPort> = Arc::new(robot(slow));
+        let guard = Arc::new(crate::guard::Guard::new(crate::guard::Policy::default()));
+        let missions = Missions::new(&profile(), Places::new(&profile(), None), robot)
+            .unwrap()
+            .with_guard(Arc::clone(&guard));
+        let hash = missions.plan(steps(), By::Model).await.data["hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let held = guard.lock(&[crate::tools::Resource::Base]).unwrap();
+        let busy = missions.run(&json!({"hash": hash})).await;
+        assert_eq!(
+            busy.status,
+            Status::Failed,
+            "an act holds the base: {}",
+            busy.message
+        );
+        assert!(!missions.busy(), "the slot is free again");
+        drop(held);
+        assert_eq!(
+            missions.run(&json!({"hash": hash})).await.status,
+            Status::Accepted
+        );
+        assert!(
+            guard.lock(&[crate::tools::Resource::RightArm]).is_err(),
+            "the mission holds it"
+        );
+        eventually(|| !missions.busy()).await;
+        assert!(
+            guard.lock(&crate::tools::Resource::ALL).is_ok(),
+            "released at its end"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2298,17 +2375,24 @@ mod tests {
             .with_advisor(Arc::clone(&advisor) as Arc<dyn advice::Advisor>);
         let bad = json!({"intent": "x", "steps": [{"skill": "PickObject", "args": {"object_id": "O99"}}]});
         let first = missions.plan(bad.clone(), By::Model).await;
-        assert!(!first.message.contains("suggests"), "{}", first.message);
+        assert!(first.data.get("advice").is_none(), "{}", first.data);
         let second = missions.plan(bad.clone(), By::Model).await;
+        assert_eq!(
+            second.data["advice"],
+            "Find the object first: O99 is not in the world model."
+        );
         assert!(
-            second.message.ends_with(
-                "A stronger model suggests: Find the object first: O99 is not in the world model."
-            ),
+            second.message.contains("advice is in `advice`"),
             "{}",
             second.message
         );
+        // Past the message's cut, the advice still reaches the model whole.
+        assert_eq!(
+            second.for_model(6000)["data"]["advice"],
+            "Find the object first: O99 is not in the world model."
+        );
         let third = missions.plan(bad, By::Model).await;
-        assert!(!third.message.contains("suggests"), "{}", third.message);
+        assert!(third.data.get("advice").is_none(), "{}", third.data);
         let asked = lock(&advisor.0);
         assert_eq!(asked.len(), 1, "asked once");
         assert!(

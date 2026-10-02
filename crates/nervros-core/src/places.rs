@@ -30,10 +30,9 @@ impl Places {
     /// The profile's places, and those remembered in `file` when it exists.
     #[must_use]
     pub fn new(profile: &Profile, file: Option<PathBuf>) -> Arc<Self> {
-        let tagged = file
-            .as_ref()
-            .and_then(|f| std::fs::read_to_string(f).ok())
-            .and_then(|text| serde_json::from_str::<Vec<PlaceConfig>>(&text).ok())
+        let tagged: Vec<PlaceConfig> = file
+            .as_deref()
+            .map(crate::persist::read_or_default)
             .unwrap_or_default();
         Arc::new(Self {
             fixed: profile.places.clone(),
@@ -64,12 +63,10 @@ impl Places {
         let Some(file) = &self.file else {
             return Ok(());
         };
-        if let Some(dir) = file.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        let text = serde_json::to_string_pretty(&tagged.iter().map(to_json).collect::<Vec<_>>())
+        let text = serde_json::to_vec_pretty(&tagged.iter().map(to_json).collect::<Vec<_>>())
             .map_err(|e| e.to_string())?;
-        std::fs::write(file, text).map_err(|e| format!("saving {}: {e}", file.display()))
+        crate::persist::write_atomic(file, &text)
+            .map_err(|e| format!("saving {}: {e}", file.display()))
     }
 
     /// Remembers a place, replacing one remembered under that name before.

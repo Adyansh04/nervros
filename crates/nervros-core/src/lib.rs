@@ -17,6 +17,7 @@ pub mod look;
 pub mod mcp;
 pub mod memory;
 pub mod mission;
+mod persist;
 pub mod places;
 pub mod point;
 pub mod profile;

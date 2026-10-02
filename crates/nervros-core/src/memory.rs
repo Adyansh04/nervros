@@ -42,9 +42,8 @@ impl Memory {
     #[must_use]
     pub fn new(file: Option<PathBuf>) -> Arc<Self> {
         let notes = file
-            .as_ref()
-            .and_then(|f| std::fs::read_to_string(f).ok())
-            .and_then(|text| serde_json::from_str(&text).ok())
+            .as_deref()
+            .map(crate::persist::read_or_default)
             .unwrap_or_default();
         Arc::new(Self {
             notes: Mutex::new(notes),
@@ -66,11 +65,9 @@ impl Memory {
         let Some(file) = &self.file else {
             return Ok(());
         };
-        if let Some(dir) = file.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        let text = serde_json::to_string_pretty(notes).map_err(|e| e.to_string())?;
-        std::fs::write(file, text).map_err(|e| format!("saving {}: {e}", file.display()))
+        let text = serde_json::to_vec_pretty(notes).map_err(|e| e.to_string())?;
+        crate::persist::write_atomic(file, &text)
+            .map_err(|e| format!("saving {}: {e}", file.display()))
     }
 
     /// Keeps a note; the same words twice are kept once.

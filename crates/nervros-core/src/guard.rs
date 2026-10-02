@@ -150,22 +150,23 @@ fn d_ttl() -> Duration {
     Duration::from_mins(1)
 }
 
-/// Names that command motors, velocities, controllers or the collision picture directly.
+/// Names that command motors, velocities, controllers or the collision picture directly, under
+/// any namespace: a robot launched as `/g1` has `/g1/clear_octomap`.
 #[must_use]
 pub fn default_hard_deny() -> Vec<String> {
     [
         "rt/lowcmd",
-        "/lowcmd",
-        "/rt/*",
+        "*/lowcmd",
+        "*/rt/*",
         "*cmd_vel*",
-        "/controller_manager/*",
+        "*/controller_manager/*",
         "*/set_parameters",
         "*/set_parameters_atomically",
         "*/joint_trajectory",
         "*/follow_joint_trajectory",
-        "/servo_node/*",
-        "/apply_planning_scene",
-        "/clear_octomap",
+        "*/servo_node/*",
+        "*/apply_planning_scene",
+        "*/clear_octomap",
     ]
     .map(str::to_owned)
     .to_vec()
@@ -330,22 +331,37 @@ impl Guard {
         &self.policy
     }
 
-    /// Whether a ROS name is on the hard-deny list.
+    /// Whether a ROS name is on the hard-deny list. A relative name is taken as the node's own
+    /// namespace takes it, under `/`.
     #[must_use]
     pub fn hard_denied(&self, ros_name: &str) -> bool {
+        let name = ros_name.trim();
+        let absolute = if name.starts_with('/') {
+            name.to_owned()
+        } else {
+            format!("/{name}")
+        };
         self.policy
             .hard_deny
             .iter()
-            .any(|p| glob_match(p, ros_name))
+            .any(|p| glob_match(p, name) || glob_match(p, &absolute))
     }
 
-    /// Whether an interface type is on the hard-deny list for generic calls and publishing.
+    /// Whether an interface type is on the hard-deny list for generic calls and publishing. A
+    /// type written `pkg/Name` is checked as every kind it could be.
     #[must_use]
     pub fn hard_denied_type(&self, ros_type: &str) -> bool {
-        self.policy
-            .hard_deny_types
+        let ty = ros_type.trim();
+        let spellings: Vec<String> = match ty.split('/').collect::<Vec<_>>().as_slice() {
+            [package, name] => ["msg", "srv", "action"]
+                .iter()
+                .map(|kind| format!("{package}/{kind}/{name}"))
+                .collect(),
+            _ => vec![ty.to_owned()],
+        };
+        spellings
             .iter()
-            .any(|p| glob_match(p, ros_type))
+            .any(|t| self.policy.hard_deny_types.iter().any(|p| glob_match(p, t)))
     }
 
     /// Whether act-lane tools are enabled.
@@ -406,18 +422,19 @@ impl Guard {
         }
     }
 
-    /// The profile's rule for a call, as the model or the operator sent its arguments: a refusal
-    /// over a request to ask.
+    /// The profile's rule for a call: a refusal over a request to ask. Values match whatever
+    /// their case and surrounding spaces, as the tools read them.
     #[must_use]
     pub fn rule(&self, tool: &str, args: &Value) -> Option<&ArgRule> {
         let hits = || {
             self.policy.rules.iter().filter(|r| {
+                let pattern = r.matches.trim().to_lowercase();
                 (r.tool == "*" || r.tool == tool)
                     && values_at(args, &r.arg.split('.').collect::<Vec<_>>())
                         .iter()
                         .any(|v| {
                             let text = v.as_str().map_or_else(|| v.to_string(), str::to_owned);
-                            glob_match(&r.matches, &text)
+                            glob_match(&pattern, &text.trim().to_lowercase())
                         })
             })
         };
@@ -639,6 +656,15 @@ mod tests {
             assert!(g.hard_denied(name), "{name}");
         }
         assert!(!g.hard_denied("/canopy/find_objects"));
+        for name in [
+            "/g1/clear_octomap",
+            "/g1/apply_planning_scene",
+            "/g1/servo_node/start_servo",
+            "controller_manager/switch_controller",
+        ] {
+            assert!(g.hard_denied(name), "{name}, under a namespace or relative");
+        }
+        assert!(g.hard_denied_type("geometry_msgs/Twist"), "two parts");
         for ty in [
             "geometry_msgs/msg/Twist",
             "trajectory_msgs/msg/JointTrajectory",

@@ -384,13 +384,14 @@ pub struct Unanswered {
 /// once.
 #[must_use]
 pub fn take_unanswered(file: &std::path::Path) -> Vec<Unanswered> {
-    let Ok(text) = std::fs::read(file) else {
-        return Vec::new();
-    };
-    if let Err(e) = std::fs::remove_file(file) {
+    // Read before it goes: an unreadable file is moved aside, not lost.
+    let left: Vec<Unanswered> = crate::persist::read_or_default(file);
+    if let Err(e) = std::fs::remove_file(file)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
         tracing::warn!(error = %e, "the unanswered requests stay");
     }
-    serde_json::from_slice(&text).unwrap_or_default()
+    left
 }
 
 /// Whether the operator's message is a plain order to stop, which takes the stop path and never
@@ -559,6 +560,18 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The stronger of two rules: a refusal over a request to ask.
+fn stronger(
+    a: Option<crate::guard::ArgRule>,
+    b: Option<crate::guard::ArgRule>,
+) -> Option<crate::guard::ArgRule> {
+    match (a, b) {
+        (Some(a), _) if a.then == RuleAction::Deny => Some(a),
+        (_, Some(b)) if b.then == RuleAction::Deny => Some(b),
+        (a, b) => a.or(b),
+    }
+}
+
 impl Shared {
     fn emit(&self, e: Event) {
         // No subscriber is fine: a headless run may not watch events.
@@ -706,7 +719,7 @@ impl Shared {
         } else {
             serde_json::to_vec(&waiting.values().collect::<Vec<_>>())
                 .map_err(std::io::Error::other)
-                .and_then(|json| std::fs::write(file, json))
+                .and_then(|json| crate::persist::write_atomic(file, &json))
         };
         if let Err(e) = written {
             tracing::warn!(error = %e, "the requests waiting on the operator were not kept");
@@ -886,6 +899,19 @@ impl Shared {
             .as_mut()
             .and_then(|a| a.args.take())
             .unwrap_or(args);
+        // And as the call will run, such as a plan by its hash: the model's spelling of a place
+        // does not slip past a rule on where it resolves to.
+        let rule = if stopping {
+            None
+        } else {
+            let view = tool.rule_view(&args);
+            let settled = view.and_then(|v| self.guard.rule(&tool.spec().name, &v).cloned());
+            stronger(rule, settled)
+        };
+        let asked_by_rule = rule
+            .as_ref()
+            .filter(|r| r.then == RuleAction::Ask)
+            .map(|r| r.reason.clone());
         let spec = match &assessment {
             Some(a) => {
                 let mut spec = tool.spec().into_owned();
@@ -918,12 +944,32 @@ impl Shared {
             None => match self.decide(&spec, &args, caller, rule) {
                 Decision::Deny(r) => ToolOutcome::refused(r.message),
                 Decision::NeedApproval { reason } => {
-                    let reason = assessment.map_or(reason, |a| a.reason);
+                    // What the call does, and why the profile asks when it does.
+                    let reason = match (assessment.map(|a| a.reason), asked_by_rule) {
+                        (Some(what), Some(why)) => format!("{what}; the profile asks: {why}"),
+                        (Some(what), None) => what,
+                        (None, _) => reason,
+                    };
                     self.approved_run(tool, &spec, args, reason, caller).await
                 }
                 Decision::Allow => self.run(tool, args, &spec.resources).await,
             },
         };
+        self.took_effect(&spec, &outcome, flags);
+        calling.done = true;
+        self.emit(Event::ToolFinished {
+            turn,
+            call,
+            tool: spec.name.clone(),
+            status: outcome.status,
+            message: crate::tools::clip(&outcome.message, 2000),
+            ms: millis(calling.started.elapsed()),
+        });
+        self.for_model(&spec.name, &outcome, caller)
+    }
+
+    /// Notes what a call did for the turn, and shows its images.
+    fn took_effect(&self, spec: &ToolSpec, outcome: &ToolOutcome, flags: &TurnFlags) {
         // An edit is not repeated by the next model either.
         if spec.lane() != Lane::Observe && outcome.status.ok() {
             flags.acted.store(true, Ordering::SeqCst);
@@ -947,16 +993,6 @@ impl Shared {
                 marks: image.marks.clone(),
             });
         }
-        calling.done = true;
-        self.emit(Event::ToolFinished {
-            turn,
-            call,
-            tool: spec.name.clone(),
-            status: outcome.status,
-            message: crate::tools::clip(&outcome.message, 2000),
-            ms: millis(calling.started.elapsed()),
-        });
-        self.for_model(&spec.name, &outcome, caller)
     }
 
     /// What the model reads of an outcome: what the operator said meanwhile, and whether the turn
@@ -1665,14 +1701,12 @@ async fn run_turn(
                 return Some(updated);
             }
             Err(e) => {
-                if matches!(
-                    e,
-                    llm::LlmError::Turn {
-                        rate_limited: true,
-                        ..
-                    }
-                ) {
-                    source.park(&model);
+                if let llm::LlmError::Turn {
+                    retry_after: Some(wait),
+                    ..
+                } = &e
+                {
+                    source.park(&model, *wait);
                 }
                 if !flags.acted.load(Ordering::SeqCst) {
                     shared.emit(Event::Notice {
@@ -1723,7 +1757,7 @@ mod tests {
         fn take_request(&self, _id: &str) -> Result<(), String> {
             Ok(())
         }
-        fn park(&self, _id: &str) {}
+        fn park(&self, _id: &str, _for: Duration) {}
     }
 
     /// A scripted model whose quota grants `allowed` requests, counting those it grants.
@@ -1748,7 +1782,7 @@ mod tests {
                 .map(|_| ())
                 .map_err(|_| "its daily limit is used up".to_owned())
         }
-        fn park(&self, _id: &str) {}
+        fn park(&self, _id: &str, _for: Duration) {}
     }
 
     fn metered(allowed: usize) -> Arc<Metered> {
@@ -1790,6 +1824,77 @@ mod tests {
             .filter(|e| matches!(e, Event::ModelCall { model, turn: 1, .. } if model == "mock"))
             .count();
         assert_eq!(costed, 2, "each request's cost is logged: {events:?}");
+    }
+
+    /// Notes each time the router would set the model aside.
+    struct Parking {
+        inner: Scripted,
+        streams: bool,
+        parked: Mutex<Vec<Duration>>,
+    }
+
+    impl AgentSource for Parking {
+        fn candidates(&self, role: Role, need: Need) -> Vec<String> {
+            self.inner.candidates(role, need)
+        }
+        fn builder(&self, id: &str) -> Result<AgentBuilder, LlmError> {
+            self.inner.builder(id)
+        }
+        fn take_request(&self, _id: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn park(&self, _id: &str, for_how_long: Duration) {
+            lock(&self.parked).push(for_how_long);
+        }
+        fn streams(&self, _id: &str) -> bool {
+            self.streams
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_real_429_sets_the_model_aside_streamed_or_not() {
+        use rig::test_utils::MockStreamEvent;
+        let replies = MockCompletionModel::new([
+            MockTurn::provider_response_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error": {"message": "you asked for 14290 tokens of 8192"}}"#,
+                "req-429",
+            ),
+            MockTurn::provider_response_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "{}",
+                "req-2",
+            ),
+        ]);
+        // A streamed failure that only mentions 429 is no rate limit either.
+        let streamed = MockCompletionModel::from_stream_turns([
+            vec![MockStreamEvent::error(
+                "status 400: asked for 14290 tokens (request id 4291)",
+            )],
+            vec![MockStreamEvent::error("status 400: no")],
+        ]);
+        for (model, streams, parks) in [(replies, false, 1), (streamed, true, 0)] {
+            let source = Arc::new(Parking {
+                inner: Scripted(model),
+                streams,
+                parked: Mutex::default(),
+            });
+            let session = Session::start(
+                Arc::clone(&source) as Arc<dyn AgentSource>,
+                registry(Risk::Observe),
+                Arc::new(Guard::new(Policy::default())),
+                None,
+                SessionConfig::default(),
+            );
+            let mut rx = session.subscribe();
+            for text in ["hello", "again"] {
+                session.send(Command::User(text.into()));
+                collect_until_finished(&mut rx, |_| None, &session).await;
+            }
+            let parked = lock(&source.parked).clone();
+            assert_eq!(parked.len(), parks, "streams: {streams}");
+            assert!(parked.iter().all(|d| *d == Duration::from_mins(1)));
+        }
     }
 
     #[tokio::test]
@@ -1997,7 +2102,7 @@ mod tests {
         fn take_request(&self, _id: &str) -> Result<(), String> {
             Ok(())
         }
-        fn park(&self, _id: &str) {}
+        fn park(&self, _id: &str, _for: Duration) {}
         fn streams(&self, _id: &str) -> bool {
             true
         }

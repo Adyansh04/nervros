@@ -56,9 +56,10 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     /// API key source; absent for keyless local servers.
     pub key: Option<KeySource>,
-    /// Refuse any model that is not free (see [`free_only`]).
+    /// Whether only free models may run here (see [`free_only`]). OpenRouter is always held to
+    /// it, so `false` is refused there; elsewhere nothing can check it, so `true` is refused.
     #[serde(default)]
-    pub free_only: bool,
+    pub free_only: Option<bool>,
     /// Extra HTTP headers sent with every request.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
@@ -69,6 +70,16 @@ pub struct ProviderConfig {
 
 fn default_timeout_s() -> u64 {
     60
+}
+
+impl ProviderConfig {
+    /// Whether it is OpenRouter, whose model ids say whether a model is free.
+    #[must_use]
+    pub fn is_openrouter(&self) -> bool {
+        self.base_url
+            .as_deref()
+            .is_some_and(|url| url.contains("openrouter.ai"))
+    }
 }
 
 /// Whether a model can be forced into a JSON schema.
@@ -224,6 +235,10 @@ pub struct RolesConfig {
     /// See [`Role::PlanCheck`].
     #[serde(default)]
     pub plan_check: Vec<String>,
+    /// Only the routine models listed answer, with no local model after them: set for an eval's
+    /// arm, whose answers must be that model's.
+    #[serde(skip)]
+    pub routine_only: bool,
 }
 
 impl RolesConfig {

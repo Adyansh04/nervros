@@ -222,18 +222,7 @@ pub enum Transport {
 pub struct PrivacyConfig {
     /// `sim` or `home`.
     #[serde(default)]
-    pub mode: PrivacyModeConfig,
-}
-
-/// Serialised form of the privacy mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrivacyModeConfig {
-    /// Simulated frames.
-    #[default]
-    Sim,
-    /// Real frames stay local.
-    Home,
+    pub mode: crate::providers::router::PrivacyMode,
 }
 
 /// Where `look` reads from: its own camera, the default, and any others in `cameras`.

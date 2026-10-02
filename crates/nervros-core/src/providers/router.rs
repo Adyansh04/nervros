@@ -22,8 +22,9 @@ pub struct Need {
     pub structured: bool,
 }
 
-/// Where camera images may go.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Where camera images may go, as the profile's `[privacy] mode` says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PrivacyMode {
     /// Simulated frames: any provider.
     #[default]
@@ -67,16 +68,9 @@ impl Router {
     }
 
     /// A router whose ledger persists at `path`.
-    ///
-    /// # Errors
-    ///
-    /// An unreadable ledger file.
-    pub fn with_ledger_file(
-        config: ModelsConfig,
-        path: &Path,
-        privacy: PrivacyMode,
-    ) -> std::io::Result<Self> {
-        Ok(Self::new(config, Ledger::load(path)?, privacy))
+    #[must_use]
+    pub fn with_ledger_file(config: ModelsConfig, path: &Path, privacy: PrivacyMode) -> Self {
+        Self::new(config, Ledger::load(path), privacy)
     }
 
     /// The config it routes over.
@@ -149,8 +143,10 @@ impl Router {
     ) -> (Vec<&ModelConfig>, Vec<(String, Skip)>) {
         let chain = self.config.roles.chain(role);
         // Outlining is a skill few models have, and a second opinion or advice from the model that
-        // planned is neither: these roles ask only the models listed for them.
-        let opt_in = matches!(role, Role::Segment | Role::PlanCheck | Role::Plan);
+        // planned is neither: these roles ask only the models listed for them, as does a routine
+        // role pinned to one model.
+        let opt_in = matches!(role, Role::Segment | Role::PlanCheck | Role::Plan)
+            || (role == Role::Routine && self.config.roles.routine_only);
         let local_tail = self
             .config
             .models
@@ -169,25 +165,6 @@ impl Router {
             }
         }
         (take, skipped)
-    }
-
-    /// Counts one request; persists the ledger.
-    ///
-    /// # Errors
-    ///
-    /// A failure to write the ledger file.
-    pub fn record_use(&self, model_id: &str, now: SystemTime) -> std::io::Result<()> {
-        let Some(model) = self.config.model(model_id) else {
-            return Ok(());
-        };
-        let mut ledger = self.ledger();
-        ledger.record(
-            &model.id,
-            model.limits.pool.as_deref(),
-            now,
-            self.zone(model),
-        );
-        ledger.save()
     }
 
     /// Counts one request if the model's limits still allow it, checked and counted under one
@@ -362,8 +339,8 @@ mod tests {
     fn a_used_up_pool_skips_every_model_in_it() {
         let r = router(PrivacyMode::Sim);
         let now = SystemTime::now();
-        r.record_use("big", now).unwrap();
-        r.record_use("text", now).unwrap();
+        r.take_request("big", now).unwrap();
+        r.take_request("text", now).unwrap();
         let (take, skipped) = r.candidates(Role::Routine, Need::default(), now);
         assert_eq!(ids(&take), ["local9b"]);
         assert!(

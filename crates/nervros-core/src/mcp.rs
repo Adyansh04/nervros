@@ -24,7 +24,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::profile::{McpServerConfig, McpTransport};
-use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
+use crate::tools::{Resource, Risk, Tool, ToolOutcome, ToolSpec};
 
 /// The lock file's name, beside the profile.
 pub const LOCK_FILE: &str = "mcp.lock.json";
@@ -106,7 +106,8 @@ impl Lock {
     /// The file cannot be written.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))
+        crate::persist::write_atomic(path, (text + "\n").as_bytes())
+            .map_err(|e| format!("{}: {e}", path.display()))
     }
 
     /// Approves a definition as it is now.
@@ -308,8 +309,16 @@ impl McpServer {
                     .get("inputSchema")
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object"}));
+                // A tool that may act could move anything: it holds the whole robot, as the
+                // generic ROS tools do, so it never overlaps a mission or another act.
+                let resources = if said.observe {
+                    Vec::new()
+                } else {
+                    Resource::ALL.to_vec()
+                };
                 let spec = ToolSpec {
                     timeout: self.config.timeout,
+                    resources,
                     ..ToolSpec::new(
                         &format!("{}__{}", self.config.id, l.name),
                         &description,
@@ -338,7 +347,13 @@ impl McpServer {
         let answer = tokio::time::timeout(self.config.timeout, self.client.call_tool_once(params));
         let result = match answer.await {
             Err(_) => return ToolOutcome::failed("the MCP server did not answer in time"),
-            Ok(Err(e)) => return ToolOutcome::failed(format!("the MCP server failed: {e}")),
+            // The server wrote the error's words, so they are its data too.
+            Ok(Err(e)) => {
+                return ToolOutcome::failed(format!(
+                    "the MCP server failed: {}",
+                    self.fenced(name, &e.to_string())
+                ));
+            }
             Ok(Ok(CallToolResponse::Complete(result))) => result,
             Ok(Ok(_)) => {
                 return ToolOutcome::failed(
@@ -357,13 +372,10 @@ impl McpServer {
         }
     }
 
-    /// What a tool returned, cut to the profile's size, stripped of control characters and
-    /// marked with where it came from.
+    /// What a tool returned, cut to the profile's size, made safe to fence and marked with where
+    /// it came from.
     fn fenced(&self, tool: &str, text: &str) -> String {
-        let clean: String = text
-            .chars()
-            .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-            .collect();
+        let clean = crate::tools::fence_text(text, "mcp");
         let max = self.config.max_result_bytes;
         let cut = if clean.len() > max {
             let end = (0..=max)

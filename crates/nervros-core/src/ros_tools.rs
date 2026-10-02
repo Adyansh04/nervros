@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nervros_ros::{Endpoint, GraphDetail, RobotPort, RosError};
+use nervros_ros::{Endpoint, GoalStatus, GraphDetail, RobotPort, RosError};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -33,7 +33,9 @@ pub struct RosToolsConfig {
     /// Parameter names whose values are masked.
     #[serde(default = "d_param_read_deny")]
     pub param_read_deny: Vec<String>,
-    /// Services that only read: `service_call` runs them without arming or approval.
+    /// Services that only read: `service_call` runs them without arming or approval. A pattern
+    /// without a `/` matches the service's last name part, so `get_*` is `/a/get_map` but not
+    /// `/a/get_ready/execute`.
     #[serde(default = "d_service_observe")]
     pub service_observe: Vec<String>,
     /// Services `service_call` may call; empty leaves the tool out.
@@ -74,7 +76,7 @@ fn d_param_read_deny() -> Vec<String> {
 }
 
 fn d_service_observe() -> Vec<String> {
-    ["*/get_*", "*/list_*", "*/describe_*"]
+    ["get_*", "list_*", "describe_*"]
         .map(str::to_owned)
         .to_vec()
 }
@@ -115,7 +117,6 @@ const BULK_TYPES: [&str; 5] = [
     "nav_msgs/msg/OccupancyGrid",
     "octomap_msgs/msg/Octomap",
 ];
-const ALL: [Resource; 3] = [Resource::Base, Resource::LeftArm, Resource::RightArm];
 
 struct Ctx {
     robot: Arc<dyn RobotPort>,
@@ -822,11 +823,13 @@ impl Ctx {
             .unwrap_or_default())
     }
 
+    /// Whether a parameter's value is hidden, whatever the case of its name: `apiKey` too.
     fn masked(&self, name: &str) -> bool {
+        let name = name.to_lowercase();
         self.config
             .param_read_deny
             .iter()
-            .any(|p| glob_match(p, name))
+            .any(|p| glob_match(&p.to_lowercase(), &name))
     }
 }
 
@@ -1023,11 +1026,26 @@ fn payload(args: &Value, key: &str) -> Value {
 
 impl ServiceCall {
     fn observes(&self, service: &str) -> bool {
-        self.ctx
-            .config
-            .service_observe
-            .iter()
-            .any(|p| glob_match(p, service))
+        let last = service.rsplit('/').next().unwrap_or(service);
+        self.ctx.config.service_observe.iter().any(|p| {
+            if p.contains('/') {
+                glob_match(p, service)
+            } else {
+                glob_match(p, last)
+            }
+        })
+    }
+
+    /// Hides the values of a `GetParameters` reply whose names the profile masks.
+    fn mask_values(&self, names: &Value, response: &mut Value) {
+        let names = names.as_array().map_or(&[][..], Vec::as_slice);
+        if let Some(values) = response["values"].as_array_mut() {
+            for (name, value) in names.iter().zip(values) {
+                if name.as_str().is_some_and(|n| self.ctx.masked(n)) {
+                    *value = json!("(hidden)");
+                }
+            }
+        }
     }
 
     async fn prepare(&self, args: &Value) -> Result<Prepared, ToolOutcome> {
@@ -1081,7 +1099,7 @@ impl Tool for ServiceCall {
             } else {
                 Assessment {
                     risk: Risk::Motion,
-                    resources: ALL.to_vec(),
+                    resources: Resource::ALL.to_vec(),
                     args: None,
                     reason: format!("calls {} ({}) with {}", p.name, p.ty, p.payload),
                 }
@@ -1095,15 +1113,22 @@ impl Tool for ServiceCall {
             Err(out) => return out,
         };
         let timeout = seconds(&args, "timeout_s", 5.0, MAX_CALL);
+        let names = p.payload["names"].clone();
         match self
             .ctx
             .robot
             .call(&p.name, &p.ty, p.payload, timeout)
             .await
         {
-            Ok(response) => ToolOutcome::ok(
-                json!({"service": p.name, "type": p.ty, "response": summarize(&response)}),
-            ),
+            Ok(mut response) => {
+                // Read through the service, a masked parameter stays masked as `params` keeps it.
+                if p.ty == "rcl_interfaces/srv/GetParameters" {
+                    self.mask_values(&names, &mut response);
+                }
+                ToolOutcome::ok(
+                    json!({"service": p.name, "type": p.ty, "response": summarize(&response)}),
+                )
+            }
             Err(e) => failed(&e),
         }
     }
@@ -1185,10 +1210,18 @@ impl ActionGoal {
             )
             .await
         {
-            Ok(out) => ToolOutcome::ok(json!({
-                "action": action,
-                "cancelling": out["goals_canceling"].as_array().map_or(0, Vec::len),
-            })),
+            // action_msgs/srv/CancelGoal: 0 is done, then rejected, unknown goal, terminated.
+            Ok(out) => match out["return_code"].as_i64().unwrap_or(0) {
+                0 | 3 => ToolOutcome::ok(json!({
+                    "action": action,
+                    "cancelling": out["goals_canceling"].as_array().map_or(0, Vec::len),
+                })),
+                1 => ToolOutcome::failed(format!("{action} refused to cancel its goals")),
+                2 => ToolOutcome::failed(format!("{action} has no goal to cancel")),
+                code => {
+                    ToolOutcome::failed(format!("{action} answered the cancel with code {code}"))
+                }
+            },
             Err(e) => failed(&e),
         }
     }
@@ -1203,7 +1236,7 @@ impl Tool for ActionGoal {
     async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
         Some(self.prepare(args).await.map(|p| Assessment {
             risk: Risk::Motion,
-            resources: ALL.to_vec(),
+            resources: Resource::ALL.to_vec(),
             args: None,
             reason: if Self::cancelling(args) {
                 format!("cancels every goal of {} ({})", p.name, p.ty)
@@ -1250,20 +1283,54 @@ impl Tool for ActionGoal {
             guard.0 = None;
         }
         match result {
-            Some(Ok(Ok(done))) => ToolOutcome::ok(json!({
-                "action": p.name,
-                "status": format!("{:?}", done.status).to_lowercase(),
-                "result": summarize(&done.result),
-                "last_feedback": feedback,
-            })),
+            Some(Ok(Ok(done))) => {
+                let ended = match done.status {
+                    GoalStatus::Succeeded => "succeeded",
+                    GoalStatus::Aborted => "aborted",
+                    GoalStatus::Canceled => "canceled",
+                    GoalStatus::Unknown => "ended in an unknown state",
+                };
+                let data = json!({
+                    "action": p.name,
+                    "status": ended,
+                    "result": summarize(&done.result),
+                    "last_feedback": feedback,
+                });
+                // A goal the server gave up on is not a success, whatever the call did.
+                if done.status == GoalStatus::Succeeded {
+                    ToolOutcome::ok(data)
+                } else {
+                    ToolOutcome {
+                        data,
+                        ..ToolOutcome::failed(format!("the goal {ended}"))
+                    }
+                }
+            }
             Some(Ok(Err(e))) => failed(&e),
             Some(Err(_)) => ToolOutcome::failed("the action server went away before it answered"),
-            // Dropping the guard cancels the goal: nothing runs on after the tool returns.
-            None => ToolOutcome::failed(format!(
-                "no result within {:.0} s, so the goal was cancelled; last feedback: {}",
-                wait.as_secs_f64(),
-                json!(feedback)
-            )),
+            // Cancelled here and waited for, so the answer says whether it really stopped.
+            None => {
+                let cancel = guard.0.take();
+                let stopped = match cancel {
+                    Some(cancel) => tokio::time::timeout(Duration::from_secs(5), cancel()).await,
+                    None => Ok(Ok(())),
+                };
+                let how = match stopped {
+                    Ok(Ok(())) => "so the goal was cancelled".to_owned(),
+                    Ok(Err(e)) => format!(
+                        "and cancelling it failed ({e}): it may still be running; stop the robot \
+                         if it moves"
+                    ),
+                    Err(_) => "and the server did not confirm the cancel: it may still be \
+                               running; stop the robot if it moves"
+                        .to_owned(),
+                };
+                ToolOutcome::failed(format!(
+                    "no result within {:.0} s, {how}; last feedback: {}",
+                    wait.as_secs_f64(),
+                    json!(feedback)
+                ))
+            }
         }
     }
 }
@@ -1329,17 +1396,24 @@ impl Tool for ParamSet {
     }
 
     async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
-        Some(self.prepare(args).await.map(|c| Assessment {
-            risk: Risk::WorldEdit,
-            resources: Vec::new(),
-            args: None,
-            reason: format!(
-                "sets {} on {} from {} to {}",
-                c.name,
-                c.node,
-                c.was,
-                param_value(&c.value)
-            ),
+        Some(self.prepare(args).await.map(|c| {
+            // The card and the log see the old value only when it is not masked.
+            let was = if self.ctx.masked(&c.name) {
+                json!("(hidden)")
+            } else {
+                c.was
+            };
+            Assessment {
+                risk: Risk::WorldEdit,
+                resources: Vec::new(),
+                args: None,
+                reason: format!(
+                    "sets {} on {} from {was} to {}",
+                    c.name,
+                    c.node,
+                    param_value(&c.value)
+                ),
+            }
         }))
     }
 
@@ -1375,11 +1449,17 @@ impl Tool for ParamSet {
             .param_values(&c.node, std::slice::from_ref(&c.name))
             .await
             .ok();
+        let now = after.and_then(|a| a.first().map(|(_, v, _)| v.clone()));
+        let (was, now) = if self.ctx.masked(&c.name) {
+            (json!("(hidden)"), Some(json!("(hidden)")))
+        } else {
+            (c.was, now)
+        };
         ToolOutcome::ok(json!({
             "node": c.node,
             "name": c.name,
-            "was": c.was,
-            "now": after.and_then(|a| a.first().map(|(_, v, _)| v.clone())),
+            "was": was,
+            "now": now,
         }))
     }
 }
@@ -1439,7 +1519,7 @@ impl Tool for TopicPublish {
         let times = count(args, "count", 1, MAX_PUBLISH);
         Some(self.prepare(args).await.map(|p| Assessment {
             risk: Risk::Motion,
-            resources: ALL.to_vec(),
+            resources: Resource::ALL.to_vec(),
             args: None,
             reason: format!(
                 "publishes {} on {} ({}) {times} time(s)",

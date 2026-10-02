@@ -150,7 +150,7 @@ impl AgentSource for Scripted {
     fn take_request(&self, _id: &str) -> Result<(), String> {
         Ok(())
     }
-    fn park(&self, _id: &str) {}
+    fn park(&self, _id: &str, _for: Duration) {}
 }
 
 fn script(turns: &[Turn]) -> Result<Vec<MockTurn>, String> {

@@ -29,9 +29,11 @@ headers = { "X-Title" = "NervROS" }
 - `key` is `{ file = "..." }` or `{ env = "NAME" }`, and absent for a local server. Keys are never
   logged. A key that cannot be read leaves its provider's models out, and says why when one is
   asked, rather than stopping the app.
-- `free_only = true` refuses at start-up any model on the provider that is not free. On OpenRouter
-  that means ids ending in `:free`; `nervros-cli models --check` also checks the prices OpenRouter
-  lists.
+- Only free models run. On OpenRouter every id must end in `:free`, checked when the file loads
+  and before every request, and `nervros-cli models --check` also checks the prices OpenRouter
+  lists; `free_only = true` there says so, and `false` is refused. Elsewhere a free tier is a
+  property of the key, which nothing here can check, so `free_only` is refused there: use a
+  free-tier key.
 
 ## Models
 

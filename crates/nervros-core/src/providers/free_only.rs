@@ -1,8 +1,10 @@
-//! The free-only rule: a provider marked `free_only` may never reach a paid model.
+//! The free-only rule: NervROS never reaches a paid model.
 //!
-//! Two checks. At config load, every OpenRouter model id must be an explicit `:free` variant (the
-//! random `openrouter/free` router and `stealth/*` models are refused). At start-up, OpenRouter's
-//! public price list must show zero for every price of every configured model.
+//! On OpenRouter, where a model id says whether it is free, every id must be an explicit `:free`
+//! variant (the random `openrouter/free` router and `stealth/*` models are refused), at config
+//! load and before every request; `nervros-cli models --check` also checks that OpenRouter's
+//! price list shows zero for each. Elsewhere, such as Gemini, a free tier is a property of the key,
+//! which nothing here can check: `free_only` there would promise what it cannot keep.
 
 use serde_json::Value;
 
@@ -31,29 +33,37 @@ pub enum FreeOnlyError {
     /// The price list has no entry for the model.
     #[error("model `{0}` is not in the provider's price list")]
     NotListed(String),
+    /// `free_only = false` on OpenRouter.
+    #[error("provider `{0}`: free_only cannot be turned off; NervROS calls free models only")]
+    TurnedOff(String),
+    /// `free_only = true` where nothing can check it.
+    #[error(
+        "provider `{0}`: free_only is checked only on OpenRouter, whose ids say what is free; \
+         use a free-tier key here and leave free_only out"
+    )]
+    Unchecked(String),
 }
 
-fn is_openrouter(provider: &ProviderConfig) -> bool {
-    provider
-        .base_url
-        .as_deref()
-        .is_some_and(|url| url.contains("openrouter.ai"))
-}
-
-/// Checks the ids of every model on a free-only OpenRouter provider.
+/// Checks every provider's `free_only` and the ids of every model on OpenRouter.
 ///
 /// # Errors
 ///
-/// The first offending model.
+/// The first offending provider or model.
 pub fn check_ids(config: &ModelsConfig) -> Result<(), FreeOnlyError> {
-    for model in &config.models {
-        let Some(provider) = config.provider_of(model) else {
-            continue;
-        };
-        if !(provider.free_only && is_openrouter(provider)) {
-            continue;
+    for provider in &config.providers {
+        match (provider.free_only, provider.is_openrouter()) {
+            (Some(false), true) => return Err(FreeOnlyError::TurnedOff(provider.id.clone())),
+            (Some(true), false) => return Err(FreeOnlyError::Unchecked(provider.id.clone())),
+            _ => {}
         }
-        check_openrouter_id(&model.model)?;
+    }
+    for model in &config.models {
+        if config
+            .provider_of(model)
+            .is_some_and(ProviderConfig::is_openrouter)
+        {
+            check_openrouter_id(&model.model)?;
+        }
     }
     Ok(())
 }
@@ -147,6 +157,32 @@ mod tests {
         let err = ModelsConfig::parse(text).unwrap_err();
         assert!(
             err.to_string().contains("not an explicit :free variant"),
+            "{err}"
+        );
+        // OpenRouter is held to it without asking, and it cannot be turned off.
+        let unasked = text.replace("free_only = true\n", "");
+        assert!(ModelsConfig::parse(&unasked).is_err());
+        let off = text.replace("free_only = true", "free_only = false");
+        assert!(
+            ModelsConfig::parse(&off)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be turned off")
+        );
+    }
+
+    #[test]
+    fn free_only_where_nothing_can_check_it_is_refused() {
+        let text = r#"
+            [[provider]]
+            id = "gemini"
+            kind = "gemini_interactions"
+            free_only = true
+            [roles]
+        "#;
+        let err = ModelsConfig::parse(text).unwrap_err();
+        assert!(
+            err.to_string().contains("checked only on OpenRouter"),
             "{err}"
         );
     }

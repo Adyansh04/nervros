@@ -3,7 +3,7 @@
 //! Daily counts reset at the provider's own midnight: UTC for OpenRouter, Pacific time for Gemini.
 //! Per-minute counts live in memory only. A model refused with 429 is parked until a given time.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -36,7 +36,7 @@ pub fn day_index(now: SystemTime, zone: ResetZone) -> u64 {
     unix_secs(now).saturating_sub(offset) / 86_400
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct DayCount {
     day: u64,
     count: u32,
@@ -51,6 +51,13 @@ pub struct Ledger {
     minute: HashMap<String, VecDeque<u64>>,
     #[serde(skip)]
     path: Option<PathBuf>,
+    /// What this process counted since it last saved: a save adds it to what the file holds by
+    /// then, so a window and a CLI on one robot count into the same day.
+    #[serde(skip)]
+    unsaved: BTreeMap<String, DayCount>,
+    /// Counts set from a provider's own figure, which replace the file's.
+    #[serde(skip)]
+    set: BTreeSet<String>,
 }
 
 /// Why a model cannot take a request now.
@@ -78,35 +85,49 @@ impl std::fmt::Display for Refused {
 }
 
 impl Ledger {
-    /// Loads the ledger from a JSON file, or starts empty when the file does not exist.
-    ///
-    /// # Errors
-    ///
-    /// An unreadable or corrupt file.
-    pub fn load(path: &Path) -> std::io::Result<Self> {
-        let mut ledger = match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).map_err(std::io::Error::other)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(e) => return Err(e),
-        };
+    /// Loads the ledger from a JSON file, or starts empty when there is none. A file that cannot
+    /// be read is moved aside and the counts start again: better a 429 later than no agent.
+    #[must_use]
+    pub fn load(path: &Path) -> Self {
+        let mut ledger: Self = crate::persist::read_or_default(path);
         ledger.path = Some(path.to_path_buf());
-        Ok(ledger)
+        ledger
     }
 
-    /// Writes the ledger back to its file, if it has one.
+    /// Writes the ledger back to its file, if it has one, taking in first what another process
+    /// saved there since: its counts and ours add up, and the later of two parks stands.
     ///
     /// # Errors
     ///
     /// A write failure.
-    pub fn save(&self) -> std::io::Result<()> {
-        let Some(path) = &self.path else {
+    pub fn save(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.path.clone() else {
             return Ok(());
         };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+        let disk: Self = crate::persist::read_or_default(&path);
+        let mut days = disk.days;
+        for (key, mine) in std::mem::take(&mut self.unsaved) {
+            let entry = days.entry(key).or_default();
+            if entry.day == mine.day {
+                entry.count = entry.count.saturating_add(mine.count);
+            } else if entry.day < mine.day {
+                *entry = mine;
+            }
         }
-        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, text)
+        for key in std::mem::take(&mut self.set) {
+            if let Some(mine) = self.days.get(&key) {
+                days.insert(key, mine.clone());
+            }
+        }
+        let mut parked = disk.parked_until;
+        for (model, until) in &self.parked_until {
+            let entry = parked.entry(model.clone()).or_default();
+            *entry = (*entry).max(*until);
+        }
+        self.days = days;
+        self.parked_until = parked;
+        let text = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        crate::persist::write_atomic(&path, &text)
     }
 
     /// Requests counted today under `key` (a model id or a pool name).
@@ -165,14 +186,16 @@ impl Ledger {
     pub fn record(&mut self, model: &str, pool: Option<&str>, now: SystemTime, zone: ResetZone) {
         let today = day_index(now, zone);
         for key in std::iter::once(model).chain(pool) {
-            let entry = self.days.entry(key.to_owned()).or_default();
-            if entry.day != today {
-                *entry = DayCount {
-                    day: today,
-                    count: 0,
-                };
+            for counts in [&mut self.days, &mut self.unsaved] {
+                let entry = counts.entry(key.to_owned()).or_default();
+                if entry.day != today {
+                    *entry = DayCount {
+                        day: today,
+                        count: 0,
+                    };
+                }
+                entry.count = entry.count.saturating_add(1);
             }
-            entry.count = entry.count.saturating_add(1);
         }
         let t = unix_secs(now);
         let q = self.minute.entry(model.to_owned()).or_default();
@@ -191,6 +214,8 @@ impl Ledger {
     /// Replaces today's count for a pool with the provider's own figure, such as OpenRouter's
     /// `free_model_daily_requests.used`.
     pub fn set_pool_used(&mut self, pool: &str, used: u32, now: SystemTime, zone: ResetZone) {
+        self.unsaved.remove(pool);
+        self.set.insert(pool.to_owned());
         self.days.insert(
             pool.to_owned(),
             DayCount {
@@ -278,11 +303,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("quota.json");
         let t = at(86_400 * 7);
-        let mut ledger = Ledger::load(&path).unwrap();
+        let mut ledger = Ledger::load(&path);
         ledger.record("m", Some("p"), t, ResetZone::Utc);
         ledger.save().unwrap();
-        let again = Ledger::load(&path).unwrap();
+        let again = Ledger::load(&path);
         assert_eq!(again.used_today("m", t, ResetZone::Utc), 1);
         assert_eq!(again.used_today("p", t, ResetZone::Utc), 1);
+    }
+
+    #[test]
+    fn two_processes_count_into_one_day_and_a_torn_file_is_no_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quota.json");
+        let t = at(86_400 * 7);
+        let (mut window, mut cli) = (Ledger::load(&path), Ledger::load(&path));
+        window.record("m", Some("p"), t, ResetZone::Utc);
+        window.save().unwrap();
+        cli.record("m", Some("p"), t, ResetZone::Utc);
+        cli.record("m", Some("p"), t, ResetZone::Utc);
+        cli.save().unwrap();
+        window.record("m", Some("p"), t, ResetZone::Utc);
+        window.save().unwrap();
+        assert_eq!(Ledger::load(&path).used_today("p", t, ResetZone::Utc), 4);
+        assert_eq!(
+            window.used_today("p", t, ResetZone::Utc),
+            4,
+            "it read the CLI's too"
+        );
+        std::fs::write(&path, "{\"days\": {").unwrap();
+        assert_eq!(Ledger::load(&path).used_today("p", t, ResetZone::Utc), 0);
     }
 }

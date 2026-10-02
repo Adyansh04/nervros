@@ -113,8 +113,8 @@ pub enum LlmError {
         model: String,
         /// What went wrong.
         message: String,
-        /// The provider answered 429.
-        rate_limited: bool,
+        /// The provider answered 429: how long to set the model aside.
+        retry_after: Option<Duration>,
     },
 }
 
@@ -217,12 +217,7 @@ impl Llm {
                 provider: model.provider.clone(),
                 message: "unknown provider".to_owned(),
             })?;
-        if provider.free_only
-            && provider
-                .base_url
-                .as_deref()
-                .is_some_and(|u| u.contains("openrouter.ai"))
-        {
+        if provider.is_openrouter() {
             free_only::check_openrouter_id(&model.model)?;
         }
         if let Some(why) = self.missing_keys.get(&provider.id) {
@@ -284,14 +279,16 @@ impl Llm {
                     continue;
                 }
             };
+            // Checked and counted before the call, as a turn's are: a call cut short by a timeout
+            // was still made, and the next candidate's limits are read anew.
+            if let Err(refused) = self.router.take_request(&model.id, SystemTime::now()) {
+                failed.push((model.id.clone(), refused.to_string()));
+                continue;
+            }
             // Gemini segments from the prompt before the image; given the image first, Flash-Lite
             // answered with boxes where the outlines belong.
             let message = user_message(ask.prompt, ask.image.as_ref(), ask.role == Role::Segment);
             let result = agent.prompt(message).extended_details().await;
-            // A failure to persist the ledger must not hide the answer; it is logged instead.
-            if let Err(e) = self.router.record_use(&model.id, SystemTime::now()) {
-                tracing::warn!(model = %model.id, error = %e, "could not save the quota ledger");
-            }
             match result {
                 Ok(response) => {
                     return Ok(Answer {
@@ -302,14 +299,12 @@ impl Llm {
                     });
                 }
                 Err(e) => {
-                    if is_rate_limited(&e)
-                        && let Err(io) =
-                            self.router.park(&model.id, SystemTime::now(), DEFAULT_PARK)
-                    {
-                        tracing::warn!(model = %model.id, error = %io, "could not save the quota ledger");
+                    if let Some(wait) = prompt_retry_after(&e) {
+                        self.park(&model.id, wait);
                     }
-                    tracing::info!(model = %model.id, error = %e, "model failed, trying the next one");
-                    failed.push((model.id.clone(), without_provider_body(&e.to_string())));
+                    let said = without_provider_body(&e.to_string());
+                    tracing::info!(model = %model.id, error = %said, "model failed, trying the next one");
+                    failed.push((model.id.clone(), said));
                 }
             }
         }
@@ -359,12 +354,39 @@ pub fn user_message(text: &str, image: Option<&ImageInput>, text_first: bool) ->
     Message::User { content }
 }
 
-fn is_rate_limited(error: &PromptError) -> bool {
+/// The longest a model is set aside: a `Retry-After` past a day is not believed.
+const MAX_PARK: Duration = Duration::from_hours(24);
+
+/// For a 429, how long to set the model aside: what the provider's `Retry-After` asks, else a
+/// minute. `None` for any other error, whatever its text says.
+fn retry_after(error: &rig::completion::CompletionError) -> Option<Duration> {
+    if error.provider_response_status()?.as_u16() != 429 {
+        return None;
+    }
+    let asked = error
+        .provider_response_headers()
+        .and_then(|h| h.get("retry-after"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    Some(
+        asked
+            .unwrap_or(DEFAULT_PARK)
+            .clamp(Duration::from_secs(1), MAX_PARK),
+    )
+}
+
+fn prompt_retry_after(error: &PromptError) -> Option<Duration> {
     match error {
-        PromptError::CompletionError(e) => {
-            e.provider_response_status().map(|s| s.as_u16()) == Some(429)
-        }
-        _ => false,
+        PromptError::CompletionError(e) => retry_after(e),
+        _ => None,
+    }
+}
+
+fn stream_retry_after(error: &rig::agent::StreamingError) -> Option<Duration> {
+    match error {
+        rig::agent::StreamingError::Completion(e) => retry_after(e),
+        rig::agent::StreamingError::Prompt(e) => prompt_retry_after(e),
     }
 }
 
@@ -681,7 +703,7 @@ impl History {
     ///
     /// The file cannot be written.
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        std::fs::write(path, serde_json::to_vec(&self.0)?)
+        crate::persist::write_atomic(path, &serde_json::to_vec(&self.0)?)
     }
 
     /// Reads one [`Self::save`] wrote.
@@ -762,12 +784,13 @@ const SUMMARY_PREAMBLE: &str = "You condense a conversation between a robot's op
 /// A summary of a transcript from the first model of the `summarise` role that answers.
 pub async fn summarise(source: &Arc<dyn AgentSource>, transcript: &str) -> Option<String> {
     for model in source.candidates(Role::Summarise, Need::default()) {
-        if source.take_request(&model).is_err() {
-            continue;
-        }
+        // Built before it is counted: a model with no key costs no quota.
         let Ok(builder) = source.builder(&model) else {
             continue;
         };
+        if source.take_request(&model).is_err() {
+            continue;
+        }
         match builder
             .preamble(SUMMARY_PREAMBLE)
             .build()
@@ -776,7 +799,13 @@ pub async fn summarise(source: &Arc<dyn AgentSource>, transcript: &str) -> Optio
         {
             Ok(text) if !text.trim().is_empty() => return Some(text),
             Ok(_) => {}
-            Err(e) => tracing::warn!(model = %model, error = %e, "the summary failed"),
+            Err(e) => {
+                if let Some(wait) = prompt_retry_after(&e) {
+                    source.park(&model, wait);
+                }
+                let said = without_provider_body(&e.to_string());
+                tracing::warn!(model = %model, error = %said, "the summary failed");
+            }
         }
     }
     None
@@ -876,8 +905,8 @@ pub trait AgentSource: Send + Sync {
     /// Why the quota refuses the request, which is then not counted.
     fn take_request(&self, model_id: &str) -> Result<(), String>;
 
-    /// Sets a model aside after a 429.
-    fn park(&self, model_id: &str);
+    /// Sets a model aside for `for_how_long` after a 429.
+    fn park(&self, model_id: &str, for_how_long: Duration);
 
     /// The model's context window in tokens, when the models file gives it.
     fn context(&self, _model_id: &str) -> Option<usize> {
@@ -918,8 +947,8 @@ impl AgentSource for Llm {
             .map_err(|refused| refused.to_string())
     }
 
-    fn park(&self, model_id: &str) {
-        if let Err(e) = self.router.park(model_id, SystemTime::now(), DEFAULT_PARK) {
+    fn park(&self, model_id: &str, for_how_long: Duration) {
+        if let Err(e) = self.router.park(model_id, SystemTime::now(), for_how_long) {
             tracing::warn!(model = %model_id, error = %e, "could not save the quota ledger");
         }
     }
@@ -1158,22 +1187,22 @@ pub async fn chat(
             last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
         });
     let agent = builder.build();
-    let turn_error = |message: String, rate_limited: bool| LlmError::Turn {
+    let turn_error = |message: String, retry_after: Option<Duration>| LlmError::Turn {
         model: model_id.to_owned(),
         message: without_provider_body(&message),
-        rate_limited,
+        retry_after,
     };
     if let Some(delta) = delta {
         return streamed(&agent, text, history, delta.as_ref())
             .await
             .map(plain)
-            .map_err(|e| turn_error(e.clone(), e.contains("429")));
+            .map_err(|(message, wait)| turn_error(message, wait));
     }
     agent
         .chat(text, &mut history.0)
         .await
         .map(plain)
-        .map_err(|e| turn_error(e.to_string(), is_rate_limited(&e)))
+        .map_err(|e| turn_error(e.to_string(), prompt_retry_after(&e)))
 }
 
 /// One turn with the reply streamed: each text delta to `delta`, and the run's transcript into
@@ -1183,14 +1212,14 @@ async fn streamed(
     text: &str,
     history: &mut History,
     delta: &(dyn Fn(&str) + Send + Sync),
-) -> Result<String, String> {
+) -> Result<String, (String, Option<Duration>)> {
     use futures::StreamExt as _;
     use rig::agent::MultiTurnStreamItem;
     use rig::streaming::{StreamedAssistantContent, StreamingChat as _};
     let mut stream = agent.stream_chat(text, history.0.clone()).await;
     let mut done = None;
     while let Some(item) = stream.next().await {
-        match item.map_err(|e| e.to_string())? {
+        match item.map_err(|e| (e.to_string(), stream_retry_after(&e)))? {
             MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
                 delta(&t.text);
             }
@@ -1198,7 +1227,8 @@ async fn streamed(
             _ => {}
         }
     }
-    let response = done.ok_or("the reply stream ended without a reply")?;
+    let response =
+        done.ok_or_else(|| ("the reply stream ended without a reply".to_owned(), None))?;
     // The run's transcript: the new messages only, or the history it was given with them.
     if let Some(messages) = response.messages {
         if messages.starts_with(&history.0) {

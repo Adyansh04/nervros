@@ -394,6 +394,26 @@ pub struct PlannedStep {
     /// How it has gone before, from the ledger; none before its first run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track: Option<super::ledger::Track>,
+    /// For a walk: the place's name, or the room's or object's id, that its `place` resolved to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+impl PlannedStep {
+    /// The step as the profile's rules read it: every argument trimmed, and a walk's `place` as
+    /// said and as resolved, so a rule on a room's id holds whatever name the model used.
+    #[must_use]
+    pub fn for_rules(&self) -> serde_json::Value {
+        let mut args: Vec<serde_json::Value> = self
+            .args
+            .iter()
+            .map(|a| serde_json::json!({"name": a.name, "value": a.value.trim()}))
+            .collect();
+        if let Some(target) = &self.target {
+            args.push(serde_json::json!({"name": "place", "value": target}));
+        }
+        serde_json::json!({"skill": self.skill, "args": args})
+    }
 }
 
 #[expect(
@@ -496,6 +516,7 @@ pub fn compile(
             let id = format!("s{n}");
             match compile_step(&id, step, catalog, world, author) {
                 Ok((node, timeout_s, spot)) => {
+                    let target = spot.as_ref().map(|s| s.id.clone());
                     if let Some(spot) = spot {
                         sim.at = Some(spot.id);
                         sim.xy = spot.xy;
@@ -519,6 +540,7 @@ pub fn compile(
                         optional: step.optional,
                         added,
                         track: None,
+                        target,
                     });
                 }
                 Err(mut p) => problems.append(&mut p),
