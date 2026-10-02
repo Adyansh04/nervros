@@ -9,7 +9,8 @@ use nervros_ros::{RobotPort, Transform};
 use rerun::RecordingStream;
 use tokio::task::JoinSet;
 
-use crate::grid::{draw_coverage, draw_map};
+use crate::blueprint::Layout;
+use crate::grid::{draw_coverage, draw_map, known_extent};
 use crate::objects::{draw_object_names, draw_objects};
 use crate::plan::{draw_plan, draw_trail};
 use crate::rooms::draw_rooms;
@@ -118,10 +119,22 @@ impl Spawner {
         views
     }
 
-    pub(super) fn world(&mut self, profile: &Profile) {
+    /// The world model's layers; the first map frames the 3D view.
+    pub(super) fn world(&mut self, profile: &Profile, layout: &Arc<Layout>) {
         if let Some(world) = &profile.world {
             let map = self.layer("Map", "world/map", true);
-            self.watch(world.map.clone(), SLOW_PERIOD, map, Box::new(draw_map));
+            let layout = Arc::clone(layout);
+            self.watch(
+                world.map.clone(),
+                SLOW_PERIOD,
+                map,
+                Box::new(move |rec, path, msg| {
+                    draw_map(rec, path, msg);
+                    if let Some(extent) = known_extent(msg) {
+                        layout.map(extent);
+                    }
+                }),
+            );
             let coverage = self.layer("Camera coverage", "world/coverage", true);
             self.watch(
                 world.coverage.clone(),
@@ -219,68 +232,4 @@ fn profile_layer(
     #[expect(clippy::cast_precision_loss, reason = "a handful of layers")]
     let lift = 0.02 + 0.005 * index as f32;
     Box::new(move |rec, path, msg| layers::draw_occupied(rec, path, msg, [r, g, b], lift))
-}
-
-/// The default layout: the world large; beside it the first camera over the others and the agent's
-/// last marked image, in tabs as the chat shows that image too; and the agent's log and the
-/// mission's steps in a strip below, as wide as the viewer so their columns read. It is made
-/// active, not only the default: the viewer would otherwise restore the last session's layout,
-/// closed panes and an older version's layout included.
-pub(super) fn layout(rec: &RecordingStream, cameras: &[(String, String)]) {
-    use rerun::blueprint::{
-        Blueprint, BlueprintActivation, Horizontal, Spatial2DView, Spatial3DView,
-        StateTimelineView, Tabs, TextLogView, TimeSeriesView, Vertical,
-    };
-    let view = |(name, path): &(String, String)| -> rerun::blueprint::ContainerLike {
-        let mut title: String = name.clone();
-        if let Some(first) = title.get_mut(0..1) {
-            first.make_ascii_uppercase();
-        }
-        Spatial2DView::new(title).with_origin(path.as_str()).into()
-    };
-    let mut views: Vec<rerun::blueprint::ContainerLike> = match cameras {
-        [] => vec![
-            Spatial2DView::new("Camera")
-                .with_origin(CAMERA_PATH[0])
-                .into(),
-        ],
-        [(_, path)] => vec![
-            Spatial2DView::new("Camera")
-                .with_origin(path.as_str())
-                .into(),
-        ],
-        many => many.iter().map(view).collect(),
-    };
-    let first = views.remove(0);
-    views.push(
-        Spatial2DView::new("Last look")
-            .with_origin("/agent/look")
-            .into(),
-    );
-    let top = Horizontal::new([
-        Spatial3DView::new("World").with_origin("/world").into(),
-        Vertical::new([first, Tabs::new(views).into()]).into(),
-    ])
-    .with_column_shares([3.0, 2.0]);
-    let strip = Tabs::new([
-        TextLogView::new("Agent").with_origin("/agent/log").into(),
-        StateTimelineView::new("Mission")
-            .with_origin("/mission")
-            .into(),
-        TimeSeriesView::new("Exploring")
-            .with_origin("/mapping")
-            .into(),
-        TimeSeriesView::new("Plots").with_origin("/plots").into(),
-    ]);
-    let root = Vertical::new([top.into(), strip.into()]).with_row_shares([3.0, 1.0]);
-    let activation = BlueprintActivation {
-        make_active: true,
-        make_default: true,
-    };
-    if let Err(e) = Blueprint::new(root)
-        .with_auto_views(false)
-        .send(rec, activation)
-    {
-        tracing::debug!(error = %e, "the viewer layout was not sent");
-    }
 }
