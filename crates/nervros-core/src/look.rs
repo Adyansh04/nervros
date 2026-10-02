@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use image::{Rgb, RgbImage};
@@ -64,8 +64,13 @@ pub(crate) fn capped(img: &RgbImage, edge: u32) -> RgbImage {
     )
 }
 
-/// Frames kept for matching detection stamps: 4 s at 10 Hz.
+/// Frames kept for matching detection stamps: 4 s at 10 Hz, 1.3 s at 30 Hz.
+// ponytail: a count, not a time span; size it by time if a fast camera's detector lags more.
 const FRAME_HISTORY: usize = 40;
+/// How far a frame's stamp may be from the detections' and still be the frame they came from.
+const DETECTION_MATCH_S: f64 = 0.05;
+/// A camera that has sent nothing for this long has stopped, whatever its last frame shows.
+const CAMERA_QUIET: Duration = Duration::from_secs(3);
 /// Snapshots kept for mark references.
 const SNAPSHOTS_KEPT: usize = 20;
 
@@ -400,36 +405,45 @@ impl SnapshotStore {
     }
 }
 
-/// Recent frames of one camera.
+/// Recent frames of one camera, and when the newest arrived.
 #[derive(Debug, Default)]
-pub(crate) struct History(Mutex<VecDeque<Arc<Frame>>>);
+pub(crate) struct History(Mutex<(VecDeque<Arc<Frame>>, Option<Instant>)>);
 
 impl History {
     fn push(&self, f: Arc<Frame>) {
-        let mut q = guard(&self.0);
-        q.push_back(f);
-        while q.len() > FRAME_HISTORY {
-            q.pop_front();
+        let mut h = guard(&self.0);
+        h.0.push_back(f);
+        while h.0.len() > FRAME_HISTORY {
+            h.0.pop_front();
         }
+        h.1 = Some(Instant::now());
     }
 
-    pub(crate) fn closest(&self, stamp_s: f64) -> Option<Arc<Frame>> {
+    /// The kept frame with the stamp `stamp_s`, give or take `within` seconds.
+    pub(crate) fn closest(&self, stamp_s: f64, within: f64) -> Option<Arc<Frame>> {
         guard(&self.0)
+            .0
             .iter()
             .min_by(|a, b| {
                 (a.stamp_s - stamp_s)
                     .abs()
                     .total_cmp(&(b.stamp_s - stamp_s).abs())
             })
+            .filter(|f| (f.stamp_s - stamp_s).abs() <= within)
             .cloned()
     }
 
     pub(crate) fn newest(&self) -> Option<Arc<Frame>> {
-        guard(&self.0).back().cloned()
+        guard(&self.0).0.back().cloned()
+    }
+
+    /// How long since a frame arrived, once one has.
+    fn quiet_for(&self) -> Option<Duration> {
+        guard(&self.0).1.map(|t| t.elapsed())
     }
 
     pub(crate) fn recent(&self) -> Vec<Arc<Frame>> {
-        guard(&self.0).iter().cloned().collect()
+        guard(&self.0).0.iter().cloned().collect()
     }
 }
 
@@ -448,14 +462,23 @@ impl Camera {
     ///
     /// # Errors
     ///
-    /// No frame has arrived yet.
+    /// No frame has arrived yet, or none for a while: an old frame is not what the camera sees.
     pub fn newest(&self) -> Result<Arc<Frame>, String> {
-        self.history.newest().ok_or_else(|| {
+        let frame = self.history.newest().ok_or_else(|| {
             format!(
                 "no frame from the {} camera ({}) yet",
                 self.name, self.config.image
             )
-        })
+        })?;
+        match self.history.quiet_for() {
+            Some(quiet) if quiet > CAMERA_QUIET => Err(format!(
+                "the {} camera ({}) has sent nothing for {:.0} s",
+                self.name,
+                self.config.image,
+                quiet.as_secs_f64()
+            )),
+            _ => Ok(frame),
+        }
     }
 }
 
@@ -599,33 +622,19 @@ impl LookTool {
     ) -> Result<ToolOutcome, String> {
         let camera = self.cameras.get(camera)?;
         let newest = camera.newest()?;
-        let (mut dets, frame, age) = if let Some(topic) = &camera.config.detections {
-            let msg = self
-                .robot
-                .latest(&topic.topic, &topic.msg_type, Duration::from_secs(3))
-                .await
-                .map_err(|e| e.to_string())?;
-            let dets = parse_detections(&msg);
-            let age = newest.stamp_s - dets.stamp_s;
-            if age > self.config.max_age.as_secs_f64() {
-                return Err(format!(
-                    "the newest detections are {age:.1} s older than the camera; the detector may be stopped"
-                ));
-            }
-            let frame = camera.history.closest(dets.stamp_s).unwrap_or(newest);
-            (dets, frame, age)
-        } else {
-            let dets = Detections {
-                stamp_s: newest.stamp_s,
-                instances: Vec::new(),
-            };
-            (dets, newest, 0.0)
-        };
+        let (mut dets, frame, age, left_out) = self.marked(camera, newest).await;
         dets.instances.sort_by(|a, b| b.score.total_cmp(&a.score));
         dets.instances.truncate(self.config.max_marks);
-        let mut img = frame.to_rgb().map_err(|e| e.to_string())?;
-        draw_marks(&mut img, &dets.instances);
-        let jpeg = nervros_ros::image::encode_jpeg(&img, 85).map_err(|e| e.to_string())?;
+        // Tens of milliseconds of pixels: off the threads that serve the stop.
+        let (marks_drawn, source) = (dets.instances.clone(), Arc::clone(&frame));
+        let (img, jpeg) = tokio::task::spawn_blocking(move || {
+            let mut img = source.to_rgb().map_err(|e| e.to_string())?;
+            draw_marks(&mut img, &marks_drawn);
+            let jpeg = nervros_ros::image::encode_jpeg(&img, 85).map_err(|e| e.to_string())?;
+            Ok::<_, String>((img, jpeg))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         let id = self.snapshots.next_id();
         let image = ImageArtifact {
             snapshot: id.clone(),
@@ -651,6 +660,9 @@ impl LookTool {
         });
         let mut data = json!({"snapshot": snapshot.id, "camera": camera.name,
             "age_s": (age * 10.0).round() / 10.0, "marks": marks});
+        if let Some(why) = left_out {
+            data["no_marks"] = Value::String(why);
+        }
         match seen {
             Some(Ok((answer, model))) => {
                 data["answer"] = Value::String(crate::tools::from_world(&answer));
@@ -663,6 +675,52 @@ impl LookTool {
         out.message = format!("{} marks; the user sees the marked image", marks.len());
         out.images.push(image);
         Ok(out)
+    }
+
+    /// The detections to draw and the frame they came from; without a detector, or with none
+    /// that match a kept frame within the age the profile allows, the newest frame unmarked and
+    /// why, rather than marks on a frame they were not cut from.
+    async fn marked(
+        &self,
+        camera: &Camera,
+        newest: Arc<Frame>,
+    ) -> (Detections, Arc<Frame>, f64, Option<String>) {
+        let unmarked = |frame: Arc<Frame>, why: Option<String>| {
+            let dets = Detections {
+                stamp_s: frame.stamp_s,
+                instances: Vec::new(),
+            };
+            (dets, frame, 0.0, why)
+        };
+        let Some(topic) = &camera.config.detections else {
+            return unmarked(newest, None);
+        };
+        let msg = match self
+            .robot
+            .latest(&topic.topic, &topic.msg_type, Duration::from_secs(3))
+            .await
+        {
+            Ok(msg) => msg,
+            Err(e) => return unmarked(newest, Some(format!("no detections ({e})"))),
+        };
+        let dets = parse_detections(&msg);
+        // Either way: detections much newer than the newest frame mean a stalled camera.
+        let age = newest.stamp_s - dets.stamp_s;
+        if age.abs() > self.config.max_age.as_secs_f64() {
+            let why = format!(
+                "the detections are {:.1} s apart from the camera's newest frame; the detector or \
+                 the camera may be stopped",
+                age.abs()
+            );
+            return unmarked(newest, Some(why));
+        }
+        match camera.history.closest(dets.stamp_s, DETECTION_MATCH_S) {
+            Some(frame) => (dets, frame, age, None),
+            None => unmarked(
+                newest,
+                Some("the frame the detections came from is no longer kept".to_owned()),
+            ),
+        }
     }
 
     /// The vision model's answer about a kept snapshot or an image the operator attached; the
@@ -922,6 +980,36 @@ mod tests {
         let snap = store.get(out.data["snapshot"].as_str().unwrap()).unwrap();
         assert_eq!(snap.marks.len(), 2);
         assert_eq!(&out.images[0].jpeg[..2], &[0xFF, 0xD8]);
+    }
+
+    #[tokio::test]
+    async fn detections_of_another_frame_are_left_out_not_drawn_on_this_one() {
+        let robot: Arc<dyn RobotPort> = Arc::new(
+            FakeRobot::new()
+                .with_frame("/camera", frame(12.0))
+                .with_topic("/masks", masks(4.0)),
+        );
+        let config: LookConfig = toml::from_str(
+            "image = \"/camera\"\ndetections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n",
+        )
+        .unwrap();
+        let look = start(config, robot, Arc::new(SnapshotStore::default()), None);
+        tokio::task::yield_now().await;
+        let out = look.call(json!({})).await;
+        assert_eq!(
+            out.status,
+            crate::tools::Status::Succeeded,
+            "{}",
+            out.message
+        );
+        assert_eq!(out.data["marks"], json!([]));
+        assert!(
+            out.data["no_marks"]
+                .as_str()
+                .is_some_and(|w| w.contains("8.0 s apart")),
+            "{}",
+            out.data
+        );
     }
 
     #[test]

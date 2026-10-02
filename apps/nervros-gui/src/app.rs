@@ -213,6 +213,8 @@ pub struct Gui {
     log_path: PathBuf,
     /// Earlier sessions for the Agent tab, and when they were listed.
     sessions: Option<(Instant, Vec<crate::sessions::SessionInfo>)>,
+    /// What the listing has read of them.
+    listing: crate::sessions::Listing,
     chat: Chat,
     event_log: VecDeque<String>,
     input: String,
@@ -333,6 +335,7 @@ impl Gui {
             live,
             log_path,
             sessions: None,
+            listing: crate::sessions::Listing::default(),
             chat,
             event_log: VecDeque::new(),
             input: String::new(),
@@ -1179,7 +1182,7 @@ impl Gui {
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_default();
-            self.sessions = Some((Instant::now(), crate::sessions::list(&logs, &self.log_path)));
+            self.sessions = Some((Instant::now(), self.listing.list(&logs, &self.log_path)));
         }
         let (mut resume, mut keep) = (None, None);
         let listed = self
@@ -1323,7 +1326,7 @@ impl Gui {
         match checks {
             None => {
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    crate::chat::spinner(ui);
                     ui.label("Checking the robot…");
                 });
             }

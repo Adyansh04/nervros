@@ -304,7 +304,9 @@ struct View {
 /// What the requests running on the runtime hand back.
 #[derive(Default)]
 struct Shared {
-    world: Option<World>,
+    /// Shared with each frame that draws it: it changes every few seconds, frames come far more
+    /// often.
+    world: Option<Arc<World>>,
     map: Option<egui::ColorImage>,
     crops: HashMap<u64, Option<Arc<egui::ColorImage>>>,
     status: Option<(String, bool)>,
@@ -321,7 +323,7 @@ impl Shared {
     fn take(&mut self, world: Value) -> Result<(), String> {
         match serde_json::from_value(world) {
             Ok(w) => {
-                self.world = Some(w);
+                self.world = Some(Arc::new(w));
                 Ok(())
             }
             Err(e) => Err(format!(
@@ -429,7 +431,7 @@ impl WorldEditor {
     #[cfg(test)]
     pub(crate) fn show_world(&mut self, world: &Value, map: egui::ColorImage) {
         let mut shared = lock(&self.shared);
-        shared.world = serde_json::from_value(world.clone()).ok();
+        shared.world = serde_json::from_value(world.clone()).ok().map(Arc::new);
         shared.map = Some(map);
         shared.reachable = Some(true);
     }
@@ -440,7 +442,7 @@ impl WorldEditor {
         self.last_poll = Some(Instant::now());
     }
 
-    fn world(&self) -> Option<World> {
+    fn world(&self) -> Option<Arc<World>> {
         lock(&self.shared).world.clone()
     }
 

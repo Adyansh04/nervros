@@ -296,18 +296,27 @@ pub(crate) fn inside(region: &Instance, x: u32, y: u32) -> bool {
         .is_none_or(|m| m[((y - by) * bw + (x - bx)) as usize] != 0)
 }
 
-/// Pixels on a region's edge: inside, with a pixel within two that is not.
+/// Pixels on a region's edge: inside, with a pixel one or two away along a row or a column that
+/// is not. Eight looks a pixel rather than the 25 of the whole square, for the same outline.
 fn edge(region: &Instance, x: u32, y: u32) -> bool {
-    (-2_i64..=2).any(|dy| {
-        (-2_i64..=2).any(|dx| {
-            match (
-                u32::try_from(i64::from(x) + dx),
-                u32::try_from(i64::from(y) + dy),
-            ) {
-                (Ok(nx), Ok(ny)) => !inside(region, nx, ny),
-                _ => true,
-            }
-        })
+    const AROUND: [(i64, i64); 8] = [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-2, 0),
+        (2, 0),
+        (0, -2),
+        (0, 2),
+    ];
+    AROUND.iter().any(|(dx, dy)| {
+        match (
+            u32::try_from(i64::from(x) + dx),
+            u32::try_from(i64::from(y) + dy),
+        ) {
+            (Ok(nx), Ok(ny)) => !inside(region, nx, ny),
+            _ => true,
+        }
     })
 }
 
@@ -440,9 +449,16 @@ impl SegmentTool {
             SegmentBackend::Model => self.ask_model(camera, prompt).await?,
             SegmentBackend::Service => self.ask_service(camera, prompt).await?,
         };
-        let img = frame.to_rgb().map_err(|e| e.to_string())?;
-        let drawn = draw(&img, &regions, view);
-        let jpeg = nervros_ros::image::encode_jpeg(&drawn, 85).map_err(|e| e.to_string())?;
+        // Tens of milliseconds of pixels: off the threads that serve the stop.
+        let (outlined, source) = (regions.clone(), Arc::clone(&frame));
+        let (img, drawn, jpeg) = tokio::task::spawn_blocking(move || {
+            let img = source.to_rgb().map_err(|e| e.to_string())?;
+            let drawn = draw(&img, &outlined, view);
+            let jpeg = nervros_ros::image::encode_jpeg(&drawn, 85).map_err(|e| e.to_string())?;
+            Ok::<_, String>((img, drawn, jpeg))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         let image = ImageArtifact {
             snapshot: self.snapshots.next_id(),
             jpeg: Arc::new(jpeg),

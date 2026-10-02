@@ -207,48 +207,54 @@ impl Tool for RobotState {
 
     async fn call(&self, _args: Value) -> ToolOutcome {
         let mut out = json!({"armed": self.guard.armed()});
+        // The rooms and the executor's state are read together: each can wait its full time.
+        let state = async {
+            match &self.executor_state {
+                Some(topic) => Some(
+                    self.robot
+                        .latest_fresh(
+                            topic,
+                            "nervros_interfaces/msg/RobotState",
+                            Duration::from_secs(1),
+                            crate::mission::STATE_FRESH,
+                        )
+                        .await,
+                ),
+                None => None,
+            }
+        };
+        let (rooms, state) = tokio::join!(rooms(self.robot.as_ref(), self.rooms.as_ref()), state);
         match self.robot.transform(&self.frames.0, &self.frames.1) {
             Ok(t) => {
                 let [x, y, _] = t.translation;
                 let round = |v: f64| (v * 100.0).round() / 100.0;
                 out["pose"] = json!({"frame": self.frames.0, "x": round(x), "y": round(y), "yaw": round(t.yaw())});
-                let room = rooms(self.robot.as_ref(), self.rooms.as_ref())
-                    .await
-                    .into_iter()
-                    .find(|r| inside((x, y), &r.outline));
-                if let Some(r) = room {
+                if let Some(r) = rooms.into_iter().find(|r| inside((x, y), &r.outline)) {
                     out["room"] = json!({"id": r.id, "name": r.name, "type": r.kind});
                 }
             }
             Err(e) => out["pose_error"] = Value::String(e.to_string()),
         }
-        if let Some(topic) = &self.executor_state {
-            let state = self
-                .robot
-                .latest_fresh(
-                    topic,
-                    "nervros_interfaces/msg/RobotState",
-                    Duration::from_secs(1),
-                    crate::mission::STATE_FRESH,
-                )
-                .await;
-            let Ok(state) = state else {
+        match state {
+            Some(Ok(state)) => {
+                let field = |k: &str| state[k].clone();
+                out["executor"] = json!({
+                    "mission": field("mission_id"),
+                    "step": field("mission_step"),
+                    "holding_left": held_by(&state, "left"),
+                    "holding_right": held_by(&state, "right"),
+                    "resources_held": field("resources_held"),
+                    "stopped": field("stopped"),
+                    "can_move": field("can_move"),
+                    "cannot_move_reason": field("cannot_move_reason"),
+                    "tilt_deg": field("tilt_deg"),
+                    "teleop": field("teleop"),
+                });
+            }
+            Some(Err(_)) => {
                 out["executor"] = json!("not heard from lately: its state is unknown");
-                return ToolOutcome::ok(out);
-            };
-            let field = |k: &str| state[k].clone();
-            out["executor"] = json!({
-                "mission": field("mission_id"),
-                "step": field("mission_step"),
-                "holding_left": held_by(&state, "left"),
-                "holding_right": held_by(&state, "right"),
-                "resources_held": field("resources_held"),
-                "stopped": field("stopped"),
-                "can_move": field("can_move"),
-                "cannot_move_reason": field("cannot_move_reason"),
-                "tilt_deg": field("tilt_deg"),
-                "teleop": field("teleop"),
-            });
+            }
+            None => {}
         }
         ToolOutcome::ok(out)
     }

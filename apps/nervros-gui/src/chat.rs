@@ -1,7 +1,7 @@
 //! The conversation as the operator sees it: items built from session events, and how each one
 //! is drawn. Colours and sizes come from `re_ui`'s tokens so chat and viewer read as one app.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -110,8 +110,8 @@ pub enum Item {
     Image {
         /// The snapshot id marks refer to.
         id: String,
-        /// Decoded once, uploaded on first draw.
-        pixels: Arc<egui::ColorImage>,
+        /// Decoded once, given up when uploaded on first draw: the texture holds it then.
+        pixels: RefCell<Option<Arc<egui::ColorImage>>>,
         texture: OnceCell<egui::TextureHandle>,
         /// What each numbered mark is, mark 1 first.
         marks: Vec<String>,
@@ -187,6 +187,8 @@ pub struct Chat {
     pub draft: Option<String>,
     /// What the operator said to start each turn, for the Retry of a turn that failed.
     asked: HashMap<u64, String>,
+    /// Each item's height when last drawn: one scrolled out of view takes its space undrawn.
+    heights: RefCell<Vec<f32>>,
 }
 
 impl Item {
@@ -245,7 +247,7 @@ impl Chat {
             } => match decode(jpeg) {
                 Some(pixels) => self.items.push(Item::Image {
                     id: id.clone(),
-                    pixels: Arc::new(pixels),
+                    pixels: RefCell::new(Some(Arc::new(pixels))),
                     texture: OnceCell::new(),
                     marks: marks.clone(),
                     at: SystemTime::now(),
@@ -593,49 +595,71 @@ impl Chat {
             .iter()
             .filter(|i| matches!(i, Item::User { turn: true, .. }))
             .count();
-        for item in &self.items {
-            ui.scope(|ui| {
-                ui.set_max_width(width);
-                match item {
-                    Item::User { text, turn } => {
-                        let keep = turn.then(|| {
-                            later -= 1;
-                            later
-                        });
-                        user_bubble(ui, text, keep, actions);
-                    }
-                    Item::Reply { text, model } => reply(ui, text, model),
-                    Item::Tool(t) => tool_chip(ui, t),
-                    Item::Image {
-                        id,
-                        pixels,
-                        texture,
-                        marks,
-                        at,
-                    } => {
-                        let texture = texture.get_or_init(|| {
-                            let options = egui::TextureOptions::LINEAR;
-                            ui.ctx().load_texture(id, Arc::clone(pixels), options)
-                        });
-                        image_card(ui, id, texture, marks, *at, actions);
-                    }
-                    Item::Approval(a) => {
-                        approval_card(ui, a, self.plan_for(a), approval_ttl, actions);
-                    }
-                    Item::Notice(text) => notice(ui, text),
-                    Item::Error { text, retry } => error_card(ui, text, retry.as_deref(), actions),
-                    Item::Report(text) => report(ui, text),
-                    Item::Plan(p) => plan_card(ui, p, actions),
-                    Item::Unanswered(u, done) => unanswered_card(ui, u, done, actions),
+        let mut heights = self.heights.borrow_mut();
+        heights.resize(self.items.len(), 0.0);
+        let shown = ui.clip_rect();
+        for (item, height) in self.items.iter().zip(heights.iter_mut()) {
+            // A long conversation lays out only what is on screen; the rest keeps its place.
+            let top = ui.cursor().top();
+            if *height > 0.0 && (top + *height < shown.top() || top > shown.bottom()) {
+                if matches!(item, Item::User { turn: true, .. }) {
+                    later -= 1;
                 }
-            });
+                ui.allocate_space(egui::vec2(width, *height));
+                continue;
+            }
+            *height = ui
+                .scope(|ui| {
+                    ui.set_max_width(width);
+                    match item {
+                        Item::User { text, turn } => {
+                            let keep = turn.then(|| {
+                                later -= 1;
+                                later
+                            });
+                            user_bubble(ui, text, keep, actions);
+                        }
+                        Item::Reply { text, model } => reply(ui, text, model),
+                        Item::Tool(t) => tool_chip(ui, t),
+                        Item::Image {
+                            id,
+                            pixels,
+                            texture,
+                            marks,
+                            at,
+                        } => {
+                            let texture = texture.get_or_init(|| {
+                                let options = egui::TextureOptions::LINEAR;
+                                let image = pixels.borrow_mut().take().unwrap_or_else(|| {
+                                    Arc::new(egui::ColorImage::filled([1, 1], Color32::GRAY))
+                                });
+                                ui.ctx().load_texture(id, image, options)
+                            });
+                            image_card(ui, id, texture, marks, *at, actions);
+                        }
+                        Item::Approval(a) => {
+                            approval_card(ui, a, self.plan_for(a), approval_ttl, actions);
+                        }
+                        Item::Notice(text) => notice(ui, text),
+                        Item::Error { text, retry } => {
+                            error_card(ui, text, retry.as_deref(), actions);
+                        }
+                        Item::Report(text) => report(ui, text),
+                        Item::Plan(p) => plan_card(ui, p, actions),
+                        Item::Unanswered(u, done) => unanswered_card(ui, u, done, actions),
+                    }
+                })
+                .response
+                .rect
+                .height();
         }
+        drop(heights);
         if let Some(draft) = self.draft.as_deref().filter(|d| !d.trim().is_empty()) {
             reply(ui, draft, "…");
         }
         if let Some(since) = self.turn {
             ui.horizontal(|ui| {
-                ui.spinner();
+                spinner(ui);
                 let secs = since.elapsed().as_secs();
                 ui.label(
                     RichText::new(format!("Working… {secs} s")).color(ui.tokens().text_subdued),
@@ -764,7 +788,7 @@ fn tool_chip(ui: &mut egui::Ui, t: &ToolCall) {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if t.status.is_none() {
-                    ui.spinner();
+                    spinner(ui);
                 } else {
                     let icon = match t.status {
                         Some(Status::Succeeded | Status::Accepted) => &icons::SUCCESS,
@@ -857,13 +881,34 @@ fn image_card(
 
 /// A JPEG as egui pixels, or `None` if it does not decode.
 fn decode(jpeg: &[u8]) -> Option<egui::ColorImage> {
-    let img = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?;
-    let rgba = img.to_rgba8();
-    let size = [rgba.width(), rgba.height()].map(|v| usize::try_from(v).unwrap_or(0));
-    Some(egui::ColorImage::from_rgba_unmultiplied(
-        size,
-        rgba.as_raw(),
-    ))
+    // A JPEG has no alpha: straight to RGB, one pass fewer.
+    let rgb = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
+        .ok()?
+        .into_rgb8();
+    let size = [rgb.width(), rgb.height()].map(|v| usize::try_from(v).unwrap_or(0));
+    Some(egui::ColorImage::from_rgb(size, rgb.as_raw()))
+}
+
+/// A spinner that moves eight times a second. egui's own redraws the whole window, viewer
+/// included, at the screen's rate for as long as it shows.
+pub fn spinner(ui: &mut egui::Ui) {
+    let size = ui.spacing().interact_size.y * 0.6;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a step of eight, from a time that is never negative"
+    )]
+    let lit = (ui.input(|i| i.time) * 8.0).rem_euclid(8.0) as u8;
+    let colour = ui.tokens().info_text_color;
+    for k in 0u8..8 {
+        let angle = f32::from(k) * std::f32::consts::TAU / 8.0;
+        let at = rect.center() + size * 0.38 * egui::vec2(angle.cos(), angle.sin());
+        let alpha = if k == lit { 1.0 } else { 0.3 };
+        ui.painter()
+            .circle_filled(at, size * 0.1, colour.gamma_multiply(alpha));
+    }
+    ui.ctx().request_repaint_after(Duration::from_millis(125));
 }
 
 fn approval_card(
@@ -938,7 +983,7 @@ fn approval_card(
             }
             None => {
                 if a.checking {
-                    ui.spinner();
+                    spinner(ui);
                     ui.label(RichText::new("Checking the edit…").color(t.text_subdued));
                 } else {
                     let left = time_left(ttl.saturating_sub(a.asked.elapsed()));

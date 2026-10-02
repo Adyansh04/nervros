@@ -49,6 +49,8 @@ const MAX_PLAN_ATTEMPTS: u32 = 4;
 const CRITIC_TIMEOUT: Duration = Duration::from_secs(30);
 /// A hash may be shortened to this many characters when it stays unique.
 const MIN_HASH_PREFIX: usize = 8;
+/// How long a failed catalog fetch stands before a turn asks again.
+const CATALOG_RETRY: Duration = Duration::from_secs(30);
 /// How often the executor is checked on while a mission runs.
 const LIVENESS: Duration = Duration::from_secs(5);
 /// Checks in a row without the executor saying it runs the mission before it is given up as
@@ -118,7 +120,10 @@ pub struct Missions {
     places: Arc<crate::places::Places>,
     profile: Profile,
     config: MissionConfig,
-    catalog: Mutex<Option<Catalog>>,
+    catalog: Mutex<Option<Arc<Catalog>>>,
+    /// When fetching the catalog last failed: a robot without an executor is not asked again
+    /// before every turn.
+    catalog_failed: Mutex<Option<Instant>>,
     planned: Mutex<VecDeque<Compiled>>,
     running: Mutex<Option<Running>>,
     plan_failures: AtomicU32,
@@ -191,6 +196,7 @@ impl Missions {
             profile: profile.clone(),
             config,
             catalog: Mutex::default(),
+            catalog_failed: Mutex::default(),
             planned: Mutex::default(),
             running: Mutex::default(),
             plan_failures: AtomicU32::new(0),
@@ -408,11 +414,11 @@ impl Missions {
     }
 
     /// The catalog, fetched once and kept.
-    async fn catalog(&self) -> Result<Catalog, String> {
+    async fn catalog(&self) -> Result<Arc<Catalog>, String> {
         if let Some(c) = lock(&self.catalog).clone() {
             return Ok(c);
         }
-        let reply = self
+        let fetched = self
             .robot
             .call(
                 &self.config.catalog,
@@ -421,12 +427,31 @@ impl Missions {
                 SERVICE_TIMEOUT,
             )
             .await
-            .map_err(|e| format!("the robot's skill catalog is not available: {e}"))?;
-        let text = reply["catalog_json"].as_str().unwrap_or_default();
-        let catalog =
-            Catalog::parse(text).map_err(|e| format!("the skill catalog is malformed: {e}"))?;
-        *lock(&self.catalog) = Some(catalog.clone());
-        Ok(catalog)
+            .map_err(|e| format!("the robot's skill catalog is not available: {e}"))
+            .and_then(|reply| {
+                let text = reply["catalog_json"].as_str().unwrap_or_default();
+                Catalog::parse(text).map_err(|e| format!("the skill catalog is malformed: {e}"))
+            });
+        match fetched {
+            Ok(catalog) => {
+                let catalog = Arc::new(catalog);
+                *lock(&self.catalog) = Some(Arc::clone(&catalog));
+                Ok(catalog)
+            }
+            Err(e) => {
+                *lock(&self.catalog_failed) = Some(Instant::now());
+                Err(e)
+            }
+        }
+    }
+
+    /// Waits for the catalog before a turn, unless it is in hand or failed lately.
+    async fn catalog_ready(&self) {
+        let failed_lately = lock(&self.catalog_failed).is_some_and(|t| t.elapsed() < CATALOG_RETRY);
+        if lock(&self.catalog).is_some() || failed_lately {
+            return;
+        }
+        let _ = tokio::time::timeout(SERVICE_TIMEOUT / 2, self.catalog()).await;
     }
 
     async fn latest(&self, topic: Option<&crate::profile::TopicRef>) -> Value {
@@ -1391,19 +1416,24 @@ impl Missions {
 
     pub(crate) async fn observe(&self) -> Observed {
         let world = self.profile.world.as_ref();
-        let rooms = self.latest(world.and_then(|w| w.rooms.as_ref())).await;
-        let objects = self.latest(world.and_then(|w| w.objects.as_ref())).await;
+        // Read together: with the world model down, each waits its full time.
+        let state = async {
+            self.robot
+                .latest(&self.config.state, STATE, WORLD_WAIT)
+                .await
+                .unwrap_or(Value::Null)
+        };
+        let (rooms, objects, state) = tokio::join!(
+            self.latest(world.and_then(|w| w.rooms.as_ref())),
+            self.latest(world.and_then(|w| w.objects.as_ref())),
+            state
+        );
         let (map, base) = (&self.profile.ros.map_frame, &self.profile.ros.base_frame);
         let pose = self
             .robot
             .transform(map, base)
             .ok()
             .map(|t| (t.translation[0], t.translation[1]));
-        let state = self
-            .robot
-            .latest(&self.config.state, STATE, WORLD_WAIT)
-            .await
-            .unwrap_or(Value::Null);
         Observed {
             pose,
             places: self.places.all(),
@@ -1562,7 +1592,7 @@ impl Tool for RunMission {
 
     /// The skill list loads when the session starts; a first message sent at once would see none.
     async fn ready(&self) {
-        let _ = tokio::time::timeout(SERVICE_TIMEOUT / 2, self.0.catalog()).await;
+        self.0.catalog_ready().await;
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {

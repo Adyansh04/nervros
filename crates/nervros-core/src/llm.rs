@@ -135,6 +135,9 @@ pub struct Llm {
     keys: HashMap<String, SecretString>,
     /// Why a provider's key could not be loaded; its models fail with this when asked.
     missing_keys: HashMap<String, String>,
+    /// One HTTP client per provider, made once: it keeps its connections open between calls and
+    /// reads the system's certificates once, not on every request.
+    http: HashMap<String, Result<reqwest::Client, String>>,
 }
 
 impl std::fmt::Debug for Llm {
@@ -170,10 +173,17 @@ impl Llm {
                 }
             }
         }
+        let http = router
+            .config()
+            .providers
+            .iter()
+            .map(|p| (p.id.clone(), http_client(p).map_err(|e| e.to_string())))
+            .collect();
         Self {
             router,
             keys,
             missing_keys,
+            http,
         }
     }
 
@@ -227,7 +237,16 @@ impl Llm {
             });
         }
         let key = self.keys.get(&provider.id);
-        let http = http_client(provider)?;
+        let http = match self.http.get(&provider.id) {
+            Some(Ok(client)) => client.clone(),
+            Some(Err(why)) => {
+                return Err(LlmError::Client {
+                    provider: provider.id.clone(),
+                    message: why.clone(),
+                });
+            }
+            None => http_client(provider)?,
+        };
         match provider.kind {
             ProviderKind::OpenaiCompat => {
                 let base = provider.base_url.as_deref().unwrap_or_default();

@@ -261,7 +261,7 @@ impl R2rPort {
         ty: &str,
         wait: Duration,
         max_age: Option<Duration>,
-    ) -> Result<Value, RosError> {
+    ) -> Result<Arc<Value>, RosError> {
         let mut rx = self.subscription(topic, ty).await?;
         let fresh = |s: &Option<Sample>| {
             s.as_ref()
@@ -270,7 +270,7 @@ impl R2rPort {
         match tokio::time::timeout(wait, rx.wait_for(fresh)).await {
             Ok(Ok(s)) => s
                 .as_ref()
-                .map(|s| Value::clone(&s.value))
+                .map(|s| Arc::clone(&s.value))
                 .ok_or_else(|| RosError::NoData(topic.to_owned())),
             _ => Err(RosError::NoData(topic.to_owned())),
         }
@@ -305,6 +305,20 @@ impl Drop for R2rPort {
             && t.join().is_err()
         {
             tracing::warn!("the ROS node thread panicked");
+        }
+    }
+}
+
+/// Destroys a publisher when dropped.
+struct Destroy<'a> {
+    cmd: &'a std_mpsc::Sender<Cmd>,
+    publisher: Option<r2r::PublisherUntyped>,
+}
+
+impl Drop for Destroy<'_> {
+    fn drop(&mut self) {
+        if let Some(publisher) = self.publisher.take() {
+            let _ = self.cmd.send(Cmd::DestroyPublisher { publisher });
         }
     }
 }
@@ -732,12 +746,20 @@ impl RobotPort for R2rPort {
             Ok(Ok(Ok(parts))) => parts,
         };
         let (fb_tx, fb_rx) = mpsc::channel(64);
+        // r2r never ends a goal's feedback stream, so this ends when the goal's reader goes.
         tokio::spawn(async move {
-            while let Some(item) = feedback.next().await {
-                if let Ok(v) = item
-                    && fb_tx.send(v).await.is_err()
-                {
-                    break;
+            loop {
+                tokio::select! {
+                    () = fb_tx.closed() => break,
+                    item = feedback.next() => match item {
+                        Some(Ok(v)) => {
+                            if fb_tx.send(v).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Err(_)) => {}
+                        None => break,
+                    },
                 }
             }
         });
@@ -767,6 +789,17 @@ impl RobotPort for R2rPort {
     }
 
     async fn latest(&self, topic: &str, ty: &str, wait: Duration) -> Result<Value, RosError> {
+        self.newest(topic, ty, wait, None)
+            .await
+            .map(|v| Value::clone(&v))
+    }
+
+    async fn latest_shared(
+        &self,
+        topic: &str,
+        ty: &str,
+        wait: Duration,
+    ) -> Result<Arc<Value>, RosError> {
         self.newest(topic, ty, wait, None).await
     }
 
@@ -777,7 +810,9 @@ impl RobotPort for R2rPort {
         wait: Duration,
         max_age: Duration,
     ) -> Result<Value, RosError> {
-        self.newest(topic, ty, wait, Some(max_age)).await
+        self.newest(topic, ty, wait, Some(max_age))
+            .await
+            .map(|v| Value::clone(&v))
     }
 
     fn frames(&self, topic: &str) -> Result<watch::Receiver<Option<Arc<Frame>>>, RosError> {
@@ -950,19 +985,33 @@ impl RobotPort for R2rPort {
             reply,
         })?;
         let publisher = rx.await.map_err(mw)?.map_err(|e| type_error(ty, &e))?;
+        // Destroyed however the call ends, a stop of the turn included.
+        let held = Destroy {
+            cmd: &self.cmd,
+            publisher: Some(publisher),
+        };
+        // Borrowed a statement at a time: a publisher may not be shared across threads, and the
+        // waits below may move this call to another.
         // A new publisher is not matched at once; waiting a moment keeps the first message.
-        if let Ok(wait) = publisher.wait_for_inter_process_subscribers() {
+        let wait = held
+            .publisher
+            .as_ref()
+            .and_then(|p| p.wait_for_inter_process_subscribers().ok());
+        if let Some(wait) = wait {
             let _ = tokio::time::timeout(Duration::from_secs(2), wait).await;
         }
-        let matched = publisher
-            .get_inter_process_subscription_count()
+        let matched = held
+            .publisher
+            .as_ref()
+            .and_then(|p| p.get_inter_process_subscription_count().ok())
             .unwrap_or(0);
         let mut result = Ok(matched);
         for i in 0..count {
             if i > 0 {
                 tokio::time::sleep(period).await;
             }
-            if let Err(e) = publisher.publish(message.clone()) {
+            let sent = held.publisher.as_ref().map(|p| p.publish(message.clone()));
+            if let Some(Err(e)) = sent {
                 result = Err(RosError::Conversion {
                     name: topic.to_owned(),
                     message: e.to_string(),
@@ -972,7 +1021,7 @@ impl RobotPort for R2rPort {
         }
         // Reliable delivery needs the publisher a moment longer.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        self.send(Cmd::DestroyPublisher { publisher })?;
+        drop(held);
         result
     }
 

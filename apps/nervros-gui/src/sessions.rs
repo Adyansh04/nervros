@@ -1,5 +1,6 @@
 //! Earlier sessions whose conversations were saved, for the Agent tab to resume.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,9 +22,53 @@ pub struct SessionInfo {
     pub messages: usize,
 }
 
-/// The saved conversations under `logs`, newest first, without the running session's own.
-#[must_use]
-pub fn list(logs: &Path, current_log: &Path) -> Vec<SessionInfo> {
+/// The saved conversations seen so far, each with the time its file was written: a file is read
+/// again only once it changes, so listing them every few seconds costs a folder listing.
+#[derive(Default)]
+pub struct Listing {
+    read: HashMap<PathBuf, (SystemTime, Option<SessionInfo>)>,
+}
+
+impl Listing {
+    /// The saved conversations under `logs`, newest first, without the running session's own.
+    pub fn list(&mut self, logs: &Path, current_log: &Path) -> Vec<SessionInfo> {
+        let mut out = Vec::new();
+        for (stamp, path) in newest(logs, current_log) {
+            let written = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            let fresh = self.read.get(&path).filter(|(at, _)| *at == written);
+            let info = if let Some((_, info)) = fresh {
+                info.clone()
+            } else {
+                let info = read(stamp, &path);
+                self.read.insert(path, (written, info.clone()));
+                info
+            };
+            out.extend(info.map(|i| SessionInfo {
+                when: ago(stamp),
+                ..i
+            }));
+        }
+        out
+    }
+}
+
+/// One saved conversation, read whole.
+fn read(stamp: u64, path: &Path) -> Option<SessionInfo> {
+    let history = History::load(path).ok()?;
+    let exchanges = history.exchanges();
+    let first = exchanges.iter().find(|(operator, _)| *operator)?.1.clone();
+    Some(SessionInfo {
+        when: ago(stamp),
+        first: shorten(&first, 48),
+        messages: exchanges.len(),
+        path: path.to_path_buf(),
+    })
+}
+
+/// The newest saved conversations' files and stamps, without the running session's own.
+fn newest(logs: &Path, current_log: &Path) -> Vec<(u64, PathBuf)> {
     let own = current_log.with_extension("history.json");
     let mut found: Vec<(u64, PathBuf)> = std::fs::read_dir(logs)
         .map(|d| {
@@ -41,21 +86,8 @@ pub fn list(logs: &Path, current_log: &Path) -> Vec<SessionInfo> {
         })
         .unwrap_or_default();
     found.sort_by_key(|(stamp, _)| std::cmp::Reverse(*stamp));
+    found.truncate(LISTED);
     found
-        .into_iter()
-        .take(LISTED)
-        .filter_map(|(stamp, path)| {
-            let history = History::load(&path).ok()?;
-            let exchanges = history.exchanges();
-            let first = exchanges.iter().find(|(operator, _)| *operator)?.1.clone();
-            Some(SessionInfo {
-                when: ago(stamp),
-                first: shorten(&first, 48),
-                messages: exchanges.len(),
-                path,
-            })
-        })
-        .collect()
 }
 
 fn shorten(text: &str, max: usize) -> String {

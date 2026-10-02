@@ -560,6 +560,8 @@ struct Shared {
     guard: Arc<Guard>,
     /// The robot's stop: always allowed, whoever asks and however busy the turn.
     stop: Option<Arc<dyn Tool>>,
+    /// The conversation to write next, for the writer that keeps the disk off this loop.
+    to_save: Option<tokio::sync::watch::Sender<Option<History>>>,
     config: SessionConfig,
 }
 
@@ -1104,6 +1106,7 @@ impl Session {
         config: SessionConfig,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let to_save = config.history_file.clone().map(writer);
         // A streamed reply sends an event per piece; a slow reader falls behind only past this.
         let (events, _) = broadcast::channel(EVENT_BACKLOG);
         let shared = Arc::new(Shared {
@@ -1119,6 +1122,7 @@ impl Session {
             waiting: Mutex::default(),
             guard,
             stop,
+            to_save,
             config,
         });
         tokio::spawn(actor(rx, shared, source, registry));
@@ -1336,13 +1340,30 @@ fn compaction(
     })
 }
 
-/// Writes the conversation where the session keeps it, if it keeps it anywhere.
+/// Hands the conversation to its writer, if the session keeps it anywhere.
 fn save(shared: &Shared, history: &History) {
-    if let Some(file) = &shared.config.history_file
-        && let Err(e) = history.save(file)
-    {
-        tracing::warn!(error = %e, "the conversation was not saved");
+    if let Some(to_save) = &shared.to_save {
+        to_save.send_replace(Some(history.clone()));
     }
+}
+
+/// Writes each conversation handed to it to `file`, in order, newest only when several wait: a
+/// slow disk holds up neither a stop nor the next turn.
+fn writer(file: std::path::PathBuf) -> tokio::sync::watch::Sender<Option<History>> {
+    let (tx, mut rx) = tokio::sync::watch::channel(None::<History>);
+    tokio::spawn(async move {
+        while rx.changed().await.is_ok() {
+            let Some(history) = rx.borrow_and_update().clone() else {
+                continue;
+            };
+            let file = file.clone();
+            let written = tokio::task::spawn_blocking(move || history.save(&file)).await;
+            if let Ok(Err(e)) = written {
+                tracing::warn!(error = %e, "the conversation was not saved");
+            }
+        }
+    });
+    tx
 }
 
 /// Before a turn, condenses a history past half the first candidate's window.

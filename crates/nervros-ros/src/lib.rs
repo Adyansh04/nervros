@@ -277,6 +277,17 @@ pub trait RobotPort: Send + Sync {
     /// old it is: a latched map is as good as ever.
     async fn latest(&self, topic: &str, msg_type: &str, wait: Duration) -> Result<Value, RosError>;
 
+    /// As [`RobotPort::latest`], shared rather than copied: a reader that polls a large message,
+    /// such as a map, tells a new one by pointer and copies nothing.
+    async fn latest_shared(
+        &self,
+        topic: &str,
+        msg_type: &str,
+        wait: Duration,
+    ) -> Result<Arc<Value>, RosError> {
+        self.latest(topic, msg_type, wait).await.map(Arc::new)
+    }
+
     /// As [`RobotPort::latest`], but only a message that arrived within `max_age`, waiting up to
     /// `wait` for one: what a publisher said before it went quiet is not its state now.
     /// A port that keeps no arrival times answers as `latest` does.

@@ -4,7 +4,7 @@
 //! robot at fixed rates and logs only what changed, which bounds what the viewer stores and keeps
 //! it idle while the robot is.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +17,7 @@ use nervros_ros::{RobotPort, Transform};
 use rerun::external::re_log_channel::{self, LogReceiver, LogSource};
 use rerun::sink::CallbackSink;
 use rerun::{AsComponents, RecordingStream, RecordingStreamBuilder};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
@@ -256,7 +256,7 @@ impl Spawner {
             );
             let (objects, mut drawn) = (
                 self.layer("Objects", "world/objects", true),
-                BTreeSet::new(),
+                BTreeMap::new(),
             );
             self.watch(
                 world.objects.clone(),
@@ -354,7 +354,7 @@ async fn scan(
             continue;
         }
         let Ok(msg) = robot
-            .latest(&topic, "sensor_msgs/msg/LaserScan", TOPIC_WAIT)
+            .latest_shared(&topic, "sensor_msgs/msg/LaserScan", TOPIC_WAIT)
             .await
         else {
             continue;
@@ -615,15 +615,22 @@ fn pose_model(
         if last.as_ref().is_some_and(|l| !moved(l, &t)) {
             continue;
         }
+        // The frames' names never change: logged once, not with every pose.
+        if last.is_none() {
+            put_static(
+                rec,
+                &frame.entity,
+                &rerun::Transform3D::update_fields()
+                    .with_parent_frame(frame.parent.as_str())
+                    .with_child_frame(frame.tf.1.as_str()),
+            );
+        }
         put(
             rec,
             &frame.entity,
-            &rerun::Transform3D::from_translation_rotation(
-                f32s(t.translation),
-                rerun::Quaternion::from_xyzw(f32s(t.rotation)),
-            )
-            .with_parent_frame(frame.parent.as_str())
-            .with_child_frame(frame.tf.1.as_str()),
+            &rerun::Transform3D::update_fields()
+                .with_translation(f32s(t.translation))
+                .with_rotation(rerun::Quaternion::from_xyzw(f32s(t.rotation))),
         );
         *last = Some(t);
     }
@@ -725,26 +732,30 @@ async fn sample(
 ) {
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut last = Value::Null;
+    let mut last: Option<Arc<Value>> = None;
     loop {
         tick.tick().await;
         if !layer.shown() {
-            if !last.is_null() {
+            if last.take().is_some() {
                 layer.clear(&rec);
-                last = Value::Null;
             }
             continue;
         }
         let Ok(msg) = robot
-            .latest(&topic.topic, &topic.msg_type, TOPIC_WAIT)
+            .latest_shared(&topic.topic, &topic.msg_type, TOPIC_WAIT)
             .await
         else {
             continue;
         };
-        if msg != last {
+        // The same message is the same pointer, a map included: compared whole only when a new
+        // one arrived, and drawn only when it differs.
+        let same = last
+            .as_ref()
+            .is_some_and(|l| Arc::ptr_eq(l, &msg) || **l == *msg);
+        if !same {
             draw(&rec, &layer.path, &msg);
-            last = msg;
         }
+        last = Some(msg);
     }
 }
 
@@ -1089,13 +1100,25 @@ fn draw_object_names(rec: &RecordingStream, path: &str, msg: &Value) {
 
 /// Objects from a `canopy_msgs/msg/WorldObjectArray`, one entity each so a click in the viewer
 /// names the object; stale ones are faded, and ones that went away are cleared.
-fn draw_objects(rec: &RecordingStream, path: &str, msg: &Value, drawn: &mut BTreeSet<String>) {
+fn draw_objects(
+    rec: &RecordingStream,
+    path: &str,
+    msg: &Value,
+    drawn: &mut BTreeMap<String, Value>,
+) {
     let list = msg["objects"].as_array().map_or(&[][..], Vec::as_slice);
-    let mut now = BTreeSet::new();
+    let mut now = BTreeMap::new();
     for o in list.iter().filter(|o| o["state"].as_u64() != Some(REMOVED)) {
         let Some(id) = o["id"].as_str().filter(|i| !i.is_empty()) else {
             continue;
         };
+        // Only what changes how it is drawn; one object's change redraws that object alone.
+        let looks = json!([o["pose"], o["size"], o["state"], o["label"], o["name"]]);
+        let unchanged = drawn.get(id) == Some(&looks);
+        now.insert(id.to_owned(), looks);
+        if unchanged {
+            continue;
+        }
         let q = &o["pose"]["orientation"];
         let w = q["w"].as_f64().unwrap_or(1.0);
         let label = o["label"].as_str().unwrap_or_default();
@@ -1122,9 +1145,8 @@ fn draw_objects(rec: &RecordingStream, path: &str, msg: &Value, drawn: &mut BTre
             .with_show_labels(false)
             .with_colors([object_colour(label, alpha)]),
         );
-        now.insert(id.to_owned());
     }
-    for gone in drawn.difference(&now) {
+    for gone in drawn.keys().filter(|id| !now.contains_key(*id)) {
         put_static(rec, &format!("{path}/{gone}"), &rerun::Clear::flat());
     }
     #[expect(clippy::cast_precision_loss, reason = "far fewer objects than 2^52")]
@@ -1167,19 +1189,19 @@ fn plot(
     async move {
         let mut tick = interval(POSE_PERIOD);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut last = Value::Null;
+        let mut last: Option<Arc<Value>> = None;
         while tokio::time::Instant::now() < until {
             tick.tick().await;
-            let Ok(msg) = robot.latest(&topic, &ty, TOPIC_WAIT).await else {
+            let Ok(msg) = robot.latest_shared(&topic, &ty, TOPIC_WAIT).await else {
                 continue;
             };
             // The newest message stays until the next arrives: draw each once.
-            if msg != last {
+            if !last.as_ref().is_some_and(|l| Arc::ptr_eq(l, &msg)) {
                 let value = nervros_core::watch::field(&msg, &field).and_then(Value::as_f64);
                 if let Some(v) = value {
                     put(&rec, &path, &rerun::Scalars::single(v));
                 }
-                last = msg;
+                last = Some(msg);
             }
         }
     }
