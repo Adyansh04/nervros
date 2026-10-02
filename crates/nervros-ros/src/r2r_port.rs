@@ -137,7 +137,13 @@ pub struct R2rPort {
     /// Set to end the spin loop: kept publishers hold the command channel open.
     stopping: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// When the node started: until discovery has had its time, the graph may not yet list a
+    /// publisher that exists.
+    started: Instant,
 }
+
+/// How long discovery takes to list the publishers already running.
+const DISCOVERY: Duration = Duration::from_secs(3);
 
 impl std::fmt::Debug for R2rPort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -190,6 +196,7 @@ impl R2rPort {
             tf,
             stopping,
             thread: Some(thread),
+            started: Instant::now(),
         })
     }
 
@@ -263,6 +270,17 @@ impl R2rPort {
         max_age: Option<Duration>,
     ) -> Result<Arc<Value>, RosError> {
         let mut rx = self.subscription(topic, ty).await?;
+        let nothing_yet = rx.borrow().is_none();
+        // Nothing yet and nobody publishing: there is nothing to wait for.
+        if nothing_yet
+            && self.started.elapsed() > DISCOVERY
+            && self
+                .endpoints(topic)
+                .await
+                .is_ok_and(|e| e.publishers.is_empty())
+        {
+            return Err(RosError::NoData(topic.to_owned()));
+        }
         let fresh = |s: &Option<Sample>| {
             s.as_ref()
                 .is_some_and(|s| max_age.is_none_or(|max| s.at.elapsed() <= max))
