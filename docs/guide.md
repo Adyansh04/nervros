@@ -1,11 +1,24 @@
 # Using NervROS
 
-This guide walks through NervROS the way an operator uses it: asking what the robot sees, giving
-it tasks, checking on it, and looking after it from the command line. Every prompt and reply
-is from a real run: a simulated Unitree G1 in a six-room apartment
-([grove-g1](https://github.com/Adyansh04/grove-g1)), with the local Qwen3.5-9B model answering.
-The [README](../README.md) has the setup; the [profile](profile.md), [models](models.md) and
-[executor](executor.md) pages have every setting.
+Every way to use NervROS, each with a short clip and the exact words typed. The clips are real
+runs: a simulated Unitree G1 in a six-room apartment ([grove-g1](https://github.com/Adyansh04/grove-g1)),
+answered by the local Qwen3.5-9B model. Missions play three or four times faster, and the
+23-minute mapping run keeps only its start and end; the rest is real time. Setup is in the [README](../README.md); every setting is in the [profile](profile.md),
+[models](models.md) and [executor](executor.md) pages.
+
+- [The window](#the-window)
+- [Asking what it sees](#asking-what-it-sees)
+- [Giving it a task](#giving-it-a-task)
+- [Clicking in the 3D view](#clicking-in-the-3d-view)
+- [Commands without the model](#commands-without-the-model)
+- [Driving by hand](#driving-by-hand)
+- [Keeping an eye on it](#keeping-an-eye-on-it)
+- [Remembering](#remembering)
+- [Mapping a new building](#mapping-a-new-building)
+- [Finishing the map](#finishing-the-map)
+- [Sessions and models](#sessions-and-models)
+- [The command line](#the-command-line)
+- [Keys](#keys)
 
 ## The window
 
@@ -14,83 +27,95 @@ source scripts/ros-env.sh
 cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 ```
 
-<!-- image window.png: The window at the start of a session -->
+![The window: chat, 3D world and cameras, dock](https://github.com/user-attachments/assets/d0e52596-0a56-49af-a0d3-42b28c34d7ef)
 
-- The top bar names the robot and shows the ROS graph, the mission executor and the model at a
-  glance. The switch on the right arms the robot: until it is armed, the agent can look and
-  answer but not act. **Stop mission** is always there.
-- The chat is on the left. Enter sends, Shift+Enter adds a line, and Esc stops the reply.
-- In the middle is the viewer: the map with its rooms and objects, the robot, the cameras with
-  what the detector marks, and the agent's log, all on one timeline you can scrub back.
-- The dock on the right holds the tabs: Mission, World, Layers, Approvals, Events, Agent, Doctor
-  and Robot (Ctrl+1 to Ctrl+8).
-- The status bar shows how full the model's context is and how much of it came from the model
-  server's cache. Ctrl+K opens the command palette, and each command also runs as a `/word` in
-  the chat, such as `/look`, `/arm` or `/compact`.
+- **Top bar:** the robot, then the state of ROS, the mission executor and the model. On the
+  right: the arming switch (until it is on, the agent can look and answer but not act),
+  **Reset layout**, **Follow robot**, **Edit world**, **Dock** and **Stop mission**, which is
+  always there.
+- **Chat, left:** Enter sends, Shift+Enter adds a line, Esc stops the reply.
+- **Viewer, middle:** the 3D world (map, rooms, objects, the robot, where it walked and is about
+  to walk), the cameras with what the detector marks, and below them the mission's steps over
+  time, the agent's log and plots. It is one timeline you can scrub back.
+- **Dock, right:** Mission, World, Layers, Approvals, Events, Agent, Doctor and Robot
+  (Ctrl+1 to Ctrl+8). A waiting approval turns its tab amber.
+- **Status bar:** whether the agent is working, how full the model's context is, and how much of
+  it came from the model server's cache.
 
 ## Asking what it sees
 
+https://github.com/user-attachments/assets/84720295-ae66-47d6-a6be-060d07b3e0eb
+
 > **You:** What can you see right now?
+>
+> **NervROS:** I can see a red wardrobe (mark 1) with two doors, positioned against a plain wall
+> on a wooden floor.
 
-The agent calls `look`: the newest camera frame, with each detection drawn as a numbered mark.
-The model answers about the marks by number, and you can refer to them the same way.
+`look` takes the newest camera frame and draws each detection as a numbered mark, which you and
+the model both refer to by number. Under the image, **Show in 3D** pauses the viewer at the
+moment the snapshot was taken, and **Ask about it** starts a message about it.
 
-<!-- image look.png: look: the desk with five numbered marks -->
+> **You:** Where is the small white mug?
+>
+> **NervROS:** I found the small white mug (O783) in room R1. It's located at position x=-1.91,
+> y=2.67 meters with a height of 0.78 meters. Would you like me to pick it up?
 
-> **NervROS:** The chest camera shows a green desk with drawers on the left, holding a brown tray
-> (mark 5) and a blue laptop (mark 4). A chair (mark 3) is partially visible under the desk. The
-> scene includes wooden flooring and plain walls. There's also a mug detected (mark 1).
+`find_objects` searches the world model, which remembers everything the cameras have seen,
+room by room.
 
-<!-- video: look.mp4 -->
+> **You:** Which rooms do you know, and how much of each have you seen?
 
-**Show in 3D** pauses the viewer at the moment the snapshot was taken, where the robot was and
-what the world model held then, and **Ask about it** starts a message about that snapshot. "Look closer at mark 1" crops the mark from the
-full frame at a higher resolution for the vision model, for a label or a small part.
+`list_places` answers with each room's type, how much of its floor and walls the camera has
+seen, and how many objects it holds, then the named places.
 
-### Pointing and segmenting
+### Pointing and outlining
+
+https://github.com/user-attachments/assets/f32f4b9b-bd5e-4961-a186-ebc9150aff91
 
 > **You:** Point at the tray.
 >
-> **NervROS:** I've pointed at the tray (mark 5). The pointer is now shown as a ring on the brown
-> tray on the desk.
-
-<!-- image point.png: point: a ring on the tray -->
-
-`point` asks a vision model, so it also finds things the detector never marked. `segment`
-outlines whatever you name:
-
-> **You:** Segment the floor in the chest camera.
+> **NervROS:** I've pointed at the tray. You can see it marked as mark 4 in the image.
 >
-> **NervROS:** I've segmented the floor in the chest camera view. The segmented region (mark 1)
-> covers about 54.7% of the frame and shows the wooden floor with the rectangular mat/rug visible.
+> **You:** Outline the desk.
+>
+> **NervROS:** I've outlined the desk in the image. The desk is marked as region 1 and covers
+> about 11.5% of the frame.
 
-<!-- image segment.png: segment: the floor outlined -->
-
-<!-- videos: point.mp4, segment.mp4 -->
-
-### Finding things
-
-`find_objects` searches the world model, which remembers what the robot has seen around the
-building, room by room:
-
-> **You:** Where is the small white mug?
-
-The World tab lists the rooms and objects, and clicking an object, a room or a point on the map
-offers messages about it, such as "Walk to O17 (shelf).", in the composer for you to send.
-
-<!-- image tab-world.png: The World tab -->
+`point` asks a vision model, so it finds things the detector never marked, and draws a ring where
+it points. `segment` outlines what you name, from a vision model or the robot's own segmentation
+service.
 
 ## Giving it a task
 
-Anything that moves the robot is a mission. The agent writes a plan from the robot's own skills,
-NervROS compiles it to a behaviour tree, the executor checks it, and only then does it reach you.
+Anything that moves the robot is a mission. The agent writes a plan from the robot's own
+skills, NervROS compiles it to a behaviour tree, the executor checks it, and only then does it
+reach you, as a card to approve.
 
-### A plan checked against your words
+### Walking somewhere
+
+https://github.com/user-attachments/assets/34cf6674-b1e5-4dec-81d7-1bfdb72a0d9f
+
+> **You:** Walk to the bedroom, room R3.
+
+The plan card lists each step with its track record on this robot ("13 of 15 · 24 s"), and the
+viewer draws the planned path. While it runs, each step shows its live state, the Mission tab
+shows the behaviour tree node by node, and the timeline strip shows it over time. When it ends,
+the agent gets a report with its goal checks:
+
+```text
+report> Mission 01a0feba (Walk to the bedroom, room R3) ended: success after 24 s.
+        Goal checks: at(R3) holds (the robot is in R3).
+```
+
+### A short one, and the plan check
+
+https://github.com/user-attachments/assets/a0839b5c-ef27-43ef-b483-2c50629f3e90
 
 > **You:** Turn left 90 degrees.
 
-The model's first plan was `TurnInPlace(degrees=-90)`, a right turn. It never reached the
-approval card:
+Plans are checked against your words: left or right, forward or back, how far, how much, which
+hand. Here the model got the sign right. In an earlier run its first plan was
+`TurnInPlace(degrees=-90)`, a right turn, and it never reached the card:
 
 ```text
 run_mission failed s1: the operator said turn left, but degrees=-90 turns the other way
@@ -98,133 +123,155 @@ run_mission failed s1: the operator said turn left, but degrees=-90 turns the ot
 right, send it again unchanged and the operator sees these concerns when approving
 ```
 
-The model fixed it, and the card asked for the corrected plan:
-
-<!-- image plan-check.png: The plan check sending the plan back, then the approval card -->
-
-```text
-? approve run_mission: runs "turn left 90 degrees": 1 step(s), at most 1 min
-report> Mission 01a0fc74 (turn left 90 degrees) ended: success after 2 s.
-```
-
-<!-- video: turn-left.mp4 -->
-
-The checks cover left and right, forward and back, how far, how much and which hand, for the
-skills the profile's `[mission.checks]` names. When the model insists, the concern stays on the
-card with a one-click fix. **Edit** changes, drops or moves a step before you approve.
-
-### Walking somewhere
-
-> **You:** Go to the bedroom.
-
-<!-- image walk-approval.png: The walk's approval, with the path previewed in the viewer -->
-
-The plan card shows each step's track record on this robot ("4 of 4 · 21 s"), and the viewer
-previews where the walk goes. When the mission ends, the agent gets a report with its goal
-checks:
-
-```text
-report> Mission 01a0fc74 (go to the bedroom (room C)) ended: success after 29 s.
-        Goal checks: at(R3) holds (the robot is in R3).
-```
-
-<!-- video: go-to-the-bedroom.mp4 -->
+When the model insists, the concern stays on the card with a one-click fix. **Edit** changes,
+drops or moves a step before you approve.
 
 ### Fetching something
 
+https://github.com/user-attachments/assets/dc4712e6-81cc-4f7a-b986-baae0cda8bf9
+
 > **You:** Bring the small white mug from the dining table to the tray on the office desk.
 
-The executor refused the first plan for naming objects by the wrong ids (`s3: object_id must be
-one of: mug_4; s6: container_id must be one of: tray_1`); the second plan went through as four
-steps:
+The plan has four steps, and the card tracks each live while the arms work (the clip plays
+four times faster while the mission runs):
 
 ```text
 plan: GoToPlace(place=dining_table_side) -> PickObject(object_id=mug_4, arm=left)
       -> GoToPlace(place=office_desk_tray) -> PlaceInto(container_id=tray_1, arm=left)
 ```
 
-<!-- image pick-and-place.png: The mission running: each step's state, track record and the preview -->
-
-The Mission tab shows the behaviour tree as it runs, node by node, and the missions before it:
-
-<!-- image mission-tab.png: The Mission tab: the plan and its behaviour tree, all done -->
-
-After five minutes:
+Under three minutes later the report comes back with its checks. The world model could not judge
+"inside" for these two objects, which only the arm's detector knows, so the camera did: the
+detector marks a mug inside the tray's box.
 
 ```text
-report> Mission 01a0fc75 (go to the dining table to pick up the mug) ended: success after 298 s.
-        Camera check, before and after: inside(mug_4, tray_1): the camera agrees.
+report> Mission 01a0ff3c (Bring the small white mug from the dining table to the tray on the
+        office desk) ended: success after 170 s. Camera check: inside(mug_4, tray_1): the
+        camera agrees: the detector marks a mug (mark 1) in or on the tray (mark 5).
 ```
 
-<!-- videos: pick-and-place.mp4 (its first four minutes), health-check.mp4 (the end) -->
+> **NervROS:** The mission was successful! The small white mug has been brought from the dining
+> table to the tray on the office desk.
+
+The Mission tab shows the behaviour tree as it runs, node by node, beside the track record of
+each step and the missions before it.
 
 A failed mission comes back with the step that failed, why, and what the world model saw of the
 object it was about; the agent then proposes a changed plan for you to approve. A mission keeps
-running while you talk: "Check the robot's health" above was asked halfway through.
+running while you talk.
 
 ### Stopping
 
+https://github.com/user-attachments/assets/8a2d0caa-46ec-472e-8664-ebf82297b63b
+
+> **You:** Walk to the office, room R4.
+>
 > **You:** Stop.
 
 A plain "stop" (or "halt", "freeze", "stop!") never waits on a model: it stops the reply and the
-robot at once, through the executor's `StopAll`. Esc stops only the reply, and **Stop mission**
-or Ctrl+Shift+S stops the robot.
+robot at once, through the executor's `StopAll`. In the clip the walk had run for seven seconds:
 
 ```text
 [halted: stopped by the operator: reply and robot]
-[the robot stopped: {"stopped":true,"state":"holding posture; hands empty"}]
+[the robot stopped: holding posture; hands empty]
+report> Mission 01a0febc (Walk to the office, room R4) ended: canceled after 9 s.
+        It was stopped during s1 GoToPlace(place=R4) (stopped: operator).
 ```
 
-<!-- image stop.png: Stop, typed in the chat -->
-
-<!-- video: stop.mp4 -->
-
-A stop never opens a hand: a robot holding a mug keeps it. While a mission runs, the window sends
-the executor a heartbeat, so a mission whose window closed or hung stops by itself.
+Esc stops only the reply;
+**Stop mission** or Ctrl+Shift+S stops the robot. A stop never opens a hand: a robot holding a
+mug keeps it. While a mission runs, the window sends the executor a heartbeat, so a mission
+whose window closed or hung stops by itself.
 
 ### Doing it again
 
-- "Save that as the evening check" keeps a plan that worked, and "Run the evening check" runs it
+- "Save that as the evening check" keeps a plan that worked; "Run the evening check" runs it
   again. The Mission tab lists saved plans.
-- "Every 30 minutes, walk through the rooms, 6 times" makes a schedule, approved once for every
-  run. A schedule can also wait for something: an object of a kind appearing, or a condition on a
-  topic. Stopping the robot cancels every schedule.
+- A schedule runs a plan on a clock or when something happens, approved once for every run
+  (see [Keeping an eye on it](#keeping-an-eye-on-it)). Stopping the robot cancels every schedule.
 - Requests no skill can do are logged as skill gaps, for whoever writes the next skill.
+
+## Clicking in the 3D view
+
+https://github.com/user-attachments/assets/a6f03d25-e631-441d-940b-dda37a833435
+
+Click a room, an object or a point on the floor in the 3D view: it lights up, and a bar above the
+message box offers what the agent can do with it. **Go there** plans the walk at once, for you to approve;
+the other buttons fill in a message for you to send. In the clip: the office, **Go there**; then
+the desk, **What is it?**, which sends "Tell me about O47 (desk).":
+
+> **NervROS:** O47 is a large grey metal desk with multiple drawers on both sides. It measures 2m
+> x 0.95m and is about 0.88m tall.
+
+**Follow robot** in the top bar keeps the 3D view on the robot as it walks; off, the view frames
+the whole map.
+
+## Commands without the model
+
+https://github.com/user-attachments/assets/4fdabfda-5e5e-4c1d-a830-6af4db0a406b
+
+Ctrl+K opens the command palette: type a few letters and Enter. Every command also runs as a
+`/word` typed in the chat. Most need no model: they open a tab, change the view or stop the
+robot; `/look`, `/places` and `/explore` send their request to the agent. In the clip: Ctrl+K,
+"follow", Enter; then `/layers` and `/doctor`.
+
+| Command | |
+|---|---|
+| `/look` | Ask the agent to look through the camera |
+| `/places` | Ask which places it can go to |
+| `/stop` | Stop the robot |
+| `/arm`, `/disarm` | Let the agent act, or only observe |
+| `/explore` | Ask it to explore the building |
+| `/compact` | Condense the conversation |
+| `/follow` | Follow the robot in 3D, or see the whole map |
+| `/layout` | Put the viewer's panes back |
+| `/edit` | The world editor |
+| `/live` | Back to the live view after **Show in 3D** |
+| `/doctor`, `/robot`, `/models`, `/missions`, `/world`, `/approvals`, `/events`, `/layers`, `/dock` | Open that tab of the dock |
+
+## Driving by hand
+
+https://github.com/user-attachments/assets/5b176fdf-aa97-401b-9e44-2cf031865379
+
+The Robot tab shows whether the robot is upright, where it is and in which room, what each hand
+holds, and its motors and battery when the robot reports them. **Drive** asks the executor for
+the base: W and S walk, A and D turn, Q and E step sideways, the pad lights the key held, and
+**Slow** halves the speed. The
+executor refuses while a mission runs and stops the base when the keys stop, so a closed window
+stops the robot too. Driving needs the robot armed.
 
 ## Keeping an eye on it
 
-> **You:** Check the robot's health.
+https://github.com/user-attachments/assets/891d3213-9841-4bc5-9f79-a09c3a4be631
+
+> **You:** Tell me if the chest camera's images drop below 5 Hz.
 >
-> **NervROS:** The robot's health check is complete and all systems are functioning properly. All
-> 11 checks pass, including both cameras operating at 10 Hz, the robot correctly located on the
-> map, and the current mission (placing mug_4 into tray_1) running successfully with the left
-> hand holding the mug.
+> **NervROS:** I'm now watching the chest camera's image rate. I'll let you know if it drops below
+> 5 Hz within the next 30 minutes.
 
-<!-- image health.png: The health check, asked while the mission ran -->
+A watch runs in the background and posts to the chat when its condition holds: a rate dropping,
+a value crossing a line, or a log line matching.
 
-> **You:** Tell me if the chest camera drops below 5 Hz.
->
-> **NervROS:** I've set up a watch to monitor the chest camera's frame rate. It will alert me if
-> the rate drops below 5 Hz for the next 30 minutes. Currently, the camera is operating at 10 Hz
-> as expected.
+> **You:** Plot the robot's forward speed for the next two minutes.
 
-A watch runs in the background and posts to the chat when its condition holds: a rate dropping, a
-value crossing a line, or a log line matching. "Plot the robot's speed" draws a number from a
-topic in the viewer's Plots tab:
+The viewer brings its **Plots** tab forward and draws the robot's speed live: still, then the
+scheduled walk below.
+
+> **You:** Every ten minutes, walk to the bedroom, room R3, three times.
+
+A schedule is approved once, runs now and then on its clock, and reports after each run:
 
 ```text
-> plot {"topic": "/Odometry_loc", "field": "twist.twist.linear.x", "for_s": 120}
-< plotting /Odometry_loc twist.twist.linear.x in the viewer's Plots tab for 120 s
+report> Mission 01a0ff18 (Walk to bedroom R3 every 10 minutes, 3 times, run 1 of 3 of schedule
+        p1) ended: success after 18 s. Goal checks: at(R3) holds (the robot is in R3).
 ```
 
-<!-- videos: health-check.mp4, watch.mp4, plot.mp4 -->
+The
+Mission tab lists it with a **Cancel** button. A schedule can also wait for something: an object
+of a kind appearing, or a condition on a topic.
 
-The Doctor tab runs the same connection check on its own, and the Robot tab shows whether the
-robot is upright, where it is, what each hand holds, and drives it by hand through the executor
-when you switch **Drive** on (W and S walk, A and D turn, Q and E step sideways).
-
-<!-- image tab-doctor.png: The Doctor tab -->
-<!-- image tab-robot.png: The Robot tab -->
+"Check the robot's health" runs the same connection check as the Doctor tab, asked even while a
+mission runs.
 
 ### Debugging the ROS side
 
@@ -235,45 +282,125 @@ the profile to allow it, and your approval each time.
 
 ## Remembering
 
-> **You:** Remember this spot as the reading corner.
+https://github.com/user-attachments/assets/60e89e67-063b-417f-920d-92c33ad09105
 
-<!-- image remember.png: The approval for a new place, then the agent's summary of the session -->
+> **You:** Remember this spot as the charging spot.
+>
+> **You:** Remember that the living room window sticks.
+>
+> **You:** What do you remember?
+>
+> **NervROS:** I remember two things: 1. The living room window sticks (note 1) 2. This spot is
+> the charging spot ...
 
-> **NervROS:** I've saved this location as the reading corner (also known as "the reading
-> corner"). The robot will remember this spot at coordinates (5.51, -3.89) with a yaw of -2.06
-> radians for future navigation tasks.
+A named place works from then on, in this session and the next: "go to the charging spot". Notes
+join what the agent knows on every turn, and the Agent tab lists them with **Forget**. "What have
+you done so far?" and "what happened to the mug?" read the mission ledger and the world model's
+history.
 
-"Go to the reading corner" works from then on, in this session and the next. Notes work the same
-way: "remember that the kitchen door sticks" joins what the agent knows on every turn, and the
-Agent tab lists them. "What have you done so far?" and "what happened to the mug?" read the
-mission ledger and the world model's history.
+## Mapping a new building
 
-<!-- videos: remember-a-place.mp4, recall.mp4 -->
+https://github.com/user-attachments/assets/90340180-66da-4bc3-a7d9-b2e6a1f24c7b
 
-The world model can be fixed in the chat ("the chair by the window is a stool", "merge the two
-halves of the sofa"), each edit approved, or by hand: **Edit world** opens it on its floor plan.
+> **You:** Explore the building to fill in the map.
+
+In a building it has never seen, the robot maps as it explores. SLAM draws the floor plan, the
+world model splits it into rooms and types each one from the objects it finds there, and the
+viewer shades in orange what the camera has yet to see. The plan is one step,
+`ExploreBuilding()`, approved once. The clip shows the first four minutes and the last one, four
+times faster:
+
+```text
+report> Mission 01a0fe14 (Explore the building to fill in the map) ended: success after 1380 s.
+```
+
+In 23 minutes the robot found six rooms and 45 objects. The World tab shows how much of each
+room's floor and walls the camera has seen; its **Explore** button, or `/explore`, asks for the
+same mission. In grove-g1, `./scripts/demos/nervros.sh map name:=my-building` starts the
+simulator with no map and saves the new world as `data/worlds/my-building`, and
+`nervros.sh app saved:=my-building` runs on it afterwards.
+
+## Finishing the map
+
+A new map needs a person's eye. The world model types each room from the objects it finds there
+and labels each object from what the detector saw, so a study with a daybed and an armchair can
+come out as a living room. Fix it by hand in the world editor, or in the chat. Nothing is kept
+until it is saved, and a save reaches the running world model at once.
+
+### In the editor
+
+https://github.com/user-attachments/assets/c1385c2b-85c4-4dec-961d-4a33d173f93c
+
+**Edit world** in the top bar (or `/edit`) puts the editor in place of the 3D view: the floor plan
+with every room and object, and in the dock the selection and a list to review, most doubtful
+first. Here the list has one entry, R7, typed "living room" from its objects at 0.30. It is the
+study, so: pick it, type "study" in **Type**, **Set type**, **Mark checked**, then **Save**.
+
+```text
+saved 2 edits to data/worlds/media-mapped; the world model read them
+```
+
+On the plan, click an object to select it, drag it to move it, drag a corner to resize it or the
+handle to turn it. **Add object** draws a box round something the detector missed, **Split off…**
+and **Merge with…** fix one object seen as two or two seen as one, and **Delete** asks whether to
+delete it for good or only remove it, which **Restore** undoes. N goes to the next thing to
+review, C checks the selection, Del deletes it, and **Undo** and **Redo** reach back to the last
+save.
+
+### In the chat
+
+https://github.com/user-attachments/assets/4606a6ec-f39d-44b3-a4ec-c19bbd7f3b64
+
+> **You:** Review the new map. What needs a second look?
+>
+> **NervROS:** The world model shows 45 objects across 6 rooms. There are no items flagged for
+> review right now. However, I notice several rooms are marked as unchecked (R6, R3, R1, R8, R4).
+>
+> **You:** R1 is the living room, with the kitchen and the dining table in it. Change its type.
+>
+> **You:** O59 in the study is a daybed, not a bed.
+>
+> **You:** Save the world edits.
+>
+> **NervROS:** The world edits have been saved. The two changes (R1 as living room and O59 as
+> daybed) are now committed to the world model.
+
+Before relabelling O59 the agent looked at it: `inspect_object` shows the camera's best view of an
+object, a daybed here. Each edit is approved on its card and waits, unsaved, until the save. The
+agent has the editor's tools: `review_world` lists what deserves a second look, `inspect_object`
+shows an object, `edit_world` relabels, renames, checks, removes, merges, splits, adds and moves
+objects and types rooms, and `world_edits` saves, undoes, redoes or discards. The editor and the
+chat share one history, so an edit made in one shows in the other.
 
 ## Sessions and models
 
 Every conversation is saved. The Agent tab lists earlier sessions to resume, what the agent
-remembers, and each model with its quota for the day:
-
-<!-- image tab-agent.png: The Agent tab -->
-
-The context is condensed before it fills; `/compact` condenses it at once, and right-clicking a
-message condenses everything before it. A model that hits its rate limit is set aside and the
-next one in its role's chain answers. **Save this one as a test** turns the session into an eval
-case.
+remembers, and each model with its quota for the day. The context is condensed before it fills;
+`/compact` condenses it at once, and right-clicking one of your messages condenses everything
+before it. A model that hits its rate limit is set aside and the next one in its role's chain
+answers. **Save this one as a test** turns the session into an eval case.
 
 ## The command line
 
-`nervros-cli` runs the same agent without a window:
+`nervros-cli` runs the same agent without a window, from the same profile:
 
 ```bash
-nervros-cli --profile my.toml chat                     # /yes N, /no N, /stop, /compact, /quit
+nervros-cli --profile my.toml chat                     # /arm, /yes N, /no N, /stop, /compact, /quit
 nervros-cli --profile my.toml chat --resume last
-nervros-cli --profile my.toml replay last              # a session as it happened
+nervros-cli --profile my.toml ask "What can you see?" --image frame.jpg
 ```
+
+| Command | |
+|---|---|
+| `chat` | Chat with the robot; `--say` sends a script of messages and exits |
+| `ask` | One prompt, optionally with an image, to one role's models |
+| `look`, `segment` | The camera's marks, or the regions a prompt names, saved as an image |
+| `ros` | One read-only ROS tool, no model: graph, topic sample, interface, TF, parameters, logs |
+| `doctor` | The profile's tools, topics and mission services against the live graph |
+| `missions`, `gaps` | The mission ledger, and the requests no skill could do |
+| `replay` | A session as it happened |
+| `eval`, `case` | Test suites against the live robot, and a session kept as a new case |
+| `models`, `skills`, `mcp` | The model chains with today's counts, the skills, and the MCP tools to approve |
 
 `doctor` checks the profile against the live graph, and `ros` runs one read tool with no model:
 
@@ -300,13 +427,17 @@ $ nervros-cli --profile nervros.toml ros topic_sample \
 }
 ```
 
-`missions` and `gaps` read the ledger:
+`missions` reads the ledger, each mission with what was asked and the step that failed:
 
 ```text
 $ nervros-cli --profile nervros.toml missions --limit 3
-01a0fc75-1e3c 16 min ago: go to the dining table to pick up the mug (success, 298 s)
-01a0fc74-53ca 17 min ago: go to the bedroom (room C) (success, 29 s)
-01a0fc74-1746 17 min ago: turn left 90 degrees (success, 2 s)
+01a0fe14-7585 30 min ago: Explore the building to fill in the map (success, 1380 s)
+    asked: Explore the building to fill in the map.
+01a0fe11-aac0 33 min ago: walk to bedroom R3 every 10 minutes, 3 times, run 1 of 3 of schedule p1 (success, 15 s)
+    asked: Every ten minutes, walk to the bedroom, room R3, three times.
+01a0fe10-ae04 34 min ago: Walk to the bedroom, room R3 (canceled, 9 s)
+    asked: Walk to the bedroom, room R3.
+    s1 GoToPlace R3 failure: stopped: operator
 ```
 
 ### Evals
