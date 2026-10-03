@@ -75,7 +75,7 @@ fn node_look(status: &str) -> (Color32, &'static str) {
         "failure" => (theme::ERROR, "✗"),
         "success" => (theme::SUCCESS, "✓"),
         "running" => (theme::INFO, "●"),
-        "skipped" => (theme::FAINT, "–"),
+        "skipped" | "stopped" => (theme::FAINT, "–"),
         _ => (theme::FAINT, "○"),
     }
 }
@@ -92,6 +92,12 @@ pub fn tree_panel(ui: &mut egui::Ui, p: &PlanCard) {
         .default_open(true)
         .show(ui, |ui| {
             for (path, status) in &p.nodes {
+                // A node still running when the mission ended was stopped with it.
+                let status = if p.finished.is_some() && status == "running" {
+                    "stopped"
+                } else {
+                    status.as_str()
+                };
                 let depth = u16::try_from(path.matches('/').count()).unwrap_or(u16::MAX);
                 let name = path.rsplit('/').next().unwrap_or(path);
                 // BehaviorTree.CPP names an unnamed node by its type and uid, as "Sequence::3".

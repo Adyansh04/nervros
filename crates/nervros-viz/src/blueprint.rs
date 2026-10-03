@@ -2,7 +2,7 @@
 //! view's properties from Rust, and the panes need theirs (the 3D view's eye, background and
 //! grid, the camera views' background, the log's columns).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use rerun::blueprint::components::{
@@ -154,8 +154,12 @@ pub(super) struct Layout {
     cameras: Vec<(String, String)>,
     /// The map's known extent, `[x0, y0, x1, y1]` in the map frame, once a map arrived.
     bounds: Mutex<Option<[f32; 4]>>,
+    /// The extent the 3D view was last framed on.
+    framed: Mutex<Option<[f32; 4]>>,
     /// The 3D view keeps to the robot.
     follow: AtomicBool,
+    /// The strip's tab on show: a plot the agent starts is brought forward.
+    strip: AtomicUsize,
 }
 
 impl Layout {
@@ -164,7 +168,9 @@ impl Layout {
             rec,
             cameras,
             bounds: Mutex::new(None),
+            framed: Mutex::new(None),
             follow: AtomicBool::new(false),
+            strip: AtomicUsize::new(MISSION_TAB),
         }
     }
 
@@ -172,7 +178,9 @@ impl Layout {
     /// restore the last session's, closed panes and an older version's layout included.
     pub(super) fn send(&self) {
         let bounds = *self.bounds.lock().unwrap_or_else(PoisonError::into_inner);
-        let root = panes(&self.cameras, bounds, self.following());
+        *self.framed.lock().unwrap_or_else(PoisonError::into_inner) = bounds;
+        let strip = self.strip.load(Ordering::Relaxed);
+        let root = panes(&self.cameras, bounds, self.following(), strip);
         if let Err(e) = send(&self.rec, &root) {
             tracing::debug!(error = %e, "the viewer layout was not sent");
         }
@@ -187,25 +195,44 @@ impl Layout {
         self.follow.load(Ordering::Relaxed)
     }
 
-    /// Frames the 3D view on the first map; a later map leaves the operator's view alone until
-    /// Reset layout.
+    /// Shows the strip's Plots tab, where a plot the agent just started draws.
+    pub(super) fn show_plots(&self) {
+        if self.strip.swap(PLOTS_TAB, Ordering::Relaxed) != PLOTS_TAB {
+            self.send();
+        }
+    }
+
+    /// Frames the 3D view on the first map, and again while a map being built outgrows what it
+    /// was framed on; a map that holds still leaves the operator's view alone.
     pub(super) fn map(&self, extent: [f32; 4]) {
-        let first = self
-            .bounds
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .replace(extent)
-            .is_none();
-        if first {
+        *self.bounds.lock().unwrap_or_else(PoisonError::into_inner) = Some(extent);
+        let framed = *self.framed.lock().unwrap_or_else(PoisonError::into_inner);
+        if framed.is_none_or(|framed| outgrows(framed, extent)) {
             self.send();
         }
     }
 }
 
+/// The strip's tabs, in the order `panes` lays them out.
+const MISSION_TAB: usize = 0;
+const PLOTS_TAB: usize = 3;
+
+/// The map has grown past the extent the view was framed on by more than a margin on some side,
+/// as while a building is mapped.
+fn outgrows([x0, y0, x1, y1]: [f32; 4], [a0, b0, a1, b1]: [f32; 4]) -> bool {
+    const MARGIN: f32 = 1.5;
+    a0 < x0 - MARGIN || b0 < y0 - MARGIN || a1 > x1 + MARGIN || b1 > y1 + MARGIN
+}
+
 /// The world wide, as a building's plan is; under it the cameras and the agent's last marked
 /// image side by side; below, the mission's steps, the agent's log and the plots, in tabs as wide
 /// as the viewer so their columns read.
-fn panes(cameras: &[(String, String)], bounds: Option<[f32; 4]>, follow: bool) -> Pane {
+fn panes(
+    cameras: &[(String, String)],
+    bounds: Option<[f32; 4]>,
+    follow: bool,
+    strip: usize,
+) -> Pane {
     let camera = |name: &str, path: &str| {
         let background =
             Background::new(BackgroundKind::SolidColor).with_color(rgb(CAMERA_BACKGROUND));
@@ -273,7 +300,7 @@ fn panes(cameras: &[(String, String)], bounds: Option<[f32; 4]>, follow: bool) -
             Pane::view("TimeSeries", "Exploring", "/mapping"),
             Pane::view("TimeSeries", "Plots", "/plots"),
         ],
-        0,
+        strip,
     );
     Pane::split(
         ContainerKind::Vertical,
@@ -378,6 +405,21 @@ mod tests {
     }
 
     #[test]
+    fn the_view_is_framed_again_only_while_the_map_grows() {
+        let framed = [0.0, 0.0, 10.0, 8.0];
+        assert!(!outgrows(framed, framed), "a map that holds still");
+        assert!(
+            !outgrows(framed, [-1.0, 0.0, 10.5, 8.0]),
+            "a metre more is no reason"
+        );
+        assert!(
+            outgrows(framed, [0.0, 0.0, 12.0, 8.0]),
+            "two metres more to the east"
+        );
+        assert!(outgrows(framed, [0.0, -2.0, 10.0, 8.0]), "two to the south");
+    }
+
+    #[test]
     fn following_tracks_the_robot_and_the_overview_waits_for_a_map() {
         // What the world view's eye says: none, a fixed eye, or one that tracks.
         let eye_of = |root: &Pane| {
@@ -392,16 +434,16 @@ mod tests {
             Some(batches.iter().any(|b| b.descriptor.component == tracking))
         };
         assert_eq!(
-            eye_of(&panes(&[], None, false)),
+            eye_of(&panes(&[], None, false, MISSION_TAB)),
             None,
             "no map: the viewer frames what it has"
         );
         assert_eq!(
-            eye_of(&panes(&[], Some([0.0, 0.0, 4.0, 3.0]), false)),
+            eye_of(&panes(&[], Some([0.0, 0.0, 4.0, 3.0]), false, MISSION_TAB)),
             Some(false)
         );
         assert_eq!(
-            eye_of(&panes(&[], None, true)),
+            eye_of(&panes(&[], None, true, MISSION_TAB)),
             Some(true),
             "following needs no map"
         );
@@ -413,7 +455,7 @@ mod tests {
             ("chest".to_owned(), "/camera".to_owned()),
             ("head".to_owned(), "/cameras/head".to_owned()),
         ];
-        let Pane::Split { panes, .. } = panes(&cameras, None, false) else {
+        let Pane::Split { panes, .. } = panes(&cameras, None, false, MISSION_TAB) else {
             panic!("the root is a split");
         };
         let Pane::Split { panes: row, .. } = &panes[1] else {
@@ -427,9 +469,27 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["Chest", "Head", "Last look"]);
+        let Pane::Split {
+            panes: tabs,
+            active,
+            ..
+        } = &panes[2]
+        else {
+            panic!("the strip is tabs");
+        };
+        assert_eq!(*active, Some(MISSION_TAB));
+        let tab_name = |i: usize| match &tabs[i] {
+            Pane::View { name, .. } => name.clone(),
+            Pane::Split { .. } => String::new(),
+        };
+        assert_eq!(tab_name(MISSION_TAB), "Mission");
+        assert_eq!(tab_name(PLOTS_TAB), "Plots");
+        let Pane::Split { panes, .. } = super::panes(&cameras, None, false, PLOTS_TAB) else {
+            panic!("the root is a split");
+        };
         let Pane::Split { active, .. } = &panes[2] else {
             panic!("the strip is tabs");
         };
-        assert_eq!(*active, Some(0));
+        assert_eq!(*active, Some(PLOTS_TAB), "a plot asked for is on show");
     }
 }

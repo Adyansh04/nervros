@@ -2,12 +2,14 @@
 
 use std::sync::Arc;
 
+use nervros_core::mission::Outcome;
 use nervros_core::session::Event;
 use nervros_ros::RobotPort;
 use rerun::RecordingStream;
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 
+use crate::blueprint::Layout;
 use crate::plan::{draw_preview, step_states};
 use crate::tasks::plot;
 use crate::{PLAN_PATH, put, put_static};
@@ -15,6 +17,7 @@ use crate::{PLAN_PATH, put, put_static};
 pub(super) async fn agent(
     rec: RecordingStream,
     robot: Arc<dyn RobotPort>,
+    layout: Arc<Layout>,
     mut events: broadcast::Receiver<Event>,
 ) {
     use rerun::TextLogLevel as L;
@@ -35,6 +38,8 @@ pub(super) async fn agent(
                 for_s,
             } => {
                 plots.spawn(plot(&rec, &robot, name, (topic, msg_type, field), *for_s));
+                // Asked for, so shown: the agent's reply says where to look.
+                layout.show_plots();
                 continue;
             }
             Event::Snapshot { jpeg, .. } => {
@@ -53,11 +58,29 @@ pub(super) async fn agent(
             }
             // A preview lasts while its plan is pending or running.
             Event::MissionPlanned { .. }
-            | Event::MissionFinished { .. }
             | Event::ApprovalResolved {
                 approved: false, ..
             } => {
                 put(&rec, PLAN_PATH, &rerun::Clear::recursive());
+                continue;
+            }
+            Event::MissionFinished {
+                outcome,
+                failed_step,
+                ..
+            } => {
+                put(&rec, PLAN_PATH, &rerun::Clear::recursive());
+                // The executor sends no last state for a step it stopped: the lane would stay
+                // "running" for good.
+                if !failed_step.is_empty() {
+                    let state = if *outcome == Outcome::Canceled {
+                        "stopped"
+                    } else {
+                        "failure"
+                    };
+                    let path = format!("mission/{failed_step}");
+                    put(&rec, &path, &rerun::StateChange::single(state));
+                }
                 continue;
             }
             Event::MissionProgress {

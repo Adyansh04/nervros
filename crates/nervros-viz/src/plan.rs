@@ -97,11 +97,14 @@ pub(super) fn draw_trail(rec: &RecordingStream, path: &str, msg: &Value) {
 /// How a mission step's states look on the "Mission" timeline.
 pub(super) fn step_states() -> rerun::StateConfiguration {
     rerun::StateConfiguration::new()
-        .with_values(["running", "success", "failure", "skipped", "idle"])
+        .with_values([
+            "running", "success", "failure", "stopped", "skipped", "idle",
+        ])
         .with_colors([
             rerun::Color::from_rgb(235, 170, 40),
             rerun::Color::from_rgb(70, 180, 90),
             rerun::Color::from_rgb(220, 80, 60),
+            rerun::Color::from_rgb(120, 130, 150),
             rerun::Color::from_rgb(140, 140, 150),
             rerun::Color::from_rgb(90, 90, 100),
         ])

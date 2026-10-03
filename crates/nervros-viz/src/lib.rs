@@ -151,9 +151,12 @@ pub fn spawn(
     layout.send();
     bridge.world(profile, &layout);
     bridge.profile_layers(profile);
-    bridge
-        .tasks
-        .spawn(agent(rec.clone(), Arc::clone(robot), events));
+    bridge.tasks.spawn(agent(
+        rec.clone(),
+        Arc::clone(robot),
+        Arc::clone(&layout),
+        events,
+    ));
     Bridge {
         layers: bridge.layers,
         layout,
