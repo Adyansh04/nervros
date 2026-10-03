@@ -234,6 +234,8 @@ pub struct Gui {
     history: Vec<String>,
     history_pos: Option<usize>,
     tab: Tab,
+    /// The tab a request to approve took the dock from, to go back to once it is answered.
+    tab_before_approval: Option<Tab>,
     dock_open: bool,
     recheck: tokio::sync::mpsc::UnboundedSender<()>,
     /// Set by the viewer on the UI thread when the selection changes.
@@ -356,6 +358,7 @@ impl Gui {
             history_pos: None,
             // A request to approve opens its tab; until then the plan and past missions.
             tab: Tab::Mission,
+            tab_before_approval: None,
             dock_open: true,
             recheck,
             picked,
@@ -440,13 +443,20 @@ impl Gui {
                     }
                     let line = serde_json::to_string(&e).unwrap_or_default();
                     self.event_log.push_front(line);
-                    if matches!(e, Event::ApprovalRequested { .. }) {
+                    if matches!(e, Event::ApprovalRequested { .. }) && self.tab != Tab::Approvals {
+                        self.tab_before_approval = Some(self.tab);
                         self.tab = Tab::Approvals;
                     }
                 }
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {}
                 Err(_) => break,
             }
+        }
+        if self.chat.pending().count() == 0
+            && let Some(tab) = self.tab_before_approval.take()
+            && self.tab == Tab::Approvals
+        {
+            self.tab = tab;
         }
     }
 
