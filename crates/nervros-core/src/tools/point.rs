@@ -209,7 +209,7 @@ impl PointTool {
         let mut out = ToolOutcome::ok(json!({"snapshot": snapshot.id, "camera": camera.name,
             "points": listed, "marks": marks_listed, "by": model}));
         out.message = if listed.is_empty() {
-            format!("the model found no {what}; the user sees the frame")
+            format!("the model did not find {what} in the frame; the user sees the frame")
         } else {
             format!("{} point(s); the user sees them as rings", listed.len())
         };
