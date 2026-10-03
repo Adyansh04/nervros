@@ -177,17 +177,20 @@ fn seeing_tools(
     let snapshots = Arc::clone(snapshots);
     let llm = Arc::clone(llm);
     let mut seen_by = None;
+    let mut looked_by = None;
     if let Some(look) = profile.look.clone() {
         let cameras = Cameras::start(&look, &robot).map_err(StartError::Look)?;
         seen_by = Some(Arc::clone(&cameras));
         let eyes: Arc<dyn crate::look::Eyes> = Arc::clone(&llm) as Arc<dyn crate::look::Eyes>;
-        registry.add(Arc::new(LookTool::new(
+        let look_tool = Arc::new(LookTool::new(
             look,
             Arc::clone(&cameras),
             Arc::clone(&robot),
             Arc::clone(&snapshots),
             Some(eyes),
-        )))?;
+        ));
+        looked_by = Some(Arc::clone(&look_tool));
+        registry.add(look_tool)?;
         // Pointing asks the models that outline, a skill few models have.
         if !llm.router().config().roles.segment.is_empty() {
             let pointer = Arc::clone(&llm) as Arc<dyn crate::segment::Outliner>;
@@ -221,11 +224,9 @@ fn seeing_tools(
             registry.add(tool)?;
         }
     }
-    let vision = seen_by.map(|cameras| crate::mission::camera::Vision {
-        eyes: Arc::clone(&llm) as Arc<dyn crate::look::Eyes>,
-        cameras,
-        snapshots: Arc::clone(&snapshots),
-    });
+    let vision = seen_by
+        .zip(looked_by)
+        .map(|(cameras, look)| crate::mission::camera::Vision { look, cameras });
     Ok(Seeing { editor, vision })
 }
 
