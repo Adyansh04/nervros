@@ -385,11 +385,17 @@ fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
     egui::Grid::new("drive_pad")
         .spacing([4.0, 4.0])
         .show(ui, |ui| {
+            // Wrapped, a button would shrink its column to a few letters.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             let mut pad = |ui: &mut egui::Ui, text: &str, axis: usize, sign: f64| {
-                let pressed = ui
-                    .add(ReButton::new(text).small().secondary())
-                    .is_pointer_button_down_on();
-                if pressed {
+                // Lit while its key holds it, so what the base is told shows on screen.
+                let button = ReButton::new(text).small();
+                let button = if held[axis] * sign > 0.0 {
+                    button.primary()
+                } else {
+                    button.secondary()
+                };
+                if ui.add(button).is_pointer_button_down_on() {
                     held[axis] = sign;
                 }
             };
