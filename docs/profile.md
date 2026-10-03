@@ -396,7 +396,7 @@ The rest are the checks you would run yourself before blaming the model:
 | `skill_gap` | With `[mission]`: logs a request no skill can do, and why; planning that gives up logs one itself. The Mission tab and `nervros-cli gaps` list them. |
 | `point` | With a `segment` model in the models file: points at what the operator names in a camera's newest frame, including things no detector marks, and says which mark a point lands on. |
 | `skill` | With `skills`: reads one skill's procedure. |
+| `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each asks for approval when supervised, like a world edit. |
 
 `look` can also answer about an earlier snapshot, and look closer at one mark: it crops the mark
 from the full frame at a higher resolution for the vision model, for a label or a small part.
-| `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each asks for approval when supervised, like a world edit. |

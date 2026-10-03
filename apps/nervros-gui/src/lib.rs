@@ -11,6 +11,7 @@ mod robot;
 mod sessions;
 #[cfg(test)]
 mod testkit;
+mod theme;
 mod toasts;
 
 use std::path::PathBuf;

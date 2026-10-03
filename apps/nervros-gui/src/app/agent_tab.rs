@@ -12,6 +12,7 @@ use rerun::external::re_ui::{ReButton, UiExt as _};
 
 use super::Gui;
 use super::bars::quota;
+use crate::theme;
 use crate::toasts::Kind;
 
 impl Gui {
@@ -29,7 +30,7 @@ impl Gui {
     /// Earlier sessions to carry on or keep as tests, then memory, then the models and quotas.
     pub(super) fn agent_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Sessions").strong());
+            theme::section(ui, "Sessions");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add(ReButton::new("Save this one as a test").small().secondary())
@@ -65,15 +66,13 @@ impl Gui {
             ui.label(
                 RichText::new("No earlier session saved its conversation yet.")
                     .small()
-                    .color(ui.tokens().text_subdued),
+                    .color(theme::DIM),
             );
         }
         for s in listed {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&s.when).monospace().small());
-                ui.label(RichText::new(&s.first).small())
-                    .on_hover_text(format!("{} messages", s.messages));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            theme::row(
+                ui,
+                |ui| {
                     if ui
                         .add(ReButton::new("Resume").small().secondary())
                         .on_hover_text("Carry on this conversation")
@@ -88,8 +87,13 @@ impl Gui {
                     {
                         keep = Some(crate::sessions::log_of(&s.path));
                     }
-                });
-            });
+                },
+                |ui| {
+                    ui.label(RichText::new(&s.when).monospace().small());
+                    ui.label(RichText::new(&s.first).size(13.0))
+                        .on_hover_text(format!("{} ({} messages)", s.first, s.messages));
+                },
+            );
         }
         if let Some(log) = keep {
             self.save_as_case(&log);
@@ -111,29 +115,38 @@ impl Gui {
 
     /// What the operator asked the agent to remember, each with a way to forget it.
     fn memory_list(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Memory").strong());
+        ui.add_space(16.0);
+        theme::section(ui, "Memory");
         let notes = self.agent.memory.all();
         if notes.is_empty() {
             ui.label(
                 RichText::new("Nothing yet: say \"remember that…\" in the chat.")
                     .small()
-                    .color(ui.tokens().text_subdued),
+                    .color(theme::DIM),
             );
         }
         let mut forget = None;
         for n in &notes {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(n.id.to_string()).monospace().small());
-                ui.label(RichText::new(&n.text).small());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            theme::row(
+                ui,
+                |ui| {
                     if ui
                         .add(ReButton::new("Forget").small().secondary())
                         .clicked()
                     {
                         forget = Some(n.id);
                     }
-                });
-            });
+                },
+                |ui| {
+                    ui.label(
+                        RichText::new(n.id.to_string())
+                            .monospace()
+                            .color(theme::FAINT),
+                    );
+                    ui.label(RichText::new(&n.text).size(13.0))
+                        .on_hover_text(&n.text);
+                },
+            );
         }
         if let Some(id) = forget
             && let Err(e) = self.agent.memory.forget(id)
@@ -143,6 +156,8 @@ impl Gui {
     }
 
     fn models_list(&self, ui: &mut egui::Ui) {
+        ui.add_space(16.0);
+        theme::section(ui, "Models");
         let router = self.agent.llm.router();
         let now = SystemTime::now();
         for (role, name) in [
@@ -159,30 +174,22 @@ impl Gui {
                 ui.label(
                     RichText::new("off: models.toml lists no model for it")
                         .small()
-                        .color(ui.tokens().text_subdued),
+                        .color(theme::DIM),
                 );
             }
             for m in take {
                 ui.horizontal(|ui| {
-                    ui.bullet(ui.tokens().success_text_color);
+                    ui.bullet(theme::SUCCESS);
                     ui.label(RichText::new(&m.id).monospace());
                     let q = quota(router, m, now);
-                    ui.label(RichText::new(q).small().color(ui.tokens().text_subdued));
+                    ui.label(RichText::new(q).small().color(theme::DIM));
                 });
             }
             for (id, why) in skipped {
                 ui.horizontal(|ui| {
-                    ui.bullet(ui.tokens().text_subdued);
-                    ui.label(
-                        RichText::new(id)
-                            .monospace()
-                            .color(ui.tokens().text_subdued),
-                    );
-                    ui.label(
-                        RichText::new(format!("{why:?}"))
-                            .small()
-                            .color(ui.tokens().text_subdued),
-                    );
+                    ui.bullet(theme::DIM);
+                    ui.label(RichText::new(id).monospace().color(theme::DIM));
+                    ui.label(RichText::new(format!("{why:?}")).small().color(theme::DIM));
                 });
             }
             ui.add_space(8.0);

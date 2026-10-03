@@ -1,39 +1,130 @@
+<p align="center">
+  <img src="docs/media/banner.svg" alt="NervROS: talk to your ROS 2 robot" width="100%">
+</p>
+
 # NervROS
 
-A native Rust agent for ROS 2 robots. You talk to it in a desktop app. It looks through the robot's
-cameras, answers with marked-up images, and carries out tasks as behaviour trees that are checked
-and approved before they run.
+Talk to your ROS 2 robot. NervROS looks through the robot's cameras, keeps track of its world,
+and turns what you ask into missions that you check and approve before anything moves.
 
-Status: early development. It is built and tested against
-[grove-g1](https://github.com/Adyansh04/grove-g1), a Unitree G1 stack on ROS 2 Jazzy, in simulation.
+## Documentation
 
-![The NervROS window: chat on the left, the robot's camera and 3D world in the middle](apps/nervros-gui/tests/snapshots/window.png)
+- **[Guide: start here](docs/guide.md).** Demo videos and how to use each feature, with the exact
+  words typed and what came back.
+- **[Robot profile](docs/profile.md):** fitting NervROS to a robot, with one TOML file.
+- **[Models](docs/models.md):** local and cloud models, roles, fallbacks and quotas.
+- **[Mission executor contract](docs/executor.md):** what the robot side provides, and how a
+  mission runs.
 
-## What it needs
+https://github.com/user-attachments/assets/dc4712e6-81cc-4f7a-b986-baae0cda8bf9
 
-On the host, Ubuntu 24.04 with:
+*A simulated Unitree G1 fetches a mug: the plan, the approval, then the walk, the pick and the
+place, four times faster while the robot works.*
 
-- ROS 2 Jazzy, for r2r's bindings and the interface overlay (`colcon`);
-- Rust through rustup: `rust-toolchain.toml` pins the version, and the first `cargo` call installs
-  it;
-- clang, libclang, mold and pkg-config for the builds;
-- for the app's viewer: `libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev
-  libxcb-xfixes0-dev libudev-dev libwayland-dev`, and a Vulkan driver;
-- Docker with the NVIDIA container toolkit and about 7 GB of GPU memory for the local model.
+NervROS fits any ROS 2 robot through one profile file and answers with a local model by default.
+It is built and tested in simulation on [grove-g1](https://github.com/Adyansh04/grove-g1), a
+Unitree G1 stack on ROS 2 Jazzy. Early development.
+
+## What you can do
+
+**Ask what it sees.** "What can you see right now?" gets an answer about numbered marks drawn on
+the camera frame. "Where is the small white mug?" searches the world model: which room, on what,
+when it was last seen. "Point at the tray" and "Outline the desk" find what no detector marked.
+
+**Give it a task.** "Walk to the bedroom" or "Bring the mug to the tray": the agent plans with the
+robot's own skills, checks the plan against your words (left or right, how far, which hand) and
+waits for your approval. Each step is tracked live, and the report comes back checked against the
+world model and the camera.
+
+**Stop it at once.** "Stop", the Stop button or Ctrl+Shift+S halts the robot without waiting on a
+model.
+
+**Keep an eye on it.** "Tell me if the camera drops below 5 Hz", "plot the robot's speed", "every
+ten minutes, walk to the bedroom": watches, live plots and schedules run while you do other things.
+It reads the ROS graph, topics, TF, parameters and logs too, as `ros2` does.
+
+**Map a new building.** "Explore the building" walks until the camera has seen every room, mapping
+as it goes. Fix what it got wrong by saying so ("R1 is the living room") or by hand in the world
+editor.
+
+**Use your hands.** Click a room or an object in the 3D view to walk there or ask about it, run
+commands from Ctrl+K, drive with W, A, S and D, and name places and notes it keeps for next time.
+
+**Or a terminal.** `nervros-cli` runs the same agent: chat, a setup check against the live graph,
+single ROS reads, and test suites against the robot.
+
+The **[guide](docs/guide.md)** has a short video of most of these, with the exact words typed and
+what came back.
+
+<p align="center">
+  <img src="docs/media/plan-approval.png" alt="A plan card waiting for approval beside its planned path in the 3D view" width="49%">
+  <img src="docs/media/camera-check.jpg" alt="The chest camera's frame with the detector's numbered marks: the mug in the tray" width="49%">
+</p>
+
+*Left: every mission waits for your approval, its path drawn in the 3D view. Right: what the
+camera sees, with the detector's numbered marks, after the mug went into the tray.*
+
+<p align="center">
+  <img src="docs/media/mapping.png" alt="A building mapped room by room, with how much of each room the camera has seen" width="49%">
+  <img src="docs/media/world-editor.png" alt="The world editor: rooms and objects on the floor plan, one room to review" width="49%">
+</p>
+
+*Left: a new building mapped room by room, with how much of each the camera has seen. Right: the
+world editor, where you fix a room's type or an object's label by hand.*
+
+## How it works
+
+<p align="center">
+  <img src="docs/media/architecture.svg" alt="How a mission runs: you, the agent, the models, the guard, the mission executor and the robot, message by message" width="100%">
+</p>
+
+1. **You ask**, in the app or a terminal.
+2. **The agent**, a Rust core with a local or cloud model, uses tools: the cameras, the world
+   model, ROS topics, services and actions, its memory, and any MCP server you add.
+3. **Anything that moves the robot is a mission.** The agent plans with the robot's own skills,
+   NervROS compiles the plan to a behaviour tree, the robot's executor checks it, and you approve
+   it.
+4. **The executor runs it** and reports each step back; the agent tells you how it went, with
+   checks against the world model and the camera.
+
+Nothing in NervROS is robot-specific. One [profile](docs/profile.md) names the robot's topics,
+services, cameras, skills and limits, and the robot runs missions through a short
+[executor contract](docs/executor.md). Models come from llama.cpp, Gemini, OpenRouter or any
+OpenAI-compatible server, each role with its own chain of fallbacks ([models](docs/models.md)).
+
+Also in the box: sessions you can resume, replay or keep as a test case; a context that condenses
+itself before it fills; a privacy mode that keeps camera frames on local models; and
+OpenTelemetry spans for each turn, model call, tool call and mission.
+
+## Safe by design
+
+- **Nothing moves until you say so.** The robot starts observe-only: arm it in the top bar, then
+  approve each plan on its card.
+- **Plans are checked before you see them.** The robot's executor validates every behaviour
+  tree, and NervROS checks the plan against what you asked.
+- **Stop always works.** "Stop", the Stop button or Ctrl+Shift+S halts the robot without a
+  model, and a mission whose window closed or hung stops by itself.
+- **The robot's data stays data.** What the cameras, topics and world model say reaches the
+  model fenced as data, never as instructions, and hard deny lists keep every tool off motor and
+  controller topics.
+
+## Quick start
+
+Ubuntu 24.04 with ROS 2 Jazzy, Rust through rustup (`rust-toolchain.toml` pins the version), and:
 
 ```bash
-sudo apt install clang libclang-dev mold pkg-config libssl-dev libxkbcommon-dev \
-  libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libudev-dev libwayland-dev
+sudo apt install ros-dev-tools clang libclang-dev mold pkg-config libssl-dev libxkbcommon-dev \
+  libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libudev-dev libwayland-dev libvulkan1
 ```
 
-The first build of the app compiles the Rerun viewer: about twenty minutes, with builds capped at
-four jobs in `.cargo/config.toml`, and 30-odd GB of `target/` on disk. The core needs neither ROS
-nor the viewer: a plain `cargo build` builds it and the schema generator only.
+The local model runs in Docker with the NVIDIA container toolkit and needs about 7 GB of GPU
+memory. Fetch it once with the Hugging Face CLI:
 
-## Try it
+```bash
+hf download unsloth/Qwen3.5-9B-GGUF Qwen3.5-9B-Q4_K_M.gguf mmproj-F16.gguf
+```
 
-NervROS runs on the host next to a ROS 2 Jazzy graph. Tests use a local model, so nothing leaves
-the machine:
+Then, from this repository:
 
 ```bash
 ./scripts/local-llm.sh start          # Qwen3.5-9B in llama.cpp on 127.0.0.1:8081
@@ -42,78 +133,18 @@ source scripts/ros-env.sh             # bash; add NERVROS_UDP_ONLY=1 if the grap
 cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 ```
 
-`nervros-cli` does the same headless: `chat`, `doctor`, `look`, `segment`, `models`, `ask`, and
-`ros`, which runs one of the ROS debugging tools against the live graph without a model:
+The first build compiles the Rerun viewer: about twenty minutes and 30-odd GB of `target/`. The
+example profile is a template for your robot; to run everything in the videos on the simulated
+G1, follow grove-g1's [NervROS guide](https://github.com/Adyansh04/grove-g1/blob/main/docs/guides/nervros.md)
+(`./scripts/demos/nervros.sh app`).
+
+Without a window:
 
 ```bash
-nervros-cli --profile my.toml ros topic_sample '{"topic": "/odom", "mode": "hz"}'
+cargo run -p nervros-cli -- --profile profiles/example/nervros.toml chat
+cargo run -p nervros-cli -- --profile profiles/example/nervros.toml doctor
+cargo run -p nervros-cli -- --profile profiles/example/nervros.toml eval suite.toml --repeat 3
 ```
 
-`eval` runs a suite of requests against the live robot, each in a fresh session with every approval
-granted, and judges what the agent did: the tools and skills it used, what the tools said, the
-mission's outcome, the approvals it asked for, its reply, and how far the robot moved, on the
-simulator's own pose when the suite names it. `--repeat k` runs each case k times for pass^k, and
-`--models a,b` runs it on each model in turn to compare them; the report gives each model's pass
-rate with its interval, its calls, model time and tokens per case, and where the run came from. A
-suite is a TOML list of cases (see grove-g1's `g1_bringup/config/nervros/eval/apartment.toml`):
-
-```bash
-nervros-cli --profile my.toml eval suite.toml --only pick --repeat 3
-```
-
-The same kind of case with a scripted model and a scripted robot lives in `scenarios/`, and
-`cargo test -p nervros-core --test scenarios` runs each through the whole agent, with no model and
-no ROS. `RUST_LOG=nervros_core=info` logs what the agent decides. Built with `--features otlp` and
-run with `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`, the apps send spans over OTLP/HTTP to
-a collector such as Jaeger: a span per turn with each model call and tool call inside it, and one
-per mission, schedule and watch. Prompts and replies stay out of them.
-
-With a [`[ros_tools]`](docs/profile.md#ros_tools) table the agent can look at any part of the
-graph as `ros2` would (topics with their QoS, rates, messages, nodes, services, actions,
-parameters, TF and logs), and, where the profile lists them, call services, send action goals,
-set parameters and publish, each approved by you. With [`[segment]`](docs/profile.md#segment) it
-segments whatever you name in a camera's view, "the floor" or "every mug", and shows you the
-regions. With [`[editor]`](docs/profile.md#editor) it reviews and fixes the saved world model when
-you ask ("the chair by the window is a stool", "merge the two halves of the sofa"), and Edit world
-opens the same world on its floor plan to fix by hand. It also runs the checks you would: "check
-the robot's health", "tell me if the chest camera drops below 5 Hz", "plot the robot's speed",
-"remember this spot as the reading corner". It remembers what you ask it to across sessions
-("remember that the kitchen door sticks"), and runs patrols you approve once ("every 30 minutes,
-walk through the rooms, 6 times").
-
-To act, the agent writes a plan and the app asks you to approve it, once: the agent never asks you
-first in the chat, and you deny what is wrong. The plan's card shows its steps, how each went on
-this robot before, and what NervROS found when it checked the plan against your words (a left turn
-planned as a right one comes with a one-click fix); the viewer previews where its walks end. Edit
-changes, drops or moves a step before you approve. A failed mission comes back with what went
-wrong, and the agent proposes a changed plan for you to approve. While a mission runs the app
-sends the executor a heartbeat, so a mission whose app closed or hung stops by itself.
-
-In the window, Enter sends, Esc stops the reply and Ctrl+Shift+S stops the mission; Ctrl+K opens
-the command palette. Ctrl+1 to Ctrl+8 switch the dock between the mission (its live behaviour tree,
-recent missions, saved plans and the requests no skill could do), the world model, the viewer's
-layers, approvals, events, the agent (earlier sessions to resume, what it remembers, the models),
-the connection check and the robot (its state, hands and motors, and driving it by hand). The status
-bar shows how full the model's context is and how much of it came from the model server's cache;
-the conversation is condensed before it fills, `/compact` condenses it at once, and right-clicking a
-message condenses up to it. An image pasted or dropped on the window goes to the agent with your
-next message. Every conversation is saved, so Resume in the Agent tab, or
-`nervros-cli chat --resume last`, carries one on. Closing the window while a mission runs asks first
-whether to stop the robot, and a new session tells you when the robot is already running one.
-The embedded viewer is [Rerun](https://rerun.io), which keeps the cameras, map, rooms, objects and
-mission steps on a timeline. [`[[viz.layer]]`](docs/profile.md#viz) adds what RViz would draw:
-occupancy grids, marker arrays and laser scans, each with a switch in the Layers tab. Clicking an
-object, a room or a point on the map offers messages about it, such as "Walk to O17 (shelf).",
-filled into the composer for you to read and send.
-
-The agent can also use tools from MCP servers the profile lists, each tool pinned to the
-definition you approved, and read skills: short procedures for the robot's rare troubles, kept as
-`SKILL.md` folders beside the profile.
-
-## Documentation
-
-- [The robot profile](docs/profile.md): one TOML file per robot; a ROS service or topic becomes a
-  tool by naming it and its type.
-- [Models](docs/models.md): providers, roles and quotas, all configuration.
-- [The mission executor contract](docs/executor.md): what a robot's executor provides so the agent
-  can plan and run behaviour trees on it.
+The core needs neither ROS nor the viewer: `cargo build` builds it, and
+`cargo test -p nervros-core --test scenarios` runs the scripted scenarios.

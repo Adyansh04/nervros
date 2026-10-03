@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::theme;
 use nervros_core::session::Event;
 use nervros_core::tools::ImageArtifact;
 use nervros_core::vision::SnapshotStore;
@@ -106,7 +107,7 @@ impl Attachments {
                         .max_height(40.0)
                         .corner_radius(4),
                 );
-                ui.label(RichText::new(&a.id).small().color(ui.tokens().text_subdued));
+                ui.label(RichText::new(&a.id).small().color(theme::DIM));
                 if ui
                     .small_icon_button(&icons::CLOSE_SMALL, "Remove this image")
                     .clicked()
@@ -119,11 +120,7 @@ impl Attachments {
             self.waiting.remove(i);
         }
         if let Some(problem) = &self.problem {
-            ui.label(
-                RichText::new(problem)
-                    .small()
-                    .color(ui.tokens().warn_fg_color),
-            );
+            ui.label(RichText::new(problem).small().color(theme::WARN));
         }
         ui.add_space(4.0);
     }

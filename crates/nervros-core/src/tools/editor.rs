@@ -192,6 +192,35 @@ impl EditorClient {
         }
     }
 
+    /// Saves, then has the running world model read the saved world, so neither the app nor the
+    /// agent leaves it working from the old one: `None` when the profile names no reload, else
+    /// whether it read it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::save`]; a world model that did not read the save is in the answer.
+    pub async fn save_and_reload(
+        &self,
+        robot: &dyn RobotPort,
+    ) -> Result<(String, Value, Option<Result<(), String>>), EditorError> {
+        let (message, world) = self.save().await?;
+        let Some(reload) = &self.reload else {
+            return Ok((message, world, None));
+        };
+        let read = match robot
+            .call(reload, "std_srvs/srv/Trigger", json!({}), TIMEOUT)
+            .await
+        {
+            Ok(a) if a["success"] == true => Ok(()),
+            Ok(a) => Err(format!(
+                "the world model did not read it: {}",
+                a["message"].as_str().unwrap_or("no reason")
+            )),
+            Err(e) => Err(format!("{reload} did not answer: {e}")),
+        };
+        Ok((message, world, Some(read)))
+    }
+
     /// What the camera saw of an object, if canopy kept a view of it.
     ///
     /// # Errors
@@ -572,10 +601,14 @@ impl WorldEdits {
 
     async fn run(&self, args: &Value) -> Result<ToolOutcome, String> {
         let action = args["action"].as_str().unwrap_or_default();
-        let (message, world) = match action {
-            "save" => self.editor.save().await,
-            "undo" | "redo" => self.editor.command(action).await,
-            "discard" => self.editor.command("reload").await,
+        let (message, world, read) = match action {
+            "save" => self.editor.save_and_reload(self.robot.as_ref()).await,
+            "undo" | "redo" => self.editor.command(action).await.map(|(m, w)| (m, w, None)),
+            "discard" => self
+                .editor
+                .command("reload")
+                .await
+                .map(|(m, w)| (m, w, None)),
             other => {
                 return Err(format!(
                     "`action` is save, undo, redo or discard, not `{other}`"
@@ -584,21 +617,9 @@ impl WorldEdits {
         }
         .map_err(|e| e.to_string())?;
         let mut data = json!({"said": message, "unsaved_edits": world["unsaved"]});
-        if action == "save"
-            && let Some(reload) = &self.editor.reload
-        {
-            let answer = self
-                .robot
-                .call(reload, "std_srvs/srv/Trigger", json!({}), TIMEOUT)
-                .await;
-            data["world_model"] = match answer {
-                Ok(a) if a["success"] == true => json!("read the saved world"),
-                Ok(a) => json!(format!(
-                    "did not read it: {}",
-                    a["message"].as_str().unwrap_or("no reason")
-                )),
-                Err(e) => json!(format!("{reload} did not answer: {e}")),
-            };
+        if let Some(read) = read {
+            data["world_model"] =
+                json!(read.map_or_else(|why| why, |()| "read the saved world".to_owned()));
         }
         let mut out = ToolOutcome::ok(data);
         out.message = message;
@@ -697,7 +718,8 @@ mod tests {
                 });
             }
         });
-        let config: EditorConfig = toml::from_str(&format!("url = \"{url}\"")).unwrap();
+        let config: EditorConfig =
+            toml::from_str(&format!("url = \"{url}\"\nreload = \"/world/reload\"")).unwrap();
         (Arc::new(EditorClient::new(&config).unwrap()), log)
     }
 
@@ -762,6 +784,30 @@ mod tests {
         assert_eq!(
             *log.lock().unwrap(),
             ["/api/save", "/api/rebase", "/api/save"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_has_the_world_model_read_it_and_says_when_it_did_not() {
+        let answer: Answer = Arc::new(|_, _| {
+            (
+                200,
+                json!({"message": "saved 1 edits", "world": {"unsaved": 0}}),
+            )
+        });
+        let (editor, _) = stub(answer).await;
+        let reading = nervros_ros::fake::FakeRobot::new()
+            .with_service("/world/reload", |_| Ok(json!({"success": true})));
+        let (_, _, read) = editor.save_and_reload(&reading).await.unwrap();
+        assert_eq!(read, Some(Ok(())));
+        assert_eq!(reading.calls().len(), 1, "one reload after the save");
+        let busy = nervros_ros::fake::FakeRobot::new().with_service("/world/reload", |_| {
+            Ok(json!({"success": false, "message": "mid-save"}))
+        });
+        let (_, _, read) = editor.save_and_reload(&busy).await.unwrap();
+        assert_eq!(
+            read,
+            Some(Err("the world model did not read it: mid-save".to_owned()))
         );
     }
 

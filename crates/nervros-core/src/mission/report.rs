@@ -58,11 +58,7 @@ impl Missions {
                 let _ = write!(report, " Goal checks: {}.", lines.join("; "));
             }
             if !camera.is_empty() {
-                let _ = write!(
-                    report,
-                    " Camera check, before and after: {}.",
-                    camera.join("; ")
-                );
+                let _ = write!(report, " Camera check: {}.", camera.join("; "));
             }
         } else {
             let n = self.run_failures.fetch_add(1, Ordering::SeqCst) + 1;

@@ -18,6 +18,8 @@ rerun.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
+nervros-ros = { path = "../nervros-ros", default-features = false, features = ["test-support"] }
 tempfile.workspace = true

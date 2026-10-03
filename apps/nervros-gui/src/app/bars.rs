@@ -10,10 +10,10 @@ use rerun::external::re_ui::{ReButton, UiExt as _};
 use rerun::external::{eframe, egui, re_memory};
 
 use super::{Gui, STOP_HINT, Tab};
+use crate::theme;
 
 impl Gui {
     pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let t = ui.tokens();
         // With the viewer drawing the window's decorations, its hidden top bar took the window
         // buttons and the drag handle with it; ours has them instead.
         let window_chrome = self.viewer.app_options().custom_window_decorations;
@@ -28,9 +28,9 @@ impl Gui {
         }
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(RichText::new("NervROS").strong().size(15.0));
-            ui.label(RichText::new(&self.agent.profile.robot.name).color(t.text_subdued));
-            ui.add_space(8.0);
+            ui.label(RichText::new("NervROS").strong().size(17.0));
+            ui.label(RichText::new(&self.agent.profile.robot.name).color(theme::DIM));
+            ui.add_space(6.0);
             self.status_chips(ui);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if window_chrome {
@@ -42,52 +42,27 @@ impl Gui {
                         .strong()
                         .color(Color32::WHITE),
                 )
-                .fill(t.error_fg_color)
+                .fill(theme::STOP)
                 .corner_radius(CornerRadius::same(8))
-                .min_size(egui::vec2(0.0, 28.0));
+                .min_size(egui::vec2(0.0, 30.0));
                 if ui.add(stop).on_hover_text(STOP_HINT).clicked() {
                     self.agent.session.send(Command::StopMission);
                 }
-                let toggle = ReButton::new("Dock")
-                    .small()
-                    .secondary()
-                    .selected(self.dock_open);
-                if ui.add(toggle).clicked() {
-                    self.dock_open = !self.dock_open;
-                }
-                if self.editor.is_some() {
-                    let edit = ReButton::new("Edit world")
-                        .small()
-                        .secondary()
-                        .selected(self.editing);
-                    if ui
-                        .add(edit)
-                        .on_hover_text("The saved world on its floor plan, to fix by hand")
-                        .clicked()
-                    {
-                        self.editing = !self.editing;
-                        if self.editing {
-                            self.tab = Tab::World;
-                            self.dock_open = true;
-                        }
-                    }
-                }
-                let reset = ReButton::new("Reset layout").small().secondary();
-                if ui
-                    .add(reset)
-                    .on_hover_text("Put the viewer's panes back the way NervROS lays them out")
-                    .clicked()
-                {
-                    self.bridge.reset_layout();
-                }
+                ui.add_space(4.0);
+                self.view_buttons(ui);
+                ui.add_space(8.0);
                 let mut armed = self.agent.guard.armed();
-                let label = if armed { "Armed" } else { "Observe only" };
-                ui.label(RichText::new(label).color(if armed {
-                    t.warn_fg_color
+                let (label, colour) = if armed {
+                    ("Armed", theme::WARN)
                 } else {
-                    t.text_subdued
-                }));
-                if ui.toggle_switch(14.0, &mut armed).changed() {
+                    ("Observe only", theme::DIM)
+                };
+                ui.label(RichText::new(label).strong().color(colour))
+                    .on_hover_text(
+                        "Armed, the agent may move the robot once you approve; observing, it \
+                         only looks",
+                    );
+                if ui.toggle_switch(15.0, &mut armed).changed() {
                     self.agent
                         .session
                         .send(if armed { Command::Arm } else { Command::Disarm });
@@ -96,27 +71,81 @@ impl Gui {
         });
     }
 
+    /// The dock, the world editor and the viewer's layout and eye, right to left.
+    fn view_buttons(&mut self, ui: &mut egui::Ui) {
+        let toggle = ReButton::new("Dock")
+            .small()
+            .secondary()
+            .selected(self.dock_open);
+        if ui
+            .add(toggle)
+            .on_hover_text("Show or hide the panel on the right")
+            .clicked()
+        {
+            self.dock_open = !self.dock_open;
+        }
+        if self.editor.is_some() {
+            let edit = ReButton::new("Edit world")
+                .small()
+                .secondary()
+                .selected(self.editing);
+            if ui
+                .add(edit)
+                .on_hover_text("The saved world on its floor plan, to fix by hand")
+                .clicked()
+            {
+                self.editing = !self.editing;
+                if self.editing {
+                    self.tab = Tab::World;
+                    self.dock_open = true;
+                }
+            }
+        }
+        let following = self.bridge.following();
+        let follow = ReButton::new("Follow robot")
+            .small()
+            .secondary()
+            .selected(following);
+        if ui
+            .add(follow)
+            .on_hover_text(
+                "Keep the 3D view on the robot as it moves; off, it shows the whole map. \
+                 Either puts the viewer's panes back as NervROS lays them out",
+            )
+            .clicked()
+        {
+            self.bridge.follow(!following);
+        }
+        let reset = ReButton::new("Reset layout").small().secondary();
+        if ui
+            .add(reset)
+            .on_hover_text("Put the viewer's panes back the way NervROS lays them out")
+            .clicked()
+        {
+            self.bridge.reset_layout();
+        }
+    }
+
     /// How the robot, the executor and the model are, and a way back to the live 3D view.
     fn status_chips(&mut self, ui: &mut egui::Ui) {
-        let t = ui.tokens();
         let (topics, executor) = {
             let live = self.live();
             (live.topics, live.executor.is_some())
         };
         match topics {
-            Some(n) if n > 2 => chip(ui, t.success_text_color, format!("ROS · {n} topics")),
-            Some(_) => chip(ui, t.error_fg_color, "ROS · empty graph"),
-            None => chip(ui, t.warn_fg_color, "ROS · connecting"),
+            Some(n) if n > 2 => chip(ui, theme::SUCCESS, format!("ROS · {n} topics")),
+            Some(_) => chip(ui, theme::ERROR, "ROS · empty graph"),
+            None => chip(ui, theme::WARN, "ROS · connecting"),
         }
         if self.agent.profile.mission.is_some() {
             if executor {
-                chip(ui, t.success_text_color, "executor");
+                chip(ui, theme::SUCCESS, "Executor");
             } else {
-                chip(ui, t.warn_fg_color, "executor offline");
+                chip(ui, theme::WARN, "Executor offline");
             }
         }
         let (model, quota) = self.model_status();
-        chip(ui, t.info_text_color, format!("{model} · {quota}"));
+        chip(ui, theme::INFO, format!("{model} · {quota}"));
         if let Some(at) = self.viewing {
             let secs = nervros_core::unix_secs(at);
             let back = ReButton::new(format!(
@@ -124,7 +153,7 @@ impl Gui {
                 crate::sessions::ago(secs)
             ))
             .small()
-            .secondary();
+            .blue();
             if ui.add(back).clicked() {
                 self.follow_live();
             }
@@ -155,29 +184,28 @@ impl Gui {
     }
 
     pub(super) fn status_bar(&self, ui: &mut egui::Ui, frame: &eframe::Frame) {
-        let t = ui.tokens();
-        let subdued = |s: String| RichText::new(s).small().color(t.text_subdued);
+        let item = |s: String| RichText::new(s).small().color(theme::DIM);
         ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 16.0;
-            let state = self.chat.turn.map_or_else(
-                || "idle".to_owned(),
-                |since| format!("working {} s", since.elapsed().as_secs()),
-            );
-            ui.label(subdued(state));
-            ui.label(subdued(format!("{} tools", self.agent.tools.len())));
+            ui.spacing_mut().item_spacing.x = 18.0;
+            match self.chat.turn {
+                Some(since) => {
+                    let text = format!("Working {} s", since.elapsed().as_secs());
+                    ui.label(RichText::new(text).small().color(theme::INFO));
+                }
+                None => {
+                    ui.label(item("Idle".to_owned()));
+                }
+            }
+            ui.label(item(format!("{} tools", self.agent.tools.len())));
             if let Some((used, window)) = self.chat.context {
                 let text = format!(
-                    "context {} / {}",
+                    "Context {} / {}",
                     crate::chat::thousands(used),
                     crate::chat::thousands(window)
                 );
                 // Past three quarters a compaction is near; past the window, a request fails.
                 let full = used.saturating_mul(4) >= window.saturating_mul(3);
-                let colour = if full {
-                    t.warn_fg_color
-                } else {
-                    t.text_subdued
-                };
+                let colour = if full { theme::WARN } else { theme::DIM };
                 ui.label(RichText::new(text).small().color(colour))
                     .on_hover_text(
                         "Tokens the latest request took; /compact condenses the conversation",
@@ -186,7 +214,7 @@ impl Gui {
             let spent = self.chat.spent;
             if spent.calls > 0 {
                 let cached = spent.cached_tokens * 100 / spent.input_tokens.max(1);
-                ui.label(subdued(format!("{} calls, {cached}% cached", spent.calls)))
+                ui.label(item(format!("{} calls · {cached}% cached", spent.calls)))
                     .on_hover_text(format!(
                         "Model calls this session: {} tokens in, {} of them read from the model's \
                          prompt cache, {} out, {:.0} s waiting",
@@ -199,13 +227,19 @@ impl Gui {
             if let Some(bytes) = re_memory::MemoryUse::capture().counted {
                 #[expect(clippy::cast_precision_loss, reason = "shown to one decimal")]
                 let gb = bytes as f64 / 1e9;
-                ui.label(subdued(format!("memory {gb:.1} GB")));
+                ui.label(item(format!("Memory {gb:.1} GB")));
             }
             if let Some(cpu) = frame.info().cpu_usage {
-                ui.label(subdued(format!("UI {:.1} ms", cpu * 1000.0)));
+                ui.label(item(format!("UI {:.1} ms", cpu * 1000.0)));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(subdued(format!("log {}", self.log_path.display())));
+                // The file's name tells sessions apart; the hover says where it is.
+                let name = self.log_path.file_name().map_or_else(
+                    || self.log_path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                ui.label(item(format!("Log {name}")))
+                    .on_hover_text(self.log_path.display().to_string());
             });
         });
     }
@@ -230,9 +264,10 @@ pub(super) fn quota(router: &Router, m: &ModelConfig, now: SystemTime) -> String
 
 fn chip(ui: &mut egui::Ui, color: Color32, text: impl Into<String>) {
     Frame::new()
-        .fill(ui.tokens().faint_bg_color)
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(8, 3))
+        .fill(theme::SURFACE)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(9, 3))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;

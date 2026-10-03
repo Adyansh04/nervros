@@ -21,13 +21,47 @@ pub enum ResetZone {
 /// The day number a timestamp falls in, for a reset zone.
 #[must_use]
 pub fn day_index(now: SystemTime, zone: ResetZone) -> u64 {
-    // ponytail: Pacific is taken as UTC-8 all year, so from March to November the day turns an
-    // hour late. A 429 still parks the model at the real reset; use a tz database if that matters.
+    let secs = crate::unix_secs(now);
     let offset = match zone {
         ResetZone::Utc => 0,
-        ResetZone::Pacific => 8 * 3600,
+        ResetZone::Pacific => pacific_offset(secs),
     };
-    crate::unix_secs(now).saturating_sub(offset) / 86_400
+    secs.saturating_sub(offset) / 86_400
+}
+
+/// Pacific time's lag behind UTC at `secs`: daylight time (UTC-7) from 02:00 on the second Sunday
+/// in March to 02:00 on the first Sunday in November, standard time (UTC-8) otherwise.
+fn pacific_offset(secs: u64) -> u64 {
+    const HOUR: u64 = 3600;
+    let year = civil_year(secs / 86_400);
+    let starts = nth_sunday(year, 3, 2) * 86_400 + 10 * HOUR;
+    let ends = nth_sunday(year, 11, 1) * 86_400 + 9 * HOUR;
+    if (starts..ends).contains(&secs) {
+        7 * HOUR
+    } else {
+        8 * HOUR
+    }
+}
+
+/// The year a day since 1970-01-01 falls in: Howard Hinnant's `civil_from_days`.
+fn civil_year(days: u64) -> u64 {
+    let z = days + 719_468;
+    let (era, doe) = (z / 146_097, z % 146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let march_based_month = (5 * doy + 2) / 153;
+    era * 400 + yoe + u64::from(march_based_month >= 10)
+}
+
+/// The day since 1970-01-01 of a month's `n`th Sunday: Howard Hinnant's `days_from_civil`.
+fn nth_sunday(year: u64, month: u64, n: u64) -> u64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let (era, yoe) = (y / 400, y % 400);
+    let doy = (153 * ((month + 9) % 12) + 2) / 5;
+    let first = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    // 1970-01-01 was a Thursday: day 3 is the first Sunday.
+    let to_sunday = (7 - (first + 4) % 7) % 7;
+    first + to_sunday + 7 * (n - 1)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -249,9 +283,25 @@ mod tests {
                 .check("m", &limits, None, next_day, ResetZone::Utc)
                 .is_ok()
         );
-        // 07:00 UTC is still the previous day in Pacific time.
-        let early = at(86_400 * 101 + 7 * 3600);
-        assert_eq!(day_index(early, ResetZone::Pacific), 100);
+        let early = at(86_400 * 10 + 7 * 3600);
+        assert_eq!(
+            day_index(early, ResetZone::Pacific),
+            9,
+            "07:00 UTC in winter"
+        );
+    }
+
+    #[test]
+    fn pacific_days_turn_at_midnight_in_summer_and_in_winter() {
+        let day = |secs| day_index(at(secs), ResetZone::Pacific);
+        assert_eq!(day(1_791_010_799), 20_728, "2026-10-03 06:59:59 UTC");
+        assert_eq!(day(1_791_010_801), 20_729, "2026-10-03 07:00:01 UTC");
+        assert_eq!(day(1_768_460_400), 20_467, "2026-01-15 07:00 UTC");
+        assert_eq!(day(1_768_464_000), 20_468, "2026-01-15 08:00 UTC");
+        assert_eq!(pacific_offset(1_772_963_999), 8 * 3600);
+        assert_eq!(pacific_offset(1_772_964_000), 7 * 3600);
+        assert_eq!(pacific_offset(1_793_523_599), 7 * 3600);
+        assert_eq!(pacific_offset(1_793_523_600), 8 * 3600);
     }
 
     #[test]

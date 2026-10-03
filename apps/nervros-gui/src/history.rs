@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 
 use nervros_core::mission::ledger::{Gap, Ledger, MissionRecord, Template};
 use nervros_core::session::Command;
-use rerun::external::egui::{self, Align, Layout, RichText};
+use rerun::external::egui::{self, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _};
 use serde_json::{Value, json};
 
 use crate::chat::Action;
+use crate::theme;
 
 /// How many of each list the tab shows.
 const SHOWN: usize = 8;
@@ -92,8 +93,8 @@ pub fn show(
 }
 
 fn heading(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(12.0);
-    ui.label(RichText::new(text).strong());
+    ui.add_space(16.0);
+    theme::section(ui, text);
 }
 
 fn run(args: Value) -> Action {
@@ -105,20 +106,19 @@ fn run(args: Value) -> Action {
 
 fn missions(ui: &mut egui::Ui, list: &[MissionRecord], actions: &mut Vec<Action>) {
     heading(ui, "Recent missions");
-    let t = ui.tokens();
     if list.is_empty() {
         ui.label(
             RichText::new("None yet: a mission is kept here when it ends.")
                 .small()
-                .color(t.text_subdued),
+                .color(theme::DIM),
         );
         return;
     }
     for m in list {
         let colour = match m.outcome.as_str() {
             "success" => ui.visuals().text_color(),
-            "canceled" => t.text_subdued,
-            _ => t.error_fg_color,
+            "canceled" => theme::DIM,
+            _ => theme::ERROR,
         };
         let header = format!(
             "{} · {} · {} · {:.0} s",
@@ -127,68 +127,61 @@ fn missions(ui: &mut egui::Ui, list: &[MissionRecord], actions: &mut Vec<Action>
             ago(m.started),
             m.ended - m.started
         );
-        let row = egui::CollapsingHeader::new(RichText::new(header).small().color(colour))
-            .id_salt(("mission", &m.id))
-            .show(ui, |ui| {
-                if !m.request.is_empty() {
-                    ui.label(
-                        RichText::new(format!("Asked: {}", m.request))
-                            .small()
-                            .color(t.text_subdued),
-                    );
-                }
-                for s in &m.steps {
-                    let time = s
-                        .seconds
-                        .map_or_else(String::new, |x| format!(" · {x:.0} s"));
-                    let why = if s.reason.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {}", s.reason)
-                    };
-                    let line = format!("{} {} {}{time}{why}", s.id, s.skill, s.outcome);
-                    ui.label(RichText::new(line).monospace().size(11.0));
-                }
-                if ui
-                    .add(ReButton::new("Run again").small().secondary())
-                    .on_hover_text("Plan the same steps; you approve them before the robot moves")
-                    .clicked()
-                {
-                    actions.push(run(again(m)));
-                }
-            });
-        row.header_response
-            .on_hover_text(format!("mission {}", m.id));
+        let id = ui.make_persistent_id(("mission", &m.id));
+        let label = RichText::new(header).size(13.0).color(colour);
+        theme::disclosure(ui, id, label, |ui| {
+            if !m.request.is_empty() {
+                ui.label(
+                    RichText::new(format!("Asked: {}", m.request))
+                        .small()
+                        .color(theme::DIM),
+                );
+            }
+            for s in &m.steps {
+                let time = s
+                    .seconds
+                    .map_or_else(String::new, |x| format!(" · {x:.0} s"));
+                let why = if s.reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", s.reason)
+                };
+                let line = format!("{} {} {}{time}{why}", s.id, s.skill, s.outcome);
+                ui.label(RichText::new(line).monospace());
+            }
+            if ui
+                .add(ReButton::new("Run again").small().secondary())
+                .on_hover_text("Plan the same steps; you approve them before the robot moves")
+                .clicked()
+            {
+                actions.push(run(again(m)));
+            }
+        })
+        .on_hover_text(format!("mission {}", m.id));
     }
 }
 
 /// The saved plans; the name of one to forget, when asked.
 fn templates(ui: &mut egui::Ui, list: &[Template], actions: &mut Vec<Action>) -> Option<String> {
     heading(ui, "Saved plans");
-    let t = ui.tokens();
     if list.is_empty() {
         ui.label(
             RichText::new("None yet: ask the agent to save a plan that worked, by name.")
                 .small()
-                .color(t.text_subdued),
+                .color(theme::DIM),
         );
         return None;
     }
     let mut forget = None;
     for plan in list {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&plan.name).small().strong());
-            let runs = match plan.runs {
-                0 => "never run".to_owned(),
-                1 => "run once".to_owned(),
-                n => format!("run {n} times"),
-            };
-            ui.label(
-                RichText::new(format!("{} · {runs}", plan.intent))
-                    .small()
-                    .color(t.text_subdued),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let runs = match plan.runs {
+            0 => "never run".to_owned(),
+            1 => "run once".to_owned(),
+            n => format!("run {n} times"),
+        };
+        theme::row(
+            ui,
+            |ui| {
                 if ui
                     .add(ReButton::new("Forget").small().secondary())
                     .clicked()
@@ -202,20 +195,28 @@ fn templates(ui: &mut egui::Ui, list: &[Template], actions: &mut Vec<Action>) ->
                 {
                     actions.push(run(json!({"template": plan.name})));
                 }
-            });
-        });
+            },
+            |ui| {
+                ui.label(RichText::new(&plan.name).strong());
+                ui.label(
+                    RichText::new(format!("{} · {runs}", plan.intent))
+                        .small()
+                        .color(theme::DIM),
+                )
+                .on_hover_text(&plan.intent);
+            },
+        );
     }
     forget
 }
 
 fn gaps(ui: &mut egui::Ui, list: &[Gap]) {
     heading(ui, "Skill gaps");
-    let t = ui.tokens();
     if list.is_empty() {
         ui.label(
             RichText::new("None: every request so far had a skill for it.")
                 .small()
-                .color(t.text_subdued),
+                .color(theme::DIM),
         );
         return;
     }
@@ -225,11 +226,11 @@ fn gaps(ui: &mut egui::Ui, list: &[Gap]) {
         } else {
             format!("; nearest: {}", g.nearest)
         };
-        ui.label(RichText::new(format!("\"{}\"", g.request)).small());
+        ui.label(RichText::new(format!("\"{}\"", g.request)).size(13.0));
         ui.label(
             RichText::new(format!("{}: {}{nearest}", ago(g.at), g.reason))
                 .small()
-                .color(t.text_subdued),
+                .color(theme::DIM),
         );
         ui.add_space(4.0);
     }
@@ -320,7 +321,7 @@ mod tests {
             .with_size(egui::vec2(380.0, 600.0))
             .build_ui(move |ui| {
                 egui::Frame::new()
-                    .fill(ui.tokens().panel_bg_color)
+                    .fill(theme::BG)
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         show(ui, &mut history, Some(&ledger), &mut Vec::new());

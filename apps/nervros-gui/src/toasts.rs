@@ -3,7 +3,8 @@
 
 use std::time::{Duration, Instant};
 
-use rerun::external::egui::{self, Align2, CornerRadius, Frame, Margin, RichText, Stroke};
+use crate::theme;
+use rerun::external::egui::{self, Align2, RichText};
 use rerun::external::re_ui::{UiExt as _, icons};
 
 /// How long a note stays; a failure stays longer, as it needs reading.
@@ -64,25 +65,23 @@ impl Toasts {
                 .anchor(Align2::RIGHT_BOTTOM, offset)
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
-                    let t = ui.tokens();
+                    theme::apply(ui);
                     let (colour, icon) = match toast.kind {
-                        Kind::Success => (t.success_text_color, &icons::SUCCESS),
-                        Kind::Failure => (t.error_fg_color, &icons::ERROR),
-                        Kind::Info => (t.info_text_color, &icons::INFO),
+                        Kind::Success => (theme::SUCCESS, &icons::SUCCESS),
+                        Kind::Failure => (theme::ERROR, &icons::ERROR),
+                        Kind::Info => (theme::INFO, &icons::INFO),
                     };
-                    Frame::new()
-                        .fill(t.panel_bg_color)
-                        .stroke(Stroke::new(1.0, colour))
-                        .corner_radius(CornerRadius::same(8))
-                        .inner_margin(Margin::symmetric(12, 8))
-                        .show(ui, |ui| {
-                            ui.set_max_width(360.0);
+                    // Its own scope: the area's response is the area's, which already senses.
+                    ui.scope(|ui| {
+                        theme::status_card(ui, colour, |ui| {
+                            ui.set_max_width(380.0);
                             ui.horizontal(|ui| {
                                 ui.small_icon(icon, Some(colour));
                                 ui.add(egui::Label::new(RichText::new(&toast.text)).wrap());
                             });
-                        })
-                        .response
+                        });
+                    })
+                    .response
                 })
                 .inner;
             if shown.interact(egui::Sense::click()).clicked() {

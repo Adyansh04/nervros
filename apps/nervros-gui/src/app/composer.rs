@@ -2,18 +2,24 @@
 
 use nervros_core::session::Command;
 use rerun::external::egui;
-use rerun::external::egui::{Frame, Key, Margin, Modifiers, RichText};
+use rerun::external::egui::{Align, CornerRadius, Frame, Key, Layout, Margin, Modifiers, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _, icons};
 use serde_json::Value;
 
 use super::{COMPOSER, Gui, Picked};
 use crate::chat::Action;
+use crate::theme;
 
 impl Gui {
     pub(super) fn chat_panel(&mut self, ui: &mut egui::Ui) {
         let mut actions = Vec::new();
         egui::Panel::bottom("nervros_composer_panel")
-            .frame(Frame::new().inner_margin(Margin::symmetric(0, 8)))
+            .frame(Frame::new().inner_margin(Margin {
+                left: 0,
+                right: 0,
+                top: 8,
+                bottom: 14,
+            }))
             .show(ui, |ui| {
                 self.picked_bar(ui, &mut actions);
                 self.composer(ui, &mut actions);
@@ -22,9 +28,10 @@ impl Gui {
             .stick_to_bottom(true)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(8.0);
+                ui.add_space(14.0);
                 self.chat
                     .show(ui, self.agent.profile.policy.approval_ttl, &mut actions);
+                ui.add_space(8.0);
             });
         self.act(ui.ctx(), actions);
     }
@@ -74,36 +81,38 @@ impl Gui {
                 }
             }
         };
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("Selected {what}"))
-                    .small()
-                    .color(ui.tokens().text_subdued),
-            );
-            if ui
-                .small_button("Go there")
-                .on_hover_text("Plan the walk now; you approve it before the robot moves")
-                .clicked()
-            {
-                actions.push(Action::Send(Command::Run {
-                    tool: "run_mission".to_owned(),
-                    args: go,
-                }));
-            }
-            for (label, text) in prompts {
-                if ui.small_button(label).clicked() {
-                    actions.push(Action::Prefill(text));
-                }
-            }
-            if ui
-                .small_button("✕")
-                .on_hover_text("Clear the selection")
-                .clicked()
-            {
-                self.picked.replace(None);
-            }
-        });
-        ui.add_space(4.0);
+        theme::card()
+            .inner_margin(Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Selected").small().color(theme::FAINT));
+                    ui.label(RichText::new(what).strong());
+                    if ui
+                        .add(ReButton::new("Go there").small().blue())
+                        .on_hover_text("Plan the walk now; you approve it before the robot moves")
+                        .clicked()
+                    {
+                        actions.push(Action::Send(Command::Run {
+                            tool: "run_mission".to_owned(),
+                            args: go,
+                        }));
+                    }
+                    for (label, text) in prompts {
+                        if ui.add(ReButton::new(label).small().secondary()).clicked() {
+                            actions.push(Action::Prefill(text));
+                        }
+                    }
+                    if ui
+                        .small_icon_button(&icons::CLOSE_SMALL, "Clear the selection")
+                        .on_hover_text("Clear the selection")
+                        .clicked()
+                    {
+                        self.picked.replace(None);
+                    }
+                });
+            });
+        ui.add_space(6.0);
     }
 
     fn composer(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -146,6 +155,46 @@ impl Gui {
         if sees {
             self.attachments.show(ui);
         }
+        let edge = if focused {
+            theme::ACCENT
+        } else {
+            theme::BORDER
+        };
+        Frame::new()
+            .fill(theme::SURFACE)
+            .stroke(egui::Stroke::new(1.0, edge))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin {
+                left: 12,
+                right: 8,
+                top: 10,
+                bottom: 8,
+            })
+            .show(ui, |ui| {
+                let hint = if working {
+                    "Say something while it works: it reads it at its next step"
+                } else {
+                    "Message the robot"
+                };
+                let edit = egui::TextEdit::multiline(&mut self.input)
+                    .id(id)
+                    .hint_text(RichText::new(hint).color(theme::FAINT))
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .frame(Frame::NONE)
+                    .margin(Margin::ZERO);
+                ui.add(edit);
+                self.composer_row(ui, (sees, working, enter), actions);
+            });
+    }
+
+    /// Under the field: paste an image, the keys, and Send, or Stop while the agent answers.
+    fn composer_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        (sees, working, enter): (bool, bool, bool),
+        actions: &mut Vec<Action>,
+    ) {
         ui.horizontal(|ui| {
             if sees
                 && ui
@@ -158,35 +207,31 @@ impl Gui {
             {
                 self.attachments.paste(ui.ctx());
             }
-            let hint = if working {
-                "Say something while it works: it reads it at its next step · Esc stops it"
+            let keys = if working {
+                "Esc stops the reply"
             } else {
-                "Message the robot · Enter sends, Shift+Enter adds a line"
+                "Enter sends · Shift+Enter adds a line"
             };
-            let edit = egui::TextEdit::multiline(&mut self.input)
-                .id(id)
-                .hint_text(hint)
-                .desired_rows(2)
-                .desired_width(ui.available_width() - 72.0)
-                .margin(Margin::symmetric(8, 6));
-            ui.add(edit);
-            let has_text = !self.input.trim().is_empty();
-            if working && !has_text {
-                if ui
-                    .add(ReButton::new("Stop").secondary())
-                    .on_hover_text("Stops the reply (Esc)")
-                    .clicked()
-                {
-                    actions.push(Action::Send(Command::StopGeneration));
+            ui.label(RichText::new(keys).small().color(theme::FAINT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let has_text = !self.input.trim().is_empty();
+                if working && !has_text {
+                    if ui
+                        .add(ReButton::new("Stop").small().secondary())
+                        .on_hover_text("Stops the reply (Esc)")
+                        .clicked()
+                    {
+                        actions.push(Action::Send(Command::StopGeneration));
+                    }
+                } else {
+                    let send = ui.add_enabled(has_text, ReButton::new("Send").small().blue());
+                    if has_text && (enter || send.clicked()) {
+                        actions.push(Action::Say(
+                            std::mem::take(&mut self.input).trim().to_owned(),
+                        ));
+                    }
                 }
-            } else {
-                let send = ui.add_enabled(has_text, ReButton::new("Send").primary());
-                if has_text && (enter || send.clicked()) {
-                    actions.push(Action::Say(
-                        std::mem::take(&mut self.input).trim().to_owned(),
-                    ));
-                }
-            }
+            });
         });
     }
 }

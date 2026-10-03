@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
@@ -232,7 +232,7 @@ fn halt(shared: &Arc<Shared>, robot: bool) {
             shared.emit(Event::Stopped {
                 ok,
                 detail: if ok {
-                    out.data.to_string()
+                    stopped_state(&out.data)
                 } else {
                     out.message
                 },
@@ -247,4 +247,30 @@ fn halt(shared: &Arc<Shared>, robot: bool) {
     shared.emit(Event::Halted {
         reason: reason.into(),
     });
+}
+
+/// The robot's own words for its state after a stop, or why nothing was running: the stop
+/// tool's answer is for the model, the operator reads a line.
+fn stopped_state(data: &Value) -> String {
+    ["state", "note"]
+        .iter()
+        .find_map(|key| data[key].as_str())
+        .map_or_else(|| data.to_string(), str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn a_stop_reads_as_the_robot_words_it() {
+        let state = json!({"stopped": true, "state": "holding posture; hands empty"});
+        assert_eq!(super::stopped_state(&state), "holding posture; hands empty");
+        let idle = json!({"stopped": true, "note": "nothing was running"});
+        assert_eq!(super::stopped_state(&idle), "nothing was running");
+        assert_eq!(
+            super::stopped_state(&json!({"stopped": true})),
+            r#"{"stopped":true}"#
+        );
+    }
 }

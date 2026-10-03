@@ -38,6 +38,17 @@ pub trait Eyes: Send + Sync {
     async fn see(&self, prompt: &str, image: ImageInput) -> Result<(String, String), String>;
 }
 
+/// What one look found: the marked frame as kept, and what the vision model said of it.
+pub(crate) struct Looked {
+    pub(crate) snapshot: Arc<crate::vision::Snapshot>,
+    pub(crate) camera: String,
+    pub(crate) age_s: f64,
+    pub(crate) marks: Vec<Value>,
+    pub(crate) left_out: Option<String>,
+    /// The answer and the model's id, or why none answered; none without eyes.
+    pub(crate) seen: Option<Result<(String, String), String>>,
+}
+
 /// The `look` tool.
 pub struct LookTool {
     spec: ToolSpec,
@@ -84,11 +95,14 @@ impl LookTool {
         }
     }
 
-    async fn run(
+    /// Looks now: the frame the newest detections were cut from with them drawn as marks, kept
+    /// as a snapshot, and the vision model's answer to `question` about it. The mission's camera
+    /// check asks through this too, so it sees the marks and their labels as the agent does.
+    pub(crate) async fn look_now(
         &self,
         question: Option<&str>,
         camera: Option<&str>,
-    ) -> Result<ToolOutcome, String> {
+    ) -> Result<Looked, String> {
         let camera = self.cameras.get(camera)?;
         let newest = camera.newest()?;
         let (mut dets, frame, age, left_out) = self.marked(camera, newest).await;
@@ -117,12 +131,28 @@ impl LookTool {
         let snapshot = self
             .snapshots
             .store(jpeg, img.dimensions(), frame.stamp_s, dets.instances);
-        let mut data = json!({"snapshot": snapshot.id, "camera": camera.name,
-            "age_s": (age * 10.0).round() / 10.0, "marks": marks});
-        if let Some(why) = left_out {
+        Ok(Looked {
+            snapshot,
+            camera: camera.name.clone(),
+            age_s: age,
+            marks,
+            left_out,
+            seen,
+        })
+    }
+
+    async fn run(
+        &self,
+        question: Option<&str>,
+        camera: Option<&str>,
+    ) -> Result<ToolOutcome, String> {
+        let looked = self.look_now(question, camera).await?;
+        let mut data = json!({"snapshot": looked.snapshot.id, "camera": looked.camera,
+            "age_s": (looked.age_s * 10.0).round() / 10.0, "marks": looked.marks});
+        if let Some(why) = looked.left_out {
             data["no_marks"] = Value::String(why);
         }
-        match seen {
+        match looked.seen {
             Some(Ok((answer, model))) => {
                 data["answer"] = Value::String(crate::tools::from_world(&answer));
                 data["seen_by"] = Value::String(model);
@@ -131,8 +161,11 @@ impl LookTool {
             None => {}
         }
         let mut out = ToolOutcome::ok(data);
-        out.message = format!("{} marks; the user sees the marked image", marks.len());
-        out.images.push(snapshot.image.clone());
+        out.message = format!(
+            "{} marks; the user sees the marked image",
+            looked.marks.len()
+        );
+        out.images.push(looked.snapshot.image.clone());
         Ok(out)
     }
 

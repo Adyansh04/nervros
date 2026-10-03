@@ -28,6 +28,8 @@ pub enum Cmd {
     EditWorld,
     /// Follow the newest data again after looking at an earlier moment.
     Live,
+    /// Keep the 3D view on the robot, or frame the whole map again.
+    Follow,
 }
 
 /// One command: what the palette lists, the `/name` that runs it from the chat, and its keys.
@@ -113,6 +115,12 @@ pub fn entries() -> Vec<Entry> {
         entry("Viewer layers", "/layers", "", Cmd::Tab(Tab::Layers)),
         entry("Show or hide the dock", "/dock", "", Cmd::Dock),
         entry("Reset the viewer layout", "/layout", "", Cmd::ResetLayout),
+        entry(
+            "Follow the robot in 3D, or see the whole map",
+            "/follow",
+            "",
+            Cmd::Follow,
+        ),
         entry("Edit the world", "/edit", "", Cmd::EditWorld),
         entry("Back to the live view", "/live", "", Cmd::Live),
     ]
