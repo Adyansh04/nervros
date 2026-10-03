@@ -306,10 +306,9 @@ impl Gui {
         panels.blueprint = Some(PanelState::Collapsed);
         panels.selection = Some(PanelState::Collapsed);
         panels.time = Some(PanelState::Collapsed);
-        let editor = agent
-            .editor
-            .clone()
-            .map(|client| crate::editor::WorldEditor::new(client, runtime.clone()));
+        let editor = agent.editor.clone().map(|client| {
+            crate::editor::WorldEditor::new(client, Arc::clone(&agent.robot), runtime.clone())
+        });
         let drive =
             crate::robot::Drive::new(&agent.profile, Arc::clone(&agent.robot), runtime.clone());
         let (viewer_commands, receiver) = re_viewer::command_channel();

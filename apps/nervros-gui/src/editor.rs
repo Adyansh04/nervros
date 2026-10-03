@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use nervros_core::editor::EditorClient;
+use nervros_ros::RobotPort;
 use rerun::external::egui::{self, Pos2, Rect, Vec2};
 use serde_json::Value;
 
@@ -131,6 +132,8 @@ enum Call {
 /// The editor's state in the app.
 pub(crate) struct WorldEditor {
     client: Arc<EditorClient>,
+    /// For the world model's reload after a save.
+    robot: Arc<dyn RobotPort>,
     runtime: tokio::runtime::Handle,
     shared: Arc<Mutex<Shared>>,
     map: Option<egui::TextureHandle>,
@@ -156,9 +159,14 @@ fn lock(m: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
 
 impl WorldEditor {
     /// An editor for the world model behind `client`, its calls run on `runtime`.
-    pub(crate) fn new(client: Arc<EditorClient>, runtime: tokio::runtime::Handle) -> Self {
+    pub(crate) fn new(
+        client: Arc<EditorClient>,
+        robot: Arc<dyn RobotPort>,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             client,
+            robot,
             runtime,
             shared: Arc::default(),
             map: None,
@@ -243,8 +251,9 @@ impl WorldEditor {
     }
 
     fn call(&self, ctx: &egui::Context, call: Call) {
-        let (client, shared, ctx) = (
+        let (client, robot, shared, ctx) = (
             Arc::clone(&self.client),
+            Arc::clone(&self.robot),
             Arc::clone(&self.shared),
             ctx.clone(),
         );
@@ -258,7 +267,7 @@ impl WorldEditor {
             let answer = match call {
                 Call::Edit(op, message) => client.edit(&op).await.map(|e| {
                     let select = e.created.first().map(|id| Picked::Object(*id));
-                    (message, e.world, select)
+                    (message, e.world, select, false)
                 }),
                 Call::Command(name, message) => client.command(name).await.map(|(said, w)| {
                     (
@@ -269,9 +278,24 @@ impl WorldEditor {
                         },
                         w,
                         None,
+                        false,
                     )
                 }),
-                Call::Save => client.save().await.map(|(said, w)| (said, w, None)),
+                Call::Save => {
+                    client
+                        .save_and_reload(robot.as_ref())
+                        .await
+                        .map(|(said, w, read)| {
+                            match read {
+                                None => (said, w, None, false),
+                                Some(Ok(())) => {
+                                    (format!("{said}; the world model read them"), w, None, false)
+                                }
+                                // Saved, but the world model still works from the old world.
+                                Some(Err(why)) => (format!("{said}, but {why}"), w, None, true),
+                            }
+                        })
+                }
             };
             let mut s = lock(&shared);
             // Only the newest request's answer sets the world: two edits can end out of order.
@@ -280,9 +304,9 @@ impl WorldEditor {
                 s.busy = false;
             }
             match answer {
-                Ok((message, world, select)) if newest => match s.take(world) {
+                Ok((message, world, select, trouble)) if newest => match s.take(world) {
                     Ok(()) => {
-                        s.status = Some((message, false));
+                        s.status = Some((message, trouble));
                         s.select = select;
                     }
                     Err(why) => s.status = Some((format!("{message}, but {why}"), true)),
@@ -415,7 +439,8 @@ mod tests {
         let config: nervros_core::profile::EditorConfig =
             serde_json::from_value(json!({"url": "http://127.0.0.1:9"})).unwrap();
         let client = Arc::new(EditorClient::new(&config).unwrap());
-        let mut editor = WorldEditor::new(client, runtime.handle().clone());
+        let robot = Arc::new(nervros_ros::fake::FakeRobot::new());
+        let mut editor = WorldEditor::new(client, robot, runtime.handle().clone());
         editor.show_world(&fixture(), plan());
         editor.select(Picked::Object(2));
         let mut harness = egui_kittest::Harness::builder()
