@@ -70,11 +70,9 @@ impl Gui {
             );
         }
         for s in listed {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&s.when).monospace().small());
-                ui.label(RichText::new(&s.first).size(13.0))
-                    .on_hover_text(format!("{} messages", s.messages));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            theme::row(
+                ui,
+                |ui| {
                     if ui
                         .add(ReButton::new("Resume").small().secondary())
                         .on_hover_text("Carry on this conversation")
@@ -89,8 +87,13 @@ impl Gui {
                     {
                         keep = Some(crate::sessions::log_of(&s.path));
                     }
-                });
-            });
+                },
+                |ui| {
+                    ui.label(RichText::new(&s.when).monospace().small());
+                    ui.label(RichText::new(&s.first).size(13.0))
+                        .on_hover_text(format!("{} ({} messages)", s.first, s.messages));
+                },
+            );
         }
         if let Some(log) = keep {
             self.save_as_case(&log);
@@ -124,22 +127,26 @@ impl Gui {
         }
         let mut forget = None;
         for n in &notes {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(n.id.to_string())
-                        .monospace()
-                        .color(theme::FAINT),
-                );
-                ui.label(RichText::new(&n.text).size(13.0));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            theme::row(
+                ui,
+                |ui| {
                     if ui
                         .add(ReButton::new("Forget").small().secondary())
                         .clicked()
                     {
                         forget = Some(n.id);
                     }
-                });
-            });
+                },
+                |ui| {
+                    ui.label(
+                        RichText::new(n.id.to_string())
+                            .monospace()
+                            .color(theme::FAINT),
+                    );
+                    ui.label(RichText::new(&n.text).size(13.0))
+                        .on_hover_text(&n.text);
+                },
+            );
         }
         if let Some(id) = forget
             && let Err(e) = self.agent.memory.forget(id)

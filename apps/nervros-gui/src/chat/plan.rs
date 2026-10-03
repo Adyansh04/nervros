@@ -13,41 +13,43 @@ use rerun::external::re_ui::{ReButton, UiExt as _, icons};
 use super::{Action, PlanCard};
 use crate::theme;
 
-/// The plan's steps with each one's state, how it has gone before, and what the preview warns of.
+/// The plan's steps with each one's state, how it has gone before, and what the preview warns of:
+/// the mark and the step's id in narrow columns, the step itself wrapping in the rest. A grid's
+/// columns shrink to the letter where its text wraps.
 fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
-    egui::Grid::new(("plan_steps", &p.hash))
-        .num_columns(3)
-        .spacing([10.0, 6.0])
-        .show(ui, |ui| {
-            for s in &p.steps {
-                let (status, node) = p.progress.get(&s.id).cloned().unwrap_or_default();
-                let failed = p.finished.as_ref().is_some_and(|f| f.1 == s.id);
-                let (color, mark) = if failed {
-                    (theme::ERROR, "✗")
-                } else {
-                    node_look(&status)
-                };
-                ui.label(RichText::new(mark).color(color));
-                ui.label(RichText::new(&s.id).monospace().color(theme::FAINT));
-                let text = if status == "running" && !node.is_empty() {
-                    format!("{} · {node}", s.summary)
-                } else {
-                    s.summary.clone()
-                };
-                let preview_note = p
-                    .preview
-                    .iter()
-                    .find(|v| v.id == s.id)
-                    .map(|v| v.note.as_str())
-                    .filter(|n| !n.is_empty());
-                ui.horizontal(|ui| {
-                    let summary = ui.label(RichText::new(text).monospace());
-                    if let Some(note) = preview_note {
-                        summary.on_hover_text(note);
-                    }
-                    track_label(ui, s);
-                });
-                ui.end_row();
+    for s in &p.steps {
+        let (status, node) = p.progress.get(&s.id).cloned().unwrap_or_default();
+        let failed = p.finished.as_ref().is_some_and(|f| f.1 == s.id);
+        let (color, mark) = if failed {
+            (theme::ERROR, "✗")
+        } else {
+            node_look(&status)
+        };
+        let text = if status == "running" && !node.is_empty() {
+            format!("{} · {node}", s.summary)
+        } else {
+            s.summary.clone()
+        };
+        let preview_note = p
+            .preview
+            .iter()
+            .find(|v| v.id == s.id)
+            .map(|v| v.note.as_str())
+            .filter(|n| !n.is_empty());
+        ui.horizontal_top(|ui| {
+            ui.add_sized(
+                [14.0, 18.0],
+                egui::Label::new(RichText::new(mark).color(color)),
+            );
+            let id = RichText::new(&s.id).monospace().color(theme::FAINT);
+            ui.add_sized([26.0, 18.0], egui::Label::new(id));
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let summary = ui.add(egui::Label::new(RichText::new(text).monospace()).wrap());
+                if let Some(note) = preview_note {
+                    summary.on_hover_text(note);
+                }
+                track_label(ui, s);
                 // Only a warning earns a line of its own; the rest is in the hover.
                 let warnings = preview_note
                     .filter(|n| n.starts_with("no path"))
@@ -59,14 +61,12 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
                             .map(|c| c.message.as_str()),
                     );
                 for warning in warnings {
-                    ui.label("");
-                    ui.label("");
                     let text = RichText::new(warning).size(13.0).color(theme::WARN);
                     ui.add(egui::Label::new(text).wrap());
-                    ui.end_row();
                 }
-            }
+            });
         });
+    }
 }
 
 /// A step's or node's status as a coloured mark.

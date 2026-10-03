@@ -2,7 +2,7 @@
 
 use nervros_core::session::Command;
 use rerun::external::egui;
-use rerun::external::egui::{Align, CornerRadius, Frame, Layout, Margin, RichText};
+use rerun::external::egui::{CornerRadius, Frame, Margin, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _, icons};
 
 use super::{Gui, Tab};
@@ -110,25 +110,28 @@ impl Gui {
         theme::section(ui, "Schedules");
         let mut cancel = None;
         for s in &list {
-            ui.horizontal(|ui| {
+            let when = if s.when.is_empty() {
+                format!(
+                    "every {} min, {} of {} runs left",
+                    s.every_min, s.left, s.times
+                )
+            } else {
+                format!("when {}, {} of {} runs left", s.when, s.left, s.times)
+            };
+            // The intent wraps on its own line: beside it, a button shrinks to a letter a line.
+            ui.horizontal_top(|ui| {
                 ui.label(RichText::new(&s.id).monospace().color(theme::FAINT));
-                ui.label(&s.intent);
-                let when = if s.when.is_empty() {
-                    format!(
-                        "every {} min, {} of {} runs left",
-                        s.every_min, s.left, s.times
-                    )
-                } else {
-                    format!("when {}, {} of {} runs left", s.when, s.left, s.times)
-                };
-                ui.label(RichText::new(when).small().color(theme::DIM));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add(ReButton::new("Cancel").small().secondary())
-                        .clicked()
-                    {
-                        cancel = Some(s.id.clone());
-                    }
+                ui.vertical(|ui| {
+                    ui.add(egui::Label::new(&s.intent).wrap());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(when).small().color(theme::DIM));
+                        if ui
+                            .add(ReButton::new("Cancel").small().secondary())
+                            .clicked()
+                        {
+                            cancel = Some(s.id.clone());
+                        }
+                    });
                 });
             });
         }

@@ -273,7 +273,7 @@ impl WorldEditor {
             .show(ui, |ui| {
                 let dim = theme::DIM;
                 for (k, v) in facts {
-                    ui.label(RichText::new(k).small().color(dim));
+                    ui.add(egui::Label::new(RichText::new(k).small().color(dim)).extend());
                     ui.label(RichText::new(v).small());
                     ui.end_row();
                 }
@@ -555,14 +555,16 @@ fn badge(ui: &mut egui::Ui, text: &str, colour: Color32) {
 
 /// A labelled text field with a menu of known words beside it.
 fn text_field(ui: &mut egui::Ui, title: &str, value: &mut String, words: &[String]) {
-    ui.label(RichText::new(title).small().color(theme::DIM));
+    let label = ui.label(RichText::new(title).small().color(theme::DIM));
     ui.horizontal(|ui| {
         let width = if words.is_empty() {
             ui.available_width()
         } else {
             ui.available_width() - 30.0
         };
-        ui.add(egui::TextEdit::singleline(value).desired_width(width.max(60.0)));
+        // Named by its title, for screen readers and for the window's tests.
+        ui.add(egui::TextEdit::singleline(value).desired_width(width.max(60.0)))
+            .labelled_by(label.id);
         if !words.is_empty() {
             ui.menu_button("…", |ui| {
                 egui::ScrollArea::vertical()

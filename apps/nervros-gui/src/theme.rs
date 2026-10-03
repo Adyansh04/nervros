@@ -4,7 +4,8 @@
 
 use rerun::external::egui::collapsing_header::CollapsingState;
 use rerun::external::egui::{
-    self, Color32, CornerRadius, Frame, Margin, Rect, RichText, Stroke, TextStyle, WidgetText,
+    self, Align, Color32, CornerRadius, Frame, Layout, Margin, Rect, RichText, Stroke, TextStyle,
+    WidgetText,
 };
 
 /// The panels.
@@ -162,4 +163,22 @@ pub fn disclosure(
         ui.indent(id.with("body"), body);
     });
     row
+}
+
+/// A row of text with buttons at its end. The buttons are laid out first, from the right, and
+/// the text is cut to the room left: beside wrapping text, a button shrinks to a letter a line.
+pub fn row(
+    ui: &mut egui::Ui,
+    buttons: impl FnOnce(&mut egui::Ui),
+    text: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            buttons(ui);
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                text(ui);
+            });
+        });
+    });
 }

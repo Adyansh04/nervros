@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use nervros_core::mission::ledger::{Gap, Ledger, MissionRecord, Template};
 use nervros_core::session::Command;
-use rerun::external::egui::{self, Align, Layout, RichText};
+use rerun::external::egui::{self, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _};
 use serde_json::{Value, json};
 
@@ -174,19 +174,14 @@ fn templates(ui: &mut egui::Ui, list: &[Template], actions: &mut Vec<Action>) ->
     }
     let mut forget = None;
     for plan in list {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&plan.name).strong());
-            let runs = match plan.runs {
-                0 => "never run".to_owned(),
-                1 => "run once".to_owned(),
-                n => format!("run {n} times"),
-            };
-            ui.label(
-                RichText::new(format!("{} · {runs}", plan.intent))
-                    .small()
-                    .color(theme::DIM),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let runs = match plan.runs {
+            0 => "never run".to_owned(),
+            1 => "run once".to_owned(),
+            n => format!("run {n} times"),
+        };
+        theme::row(
+            ui,
+            |ui| {
                 if ui
                     .add(ReButton::new("Forget").small().secondary())
                     .clicked()
@@ -200,8 +195,17 @@ fn templates(ui: &mut egui::Ui, list: &[Template], actions: &mut Vec<Action>) ->
                 {
                     actions.push(run(json!({"template": plan.name})));
                 }
-            });
-        });
+            },
+            |ui| {
+                ui.label(RichText::new(&plan.name).strong());
+                ui.label(
+                    RichText::new(format!("{} · {runs}", plan.intent))
+                        .small()
+                        .color(theme::DIM),
+                )
+                .on_hover_text(&plan.intent);
+            },
+        );
     }
     forget
 }
