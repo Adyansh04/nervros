@@ -684,9 +684,15 @@ fn ports_for(
     let mut ports = Vec::new();
     for arg in &skill.args {
         let derived;
-        let value = match (self::arg(&step.args, &arg.name), &arg.default_from) {
-            (Some(given), _) => given,
-            (None, Some(rule)) => {
+        let only = match arg.choices.as_slice() {
+            [only] => Some(only.as_str()),
+            _ => None,
+        };
+        let value = match (self::arg(&step.args, &arg.name), only, &arg.default_from) {
+            (Some(given), _, _) => given,
+            // One allowed value is the value, whatever a rule would derive.
+            (None, Some(only), _) => only,
+            (None, None, Some(rule)) => {
                 if let Some(v) = derive(rule, step, world) {
                     derived = v;
                     derived.as_str()
@@ -702,7 +708,7 @@ fn ports_for(
                     continue;
                 }
             }
-            (None, None) => {
+            (None, None, None) => {
                 problems.push(Problem::new(
                     id,
                     &arg.name,
@@ -1258,6 +1264,29 @@ mod tests {
             compiled
                 .xml
                 .contains(r#"object_id="red_block" phrase="red block""#),
+            "{}",
+            compiled.xml
+        );
+    }
+
+    #[test]
+    fn the_one_allowed_value_wins_over_a_derived_one() {
+        let mut c = catalog();
+        let pick = c
+            .skills
+            .iter_mut()
+            .find(|s| s.name == "PickObject")
+            .unwrap();
+        let phrase = pick.args.iter_mut().find(|a| a.name == "phrase").unwrap();
+        phrase.default_from = Some("label(object_id)".to_owned());
+        phrase.choices = vec!["red mug".to_owned()];
+        let p =
+            plan(&json!([{"skill": "PickObject", "args": {"object_id": "mug_4", "arm": "left"}}]));
+        let compiled = compile(&p, &c, &world(), Author::Model).unwrap();
+        assert!(
+            compiled
+                .xml
+                .contains(r#"object_id="mug_4" phrase="red mug""#),
             "{}",
             compiled.xml
         );

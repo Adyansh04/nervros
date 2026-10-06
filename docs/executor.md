@@ -134,8 +134,9 @@ and whether the balance controller is active, with some hysteresis, and says why
 
 - **Arguments.** `type` is `world_id` when the value must be an id in the world model, which the
   planner checks against the live one, and `string` otherwise. `enum` lists the only values
-  allowed. `default_from: "label(<arg>)"` lets the planner fill the value with the world model's
-  label for what the other argument names, or with the words of an id it does not know
+  allowed, and a single one fills the argument when a plan leaves it out, ahead of any
+  `default_from`. `default_from: "label(<arg>)"` lets the planner fill the value with the world
+  model's label for what the other argument names, or with the words of an id it does not know
   (`red_block` gives "red block"). The model never sees such an argument, but the mission still
   carries it.
 - **Needs and effects.** The planner understands these predicates in `requires` and `effects`:
