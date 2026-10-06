@@ -12,7 +12,6 @@ use rig::agent::{
     AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, InvalidToolCallAction,
     InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, RequestPatch,
 };
-use rig::completion::Chat as _;
 
 use super::LlmError;
 use super::client::{Llm, prompt_retry_after, stream_retry_after};
@@ -190,10 +189,11 @@ impl AgentHook for TurnHook {
     ) -> ModelTurnAction {
         if let Some(on_call) = &self.on_call {
             let sent = self.sent.lock().ok().and_then(|mut s| s.take());
+            // A count the provider leaves out is zero tokens to the budget and the report.
             on_call(CallCost {
-                input_tokens: event.usage.input_tokens,
-                cached_tokens: event.usage.cached_input_tokens,
-                output_tokens: event.usage.output_tokens,
+                input_tokens: event.usage.input_tokens.unwrap_or(0),
+                cached_tokens: event.usage.cached_input_tokens.unwrap_or(0),
+                output_tokens: event.usage.output_tokens.unwrap_or(0),
                 ms: sent.map_or(0, |t| {
                     u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
                 }),
@@ -320,7 +320,7 @@ pub async fn chat(
                 t.name.clone(),
                 t.description.clone(),
                 t.parameters.clone(),
-                move |_cx, args| {
+                move |args| {
                     let fut = invoke(args);
                     Box::pin(async move { Ok(ToolOutput::json(fut.await)) })
                 },
@@ -360,7 +360,7 @@ pub async fn chat(
     agent
         .chat(text, &mut history.0)
         .await
-        .map(plain)
+        .map(|response| plain(response.output))
         .map_err(|e| turn_error(e.to_string(), prompt_retry_after(&e)))
 }
 
@@ -374,14 +374,15 @@ pub(super) async fn streamed(
 ) -> Result<String, (String, Option<Duration>)> {
     use futures::StreamExt as _;
     use rig::agent::MultiTurnStreamItem;
-    use rig::streaming::{StreamedAssistantContent, StreamingChat as _};
-    let mut stream = agent.stream_chat(text, history.0.clone()).await;
+    use rig::streaming::{Item, StreamEvent};
+    let mut stream = agent.prompt(text).history(history.0.clone()).stream();
     let mut done = None;
     while let Some(item) = stream.next().await {
         match item.map_err(|e| (e.to_string(), stream_retry_after(&e)))? {
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
-                delta(&t.text);
-            }
+            MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                text,
+                ..
+            })) => delta(&text),
             MultiTurnStreamItem::FinalResponse(response) => done = Some(response),
             _ => {}
         }

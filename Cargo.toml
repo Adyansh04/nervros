@@ -69,9 +69,9 @@ opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = 
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
-# The MCP client, used directly: rig 0.42's route is rmcp 2. Tools only, no client capabilities.
+# The MCP client, used directly: rig 0.43's route is rmcp 2. Tools only, no client capabilities.
 rmcp = { version = "=3.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
-rig = "=0.42.0"
+rig = "=0.43.0"
 # The mission ledger. Bundled: one SQLite for every build, whatever the host has.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 schemars = "=1.2.2"

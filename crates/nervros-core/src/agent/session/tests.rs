@@ -71,7 +71,7 @@ impl AgentSource for Scripted {
 fn metered(allowed: usize) -> Arc<Scripted> {
     Arc::new(Scripted {
         allowed: Some(allowed),
-        ..Scripted::new(MockCompletionModel::new([
+        ..Scripted::new(MockCompletionModel::from_turns([
             MockTurn::tool_call("c1", "find_objects", json!({"query": "cup"})),
             MockTurn::text("The cup is in the kitchen."),
         ]))
@@ -111,7 +111,7 @@ async fn every_request_of_a_turn_counts_against_the_quota() {
 #[tokio::test]
 async fn only_a_real_429_sets_the_model_aside_streamed_or_not() {
     use rig::test_utils::MockStreamEvent;
-    let replies = MockCompletionModel::new([
+    let replies = MockCompletionModel::from_turns([
         MockTurn::provider_response_error(
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error": {"message": "you asked for 14290 tokens of 8192"}}"#,
@@ -165,7 +165,7 @@ async fn a_spent_quota_ends_the_turn() {
 
 #[tokio::test]
 async fn a_synchronous_act_leaves_the_tools_offered_to_check_its_effect() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "find_objects", json!({})),
         MockTurn::text("Done."),
     ]);
@@ -191,7 +191,7 @@ async fn a_synchronous_act_leaves_the_tools_offered_to_check_its_effect() {
 
 #[tokio::test]
 async fn once_a_mission_has_started_the_model_is_offered_no_tools() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "find_objects", json!({})),
         MockTurn::text("Started."),
     ]);
@@ -230,7 +230,7 @@ async fn once_a_mission_has_started_the_model_is_offered_no_tools() {
 
 #[tokio::test]
 async fn an_invented_tool_name_gets_the_real_ones_back() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "default_api", json!({})),
         MockTurn::text("The cup is in the kitchen."),
     ]);
@@ -318,7 +318,7 @@ async fn collect_until_finished(
 
 #[tokio::test]
 async fn a_turn_calls_a_tool_and_replies() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "find_objects", json!({"query": "cup"})),
         MockTurn::text("The cup is in the kitchen."),
     ]);
@@ -380,7 +380,7 @@ async fn a_streamed_reply_arrives_in_pieces_then_whole() {
 
 #[tokio::test]
 async fn the_operator_compacts_and_resumes_a_conversation() {
-    let model = MockCompletionModel::new([MockTurn::text("They asked for ten things.")]);
+    let model = MockCompletionModel::from_turns([MockTurn::text("They asked for ten things.")]);
     let config = SessionConfig {
         resume: Some(History::sample(10, 3000)),
         ..SessionConfig::default()
@@ -437,7 +437,7 @@ impl Tool for Slow {
 
 #[tokio::test]
 async fn a_message_sent_while_a_report_is_answered_runs_after_it() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "find_objects", json!({})),
         MockTurn::text("noted"),
         MockTurn::text("hello"),
@@ -491,7 +491,7 @@ async fn a_message_sent_while_a_report_is_answered_runs_after_it() {
 
 #[tokio::test]
 async fn a_turn_over_its_time_limit_is_stopped() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "find_objects", json!({})),
         MockTurn::text("done"),
     ]);
@@ -528,7 +528,7 @@ async fn a_turn_over_its_time_limit_is_stopped() {
 
 /// Two calls of the one tool in one turn, the second with other arguments.
 fn twice() -> MockCompletionModel {
-    MockCompletionModel::new([
+    MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "find_objects", json!({"n": 1})),
         MockTurn::tool_call("c2", "find_objects", json!({"n": 2})),
         MockTurn::text("done"),
@@ -621,7 +621,7 @@ async fn a_request_left_waiting_is_kept_for_the_next_session_and_dropped_once_an
 #[tokio::test]
 async fn act_tools_are_refused_while_disarmed_and_run_after_approval() {
     let script = || {
-        MockCompletionModel::new([
+        MockCompletionModel::from_turns([
             MockTurn::tool_call("c1", "find_objects", json!({})),
             MockTurn::text("done"),
         ])
@@ -676,7 +676,7 @@ async fn act_tools_are_refused_while_disarmed_and_run_after_approval() {
 
 #[tokio::test]
 async fn stop_ends_the_turn_and_denies_pending_approvals() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "find_objects", json!({})),
         MockTurn::text("done"),
     ]);
@@ -749,7 +749,7 @@ fn a_plain_order_to_stop_is_known_and_a_sentence_about_stopping_is_not() {
 
 #[tokio::test]
 async fn a_stop_closes_what_it_cut_short_and_forgets_the_request() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "find_objects", json!({})),
         MockTurn::text("done"),
     ]);
@@ -802,7 +802,7 @@ async fn a_stop_closes_what_it_cut_short_and_forgets_the_request() {
 
 #[tokio::test]
 async fn disarming_turns_down_a_waiting_approval_however_it_is_answered() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "find_objects", json!({})),
         MockTurn::text("not moving"),
     ]);
@@ -846,7 +846,7 @@ async fn disarming_turns_down_a_waiting_approval_however_it_is_answered() {
 #[tokio::test]
 async fn the_model_can_always_stop_the_robot() {
     let stop_spec = ToolSpec::new("stop", "Stops.", json!({"type": "object"}), Risk::Observe);
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "find_objects", json!({})),
         MockTurn::tool_call("c2", "stop", json!({"reason": null})),
         MockTurn::tool_call("c3", "stop", json!({"reason": null})),
@@ -897,7 +897,7 @@ async fn the_model_can_always_stop_the_robot() {
 
 #[tokio::test]
 async fn a_reply_lost_after_acting_keeps_the_request_in_the_history() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "run_mission", json!({})),
         MockTurn::error("the provider is down"),
         MockTurn::text("It is still running."),
@@ -960,7 +960,7 @@ impl Tool for Editable {
 
 #[tokio::test]
 async fn an_edit_that_fails_its_checks_keeps_the_request_and_one_that_passes_replaces_it() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "run_mission", json!({"hash": "planned"})),
         MockTurn::text("Done."),
     ]);
@@ -1022,7 +1022,7 @@ async fn an_edit_that_fails_its_checks_keeps_the_request_and_one_that_passes_rep
 
 #[tokio::test]
 async fn an_approval_sent_while_an_edit_is_checked_does_not_approve_the_edit() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "run_mission", json!({"hash": "planned"})),
         MockTurn::text("Not run."),
     ]);
@@ -1079,7 +1079,7 @@ async fn the_operator_runs_a_tool_checked_as_their_own_and_approves_it() {
     );
     r.add(Arc::new(Editable(spec))).unwrap();
     let session = Session::start(
-        Arc::new(Scripted::new(MockCompletionModel::new([]))),
+        Arc::new(Scripted::new(MockCompletionModel::from_turns([]))),
         Arc::new(r),
         Arc::clone(&guard),
         None,
@@ -1151,7 +1151,7 @@ async fn after_three_denials_in_a_row_the_model_is_told_to_stop_asking() {
         .map(|n| MockTurn::tool_call(format!("c{n}"), "find_objects", json!({"n": n})))
         .chain([MockTurn::text("I will ask what you want.")])
         .collect();
-    let model = MockCompletionModel::new(calls);
+    let model = MockCompletionModel::from_turns(calls);
     let guard = Arc::new(Guard::new(Policy::default()));
     guard.set_armed(true);
     let session = Session::start(
@@ -1184,7 +1184,7 @@ async fn the_same_failure_three_times_in_a_row_is_called_stuck() {
         .map(|n| MockTurn::tool_call(format!("c{n}"), "look", json!({"n": n})))
         .chain([MockTurn::text("The camera is stuck.")])
         .collect();
-    let model = MockCompletionModel::new(calls);
+    let model = MockCompletionModel::from_turns(calls);
     let spec = ToolSpec::new("look", "Looks.", json!({"type": "object"}), Risk::Observe);
     let session = Session::start(
         Arc::new(Scripted::new(model.clone())),
@@ -1208,7 +1208,7 @@ async fn the_same_failure_three_times_in_a_row_is_called_stuck() {
 
 #[tokio::test]
 async fn a_message_sent_mid_turn_reaches_the_model_with_its_next_tool_result() {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "look", json!({})),
         MockTurn::text("Looking at the kitchen too."),
     ]);
@@ -1264,7 +1264,7 @@ async fn a_profile_rule_refuses_one_value_and_asks_before_another() {
         "#,
     )
     .unwrap();
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("c1", "find_objects", json!({"query": "the knife"})),
         MockTurn::tool_call("c2", "find_objects", json!({"query": "the bedroom lamp"})),
         MockTurn::text("Done."),
