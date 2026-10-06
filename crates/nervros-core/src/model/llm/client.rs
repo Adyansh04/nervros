@@ -5,8 +5,11 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use rig::AgentBuilder;
-use rig::client::CompletionClient as _;
-use rig::completion::{Prompt as _, PromptError};
+use rig::agent::StreamingError;
+use rig::completion::PromptError;
+use rig::http_client::ReqwestClient;
+use rig::providers::gemini::GeminiConfig;
+use rig::providers::openai::OpenAIConfig;
 use secrecy::{ExposeSecret as _, SecretString};
 
 use super::turn::{AgentSource as _, without_provider_body};
@@ -151,28 +154,20 @@ impl Llm {
                 let base = provider.base_url.as_deref().unwrap_or_default();
                 // Keyless local servers ignore the bearer value.
                 let key = key.map_or("none", |k| k.expose_secret());
-                let client = rig::providers::openai::Client::builder()
-                    .api_key(key)
-                    .base_url(base)
-                    .http_client(http)
-                    .build()
-                    .map_err(|e| client_error(provider, &e))?
-                    .completions_api();
-                Ok(AgentBuilder::new(client.completion_model(&model.model)))
+                let client = OpenAIConfig::new(key)
+                    .with_base_url(base)
+                    .connect(ReqwestClient::from(http));
+                Ok(AgentBuilder::new(client.chat(&model.model)))
             }
             ProviderKind::GeminiInteractions => {
                 let key = key.ok_or_else(|| LlmError::Client {
                     provider: provider.id.clone(),
                     message: "gemini_interactions needs a key".to_owned(),
                 })?;
-                // The Interactions client sends the key in x-goog-api-key, never in the URL.
-                let client = rig::providers::gemini::Client::builder()
-                    .api_key(key.expose_secret())
-                    .http_client(http)
-                    .build()
-                    .map_err(|e| client_error(provider, &e))?
-                    .interactions_api();
-                Ok(AgentBuilder::new(client.completion_model(&model.model)))
+                // The Interactions wire sends the key in x-goog-api-key, never in the URL.
+                let client =
+                    GeminiConfig::new(key.expose_secret()).connect(ReqwestClient::from(http));
+                Ok(AgentBuilder::new(client.interactions(&model.model)))
             }
         }
     }
@@ -206,14 +201,14 @@ impl Llm {
             // Gemini segments from the prompt before the image; given the image first, Flash-Lite
             // answered with boxes where the outlines belong.
             let message = user_message(ask.prompt, ask.image.as_ref(), ask.role == Role::Segment);
-            let result = agent.prompt(message).extended_details().await;
-            match result {
+            match agent.prompt(message).await {
                 Ok(response) => {
+                    // A count the provider leaves out is zero tokens to the budget and the report.
                     return Ok(Answer {
                         text: response.output,
                         model: model.id.clone(),
-                        input_tokens: response.usage.input_tokens,
-                        output_tokens: response.usage.output_tokens,
+                        input_tokens: response.usage.input_tokens.unwrap_or(0),
+                        output_tokens: response.usage.output_tokens.unwrap_or(0),
                     });
                 }
                 Err(e) => {
@@ -257,13 +252,15 @@ fn client_error(provider: &ProviderConfig, e: &dyn std::fmt::Display) -> LlmErro
 const MAX_PARK: Duration = Duration::from_hours(24);
 
 /// For a 429, how long to set the model aside: what the provider's `Retry-After` asks, else a
-/// minute. `None` for any other error, whatever its text says.
-pub(super) fn retry_after(error: &rig::completion::CompletionError) -> Option<Duration> {
-    if error.provider_response_status()?.as_u16() != 429 {
+/// minute. `None` for any other status, whatever the error's text says.
+fn retry_after(
+    status: Option<reqwest::StatusCode>,
+    headers: Option<&reqwest::header::HeaderMap>,
+) -> Option<Duration> {
+    if status? != reqwest::StatusCode::TOO_MANY_REQUESTS {
         return None;
     }
-    let asked = error
-        .provider_response_headers()
+    let asked = headers
         .and_then(|h| h.get("retry-after"))
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -277,14 +274,24 @@ pub(super) fn retry_after(error: &rig::completion::CompletionError) -> Option<Du
 
 pub(super) fn prompt_retry_after(error: &PromptError) -> Option<Duration> {
     match error {
-        PromptError::CompletionError(e) => retry_after(e),
+        PromptError::CompletionError(e) => {
+            retry_after(e.provider_response_status(), e.provider_response_headers())
+        }
+        PromptError::Report(e) => {
+            retry_after(e.provider_response_status(), e.provider_response_headers())
+        }
         _ => None,
     }
 }
 
-pub(super) fn stream_retry_after(error: &rig::agent::StreamingError) -> Option<Duration> {
+pub(super) fn stream_retry_after(error: &StreamingError) -> Option<Duration> {
     match error {
-        rig::agent::StreamingError::Completion(e) => retry_after(e),
-        rig::agent::StreamingError::Prompt(e) => prompt_retry_after(e),
+        StreamingError::Completion(e) => {
+            retry_after(e.provider_response_status(), e.provider_response_headers())
+        }
+        StreamingError::Report(e) => {
+            retry_after(e.provider_response_status(), e.provider_response_headers())
+        }
+        StreamingError::Prompt(e) => prompt_retry_after(e),
     }
 }

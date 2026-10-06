@@ -2,8 +2,6 @@
 
 use std::sync::Arc;
 
-use rig::completion::Prompt as _;
-
 use super::client::{Llm, prompt_retry_after};
 use super::turn::{AgentSource, without_provider_body};
 use super::{Ask, ImageInput};
@@ -37,7 +35,7 @@ pub async fn summarise(source: &Arc<dyn AgentSource>, transcript: &str) -> Optio
             .prompt(transcript)
             .await
         {
-            Ok(text) if !text.trim().is_empty() => return Some(text),
+            Ok(response) if !response.output.trim().is_empty() => return Some(response.output),
             Ok(_) => {}
             Err(e) => {
                 if let Some(wait) = prompt_retry_after(&e) {

@@ -10,7 +10,6 @@ use nervros_core::providers::ledger::Ledger;
 use nervros_core::providers::router::{PrivacyMode, Router};
 use nervros_core::providers::{ModelsConfig, Role};
 use rig::agent::tool::ToolOutput;
-use rig::completion::Prompt as _;
 
 const LOCAL_ONLY: &str = r#"
     [[provider]]
@@ -85,7 +84,7 @@ async fn calls_a_runtime_declared_tool_and_uses_its_result() {
             "required": ["query"],
             "additionalProperties": false
         }),
-        move |_cx, args| {
+        move |args| {
             let flag = Arc::clone(&flag);
             Box::pin(async move {
                 flag.store(true, Ordering::SeqCst);
@@ -104,7 +103,7 @@ async fn calls_a_runtime_declared_tool_and_uses_its_result() {
         .dynamic_tool(tool)
         .default_max_turns(4)
         .build();
-    let reply = agent.prompt("Where is the red ball?").await.unwrap();
+    let reply = agent.prompt("Where is the red ball?").await.unwrap().output;
     assert!(
         called.load(Ordering::SeqCst),
         "the model never called the tool"

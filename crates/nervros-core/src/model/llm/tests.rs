@@ -1,5 +1,5 @@
 use rig::completion::Message;
-use rig::message::{AssistantContent, UserContent};
+use rig::message::{AssistantContent, CallId, ToolName, UserContent};
 
 use super::client::Llm;
 use super::history::{CUT_MARK, History, is_user_text, result_text};
@@ -45,12 +45,19 @@ fn old_results_are_cut_once_and_up_to_here_counts_the_operator_only() {
     let said = |text: &str| Message::User {
         content: vec![UserContent::text(text)],
     };
+    let found = |call: &str, text: String| {
+        Message::tool_result(
+            CallId::from_wire(call),
+            ToolName::new("find_objects").unwrap(),
+            text,
+        )
+    };
     let mut history = History(vec![
         said("where is the mug?"),
-        Message::tool_result("c1", "find_objects", "y".repeat(2000)),
+        found("c1", "y".repeat(2000)),
         said(&format!("{REPORT_MARK}\nthe mission succeeded")),
         said("and the basket?"),
-        Message::tool_result("c2", "find_objects", "z".repeat(2000)),
+        found("c2", "z".repeat(2000)),
     ]);
     history.mask();
     let results: Vec<String> = history

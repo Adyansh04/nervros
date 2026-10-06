@@ -176,7 +176,7 @@ async fn run(path: &Path) -> Result<Vec<String>, String> {
     let shared: Robot =
         toml::from_str(&read(&root().join("robot/robot.toml"))?).map_err(|e| e.to_string())?;
     let robot: Arc<dyn RobotPort> = Arc::new(shared.with(scenario.robot).build()?);
-    let model = MockCompletionModel::new(script(&scenario.model)?);
+    let model = MockCompletionModel::from_turns(script(&scenario.model)?);
     let state = tempfile::tempdir().map_err(|e| e.to_string())?;
     let options = nervros_core::app::StartOptions {
         source: Some(Arc::new(Scripted(model.clone()))),
