@@ -179,13 +179,15 @@ vision model available, `look` returns the marks alone and says why.
 | `name` | `"main"` | The camera's name, as `look` and `segment` take it in `camera`. |
 | `image` | required | A `sensor_msgs/msg/Image` topic. |
 | `detections` | required | `{ topic, type }`, where the type is `canopy_msgs/msg/InstanceMaskArray` or `vision_msgs/msg/Detection2DArray`. |
+| `detection_image` | none | The image topic the detector reads, when it is not `image`, such as frames from a still base. Its frames are kept apart, so the marks are drawn on the frame they were cut from. |
 | `max_marks` | `12` | |
-| `max_age` | `"5s"` | Older detections are left out. |
+| `max_age` | `"5s"` | Older detections are left out, and `look` waits this long for the first. A slow detector needs more. |
 | `about` | none | What the vision model should know about the camera, such as where it points and how far it sees. |
 
 More cameras go under `[look.cameras.<name>]` with `image`, `about` and, optionally, `detections`
-(without them `look` shows that camera's frame unmarked). The tools then take a `camera` argument,
-`[look]`'s own by default, and the chat model sees each camera's `about` to choose one.
+and `detection_image` (without detections `look` shows that camera's frame unmarked). The tools
+then take a `camera` argument, `[look]`'s own by default, and the chat model sees each camera's
+`about` to choose one.
 
 ```toml
 [look]

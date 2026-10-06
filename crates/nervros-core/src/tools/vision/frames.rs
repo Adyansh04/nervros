@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 use crate::profile::{CameraConfig, LookConfig};
 
 /// Frames kept for matching detection stamps: 4 s at 10 Hz, 1.3 s at 30 Hz.
-// ponytail: a count, not a time span; size it by time if a fast camera's detector lags more.
+// ponytail: a count, not a time span; a detector that lags more reads frames of its own
+// (`detection_image`), and those are kept apart.
 const FRAME_HISTORY: usize = 40;
 
 /// A camera that has sent nothing for this long has stopped, whatever its last frame shows.
@@ -66,6 +67,8 @@ pub struct Camera {
     /// Its topics.
     pub config: CameraConfig,
     pub(crate) history: Arc<History>,
+    /// The frames its detector reads, when they are not `history`'s.
+    pub(crate) detected: Option<Arc<History>>,
 }
 
 impl Camera {
@@ -93,6 +96,25 @@ impl Camera {
     }
 }
 
+/// Starts keeping the recent frames of an image topic.
+fn keep(robot: &Arc<dyn RobotPort>, topic: &str) -> Result<Arc<History>, nervros_ros::RosError> {
+    let mut frames = robot.frames(topic)?;
+    let history = Arc::new(History::default());
+    let kept = Arc::clone(&history);
+    tokio::spawn(async move {
+        loop {
+            let latest = frames.borrow_and_update().clone();
+            if let Some(f) = latest {
+                kept.push(f);
+            }
+            if frames.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok(history)
+}
+
 /// Every camera the profile names, `[look]`'s own first, each keeping its recent frames.
 #[derive(Debug)]
 pub struct Cameras(Vec<Camera>);
@@ -109,24 +131,17 @@ impl Cameras {
     ) -> Result<Arc<Self>, nervros_ros::RosError> {
         let mut cameras = Vec::new();
         for (name, config) in look.all_cameras() {
-            let mut frames = robot.frames(&config.image)?;
-            let history = Arc::new(History::default());
-            let keep = Arc::clone(&history);
-            tokio::spawn(async move {
-                loop {
-                    let latest = frames.borrow_and_update().clone();
-                    if let Some(f) = latest {
-                        keep.push(f);
-                    }
-                    if frames.changed().await.is_err() {
-                        break;
-                    }
-                }
-            });
+            let history = keep(robot, &config.image)?;
+            let detected = config
+                .detection_image
+                .as_deref()
+                .map(|topic| keep(robot, topic))
+                .transpose()?;
             cameras.push(Camera {
                 name,
                 config,
                 history,
+                detected,
             });
         }
         Ok(Arc::new(Self(cameras)))
