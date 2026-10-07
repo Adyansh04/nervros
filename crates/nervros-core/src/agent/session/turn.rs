@@ -180,6 +180,75 @@ fn announce(shared: &Shared, turn: u64, origin: Origin) -> String {
     }
 }
 
+/// One model's go at the turn, asked once more when busy: its result, the history it leaves and
+/// the tokens it used.
+async fn ask(
+    model: &str,
+    (shared, source, flags): (&Arc<Shared>, &Arc<dyn AgentSource>, &Arc<TurnFlags>),
+    (turn, text, tools): (u64, &str, &[LoopTool]),
+    history: &History,
+) -> (Result<String, llm::LlmError>, History, u64) {
+    let system = preamble(shared);
+    // The reasoning in the history is the last turn's model's, and only it takes it back.
+    let theirs = lock(&shared.answered_by).as_deref() != Some(model);
+    let mut retried = false;
+    loop {
+        let mut updated = history.clone();
+        if theirs {
+            updated.drop_reasoning();
+        }
+        let used = Arc::new(AtomicU64::new(0));
+        let answered = Arc::new(AtomicBool::new(false));
+        let setup = llm::TurnSetup {
+            preamble: &system,
+            max_turns: shared.config.max_model_calls,
+            tools,
+            started: Arc::clone(&flags.started),
+            window: source.context(model),
+            on_call: Some(costs(shared, turn, model, &used, &answered)),
+            delta: Some(deltas(shared, turn, &answered)),
+        };
+        let result = llm::chat(model, Arc::clone(source), setup, &mut updated, text).await;
+        // A busy provider often answers a moment later: once more, while nothing came back or was
+        // done that a second try would repeat.
+        let busy = matches!(&result, Err(e) if e.setback() == Some(llm::Setback::Busy));
+        if busy
+            && !retried
+            && !answered.load(Ordering::Relaxed)
+            && !flags.acted.load(Ordering::SeqCst)
+        {
+            retried = true;
+            tokio::time::sleep(llm::BUSY_RETRY).await;
+            continue;
+        }
+        return (result, updated, used.load(Ordering::Relaxed));
+    }
+}
+
+/// Waits for the first model that its per-minute limit or a 429 holds back, when that lifts within
+/// [`llm::MINUTE_WAIT`], and gives the models to try again.
+async fn wait_for_a_model(
+    shared: &Shared,
+    source: &Arc<dyn AgentSource>,
+    need: Need,
+    tools: &[LoopTool],
+    history: &mut History,
+) -> Option<Vec<String>> {
+    let wait = source
+        .ready_in(Role::Routine, need)
+        .filter(|w| *w <= llm::MINUTE_WAIT)?;
+    shared.emit(Event::Notice {
+        text: format!(
+            "every model is at its limit for now; waiting {} s for the first to free up",
+            wait.as_secs().max(1)
+        ),
+    });
+    tokio::time::sleep(wait).await;
+    let candidates = source.candidates(Role::Routine, need);
+    fit_window(shared, source, &candidates, tools, history).await;
+    Some(candidates)
+}
+
 pub(super) async fn run_turn(
     turn: u64,
     origin: Origin,
@@ -200,47 +269,42 @@ pub(super) async fn run_turn(
         tools: !tools.is_empty(),
         ..Need::default()
     };
-    let candidates = source.candidates(Role::Routine, need);
+    let mut candidates = source.candidates(Role::Routine, need).into_iter();
     let mut history = history;
-    fit_window(&shared, &source, &candidates, &tools, &mut history).await;
+    fit_window(
+        &shared,
+        &source,
+        candidates.as_slice(),
+        &tools,
+        &mut history,
+    )
+    .await;
     let mut failures = Vec::new();
-    for model in candidates {
-        let window = source.context(&model);
-        let system = preamble(&shared);
-        let mut retried = false;
-        // The reasoning in the history is the last turn's model's, and only it takes it back.
-        let theirs = lock(&shared.answered_by).as_deref() != Some(model.as_str());
-        let (result, mut updated, used) = loop {
-            let mut updated = history.clone();
-            if theirs {
-                updated.drop_reasoning();
+    let mut waited = false;
+    loop {
+        let Some(model) = candidates.next() else {
+            // Free tiers count requests a minute, and a burst of calls can spend every model's:
+            // once a turn, waiting for the first to free up beats failing it.
+            if waited {
+                break;
             }
-            let used = Arc::new(AtomicU64::new(0));
-            let answered = Arc::new(AtomicBool::new(false));
-            let setup = llm::TurnSetup {
-                preamble: &system,
-                max_turns: shared.config.max_model_calls,
-                tools: &tools,
-                started: Arc::clone(&flags.started),
-                window,
-                on_call: Some(costs(&shared, turn, &model, &used, &answered)),
-                delta: Some(deltas(&shared, turn, &answered)),
+            waited = true;
+            let Some(again) = wait_for_a_model(&shared, &source, need, &tools, &mut history).await
+            else {
+                break;
             };
-            let result = llm::chat(&model, Arc::clone(&source), setup, &mut updated, &text).await;
-            // A busy provider often answers a moment later: once more, while nothing came back or
-            // was done that a second try would repeat.
-            let busy = matches!(&result, Err(e) if e.setback() == Some(llm::Setback::Busy));
-            if busy
-                && !retried
-                && !answered.load(Ordering::Relaxed)
-                && !flags.acted.load(Ordering::SeqCst)
-            {
-                retried = true;
-                tokio::time::sleep(llm::BUSY_RETRY).await;
-                continue;
-            }
-            break (result, updated, used);
+            candidates = again.into_iter();
+            failures.clear();
+            continue;
         };
+        let window = source.context(&model);
+        let (result, mut updated, used) = ask(
+            &model,
+            (&shared, &source, &flags),
+            (turn, &text, &tools),
+            &history,
+        )
+        .await;
         match result {
             Ok(reply) => {
                 *lock(&shared.answered_by) = Some(model.clone());
@@ -250,20 +314,20 @@ pub(super) async fn run_turn(
                     model,
                 });
                 if let Some(window) = window {
-                    report_context(
-                        &shared,
-                        &tools,
-                        &updated,
-                        used.load(Ordering::Relaxed),
-                        window,
-                    );
+                    report_context(&shared, &tools, &updated, used, window);
                 }
                 updated.trim(shared.config.history_max);
                 return Some(updated);
             }
             Err(e) => {
-                if let Some(wait) = e.setback().and_then(llm::Setback::park) {
-                    source.park(&model, wait);
+                if let Some(setback) = e.setback()
+                    && let Some(wait) = setback.park()
+                {
+                    if setback == llm::Setback::Unreachable {
+                        source.set_aside(&model, wait);
+                    } else {
+                        source.park(&model, wait);
+                    }
                 }
                 if !flags.acted.load(Ordering::SeqCst) {
                     shared.emit(Event::Notice {

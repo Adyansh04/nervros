@@ -204,6 +204,32 @@ impl Router {
         ledger.save()
     }
 
+    /// Sets a model whose server did not answer aside for `for_how_long`, in this process only.
+    pub fn set_aside(&self, model_id: &str, now: SystemTime, for_how_long: Duration) {
+        self.ledger().set_aside(model_id, now, for_how_long);
+    }
+
+    /// How long until the first model for a call that its per-minute limit or a 429 holds back
+    /// may take a request again; none when nothing holds a model back that briefly.
+    #[must_use]
+    pub fn ready_in(&self, role: Role, need: Need, now: SystemTime) -> Option<Duration> {
+        let (_, skipped) = self.candidates(role, need, now);
+        skipped
+            .iter()
+            .filter(|(_, skip)| matches!(skip, Skip::Refused(Refused::Minute | Refused::Parked(_))))
+            .filter_map(|(id, _)| {
+                let model = self.config.model(id)?;
+                let (pool, zone) = (self.pool_of(model), self.zone(model));
+                let ledger = self.ledger();
+                ledger.lifts(id, now).into_iter().find(|d| {
+                    ledger
+                        .check(id, &model.limits, pool, now + *d, zone)
+                        .is_ok()
+                })
+            })
+            .min()
+    }
+
     /// Sets a pool's count from the provider's own figure; persists the ledger.
     ///
     /// # Errors
@@ -377,6 +403,23 @@ mod tests {
         let later = now + Duration::from_secs(61);
         let (take, _) = r.candidates(Role::Routine, Need::default(), later);
         assert_eq!(ids(&take), ["big", "text", "local9b"]);
+    }
+
+    #[test]
+    fn says_when_a_short_limit_lifts_but_not_a_daily_one_or_a_silent_server() {
+        let r = router(PrivacyMode::Sim);
+        let now = SystemTime::now();
+        assert_eq!(r.ready_in(Role::Routine, Need::default(), now), None);
+        r.park("big", now, Duration::from_secs(30)).unwrap();
+        r.set_aside("local9b", now, Duration::from_secs(10));
+        assert_eq!(
+            r.ready_in(Role::Routine, Need::default(), now),
+            Some(Duration::from_secs(30))
+        );
+        // The pool is spent by the time the park ends: waiting for it would be for nothing.
+        r.take_request("text", now).unwrap();
+        r.take_request("text", now).unwrap();
+        assert_eq!(r.ready_in(Role::Routine, Need::default(), now), None);
     }
 
     #[test]

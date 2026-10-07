@@ -89,6 +89,10 @@ pub struct Ledger {
     parked_until: BTreeMap<String, u64>,
     #[serde(skip)]
     minute: HashMap<String, VecDeque<u64>>,
+    /// Models whose server did not answer, set aside by this process alone: that one process
+    /// cannot reach a server says nothing of the model's quota.
+    #[serde(skip)]
+    silent_until: HashMap<String, u64>,
     #[serde(skip)]
     path: Option<PathBuf>,
     /// What this process counted since it last saved: a save adds it to what the file holds by
@@ -105,6 +109,8 @@ pub struct Ledger {
 pub enum Refused {
     /// Parked after a 429 until this Unix time.
     Parked(u64),
+    /// Set aside until this Unix time after its server did not answer.
+    Silent(u64),
     /// Its own daily limit is used up.
     Daily,
     /// Its shared pool's daily limit is used up.
@@ -117,6 +123,7 @@ impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parked(_) => f.write_str("set aside after a 429"),
+            Self::Silent(_) => f.write_str("set aside: its server did not answer"),
             Self::Daily => f.write_str("its daily limit is used up"),
             Self::Pool(pool) => write!(f, "the {pool} pool's daily limit is used up"),
             Self::Minute => f.write_str("its per-minute limit is used up"),
@@ -199,6 +206,11 @@ impl Ledger {
         {
             return Err(Refused::Parked(until));
         }
+        if let Some(&until) = self.silent_until.get(model)
+            && until > t
+        {
+            return Err(Refused::Silent(until));
+        }
         if limits
             .rpd
             .is_some_and(|rpd| self.used_today(model, now, zone) >= rpd)
@@ -249,6 +261,29 @@ impl Ledger {
     pub fn park(&mut self, model: &str, now: SystemTime, for_how_long: Duration) {
         self.parked_until
             .insert(model.to_owned(), crate::unix_secs(now + for_how_long));
+    }
+
+    /// Sets a model whose server did not answer aside for `for_how_long`, in this process only.
+    pub fn set_aside(&mut self, model: &str, now: SystemTime, for_how_long: Duration) {
+        self.silent_until
+            .insert(model.to_owned(), crate::unix_secs(now + for_how_long));
+    }
+
+    /// When a model's park, and each request of its last minute, stop counting against it, as
+    /// offsets from `now`, soonest first: the moments a refusal may lift.
+    #[must_use]
+    pub fn lifts(&self, model: &str, now: SystemTime) -> Vec<Duration> {
+        let t = crate::unix_secs(now);
+        let mut at: Vec<u64> = self
+            .parked_until
+            .get(model)
+            .copied()
+            .into_iter()
+            .chain(self.minute.get(model).into_iter().flatten().map(|s| s + 60))
+            .filter(|&s| s > t)
+            .collect();
+        at.sort_unstable();
+        at.into_iter().map(|s| Duration::from_secs(s - t)).collect()
     }
 
     /// Replaces today's count for a pool with the provider's own figure, such as OpenRouter's
@@ -367,6 +402,27 @@ mod tests {
             ledger.check("m", &Limits::default(), None, at(1_000_010), ResetZone::Utc),
             Err(Refused::Parked(_))
         ));
+    }
+
+    #[test]
+    fn a_park_and_the_last_minutes_requests_lift_in_turn_and_a_silent_server_stays_out() {
+        let mut ledger = Ledger::default();
+        let t = at(1_000_000);
+        ledger.record("m", None, at(999_950), ResetZone::Utc);
+        ledger.record("m", None, at(999_980), ResetZone::Utc);
+        ledger.park("m", t, Duration::from_secs(25));
+        assert_eq!(ledger.lifts("m", t), [10, 25, 40].map(Duration::from_secs));
+        ledger.set_aside("s", t, Duration::from_secs(5));
+        assert_eq!(
+            ledger.check("s", &Limits::default(), None, t, ResetZone::Utc),
+            Err(Refused::Silent(1_000_005))
+        );
+        assert!(ledger.lifts("s", t).is_empty());
+        assert_eq!(
+            serde_json::to_value(&ledger).unwrap()["parked_until"],
+            serde_json::json!({"m": 1_000_025}),
+            "a server one process cannot reach is not the others' business"
+        );
     }
 
     #[test]

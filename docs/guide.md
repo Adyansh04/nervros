@@ -378,7 +378,8 @@ Every conversation is saved. The Agent tab lists earlier sessions to resume, wha
 remembers, and each model with its quota for the day. The context is condensed before it fills;
 `/compact` condenses it at once, and right-clicking one of your messages condenses everything
 before it. A model that hits its rate limit, or whose server is not running, is set aside and
-the next one in its role's chain answers; a busy one is asked once more first. **Save this one
+the next one in its role's chain answers; a busy one is asked once more first, and when every
+model is at its limit for the minute the turn waits for the first to free up. **Save this one
 as a test** turns the session into an eval case.
 
 ## The command line

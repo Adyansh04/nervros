@@ -66,6 +66,17 @@ pub trait AgentSource: Send + Sync {
     /// Sets a model aside for `for_how_long` after a 429.
     fn park(&self, model_id: &str, for_how_long: Duration);
 
+    /// Sets a model whose server did not answer aside for `for_how_long`.
+    fn set_aside(&self, model_id: &str, for_how_long: Duration) {
+        self.park(model_id, for_how_long);
+    }
+
+    /// How long until the first model for a call that its per-minute limit or a 429 holds back
+    /// may take a request again; none when nothing holds a model back that briefly.
+    fn ready_in(&self, _role: Role, _need: Need) -> Option<Duration> {
+        None
+    }
+
     /// The model's context window in tokens, when the models file gives it.
     fn context(&self, _model_id: &str) -> Option<usize> {
         None
@@ -109,6 +120,15 @@ impl AgentSource for Llm {
         if let Err(e) = self.router.park(model_id, SystemTime::now(), for_how_long) {
             tracing::warn!(model = %model_id, error = %e, "could not save the quota ledger");
         }
+    }
+
+    fn set_aside(&self, model_id: &str, for_how_long: Duration) {
+        self.router
+            .set_aside(model_id, SystemTime::now(), for_how_long);
+    }
+
+    fn ready_in(&self, role: Role, need: Need) -> Option<Duration> {
+        self.router.ready_in(role, need, SystemTime::now())
     }
 
     fn context(&self, model_id: &str) -> Option<usize> {
