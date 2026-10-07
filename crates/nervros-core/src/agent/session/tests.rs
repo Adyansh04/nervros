@@ -184,6 +184,37 @@ async fn a_busy_model_is_asked_once_more_before_the_next() {
 }
 
 #[tokio::test]
+async fn the_model_that_reasoned_gets_its_reasoning_back() {
+    use rig::message::{AssistantContent, Issuer, Message, Reasoning, Sealed};
+    let model = MockCompletionModel::from_turns([
+        MockTurn::from_contents([
+            AssistantContent::Reasoning(Sealed::new(Issuer::from("mock"), Reasoning::new("hm"))),
+            AssistantContent::text("first"),
+        ]),
+        MockTurn::text("second"),
+    ]);
+    let source = Arc::new(Scripted::new(model.clone()));
+    let session = Session::start(
+        Arc::clone(&source) as Arc<dyn AgentSource>,
+        registry(Risk::Observe),
+        Arc::new(Guard::new(Policy::default())),
+        None,
+        SessionConfig::default(),
+    );
+    let mut rx = session.subscribe();
+    for text in ["one", "two"] {
+        session.send(Command::User(text.into()));
+        collect_until_finished(&mut rx, |_| None, &session).await;
+    }
+    let requests = model.requests();
+    let reasoned = requests[1].chat_history.iter().any(|m| {
+        matches!(m, Message::Assistant { content, .. }
+            if content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))))
+    });
+    assert!(reasoned, "{:?}", requests[1].chat_history);
+}
+
+#[tokio::test]
 async fn a_spent_quota_ends_the_turn() {
     let source = metered(1);
     let events = ask_where_the_cup_is(&source).await;

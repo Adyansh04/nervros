@@ -225,3 +225,37 @@ fn a_failure_says_how_the_model_fares() {
     assert_eq!(Setback::Unreachable.park(), Some(Duration::from_mins(1)));
     assert_eq!(Setback::Busy.park(), None);
 }
+
+#[test]
+fn earlier_reasoning_is_dropped_and_turns_left_empty_go_with_it() {
+    use rig::message::{Issuer, Reasoning, Sealed};
+    let thought = |text: &str| {
+        AssistantContent::Reasoning(Sealed::new(
+            Issuer::from("gcp.gemini"),
+            Reasoning::new(text),
+        ))
+    };
+    let mut history = History(vec![
+        Message::User {
+            content: vec![UserContent::text("where is the mug?")],
+        },
+        Message::Assistant {
+            id: None,
+            content: vec![
+                thought("the kitchen, probably"),
+                AssistantContent::text("In the kitchen."),
+            ],
+        },
+        Message::Assistant {
+            id: None,
+            content: vec![thought("nothing to add")],
+        },
+    ]);
+    history.drop_reasoning();
+    assert_eq!(history.0.len(), 2);
+    assert!(matches!(
+        &history.0[1],
+        Message::Assistant { content, .. } if content.len() == 1
+            && matches!(&content[0], AssistantContent::Text(t) if t.text == "In the kitchen.")
+    ));
+}

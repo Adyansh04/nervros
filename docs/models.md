@@ -112,5 +112,6 @@ Pacific time, as the providers count them. A model answering 429 is set aside fo
 spent daily quota comes back. A model whose server does not answer, such as a local model that is
 not running, is set aside for a minute, so the turns meanwhile go to the next model quietly. A
 busy one (a 5xx, as Gemini's 503 under load) is asked once more two seconds later, unless part of
-the turn already came back. The app's top bar shows the answering model with today's count, and
+the turn already came back. A model that takes over from another gets the conversation without the
+other's reasoning, which Gemma refuses with a 400, while a model carrying on gets its own back. The app's top bar shows the answering model with today's count, and
 the dock's Models tab shows every role's chain and why a model is skipped.

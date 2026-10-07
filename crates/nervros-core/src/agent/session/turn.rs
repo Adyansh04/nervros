@@ -208,8 +208,13 @@ pub(super) async fn run_turn(
         let window = source.context(&model);
         let system = preamble(&shared);
         let mut retried = false;
+        // The reasoning in the history is the last turn's model's, and only it takes it back.
+        let theirs = lock(&shared.answered_by).as_deref() != Some(model.as_str());
         let (result, mut updated, used) = loop {
             let mut updated = history.clone();
+            if theirs {
+                updated.drop_reasoning();
+            }
             let used = Arc::new(AtomicU64::new(0));
             let answered = Arc::new(AtomicBool::new(false));
             let setup = llm::TurnSetup {
@@ -238,6 +243,7 @@ pub(super) async fn run_turn(
         };
         match result {
             Ok(reply) => {
+                *lock(&shared.answered_by) = Some(model.clone());
                 shared.emit(Event::Reply {
                     turn,
                     text: reply,
