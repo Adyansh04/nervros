@@ -39,10 +39,9 @@ headers = { "X-Title" = "NervROS" }
 
 ```toml
 [[model]]
-id = "qwen3.8-27b-or"            # the name used in roles and the logs
+id = "nemotron-super-or"                        # the name used in roles and the logs
 provider = "openrouter"
-model = "qwen/qwen3.8-27b:free"  # the provider's own name
-vision = true
+model = "nvidia/nemotron-3-super-120b-a12b:free"  # the provider's own name
 tools = true
 limits = { rpm = 20, pool = "openrouter_free" }
 privacy = { trains = false }
