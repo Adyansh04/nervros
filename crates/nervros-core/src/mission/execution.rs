@@ -8,10 +8,10 @@ use serde_json::{Value, json};
 use tracing::Instrument as _;
 
 use super::ledger::{MissionRecord, StepRecord};
-use super::plan::{Author as By, Compiled, PlannedStep};
+use super::plan::{Author as By, Compiled, PlannedStep, arg};
 use super::{
     Claim, EXECUTE, LIVENESS, LOST_AFTER, Missions, Outcome, Running, SERVICE_TIMEOUT, STATE,
-    STATE_FRESH, STATUSES, camera, check, ledger,
+    STATE_FRESH, STATUSES, camera, check, history, ledger,
 };
 use crate::lock;
 use crate::session::{Command, Event};
@@ -206,17 +206,28 @@ impl Missions {
                 .collect(),
         });
         let seen = self.observe().await;
-        // What happened to what the failed step was about: often it was moved, not missed.
-        let object = compiled
+        // What happened to what the failed step was about: often it was moved, not missed. The
+        // robot's own missions with it say so where the world model cannot tell which it is.
+        let failed = compiled
             .steps
             .iter()
-            .find(|s| s.id == step && outcome != Outcome::Success)
+            .find(|s| s.id == step && outcome != Outcome::Success);
+        let object = failed
             .and_then(|s| check::step_object(s, &seen))
             .and_then(|o| o["id"].as_str());
-        let story = match object {
-            Some(id) => self.object_story(id).await,
-            None => Vec::new(),
+        let story = async {
+            match object {
+                Some(id) => self.object_story(id).await,
+                None => Vec::new(),
+            }
         };
+        let moves = async {
+            match failed.and_then(|s| arg(&s.args, "object_id")) {
+                Some(id) => history::moves_of(&self, id).await,
+                None => Vec::new(),
+            }
+        };
+        let (story, moves) = tokio::join!(story, moves);
         let camera = match self.vision.get().filter(|_| outcome == Outcome::Success) {
             Some(vision) => {
                 let verdicts = check::check(&compiled.goal, &seen);
@@ -232,7 +243,7 @@ impl Missions {
             &compiled,
             (outcome, &step, &reason),
             elapsed,
-            (&seen, &story, &camera.lines),
+            (&seen, &story, &moves, &camera.lines),
         );
         if let Some(s) = self.session.get() {
             s.send(Command::Report(report));

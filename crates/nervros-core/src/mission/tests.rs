@@ -9,7 +9,7 @@ use nervros_ros::{GoalResult, GoalStatus, RobotPort};
 use serde_json::{Value, json};
 
 use super::execution::step_of;
-use super::ledger::Ledger;
+use super::ledger::{Ledger, MissionRecord, StepRecord};
 use super::plan::Author as By;
 use super::sanity::Critic;
 use super::{advice, history, *};
@@ -184,6 +184,58 @@ async fn a_mission_is_kept_recalled_saved_by_name_and_run_again_and_gaps_are_log
         .await;
     eventually(|| ledger.gaps(1).is_ok_and(|g| !g.is_empty())).await;
     assert_eq!(ledger.gaps(1).unwrap()[0].nearest, "PlaceInto");
+}
+
+#[tokio::test]
+async fn the_robots_own_missions_say_where_it_took_a_thing() {
+    let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
+    let ledger = Ledger::in_memory().unwrap();
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot)
+        .unwrap()
+        .with_ledger(Arc::clone(&ledger));
+    let step = |id: &str, skill: &str, args: Value| StepRecord {
+        id: id.to_owned(),
+        skill: skill.to_owned(),
+        args,
+        outcome: "success".to_owned(),
+        ..StepRecord::default()
+    };
+    let now = crate::now_s();
+    let kept = |id: &str, outcome: &str, ago: f64| MissionRecord {
+        id: id.to_owned(),
+        intent: "bring the mug to the tray".to_owned(),
+        started: now - ago,
+        ended: now - ago + 60.0,
+        outcome: outcome.to_owned(),
+        steps: vec![
+            step("s1", "GoToPlace", json!({"place": "table"})),
+            step("s2", "PickObject", json!({"object_id": "mug_4"})),
+            step("s3", "PlaceInto", json!({"container_id": "tray_1"})),
+        ],
+        ..MissionRecord::default()
+    };
+    ledger.record(&kept("m1", "success", 600.0)).unwrap();
+    ledger.record(&kept("m2", "failure", 60.0)).unwrap();
+    assert_eq!(
+        history::moves_of(&missions, "MUG_4").await,
+        [
+            "10 min ago: bring the mug to the tray (success): PickObject(object_id=mug_4), \
+          PlaceInto(container_id=tray_1)"
+        ]
+    );
+    assert!(history::moves_of(&missions, "mug_5").await.is_empty());
+
+    let [recall, ..] = history::tools(&missions);
+    let taken = recall
+        .call(json!({"about": "object", "query": "mug_4"}))
+        .await;
+    assert_eq!(taken.status, Status::Succeeded, "{}", taken.message);
+    assert!(
+        taken.data["missions"][0]
+            .as_str()
+            .unwrap()
+            .contains("PlaceInto(container_id=tray_1)")
+    );
 }
 
 fn ended(outcome: u64, step: &str, reason: &str) -> ScriptedRun {

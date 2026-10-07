@@ -244,7 +244,9 @@ rooms with their floor and walls seen, and its Explore button asks the agent to 
 
 `history` names canopy's `canopy_msgs/srv/ObjectHistory` service: what happened to each object,
 when it appeared, moved, went missing, was seen again or merged. `recall` reads it, and a failed
-mission's report says where its object was last seen.
+mission's report says where its object was last seen. An id the world model does not hold, such
+as an executor's `mug_4`, names its object only when one object of that kind is known: with
+several mugs, the robot's own missions with `mug_4` say where it went instead.
 
 ### `[viz]`
 
@@ -393,7 +395,7 @@ The rest are the checks you would run yourself before blaming the model:
 | `plot` | Draws a number from a topic's messages over time in the app's Plots tab, as `rqt_plot` does, for two minutes unless told longer. |
 | `memory` | Keeps what the operator asks it to remember across sessions ("the kitchen door sticks"), in the state directory, one file per robot; lists and forgets notes. The notes join the system prompt on every turn, and the Agent tab lists them. Remembering and forgetting are approved like an edit. |
 | `schedule` | With `[mission]`: runs a plan again and again, such as a patrol every 30 minutes, a set number of times, or each time something happens: an object of a kind appears, in a room or anywhere, or a condition on a topic as `watch` takes it becomes true. The operator approves it once for all its runs; a run is skipped while the robot is disarmed or busy, and stopping the robot cancels every schedule. The Mission tab lists them. |
-| `recall` | With `[mission]`: what the robot did lately, from the mission ledger, what happened to an object, from `[world] history`, and the operator's notes. |
+| `recall` | With `[mission]`: what the robot did lately, from the mission ledger, what happened to an object, from `[world] history` and the robot's own missions with it, and the operator's notes. |
 | `plans` | With `[mission]`: saves a plan that worked by name ("evening check"), lists them, and runs one again. |
 | `skill_gap` | With `[mission]`: logs a request no skill can do, and why; planning that gives up logs one itself. The Mission tab and `nervros-cli gaps` list them. |
 | `point` | With a `segment` model in the models file: points at what the operator names in a camera's newest frame, including things no detector marks, and says which mark a point lands on. |

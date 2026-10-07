@@ -228,8 +228,9 @@ fn stamp_s(stamp: &Value) -> f64 {
 }
 
 /// The world model's object that `keys` (ids or names such as `mug_4`) or `phrase` (the
-/// operator's words) refer to: an exact id first, then words in a label or name, the most
-/// recently seen winning.
+/// operator's words) refer to: an exact id first, then the phrase in a label or name, the most
+/// recently seen winning, then a key's words only when they name one object: `mug_4` is not
+/// whichever mug the camera saw last.
 #[must_use]
 pub fn find_object<'a>(
     seen: &'a Observed,
@@ -244,16 +245,20 @@ pub fn find_object<'a>(
                 .find(|o| text(o, "id").eq_ignore_ascii_case(k))
         })
         .or_else(|| {
-            phrase
-                .map(str::to_owned)
-                .into_iter()
-                .chain(keys.iter().map(|k| words_of(k)))
+            let phrase = phrase.filter(|p| !p.is_empty())?;
+            objects
+                .iter()
+                .filter(|o| named(o, phrase))
+                .max_by(|a, b| seen_at(a).total_cmp(&seen_at(b)))
+        })
+        .or_else(|| {
+            keys.iter()
+                .map(|k| words_of(k))
                 .filter(|w| !w.is_empty())
                 .find_map(|w| {
-                    objects
-                        .iter()
-                        .filter(|o| named(o, &w))
-                        .max_by(|a, b| seen_at(a).total_cmp(&seen_at(b)))
+                    let mut found = objects.iter().filter(|o| named(o, &w));
+                    let first = found.next()?;
+                    found.next().is_none().then_some(first)
                 })
         })
 }
@@ -471,8 +476,19 @@ mod tests {
                 name: "object_id".to_owned(),
                 value: "kettle_2".to_owned(),
             }],
-            ..step
+            ..step.clone()
         };
         assert_eq!(last_seen(&unknown, &seen, 1000.0), None);
+
+        // A phrase no label holds leaves the id's kind: naming one of two mugs would be a guess.
+        let mut red = step;
+        red.args[1].value = "red mug".to_owned();
+        assert_eq!(last_seen(&red, &seen, 1000.0), None);
+        seen.objects["objects"].as_array_mut().unwrap().truncate(2);
+        assert!(
+            last_seen(&red, &seen, 1000.0)
+                .unwrap()
+                .starts_with("small white mug O244")
+        );
     }
 }
