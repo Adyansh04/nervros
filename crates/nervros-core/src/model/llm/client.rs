@@ -1,19 +1,20 @@
 //! The client: each model a rig agent builder from `models.toml`, asked in the order the router
-//! gives, a 429 parking the model.
+//! gives, a 429 or a silent server parking the model and a busy one asked once more.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use rig::AgentBuilder;
 use rig::agent::StreamingError;
-use rig::completion::PromptError;
+use rig::completion::{Message, PromptError};
 use rig::http_client::ReqwestClient;
 use rig::providers::gemini::GeminiConfig;
 use rig::providers::openai::OpenAIConfig;
+use rig::run::PromptResponse;
+use rig::{Agent, AgentBuilder, ErrorKind};
 use secrecy::{ExposeSecret as _, SecretString};
 
 use super::turn::{AgentSource as _, without_provider_body};
-use super::{Answer, Ask, LlmError, user_message};
+use super::{Answer, Ask, BUSY_RETRY, LlmError, Setback, user_message};
 use crate::providers::router::{Need, Router, Skip};
 use crate::providers::{ModelConfig, ProviderConfig, ProviderKind, Role, free_only};
 
@@ -201,7 +202,12 @@ impl Llm {
             // Gemini segments from the prompt before the image; given the image first, Flash-Lite
             // answered with boxes where the outlines belong.
             let message = user_message(ask.prompt, ask.image.as_ref(), ask.role == Role::Segment);
-            match agent.prompt(message).await {
+            let again = || {
+                self.router
+                    .take_request(&model.id, SystemTime::now())
+                    .is_ok()
+            };
+            match prompt_once_more(&agent, message, again).await {
                 Ok(response) => {
                     // A count the provider leaves out is zero tokens to the budget and the report.
                     return Ok(Answer {
@@ -212,7 +218,7 @@ impl Llm {
                     });
                 }
                 Err(e) => {
-                    if let Some(wait) = prompt_retry_after(&e) {
+                    if let Some(wait) = prompt_setback(&e).and_then(Setback::park) {
                         self.park(&model.id, wait);
                     }
                     let said = without_provider_body(&e.to_string());
@@ -251,47 +257,77 @@ fn client_error(provider: &ProviderConfig, e: &dyn std::fmt::Display) -> LlmErro
 /// The longest a model is set aside: a `Retry-After` past a day is not believed.
 const MAX_PARK: Duration = Duration::from_hours(24);
 
-/// For a 429, how long to set the model aside: what the provider's `Retry-After` asks, else a
-/// minute. `None` for any other status, whatever the error's text says.
-fn retry_after(
+/// What a failure says about the model: limited by a 429 for what the provider's `Retry-After`
+/// asks, else a minute; busy on a server error; unreachable when nothing answered at all. `None`
+/// for any other failure, whatever its text says.
+pub(super) fn setback(
+    kind: ErrorKind,
     status: Option<reqwest::StatusCode>,
     headers: Option<&reqwest::header::HeaderMap>,
-) -> Option<Duration> {
-    if status? != reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return None;
+) -> Option<Setback> {
+    if kind == ErrorKind::Http {
+        return Some(Setback::Unreachable);
     }
-    let asked = headers
-        .and_then(|h| h.get("retry-after"))
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(Duration::from_secs);
-    Some(
-        asked
+    let status = status?;
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let asked = headers
+            .and_then(|h| h.get("retry-after"))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let wait = asked
             .unwrap_or(DEFAULT_PARK)
-            .clamp(Duration::from_secs(1), MAX_PARK),
-    )
+            .clamp(Duration::from_secs(1), MAX_PARK);
+        return Some(Setback::Limited(wait));
+    }
+    status.is_server_error().then_some(Setback::Busy)
 }
 
-pub(super) fn prompt_retry_after(error: &PromptError) -> Option<Duration> {
+pub(super) fn prompt_setback(error: &PromptError) -> Option<Setback> {
     match error {
-        PromptError::CompletionError(e) => {
-            retry_after(e.provider_response_status(), e.provider_response_headers())
-        }
-        PromptError::Report(e) => {
-            retry_after(e.provider_response_status(), e.provider_response_headers())
-        }
+        PromptError::CompletionError(e) => setback(
+            e.kind(),
+            e.provider_response_status(),
+            e.provider_response_headers(),
+        ),
+        PromptError::Report(e) => setback(
+            e.kind,
+            e.provider_response_status(),
+            e.provider_response_headers(),
+        ),
         _ => None,
     }
 }
 
-pub(super) fn stream_retry_after(error: &StreamingError) -> Option<Duration> {
+pub(super) fn stream_setback(error: &StreamingError) -> Option<Setback> {
     match error {
-        StreamingError::Completion(e) => {
-            retry_after(e.provider_response_status(), e.provider_response_headers())
+        StreamingError::Completion(e) => setback(
+            e.kind(),
+            e.provider_response_status(),
+            e.provider_response_headers(),
+        ),
+        StreamingError::Report(e) => setback(
+            e.kind,
+            e.provider_response_status(),
+            e.provider_response_headers(),
+        ),
+        StreamingError::Prompt(e) => prompt_setback(e),
+    }
+}
+
+/// `agent`'s answer to `message`, asked once more [`BUSY_RETRY`] later when the provider was busy
+/// and `again` counts a second request against the model's limits.
+pub(super) async fn prompt_once_more(
+    agent: &Agent,
+    message: impl Into<Message>,
+    again: impl FnOnce() -> bool,
+) -> Result<PromptResponse, PromptError> {
+    let message = message.into();
+    match agent.prompt(message.clone()).await {
+        Err(e) if prompt_setback(&e) == Some(Setback::Busy) && again() => {
+            tokio::time::sleep(BUSY_RETRY).await;
+            agent.prompt(message).await
         }
-        StreamingError::Report(e) => {
-            retry_after(e.provider_response_status(), e.provider_response_headers())
-        }
-        StreamingError::Prompt(e) => prompt_retry_after(e),
+        answered => answered,
     }
 }

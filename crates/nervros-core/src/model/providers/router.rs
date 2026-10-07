@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
-use super::ledger::{Ledger, Refused, ResetZone};
+use super::ledger::{Ledger, Refused, ResetZone, until_next_day};
 use super::{ModelConfig, ModelsConfig, ProviderKind, Role};
 
 /// What a call needs from a model.
@@ -180,7 +180,8 @@ impl Router {
         Ok(())
     }
 
-    /// Parks a model after a 429; persists the ledger.
+    /// Parks a model for `for_how_long`, at most until its provider's next daily reset; persists
+    /// the ledger.
     ///
     /// # Errors
     ///
@@ -191,6 +192,13 @@ impl Router {
         now: SystemTime,
         for_how_long: Duration,
     ) -> std::io::Result<()> {
+        // A spent daily quota comes back at the provider's midnight, whatever its Retry-After said:
+        // Gemini's ran to UTC midnight, 17 hours past its own Pacific reset.
+        let zone = self
+            .config
+            .model(model_id)
+            .map_or(ResetZone::Utc, |m| self.zone(m));
+        let for_how_long = for_how_long.min(until_next_day(now, zone));
         let mut ledger = self.ledger();
         ledger.park(model_id, now, for_how_long);
         ledger.save()
@@ -368,6 +376,18 @@ mod tests {
         assert_eq!(ids(&take), ["text", "local9b"]);
         let later = now + Duration::from_secs(61);
         let (take, _) = r.candidates(Role::Routine, Need::default(), later);
+        assert_eq!(ids(&take), ["big", "text", "local9b"]);
+    }
+
+    #[test]
+    fn a_park_ends_at_the_providers_midnight_whatever_it_asked() {
+        let r = router(PrivacyMode::Sim);
+        let late = std::time::UNIX_EPOCH + Duration::from_hours(20_000 * 24 + 23);
+        r.park("big", late, Duration::from_hours(20)).unwrap();
+        let (take, _) = r.candidates(Role::Routine, Need::default(), late);
+        assert_eq!(ids(&take), ["text", "local9b"]);
+        let past_midnight = late + Duration::from_secs(3601);
+        let (take, _) = r.candidates(Role::Routine, Need::default(), past_midnight);
         assert_eq!(ids(&take), ["big", "text", "local9b"]);
     }
 }

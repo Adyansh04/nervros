@@ -107,6 +107,10 @@ acted, the turn ends instead of repeating the action.
 Every request is counted, per model and per pool, in `~/.local/state/nervros/quota.json`
 (`$XDG_STATE_HOME/nervros` when set): a turn that calls tools makes several, and one the quota
 refuses ends the turn there. Days roll over at midnight UTC, and for Gemini at midnight
-Pacific time, as the providers count them. A model answering 429 is set aside for a minute. The
-app's top bar shows the answering model with today's count, and the dock's Models tab shows every
-role's chain and why a model is skipped.
+Pacific time, as the providers count them. A model answering 429 is set aside for as long as its
+`Retry-After` asks, a minute without one, and never past its provider's next midnight, when a
+spent daily quota comes back. A model whose server does not answer, such as a local model that is
+not running, is set aside for a minute, so the turns meanwhile go to the next model quietly. A
+busy one (a 5xx, as Gemini's 503 under load) is asked once more two seconds later, unless part of
+the turn already came back. The app's top bar shows the answering model with today's count, and
+the dock's Models tab shows every role's chain and why a model is skipped.

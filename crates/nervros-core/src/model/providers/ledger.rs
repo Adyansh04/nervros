@@ -29,6 +29,18 @@ pub fn day_index(now: SystemTime, zone: ResetZone) -> u64 {
     secs.saturating_sub(offset) / 86_400
 }
 
+/// How long from `now` until the zone's next midnight, when a daily quota comes back.
+#[must_use]
+pub fn until_next_day(now: SystemTime, zone: ResetZone) -> Duration {
+    let secs = crate::unix_secs(now);
+    let offset = match zone {
+        ResetZone::Utc => 0,
+        ResetZone::Pacific => pacific_offset(secs),
+    };
+    let next = (day_index(now, zone) + 1) * 86_400 + offset;
+    Duration::from_secs(next.saturating_sub(secs))
+}
+
 /// Pacific time's lag behind UTC at `secs`: daylight time (UTC-7) from 02:00 on the second Sunday
 /// in March to 02:00 on the first Sunday in November, standard time (UTC-8) otherwise.
 fn pacific_offset(secs: u64) -> u64 {
@@ -261,6 +273,21 @@ mod tests {
 
     fn at(secs: u64) -> SystemTime {
         std::time::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn the_next_day_starts_at_the_zones_midnight() {
+        let noon = at(86_400 * 100 + 12 * 3600);
+        assert_eq!(
+            until_next_day(noon, ResetZone::Utc),
+            Duration::from_hours(12)
+        );
+        // 2026-10-07 06:00 UTC is 23:00 the day before in California, on daylight time.
+        let late = at(1_791_352_800);
+        assert_eq!(
+            until_next_day(late, ResetZone::Pacific),
+            Duration::from_hours(1)
+        );
     }
 
     #[test]

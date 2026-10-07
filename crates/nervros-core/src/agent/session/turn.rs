@@ -14,10 +14,19 @@ use crate::providers::router::Need;
 use crate::tools::Registry;
 use crate::{llm, lock};
 
-/// Each model call's cost, to the log and to `used`, the context gauge's count.
-fn costs(shared: &Arc<Shared>, turn: u64, model: &str, used: &Arc<AtomicU64>) -> llm::OnCall {
-    let (shared, model, used) = (Arc::clone(shared), model.to_owned(), Arc::clone(used));
+/// Each model call's cost, to the log and to `used`, the context gauge's count; `answered` notes
+/// that a call came back.
+fn costs(
+    shared: &Arc<Shared>,
+    turn: u64,
+    model: &str,
+    used: &Arc<AtomicU64>,
+    answered: &Arc<AtomicBool>,
+) -> llm::OnCall {
+    let (shared, model) = (Arc::clone(shared), model.to_owned());
+    let (used, answered) = (Arc::clone(used), Arc::clone(answered));
     Arc::new(move |cost: llm::CallCost| {
+        answered.store(true, Ordering::Relaxed);
         if cost.input_tokens > 0 {
             used.store(cost.input_tokens, Ordering::Relaxed);
         }
@@ -32,10 +41,11 @@ fn costs(shared: &Arc<Shared>, turn: u64, model: &str, used: &Arc<AtomicU64>) ->
     })
 }
 
-/// Passes a streamed reply's pieces to the UI.
-fn deltas(shared: &Arc<Shared>, turn: u64) -> llm::OnDelta {
-    let shared = Arc::clone(shared);
+/// Passes a streamed reply's pieces to the UI; `answered` notes that the reply began.
+fn deltas(shared: &Arc<Shared>, turn: u64, answered: &Arc<AtomicBool>) -> llm::OnDelta {
+    let (shared, answered) = (Arc::clone(shared), Arc::clone(answered));
     Arc::new(move |text: &str| {
+        answered.store(true, Ordering::Relaxed);
         shared.emit(Event::ReplyDelta {
             turn,
             text: text.to_owned(),
@@ -149,18 +159,10 @@ fn loop_tools(
         .collect()
 }
 
-pub(super) async fn run_turn(
-    turn: u64,
-    origin: Origin,
-    history: History,
-    shared: Arc<Shared>,
-    source: Arc<dyn AgentSource>,
-    registry: Arc<Registry>,
-) -> Option<History> {
-    shared.guard.begin_turn();
-    *lock(&shared.repeated) = (String::new(), 0);
+/// Logs the turn's start and what started it, and gives the text the model gets.
+fn announce(shared: &Shared, turn: u64, origin: Origin) -> String {
     shared.emit(Event::TurnStarted { turn });
-    let text = match origin {
+    match origin {
         Origin::User(text) => {
             shared.emit(Event::User {
                 turn,
@@ -175,7 +177,20 @@ pub(super) async fn run_turn(
             });
             format!("{}\n{text}", llm::REPORT_MARK)
         }
-    };
+    }
+}
+
+pub(super) async fn run_turn(
+    turn: u64,
+    origin: Origin,
+    history: History,
+    shared: Arc<Shared>,
+    source: Arc<dyn AgentSource>,
+    registry: Arc<Registry>,
+) -> Option<History> {
+    shared.guard.begin_turn();
+    *lock(&shared.repeated) = (String::new(), 0);
+    let text = announce(&shared, turn, origin);
     let flags = Arc::new(TurnFlags::default());
     for tool in registry.iter() {
         tool.ready().await;
@@ -190,20 +205,37 @@ pub(super) async fn run_turn(
     fit_window(&shared, &source, &candidates, &tools, &mut history).await;
     let mut failures = Vec::new();
     for model in candidates {
-        let mut updated = history.clone();
-        let used = Arc::new(AtomicU64::new(0));
         let window = source.context(&model);
         let system = preamble(&shared);
-        let setup = llm::TurnSetup {
-            preamble: &system,
-            max_turns: shared.config.max_model_calls,
-            tools: &tools,
-            started: Arc::clone(&flags.started),
-            window,
-            on_call: Some(costs(&shared, turn, &model, &used)),
-            delta: Some(deltas(&shared, turn)),
+        let mut retried = false;
+        let (result, mut updated, used) = loop {
+            let mut updated = history.clone();
+            let used = Arc::new(AtomicU64::new(0));
+            let answered = Arc::new(AtomicBool::new(false));
+            let setup = llm::TurnSetup {
+                preamble: &system,
+                max_turns: shared.config.max_model_calls,
+                tools: &tools,
+                started: Arc::clone(&flags.started),
+                window,
+                on_call: Some(costs(&shared, turn, &model, &used, &answered)),
+                delta: Some(deltas(&shared, turn, &answered)),
+            };
+            let result = llm::chat(&model, Arc::clone(&source), setup, &mut updated, &text).await;
+            // A busy provider often answers a moment later: once more, while nothing came back or
+            // was done that a second try would repeat.
+            let busy = matches!(&result, Err(e) if e.setback() == Some(llm::Setback::Busy));
+            if busy
+                && !retried
+                && !answered.load(Ordering::Relaxed)
+                && !flags.acted.load(Ordering::SeqCst)
+            {
+                retried = true;
+                tokio::time::sleep(llm::BUSY_RETRY).await;
+                continue;
+            }
+            break (result, updated, used);
         };
-        let result = llm::chat(&model, Arc::clone(&source), setup, &mut updated, &text).await;
         match result {
             Ok(reply) => {
                 shared.emit(Event::Reply {
@@ -224,12 +256,8 @@ pub(super) async fn run_turn(
                 return Some(updated);
             }
             Err(e) => {
-                if let llm::LlmError::Turn {
-                    retry_after: Some(wait),
-                    ..
-                } = &e
-                {
-                    source.park(&model, *wait);
+                if let Some(wait) = e.setback().and_then(llm::Setback::park) {
+                    source.park(&model, wait);
                 }
                 if !flags.acted.load(Ordering::SeqCst) {
                     shared.emit(Event::Notice {

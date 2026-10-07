@@ -13,9 +13,9 @@ use rig::agent::{
     InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, RequestPatch,
 };
 
-use super::LlmError;
-use super::client::{Llm, prompt_retry_after, stream_retry_after};
+use super::client::{Llm, prompt_setback, stream_setback};
 use super::history::{History, RESERVE_TOKENS, cut_old, fit, size, tokens_of};
+use super::{LlmError, Setback};
 use crate::providers::Role;
 use crate::providers::router::Need;
 
@@ -346,22 +346,22 @@ pub async fn chat(
             last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
         });
     let agent = builder.build();
-    let turn_error = |message: String, retry_after: Option<Duration>| LlmError::Turn {
+    let turn_error = |message: String, setback: Option<Setback>| LlmError::Turn {
         model: model_id.to_owned(),
         message: without_provider_body(&message),
-        retry_after,
+        setback,
     };
     if let Some(delta) = delta {
         return streamed(&agent, text, history, delta.as_ref())
             .await
             .map(plain)
-            .map_err(|(message, wait)| turn_error(message, wait));
+            .map_err(|(message, setback)| turn_error(message, setback));
     }
     agent
         .chat(text, &mut history.0)
         .await
         .map(|response| plain(response.output))
-        .map_err(|e| turn_error(e.to_string(), prompt_retry_after(&e)))
+        .map_err(|e| turn_error(e.to_string(), prompt_setback(&e)))
 }
 
 /// One turn with the reply streamed: each text delta to `delta`, and the run's transcript into
@@ -371,14 +371,14 @@ pub(super) async fn streamed(
     text: &str,
     history: &mut History,
     delta: &(dyn Fn(&str) + Send + Sync),
-) -> Result<String, (String, Option<Duration>)> {
+) -> Result<String, (String, Option<Setback>)> {
     use futures::StreamExt as _;
     use rig::agent::MultiTurnStreamItem;
     use rig::streaming::{Item, StreamEvent};
     let mut stream = agent.prompt(text).history(history.0.clone()).stream();
     let mut done = None;
     while let Some(item) = stream.next().await {
-        match item.map_err(|e| (e.to_string(), stream_retry_after(&e)))? {
+        match item.map_err(|e| (e.to_string(), stream_setback(&e)))? {
             MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
                 text,
                 ..

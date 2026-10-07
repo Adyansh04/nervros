@@ -193,3 +193,35 @@ fn a_provider_error_keeps_its_words_and_loses_its_body() {
         "oops: details withheld"
     );
 }
+
+#[test]
+fn a_failure_says_how_the_model_fares() {
+    use super::client::setback;
+    use reqwest::StatusCode;
+    use rig::ErrorKind;
+    let reply = ErrorKind::ProviderResponse;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "retry-after",
+        reqwest::header::HeaderValue::from_static("30"),
+    );
+    assert_eq!(
+        setback(ErrorKind::Http, None, None),
+        Some(Setback::Unreachable)
+    );
+    assert_eq!(
+        setback(reply, Some(StatusCode::TOO_MANY_REQUESTS), Some(&headers)),
+        Some(Setback::Limited(Duration::from_secs(30)))
+    );
+    assert_eq!(
+        setback(reply, Some(StatusCode::TOO_MANY_REQUESTS), None),
+        Some(Setback::Limited(Duration::from_mins(1)))
+    );
+    assert_eq!(
+        setback(reply, Some(StatusCode::SERVICE_UNAVAILABLE), None),
+        Some(Setback::Busy)
+    );
+    assert_eq!(setback(reply, Some(StatusCode::BAD_REQUEST), None), None);
+    assert_eq!(Setback::Unreachable.park(), Some(Duration::from_mins(1)));
+    assert_eq!(Setback::Busy.park(), None);
+}

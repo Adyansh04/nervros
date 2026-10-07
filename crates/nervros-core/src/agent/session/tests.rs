@@ -150,6 +150,40 @@ async fn only_a_real_429_sets_the_model_aside_streamed_or_not() {
 }
 
 #[tokio::test]
+async fn a_busy_model_is_asked_once_more_before_the_next() {
+    let model = MockCompletionModel::from_turns([
+        MockTurn::provider_response_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            "req-503",
+        ),
+        MockTurn::text("The cup is in the kitchen."),
+    ]);
+    let source = Arc::new(Scripted::new(model));
+    let session = Session::start(
+        Arc::clone(&source) as Arc<dyn AgentSource>,
+        registry(Risk::Observe),
+        Arc::new(Guard::new(Policy::default())),
+        None,
+        SessionConfig::default(),
+    );
+    let mut rx = session.subscribe();
+    session.send(Command::User("Where is the cup?".into()));
+    let events = collect_until_finished(&mut rx, |_| None, &session).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Reply { text, .. } if text.contains("kitchen"))),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Notice { .. })),
+        "{events:?}"
+    );
+    assert!(lock(&source.parked).is_empty());
+}
+
+#[tokio::test]
 async fn a_spent_quota_ends_the_turn() {
     let source = metered(1);
     let events = ask_where_the_cup_is(&source).await;
