@@ -4,24 +4,21 @@
 //!
 //! Detections arrive as `canopy_msgs/msg/InstanceMaskArray` (masks) or
 //! `vision_msgs/msg/Detection2DArray` (boxes), read as JSON. Frames are kept for a few seconds so a
-//! detection that lags its camera is drawn on the frame it came from, not on a newer one.
+//! detection that lags its camera is drawn on the frame it came from, not on a newer one; a
+//! detector that reads frames of its own (`detection_image`) is matched to those.
 
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use image::RgbImage;
-use nervros_ros::{Frame, RobotPort};
+use nervros_ros::RobotPort;
 use serde_json::{Value, json};
 
 use crate::llm::ImageInput;
 use crate::profile::LookConfig;
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
-use crate::vision::{
-    Camera, Cameras, DETECTION_MATCH_S, Detections, Instance, SnapshotStore, close_up, draw_marks,
-    marks_json, parse_detections,
-};
+use crate::vision::{Cameras, Instance, SnapshotStore, close_up, draw_marks, marks_json};
 
 /// What `look` asks when the model gave no question.
 const DEFAULT_QUESTION: &str =
@@ -105,7 +102,7 @@ impl LookTool {
     ) -> Result<Looked, String> {
         let camera = self.cameras.get(camera)?;
         let newest = camera.newest()?;
-        let (mut dets, frame, age, left_out) = self.marked(camera, newest).await;
+        let (mut dets, frame, age, left_out) = camera.marked(self.robot.as_ref(), newest).await;
         dets.instances.sort_by(|a, b| b.score.total_cmp(&a.score));
         dets.instances.truncate(self.config.max_marks);
         // Tens of milliseconds of pixels: off the threads that serve the stop.
@@ -167,52 +164,6 @@ impl LookTool {
         );
         out.images.push(looked.snapshot.image.clone());
         Ok(out)
-    }
-
-    /// The detections to draw and the frame they came from; without a detector, or with none
-    /// that match a kept frame within the age the profile allows, the newest frame unmarked and
-    /// why, rather than marks on a frame they were not cut from.
-    async fn marked(
-        &self,
-        camera: &Camera,
-        newest: Arc<Frame>,
-    ) -> (Detections, Arc<Frame>, f64, Option<String>) {
-        let unmarked = |frame: Arc<Frame>, why: Option<String>| {
-            let dets = Detections {
-                stamp_s: frame.stamp_s,
-                instances: Vec::new(),
-            };
-            (dets, frame, 0.0, why)
-        };
-        let Some(topic) = &camera.config.detections else {
-            return unmarked(newest, None);
-        };
-        let msg = match self
-            .robot
-            .latest(&topic.topic, &topic.msg_type, Duration::from_secs(3))
-            .await
-        {
-            Ok(msg) => msg,
-            Err(e) => return unmarked(newest, Some(format!("no detections ({e})"))),
-        };
-        let dets = parse_detections(&msg);
-        // Either way: detections much newer than the newest frame mean a stalled camera.
-        let age = newest.stamp_s - dets.stamp_s;
-        if age.abs() > self.config.max_age.as_secs_f64() {
-            let why = format!(
-                "the detections are {:.1} s apart from the camera's newest frame; the detector or \
-                 the camera may be stopped",
-                age.abs()
-            );
-            return unmarked(newest, Some(why));
-        }
-        match camera.history.closest(dets.stamp_s, DETECTION_MATCH_S) {
-            Some(frame) => (dets, frame, age, None),
-            None => unmarked(
-                newest,
-                Some("the frame the detections came from is no longer kept".to_owned()),
-            ),
-        }
     }
 
     /// The vision model's answer about a kept snapshot or an image the operator attached; the
@@ -334,15 +285,19 @@ impl Tool for LookTool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Duration;
+
+    use crate::vision::parse_detections;
+    use nervros_ros::Frame;
 
     use crate::vision::{CLOSE_UP_PX, PALETTE};
     use bytes::Bytes;
     use nervros_ros::fake::FakeRobot;
 
-    fn frame(stamp_s: f64) -> Frame {
+    pub(crate) fn frame(stamp_s: f64) -> Frame {
         Frame {
             stamp_s,
             frame_id: "camera".into(),
@@ -355,7 +310,7 @@ mod tests {
         }
     }
 
-    fn masks(stamp_s: f64) -> Value {
+    pub(crate) fn masks(stamp_s: f64) -> Value {
         json!({
             "header": {"stamp": {"sec": stamp_s.floor(), "nanosec": 0}, "frame_id": "camera"},
             "image_width": 64, "image_height": 48, "model": "mock",
@@ -496,6 +451,98 @@ mod tests {
             "{}",
             out.data
         );
+    }
+
+    #[tokio::test]
+    async fn a_detector_that_reads_its_own_frames_is_drawn_on_the_frame_it_read() {
+        let robot: Arc<dyn RobotPort> = Arc::new(
+            FakeRobot::new()
+                .with_frame("/camera", frame(12.0))
+                .with_frame("/still", frame(4.0))
+                .with_topic("/masks", masks(4.0)),
+        );
+        let config: LookConfig = toml::from_str(
+            "image = \"/camera\"\ndetection_image = \"/still\"\nmax_age = \"12s\"\n\
+             detections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n",
+        )
+        .unwrap();
+        let look = start(config, robot, Arc::new(SnapshotStore::default()), None);
+        tokio::task::yield_now().await;
+        let out = look.call(json!({})).await;
+        assert_eq!(out.data["marks"][0]["label"], "dustbin", "{}", out.data);
+        assert_eq!(out.data["age_s"], 8.0);
+    }
+
+    fn still_frames(max_age: &str) -> LookConfig {
+        toml::from_str(&format!(
+            "image = \"/camera\"\ndetection_image = \"/still\"\nmax_age = \"{max_age}\"\n\
+             detections = {{ topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }}\n"
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn old_masks_of_a_still_base_are_waited_out_and_said_to_be_expected() {
+        let fake = Arc::new(
+            FakeRobot::new()
+                .with_frame("/camera", frame(20.0))
+                .with_frame("/still", frame(4.0))
+                .with_topic("/masks", masks(4.0)),
+        );
+        let robot: Arc<dyn RobotPort> = fake.clone();
+        let look = start(
+            still_frames("1s"),
+            robot,
+            Arc::new(SnapshotStore::default()),
+            None,
+        );
+        tokio::task::yield_now().await;
+        let out = look.call(json!({})).await;
+        assert_eq!(out.data["marks"], json!([]));
+        let why = out.data["no_marks"].as_str().unwrap_or_default();
+        assert!(why.contains("only the frames it reads"), "{why}");
+
+        // The base stops: its next still frame's masks are drawn.
+        let robot: Arc<dyn RobotPort> = fake.clone();
+        let look = start(
+            still_frames("12s"),
+            robot,
+            Arc::new(SnapshotStore::default()),
+            None,
+        );
+        tokio::task::yield_now().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            fake.set_frame("/still", frame(20.0));
+            fake.set_topic("/masks", masks(20.0));
+        });
+        let out = look.call(json!({})).await;
+        assert_eq!(out.data["marks"][0]["label"], "dustbin", "{}", out.data);
+    }
+
+    #[tokio::test]
+    async fn masks_of_a_frame_never_kept_are_waited_out_for_the_next() {
+        let fake = Arc::new(
+            FakeRobot::new()
+                .with_frame("/camera", frame(12.0))
+                .with_frame("/still", frame(10.0))
+                .with_topic("/masks", masks(6.0)),
+        );
+        let robot: Arc<dyn RobotPort> = fake.clone();
+        let config: LookConfig = toml::from_str(
+            "image = \"/camera\"\ndetection_image = \"/still\"\nmax_age = \"12s\"\n\
+             detections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n",
+        )
+        .unwrap();
+        let look = start(config, robot, Arc::new(SnapshotStore::default()), None);
+        tokio::task::yield_now().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            fake.set_topic("/masks", masks(10.0));
+        });
+        let out = look.call(json!({})).await;
+        assert_eq!(out.data["marks"][0]["label"], "dustbin", "{}", out.data);
+        assert_eq!(out.data["age_s"], 2.0);
     }
 
     struct FakeEyes {

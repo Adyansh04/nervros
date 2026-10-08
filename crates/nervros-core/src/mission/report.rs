@@ -10,15 +10,16 @@ use super::plan::Compiled;
 use super::{Missions, Outcome, SERVICE_TIMEOUT, check, held_by};
 
 impl Missions {
-    /// What the model reads when a mission ends: how it went, the goal checks or why it failed
-    /// and where its object was last seen, and what the hands hold now.
+    /// What the model reads when a mission ends: how it went, the goal checks or why it failed,
+    /// where its object was last seen and which earlier missions took it, and what the hands
+    /// hold now.
     pub(super) fn report(
         &self,
         id: &str,
         compiled: &Compiled,
         (outcome, step, reason): (Outcome, &str, &str),
         elapsed: f64,
-        (seen, story, camera): (&Observed, &[String], &[String]),
+        (seen, story, moves, camera): (&Observed, &[String], &[String], &[String]),
     ) -> String {
         let mut report = format!(
             "Mission {id} ({}) ended: {outcome} after {elapsed:.0} s.",
@@ -70,6 +71,9 @@ impl Missions {
             }
             if !story.is_empty() {
                 let _ = write!(report, " What happened to it: {}.", story.join(". "));
+            }
+            if !moves.is_empty() {
+                let _ = write!(report, " Earlier missions with it: {}.", moves.join("; "));
             }
             next = if n > self.config.max_replans {
                 "This request has failed too often: do not retry. Tell the operator what went \

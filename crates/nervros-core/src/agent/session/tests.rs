@@ -28,6 +28,10 @@ struct Scripted {
     allowed: Option<usize>,
     /// Requests granted so far.
     taken: std::sync::atomic::AtomicUsize,
+    /// Requests refused first, as a spent per-minute limit refuses them.
+    minute_refusals: std::sync::atomic::AtomicUsize,
+    /// When the router would say a per-minute limit lifts.
+    ready_after: Option<Duration>,
     /// How long it was set aside, each time.
     parked: Mutex<Vec<Duration>>,
 }
@@ -39,6 +43,8 @@ impl Scripted {
             streams: false,
             allowed: None,
             taken: std::sync::atomic::AtomicUsize::new(0),
+            minute_refusals: std::sync::atomic::AtomicUsize::new(0),
+            ready_after: None,
             parked: Mutex::default(),
         }
     }
@@ -52,6 +58,13 @@ impl AgentSource for Scripted {
         Ok(AgentBuilder::new(self.model.clone()))
     }
     fn take_request(&self, _id: &str) -> Result<(), String> {
+        if self
+            .minute_refusals
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err("its per-minute limit is used up".to_owned());
+        }
         let allowed = self.allowed.unwrap_or(usize::MAX);
         self.taken
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
@@ -65,6 +78,9 @@ impl AgentSource for Scripted {
     }
     fn streams(&self, _id: &str) -> bool {
         self.streams
+    }
+    fn ready_in(&self, _role: Role, _need: Need) -> Option<Duration> {
+        self.ready_after
     }
 }
 
@@ -89,6 +105,38 @@ async fn ask_where_the_cup_is(source: &Arc<Scripted>) -> Vec<Event> {
     let mut rx = session.subscribe();
     session.send(Command::User("Where is the cup?".into()));
     collect_until_finished(&mut rx, |_| None, &session).await
+}
+
+#[tokio::test]
+async fn a_turn_waits_once_for_a_per_minute_limit_to_lift() {
+    let waiting = |refusals: usize| {
+        Arc::new(Scripted {
+            minute_refusals: std::sync::atomic::AtomicUsize::new(refusals),
+            ready_after: Some(Duration::from_millis(20)),
+            ..Scripted::new(MockCompletionModel::from_turns([MockTurn::text(
+                "The cup is in the kitchen.",
+            )]))
+        })
+    };
+    let waits = |events: &[Event]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::Notice { text } if text.contains("waiting")))
+            .count()
+    };
+    let events = ask_where_the_cup_is(&waiting(1)).await;
+    assert_eq!(waits(&events), 1, "{events:?}");
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Reply { .. })),
+        "{events:?}"
+    );
+
+    let events = ask_where_the_cup_is(&waiting(2)).await;
+    assert_eq!(waits(&events), 1, "only once a turn: {events:?}");
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Error { .. })),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
@@ -147,6 +195,71 @@ async fn only_a_real_429_sets_the_model_aside_streamed_or_not() {
         assert_eq!(parked.len(), parks, "streams: {streams}");
         assert!(parked.iter().all(|d| *d == Duration::from_mins(1)));
     }
+}
+
+#[tokio::test]
+async fn a_busy_model_is_asked_once_more_before_the_next() {
+    let model = MockCompletionModel::from_turns([
+        MockTurn::provider_response_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            "req-503",
+        ),
+        MockTurn::text("The cup is in the kitchen."),
+    ]);
+    let source = Arc::new(Scripted::new(model));
+    let session = Session::start(
+        Arc::clone(&source) as Arc<dyn AgentSource>,
+        registry(Risk::Observe),
+        Arc::new(Guard::new(Policy::default())),
+        None,
+        SessionConfig::default(),
+    );
+    let mut rx = session.subscribe();
+    session.send(Command::User("Where is the cup?".into()));
+    let events = collect_until_finished(&mut rx, |_| None, &session).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Reply { text, .. } if text.contains("kitchen"))),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Notice { .. })),
+        "{events:?}"
+    );
+    assert!(lock(&source.parked).is_empty());
+}
+
+#[tokio::test]
+async fn the_model_that_reasoned_gets_its_reasoning_back() {
+    use rig::message::{AssistantContent, Issuer, Message, Reasoning, Sealed};
+    let model = MockCompletionModel::from_turns([
+        MockTurn::from_contents([
+            AssistantContent::Reasoning(Sealed::new(Issuer::from("mock"), Reasoning::new("hm"))),
+            AssistantContent::text("first"),
+        ]),
+        MockTurn::text("second"),
+    ]);
+    let source = Arc::new(Scripted::new(model.clone()));
+    let session = Session::start(
+        Arc::clone(&source) as Arc<dyn AgentSource>,
+        registry(Risk::Observe),
+        Arc::new(Guard::new(Policy::default())),
+        None,
+        SessionConfig::default(),
+    );
+    let mut rx = session.subscribe();
+    for text in ["one", "two"] {
+        session.send(Command::User(text.into()));
+        collect_until_finished(&mut rx, |_| None, &session).await;
+    }
+    let requests = model.requests();
+    let reasoned = requests[1].chat_history.iter().any(|m| {
+        matches!(m, Message::Assistant { content, .. }
+            if content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))))
+    });
+    assert!(reasoned, "{:?}", requests[1].chat_history);
 }
 
 #[tokio::test]

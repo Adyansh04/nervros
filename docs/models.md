@@ -39,13 +39,12 @@ headers = { "X-Title" = "NervROS" }
 
 ```toml
 [[model]]
-id = "qwen3.8-27b-or"            # the name used in roles and the logs
+id = "nemotron-super-or"                        # the name used in roles and the logs
 provider = "openrouter"
-model = "qwen/qwen3.8-27b:free"  # the provider's own name
-vision = true
+model = "nvidia/nemotron-3-super-120b-a12b:free"  # the provider's own name
 tools = true
 limits = { rpm = 20, pool = "openrouter_free" }
-privacy = { trains = false }
+privacy = { trains = true }                     # free endpoints may train on what they get
 ```
 
 | Key | Default | |
@@ -108,6 +107,14 @@ acted, the turn ends instead of repeating the action.
 Every request is counted, per model and per pool, in `~/.local/state/nervros/quota.json`
 (`$XDG_STATE_HOME/nervros` when set): a turn that calls tools makes several, and one the quota
 refuses ends the turn there. Days roll over at midnight UTC, and for Gemini at midnight
-Pacific time, as the providers count them. A model answering 429 is set aside for a minute. The
-app's top bar shows the answering model with today's count, and the dock's Models tab shows every
-role's chain and why a model is skipped.
+Pacific time, as the providers count them. A model answering 429 is set aside for as long as its
+`Retry-After` asks, a minute without one, and never past its provider's next midnight, when a
+spent daily quota comes back. A model whose server does not answer, such as a local model that is
+not running, is tried last for a minute, by that process alone, so its turns meanwhile go to the
+next model quietly. A busy one (a 5xx, as Gemini's 503 under load) is asked once more two seconds
+later, unless part of the turn already came back. When every model of a turn is held back and the
+first per-minute limit or 429 lifts within a minute, as after a burst of calls on free tiers, the
+turn says so and waits for it, once; daily limits still end the turn at once. A model that takes
+over from another gets the conversation without the other's reasoning, which Gemma refuses with a
+400, while a model carrying on gets its own back. The app's top bar shows the answering model with
+today's count, and the dock's Models tab shows every role's chain and why a model is skipped.

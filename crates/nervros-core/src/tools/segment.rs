@@ -4,7 +4,7 @@
 //!
 //! Masks come from a vision model, the models file's `segment` role asked for outlines the way
 //! Gemini draws them, or from a ROS service that answers with an `InstanceMaskArray`, such as
-//! canopy's segmenter in front of a local Grounded SAM 2 server.
+//! canopy's segmenter in front of its local SAM 3.1 server.
 
 use std::borrow::Cow;
 use std::sync::Arc;

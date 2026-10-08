@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::client::{Llm, prompt_retry_after};
+use super::client::{Llm, prompt_once_more, prompt_setback};
 use super::turn::{AgentSource, without_provider_body};
 use super::{Ask, ImageInput};
 use crate::providers::Role;
@@ -29,17 +29,14 @@ pub async fn summarise(source: &Arc<dyn AgentSource>, transcript: &str) -> Optio
         if source.take_request(&model).is_err() {
             continue;
         }
-        match builder
-            .preamble(SUMMARY_PREAMBLE)
-            .build()
-            .prompt(transcript)
-            .await
-        {
+        let agent = builder.preamble(SUMMARY_PREAMBLE).build();
+        let again = || source.take_request(&model).is_ok();
+        match prompt_once_more(&agent, transcript.to_owned(), again).await {
             Ok(response) if !response.output.trim().is_empty() => return Some(response.output),
             Ok(_) => {}
             Err(e) => {
-                if let Some(wait) = prompt_retry_after(&e) {
-                    source.park(&model, wait);
+                if let Some(setback) = prompt_setback(&e) {
+                    source.set_back(&model, setback);
                 }
                 let said = without_provider_body(&e.to_string());
                 tracing::warn!(model = %model, error = %said, "the summary failed");

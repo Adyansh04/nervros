@@ -20,6 +20,8 @@ const RECENT: usize = 8;
 const SEARCHED: usize = 200;
 /// How many such plans it gives.
 const PROVEN: usize = 3;
+/// How many of the robot's missions with an object it gives, as a failure report does.
+const MOVES: usize = 2;
 
 /// The three tools.
 #[must_use]
@@ -93,13 +95,41 @@ fn mission_line(m: &MissionRecord, now_s: f64) -> String {
     line
 }
 
+/// The robot's own successful missions that named `what` (an id such as `mug_4`), newest first:
+/// a line each, with its steps from the first that named it. They say where the robot took it
+/// when the world model cannot tell which of its mugs `mug_4` is.
+pub(super) async fn moves_of(missions: &Missions, what: &str) -> Vec<String> {
+    let now_s = crate::now_s();
+    let Ok(recent) = read(missions, |l| l.recent(SEARCHED)).await else {
+        return Vec::new();
+    };
+    recent
+        .iter()
+        .filter(|m| m.outcome == "success")
+        .filter_map(|m| {
+            let from = m.steps.iter().position(|s| {
+                s.args.as_object().is_some_and(|a| {
+                    a.values()
+                        .any(|v| v.as_str().is_some_and(|v| v.eq_ignore_ascii_case(what)))
+                })
+            })?;
+            let steps: Vec<String> = m.steps[from..]
+                .iter()
+                .map(|s| step_text(&s.skill, &s.args))
+                .collect();
+            Some(format!("{}: {}", mission_line(m, now_s), steps.join(", ")))
+        })
+        .take(MOVES)
+        .collect()
+}
+
 fn recall_spec() -> ToolSpec {
     ToolSpec::new(
         "recall",
         "What the robot remembers: about=missions lists what it did lately, and how each \
-         ended; about=object says where and when the world model last saw something \
-         (query: its name or id); about=plans gives plans that worked before for a request \
-         like the query, to plan from.",
+         ended; about=object says where and when the world model last saw something, and \
+         which of the robot's missions took it (query: its name or id); about=plans gives \
+         plans that worked before for a request like the query, to plan from.",
         json!({"type": "object", "properties": {
             "about": {"type": "string", "enum": ["missions", "object", "plans"]},
             "query": {"type": "string", "description": "For object: the thing; for plans: the request; for missions: optional words to filter by."}
@@ -128,24 +158,28 @@ impl Tool for Recall {
                 if query.is_empty() {
                     return ToolOutcome::failed("`query` names the object");
                 }
-                let seen = self.missions.observe().await;
-                let story = self.missions.object_story(&query).await;
-                match (
-                    find_object(&seen, &[query.as_str()], Some(&query)),
-                    story.is_empty(),
-                ) {
-                    (Some(found), true) => {
-                        ToolOutcome::ok(json!({"seen": describe_seen(found, &seen, now_s)}))
-                    }
-                    (Some(found), false) => ToolOutcome::ok(json!({
-                        "seen": describe_seen(found, &seen, now_s),
-                        "history": story,
-                    })),
-                    (None, false) => ToolOutcome::ok(json!({"history": story})),
-                    (None, true) => ToolOutcome::failed(format!(
+                let (seen, story, moves) = tokio::join!(
+                    self.missions.observe(),
+                    self.missions.object_story(&query),
+                    moves_of(&self.missions, &query)
+                );
+                let found = find_object(&seen, &[query.as_str()], Some(&query));
+                if found.is_none() && story.is_empty() && moves.is_empty() {
+                    return ToolOutcome::failed(format!(
                         "the world model knows nothing called \"{query}\"; find_objects searches it"
-                    )),
+                    ));
                 }
+                let mut out = json!({});
+                if let Some(found) = found {
+                    out["seen"] = json!(describe_seen(found, &seen, now_s));
+                }
+                if !story.is_empty() {
+                    out["history"] = json!(story);
+                }
+                if !moves.is_empty() {
+                    out["missions"] = json!(moves);
+                }
+                ToolOutcome::ok(out)
             }
             Some("plans") => {
                 let wanted = words(&query);

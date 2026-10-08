@@ -66,6 +66,19 @@ impl History {
         self.0 = cut_old(&self.0, self.0.len() - newest);
     }
 
+    /// Drops the reasoning in it, for a model that did not give it: Gemma answers 400 to Gemini's
+    /// thoughts, while Gemini fails more often without its own.
+    pub fn drop_reasoning(&mut self) {
+        for message in &mut self.0 {
+            if let Message::Assistant { content, .. } = message {
+                content.retain(|part| !matches!(part, AssistantContent::Reasoning(_)));
+            }
+        }
+        // A turn left with nothing in it is refused as empty.
+        self.0
+            .retain(|m| !matches!(m, Message::Assistant { content, .. } if content.is_empty()));
+    }
+
     /// Replaces the first `n` messages with a summary of them.
     pub fn summarised(&mut self, n: usize, summary: &str) {
         let kept = self.0.split_off(n.min(self.0.len()));

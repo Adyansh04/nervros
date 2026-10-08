@@ -29,6 +29,18 @@ pub fn day_index(now: SystemTime, zone: ResetZone) -> u64 {
     secs.saturating_sub(offset) / 86_400
 }
 
+/// How long from `now` until the zone's next midnight, when a daily quota comes back.
+#[must_use]
+pub fn until_next_day(now: SystemTime, zone: ResetZone) -> Duration {
+    let secs = crate::unix_secs(now);
+    let offset = match zone {
+        ResetZone::Utc => 0,
+        ResetZone::Pacific => pacific_offset(secs),
+    };
+    let next = (day_index(now, zone) + 1) * 86_400 + offset;
+    Duration::from_secs(next.saturating_sub(secs))
+}
+
 /// Pacific time's lag behind UTC at `secs`: daylight time (UTC-7) from 02:00 on the second Sunday
 /// in March to 02:00 on the first Sunday in November, standard time (UTC-8) otherwise.
 fn pacific_offset(secs: u64) -> u64 {
@@ -77,6 +89,10 @@ pub struct Ledger {
     parked_until: BTreeMap<String, u64>,
     #[serde(skip)]
     minute: HashMap<String, VecDeque<u64>>,
+    /// Models whose server did not answer, tried last by this process alone: that one process
+    /// cannot reach a server says nothing of the model's quota.
+    #[serde(skip)]
+    silent_until: HashMap<String, u64>,
     #[serde(skip)]
     path: Option<PathBuf>,
     /// What this process counted since it last saved: a save adds it to what the file holds by
@@ -239,6 +255,37 @@ impl Ledger {
             .insert(model.to_owned(), crate::unix_secs(now + for_how_long));
     }
 
+    /// Tries a model whose server did not answer last for `for_how_long`, in this process only.
+    pub fn set_aside(&mut self, model: &str, now: SystemTime, for_how_long: Duration) {
+        self.silent_until
+            .insert(model.to_owned(), crate::unix_secs(now + for_how_long));
+    }
+
+    /// Whether a model's server did not answer a moment ago.
+    #[must_use]
+    pub fn silent(&self, model: &str, now: SystemTime) -> bool {
+        self.silent_until
+            .get(model)
+            .is_some_and(|&until| until > crate::unix_secs(now))
+    }
+
+    /// When a model's park, and each request of its last minute, stop counting against it, as
+    /// offsets from `now`, soonest first: the moments a refusal may lift.
+    #[must_use]
+    pub fn lifts(&self, model: &str, now: SystemTime) -> Vec<Duration> {
+        let t = crate::unix_secs(now);
+        let mut at: Vec<u64> = self
+            .parked_until
+            .get(model)
+            .copied()
+            .into_iter()
+            .chain(self.minute.get(model).into_iter().flatten().map(|s| s + 60))
+            .filter(|&s| s > t)
+            .collect();
+        at.sort_unstable();
+        at.into_iter().map(|s| Duration::from_secs(s - t)).collect()
+    }
+
     /// Replaces today's count for a pool with the provider's own figure, such as OpenRouter's
     /// `free_model_daily_requests.used`.
     pub fn set_pool_used(&mut self, pool: &str, used: u32, now: SystemTime, zone: ResetZone) {
@@ -261,6 +308,21 @@ mod tests {
 
     fn at(secs: u64) -> SystemTime {
         std::time::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn the_next_day_starts_at_the_zones_midnight() {
+        let noon = at(86_400 * 100 + 12 * 3600);
+        assert_eq!(
+            until_next_day(noon, ResetZone::Utc),
+            Duration::from_hours(12)
+        );
+        // 2026-10-07 06:00 UTC is 23:00 the day before in California, on daylight time.
+        let late = at(1_791_352_800);
+        assert_eq!(
+            until_next_day(late, ResetZone::Pacific),
+            Duration::from_hours(1)
+        );
     }
 
     #[test]
@@ -340,6 +402,29 @@ mod tests {
             ledger.check("m", &Limits::default(), None, at(1_000_010), ResetZone::Utc),
             Err(Refused::Parked(_))
         ));
+    }
+
+    #[test]
+    fn a_park_and_the_last_minutes_requests_lift_in_turn_and_a_silent_server_is_not_refused() {
+        let mut ledger = Ledger::default();
+        let t = at(1_000_000);
+        ledger.record("m", None, at(999_950), ResetZone::Utc);
+        ledger.record("m", None, at(999_980), ResetZone::Utc);
+        ledger.park("m", t, Duration::from_secs(25));
+        assert_eq!(ledger.lifts("m", t), [10, 25, 40].map(Duration::from_secs));
+        ledger.set_aside("s", t, Duration::from_secs(5));
+        assert!(ledger.silent("s", t) && !ledger.silent("s", at(1_000_005)));
+        assert!(
+            ledger
+                .check("s", &Limits::default(), None, t, ResetZone::Utc)
+                .is_ok()
+        );
+        assert!(ledger.lifts("s", t).is_empty());
+        assert_eq!(
+            serde_json::to_value(&ledger).unwrap()["parked_until"],
+            serde_json::json!({"m": 1_000_025}),
+            "a server one process cannot reach is not the others' business"
+        );
     }
 
     #[test]

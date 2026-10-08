@@ -236,10 +236,14 @@ pub struct LookConfig {
     pub image: String,
     /// The detection topic and its type.
     pub detections: TopicRef,
+    /// The image topic the detector reads, when it is not `image`, such as frames from a still
+    /// base: kept apart, so its marks are drawn on the frame they were cut from.
+    #[serde(default)]
+    pub detection_image: Option<String>,
     /// At most this many marks.
     #[serde(default = "default_marks")]
     pub max_marks: usize,
-    /// Detections older than this are ignored.
+    /// Detections older than this are ignored, and `look` waits this long for the first.
     #[serde(default = "default_look_age", deserialize_with = "duration")]
     pub max_age: Duration,
     /// What the vision model should know about this camera, such as where it points and how far
@@ -259,6 +263,9 @@ pub struct CameraConfig {
     pub image: String,
     /// Its detections; without them `look` shows the frame unmarked.
     pub detections: Option<TopicRef>,
+    /// As [`LookConfig::detection_image`].
+    #[serde(default)]
+    pub detection_image: Option<String>,
     /// What the vision model should know about this camera.
     #[serde(default)]
     pub about: Option<String>,
@@ -271,6 +278,7 @@ impl LookConfig {
         let own = CameraConfig {
             image: self.image.clone(),
             detections: Some(self.detections.clone()),
+            detection_image: self.detection_image.clone(),
             about: self.about.clone(),
         };
         std::iter::once((self.name.clone(), own))

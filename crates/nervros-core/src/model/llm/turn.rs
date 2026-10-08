@@ -13,9 +13,9 @@ use rig::agent::{
     InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, RequestPatch,
 };
 
-use super::LlmError;
-use super::client::{Llm, prompt_retry_after, stream_retry_after};
+use super::client::{Llm, prompt_setback, stream_setback};
 use super::history::{History, RESERVE_TOKENS, cut_old, fit, size, tokens_of};
+use super::{LlmError, Setback};
 use crate::providers::Role;
 use crate::providers::router::Need;
 
@@ -66,6 +66,27 @@ pub trait AgentSource: Send + Sync {
     /// Sets a model aside for `for_how_long` after a 429.
     fn park(&self, model_id: &str, for_how_long: Duration);
 
+    /// Tries a model whose server did not answer last, for `for_how_long`.
+    fn set_aside(&self, model_id: &str, for_how_long: Duration) {
+        self.park(model_id, for_how_long);
+    }
+
+    /// Sets a model back after a failure: a 429 parks it for every process that shares the quota
+    /// file, and a server that did not answer is tried last for a while, by this one alone.
+    fn set_back(&self, model_id: &str, setback: Setback) {
+        match setback {
+            Setback::Limited(wait) => self.park(model_id, wait),
+            Setback::Unreachable => self.set_aside(model_id, super::UNREACHABLE_PARK),
+            Setback::Busy => {}
+        }
+    }
+
+    /// How long until the first model for a call that its per-minute limit or a 429 holds back
+    /// may take a request again; none when nothing holds a model back that briefly.
+    fn ready_in(&self, _role: Role, _need: Need) -> Option<Duration> {
+        None
+    }
+
     /// The model's context window in tokens, when the models file gives it.
     fn context(&self, _model_id: &str) -> Option<usize> {
         None
@@ -109,6 +130,15 @@ impl AgentSource for Llm {
         if let Err(e) = self.router.park(model_id, SystemTime::now(), for_how_long) {
             tracing::warn!(model = %model_id, error = %e, "could not save the quota ledger");
         }
+    }
+
+    fn set_aside(&self, model_id: &str, for_how_long: Duration) {
+        self.router
+            .set_aside(model_id, SystemTime::now(), for_how_long);
+    }
+
+    fn ready_in(&self, role: Role, need: Need) -> Option<Duration> {
+        self.router.ready_in(role, need, SystemTime::now())
     }
 
     fn context(&self, model_id: &str) -> Option<usize> {
@@ -346,22 +376,22 @@ pub async fn chat(
             last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
         });
     let agent = builder.build();
-    let turn_error = |message: String, retry_after: Option<Duration>| LlmError::Turn {
+    let turn_error = |message: String, setback: Option<Setback>| LlmError::Turn {
         model: model_id.to_owned(),
         message: without_provider_body(&message),
-        retry_after,
+        setback,
     };
     if let Some(delta) = delta {
         return streamed(&agent, text, history, delta.as_ref())
             .await
             .map(plain)
-            .map_err(|(message, wait)| turn_error(message, wait));
+            .map_err(|(message, setback)| turn_error(message, setback));
     }
     agent
         .chat(text, &mut history.0)
         .await
         .map(|response| plain(response.output))
-        .map_err(|e| turn_error(e.to_string(), prompt_retry_after(&e)))
+        .map_err(|e| turn_error(e.to_string(), prompt_setback(&e)))
 }
 
 /// One turn with the reply streamed: each text delta to `delta`, and the run's transcript into
@@ -371,14 +401,14 @@ pub(super) async fn streamed(
     text: &str,
     history: &mut History,
     delta: &(dyn Fn(&str) + Send + Sync),
-) -> Result<String, (String, Option<Duration>)> {
+) -> Result<String, (String, Option<Setback>)> {
     use futures::StreamExt as _;
     use rig::agent::MultiTurnStreamItem;
     use rig::streaming::{Item, StreamEvent};
     let mut stream = agent.prompt(text).history(history.0.clone()).stream();
     let mut done = None;
     while let Some(item) = stream.next().await {
-        match item.map_err(|e| (e.to_string(), stream_retry_after(&e)))? {
+        match item.map_err(|e| (e.to_string(), stream_setback(&e)))? {
             MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
                 text,
                 ..

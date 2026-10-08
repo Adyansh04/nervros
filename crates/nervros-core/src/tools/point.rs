@@ -4,7 +4,6 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use image::{Rgb, RgbImage};
@@ -14,10 +13,8 @@ use serde_json::{Value, json};
 use crate::llm::ImageInput;
 use crate::segment::{Outliner, inside};
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
-use crate::vision::{Cameras, Instance, SnapshotStore, draw_marks, marks_json, parse_detections};
+use crate::vision::{Cameras, Instance, SnapshotStore, draw_marks, marks_json};
 
-/// Detections this far in time from the frame are of another moment.
-const SAME_MOMENT: Duration = Duration::from_millis(500);
 /// A point this near a mark's box centre, and inside no mark, is on that mark, px.
 const SNAP_PX: f64 = 40.0;
 const MAX_POINTS: usize = 5;
@@ -142,9 +139,10 @@ impl PointTool {
         cameras.add_argument(&mut parameters);
         let spec = ToolSpec::new(
             "point",
-            "Points at what `what` names in a camera's newest frame, including things no \
-             detector marks. The operator sees the points; you get each point's pixel and, when \
-             it lands on one of the detector's marks, that mark, to use as with look.",
+            "Points at what `what` names in a camera's newest frame, or the one its detector's \
+             newest marks were cut from, including things no detector marks. The operator sees \
+             the points; you get each point's pixel and, when it lands on one of the detector's \
+             marks, that mark, to use as with look.",
             parameters,
             Risk::Observe,
         );
@@ -163,24 +161,12 @@ impl PointTool {
             return Err("say what to point at in `what`".to_owned());
         }
         let camera = self.cameras.get(args["camera"].as_str())?;
-        let frame = camera.newest()?;
+        let newest = camera.newest()?;
+        // Points are found on the frame the marks were cut from, as look draws them, so they land
+        // on the marks they are reported with.
+        let (dets, frame, _, _) = camera.marked(self.robot.as_ref(), newest).await;
+        let marks = dets.instances;
         let img = frame.to_rgb().map_err(|e| e.to_string())?;
-        let marks = match &camera.config.detections {
-            Some(topic) => {
-                let msg = self
-                    .robot
-                    .latest(&topic.topic, &topic.msg_type, SAME_MOMENT)
-                    .await
-                    .unwrap_or(Value::Null);
-                let dets = parse_detections(&msg);
-                if (dets.stamp_s - frame.stamp_s).abs() <= SAME_MOMENT.as_secs_f64() {
-                    dets.instances
-                } else {
-                    Vec::new()
-                }
-            }
-            None => Vec::new(),
-        };
         let image = ImageInput::jpeg(&img)?;
         let (answer, model) = self.pointer.outline(&point_prompt(what), image).await?;
         tracing::debug!(%model, %answer, "points");
@@ -263,6 +249,42 @@ mod tests {
         assert!(parse_points(answer, 800, 600).is_empty());
         let answer = "[{\"point\": 536, 270], \"label\": \"box [left]\"}]";
         assert!(parse_points(answer, 800, 600).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_point_lands_on_the_marks_of_the_still_frame_they_were_cut_from() {
+        use crate::look::tests::{frame, masks};
+        use nervros_ros::fake::FakeRobot;
+        struct Bin;
+        #[async_trait]
+        impl Outliner for Bin {
+            async fn outline(&self, _: &str, _: ImageInput) -> Result<(String, String), String> {
+                Ok((
+                    r#"[{"point": [700, 150], "label": "bin"}]"#.to_owned(),
+                    "fake".to_owned(),
+                ))
+            }
+        }
+        let robot: Arc<dyn RobotPort> = Arc::new(
+            FakeRobot::new()
+                .with_frame("/camera", frame(12.0))
+                .with_frame("/still", frame(4.0))
+                .with_topic("/masks", masks(4.0)),
+        );
+        let look: crate::profile::LookConfig = toml::from_str(
+            "image = \"/camera\"\ndetection_image = \"/still\"\nmax_age = \"12s\"\n\
+             detections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n",
+        )
+        .unwrap();
+        let cameras = Cameras::start(&look, &robot).unwrap();
+        tokio::task::yield_now().await;
+        let point = PointTool::new(cameras, robot, Arc::default(), Arc::new(Bin));
+        let out = point.call(json!({"what": "the bin"})).await;
+        assert_eq!(
+            out.data["points"][0]["mark_label"], "dustbin",
+            "{}",
+            out.data
+        );
     }
 
     #[test]

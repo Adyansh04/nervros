@@ -60,6 +60,8 @@ struct Shared {
     stop: Option<Arc<dyn Tool>>,
     /// The conversation to write next, for the writer that keeps the disk off this loop.
     to_save: Option<tokio::sync::watch::Sender<Option<History>>>,
+    /// The model whose reasoning the history holds: the one that answered the last turn.
+    answered_by: Mutex<Option<String>>,
     config: SessionConfig,
 }
 
@@ -176,6 +178,7 @@ impl Session {
             guard,
             stop,
             to_save,
+            answered_by: Mutex::default(),
             config,
         });
         tokio::spawn(actor(rx, shared, source, registry));

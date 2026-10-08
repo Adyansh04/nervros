@@ -1,8 +1,9 @@
 //! The only module that imports `rig`.
 //!
 //! It turns a model from `models.toml` into a rig agent builder, and runs one prompt against the
-//! router's candidates in order: a 429 parks the model and moves on, any other provider or
-//! transport failure moves on without parking, and the answer names the model that gave it.
+//! router's candidates in order: a 429 or a server that does not answer parks the model, a busy
+//! one (5xx) is asked once more, any other failure moves on, and the answer names the model that
+//! gave it.
 
 use std::time::Duration;
 
@@ -136,10 +137,44 @@ pub enum LlmError {
         model: String,
         /// What went wrong.
         message: String,
-        /// The provider answered 429: how long to set the model aside.
-        retry_after: Option<Duration>,
+        /// What the failure says about the model, when it says anything.
+        setback: Option<Setback>,
     },
 }
+
+impl LlmError {
+    /// What a turn's failure says about the model that failed it.
+    #[must_use]
+    pub fn setback(&self) -> Option<Setback> {
+        match self {
+            Self::Turn { setback, .. } => *setback,
+            _ => None,
+        }
+    }
+}
+
+/// What a failed call says about the model that made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setback {
+    /// The provider answered 429: set the model aside this long.
+    Limited(Duration),
+    /// The provider answered with a server error, as Gemini's 503 under load: it often answers a
+    /// moment later.
+    Busy,
+    /// Nothing answered, as from a local server that is not running.
+    Unreachable,
+}
+
+/// How long a model whose server does not answer is tried last: its turns go to the next model
+/// without announcing the same failure each time.
+const UNREACHABLE_PARK: Duration = Duration::from_mins(1);
+
+/// How long before a busy model is asked once more.
+pub const BUSY_RETRY: Duration = Duration::from_secs(2);
+
+/// The longest a turn waits for a model's per-minute limit or 429 to lift, when every model is
+/// held back: free tiers count requests a minute, and a burst of calls spends them all.
+pub const MINUTE_WAIT: Duration = Duration::from_mins(1);
 
 /// A user message with optional image content, image first as most vision models prefer, or
 /// after the text when `text_first`.

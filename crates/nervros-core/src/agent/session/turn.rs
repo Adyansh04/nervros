@@ -14,10 +14,19 @@ use crate::providers::router::Need;
 use crate::tools::Registry;
 use crate::{llm, lock};
 
-/// Each model call's cost, to the log and to `used`, the context gauge's count.
-fn costs(shared: &Arc<Shared>, turn: u64, model: &str, used: &Arc<AtomicU64>) -> llm::OnCall {
-    let (shared, model, used) = (Arc::clone(shared), model.to_owned(), Arc::clone(used));
+/// Each model call's cost, to the log and to `used`, the context gauge's count; `answered` notes
+/// that a call came back.
+fn costs(
+    shared: &Arc<Shared>,
+    turn: u64,
+    model: &str,
+    used: &Arc<AtomicU64>,
+    answered: &Arc<AtomicBool>,
+) -> llm::OnCall {
+    let (shared, model) = (Arc::clone(shared), model.to_owned());
+    let (used, answered) = (Arc::clone(used), Arc::clone(answered));
     Arc::new(move |cost: llm::CallCost| {
+        answered.store(true, Ordering::Relaxed);
         if cost.input_tokens > 0 {
             used.store(cost.input_tokens, Ordering::Relaxed);
         }
@@ -32,10 +41,11 @@ fn costs(shared: &Arc<Shared>, turn: u64, model: &str, used: &Arc<AtomicU64>) ->
     })
 }
 
-/// Passes a streamed reply's pieces to the UI.
-fn deltas(shared: &Arc<Shared>, turn: u64) -> llm::OnDelta {
-    let shared = Arc::clone(shared);
+/// Passes a streamed reply's pieces to the UI; `answered` notes that the reply began.
+fn deltas(shared: &Arc<Shared>, turn: u64, answered: &Arc<AtomicBool>) -> llm::OnDelta {
+    let (shared, answered) = (Arc::clone(shared), Arc::clone(answered));
     Arc::new(move |text: &str| {
+        answered.store(true, Ordering::Relaxed);
         shared.emit(Event::ReplyDelta {
             turn,
             text: text.to_owned(),
@@ -69,7 +79,8 @@ pub(super) fn turn_span(turn: u64, origin: &Origin) -> tracing::Span {
 }
 
 /// Runs a turn under its time limit. A turn over it ends with an error, as a stopped one does;
-/// the operator's time on approvals is added back, and never runs out while one is open.
+/// the operator's time on approvals and a wait for a model's limit are added back, and it never
+/// runs out while an approval is open.
 pub(super) async fn limited(
     turn: u64,
     shared: Arc<Shared>,
@@ -149,18 +160,10 @@ fn loop_tools(
         .collect()
 }
 
-pub(super) async fn run_turn(
-    turn: u64,
-    origin: Origin,
-    history: History,
-    shared: Arc<Shared>,
-    source: Arc<dyn AgentSource>,
-    registry: Arc<Registry>,
-) -> Option<History> {
-    shared.guard.begin_turn();
-    *lock(&shared.repeated) = (String::new(), 0);
+/// Logs the turn's start and what started it, and gives the text the model gets.
+fn announce(shared: &Shared, turn: u64, origin: Origin) -> String {
     shared.emit(Event::TurnStarted { turn });
-    let text = match origin {
+    match origin {
         Origin::User(text) => {
             shared.emit(Event::User {
                 turn,
@@ -175,7 +178,94 @@ pub(super) async fn run_turn(
             });
             format!("{}\n{text}", llm::REPORT_MARK)
         }
-    };
+    }
+}
+
+/// One model's go at the turn, asked once more when busy: its result, the history it leaves and
+/// the tokens it used.
+async fn ask(
+    model: &str,
+    (shared, source, flags): (&Arc<Shared>, &Arc<dyn AgentSource>, &Arc<TurnFlags>),
+    (turn, text, tools): (u64, &str, &[LoopTool]),
+    history: &History,
+) -> (Result<String, llm::LlmError>, History, u64) {
+    let system = preamble(shared);
+    // The reasoning in the history is the last turn's model's, and only it takes it back.
+    let theirs = lock(&shared.answered_by).as_deref() != Some(model);
+    let mut retried = false;
+    loop {
+        let mut updated = history.clone();
+        if theirs {
+            updated.drop_reasoning();
+        }
+        let used = Arc::new(AtomicU64::new(0));
+        let answered = Arc::new(AtomicBool::new(false));
+        let setup = llm::TurnSetup {
+            preamble: &system,
+            max_turns: shared.config.max_model_calls,
+            tools,
+            started: Arc::clone(&flags.started),
+            window: source.context(model),
+            on_call: Some(costs(shared, turn, model, &used, &answered)),
+            delta: Some(deltas(shared, turn, &answered)),
+        };
+        let result = llm::chat(model, Arc::clone(source), setup, &mut updated, text).await;
+        // A busy provider often answers a moment later: once more, while nothing came back or was
+        // done that a second try would repeat.
+        let busy = matches!(&result, Err(e) if e.setback() == Some(llm::Setback::Busy));
+        if busy
+            && !retried
+            && !answered.load(Ordering::Relaxed)
+            && !flags.acted.load(Ordering::SeqCst)
+        {
+            retried = true;
+            tokio::time::sleep(llm::BUSY_RETRY).await;
+            continue;
+        }
+        return (result, updated, used.load(Ordering::Relaxed));
+    }
+}
+
+/// Waits for the first model that its per-minute limit or a 429 holds back, when that lifts within
+/// [`llm::MINUTE_WAIT`], and gives the models to try again.
+async fn wait_for_a_model(
+    shared: &Shared,
+    source: &Arc<dyn AgentSource>,
+    need: Need,
+    tools: &[LoopTool],
+    history: &mut History,
+) -> Option<Vec<String>> {
+    let wait = source
+        .ready_in(Role::Routine, need)
+        .filter(|w| *w <= llm::MINUTE_WAIT)?;
+    shared.emit(Event::Notice {
+        text: format!(
+            "every model is at its limit for now; waiting {} s for the first to free up",
+            wait.as_secs().max(1)
+        ),
+    });
+    // Not the turn's own time, as the operator's on approvals is not.
+    shared.waited_ms.fetch_add(
+        u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    tokio::time::sleep(wait).await;
+    let candidates = source.candidates(Role::Routine, need);
+    fit_window(shared, source, &candidates, tools, history).await;
+    Some(candidates)
+}
+
+pub(super) async fn run_turn(
+    turn: u64,
+    origin: Origin,
+    history: History,
+    shared: Arc<Shared>,
+    source: Arc<dyn AgentSource>,
+    registry: Arc<Registry>,
+) -> Option<History> {
+    shared.guard.begin_turn();
+    *lock(&shared.repeated) = (String::new(), 0);
+    let text = announce(&shared, turn, origin);
     let flags = Arc::new(TurnFlags::default());
     for tool in registry.iter() {
         tool.ready().await;
@@ -185,51 +275,59 @@ pub(super) async fn run_turn(
         tools: !tools.is_empty(),
         ..Need::default()
     };
-    let candidates = source.candidates(Role::Routine, need);
+    let mut candidates = source.candidates(Role::Routine, need).into_iter();
     let mut history = history;
-    fit_window(&shared, &source, &candidates, &tools, &mut history).await;
+    fit_window(
+        &shared,
+        &source,
+        candidates.as_slice(),
+        &tools,
+        &mut history,
+    )
+    .await;
     let mut failures = Vec::new();
-    for model in candidates {
-        let mut updated = history.clone();
-        let used = Arc::new(AtomicU64::new(0));
-        let window = source.context(&model);
-        let system = preamble(&shared);
-        let setup = llm::TurnSetup {
-            preamble: &system,
-            max_turns: shared.config.max_model_calls,
-            tools: &tools,
-            started: Arc::clone(&flags.started),
-            window,
-            on_call: Some(costs(&shared, turn, &model, &used)),
-            delta: Some(deltas(&shared, turn)),
+    let mut waited = false;
+    loop {
+        let Some(model) = candidates.next() else {
+            // Free tiers count requests a minute, and a burst of calls can spend every model's:
+            // once a turn, waiting for the first to free up beats failing it.
+            if waited {
+                break;
+            }
+            waited = true;
+            let Some(again) = wait_for_a_model(&shared, &source, need, &tools, &mut history).await
+            else {
+                break;
+            };
+            candidates = again.into_iter();
+            failures.clear();
+            continue;
         };
-        let result = llm::chat(&model, Arc::clone(&source), setup, &mut updated, &text).await;
+        let window = source.context(&model);
+        let (result, mut updated, used) = ask(
+            &model,
+            (&shared, &source, &flags),
+            (turn, &text, &tools),
+            &history,
+        )
+        .await;
         match result {
             Ok(reply) => {
+                *lock(&shared.answered_by) = Some(model.clone());
                 shared.emit(Event::Reply {
                     turn,
                     text: reply,
                     model,
                 });
                 if let Some(window) = window {
-                    report_context(
-                        &shared,
-                        &tools,
-                        &updated,
-                        used.load(Ordering::Relaxed),
-                        window,
-                    );
+                    report_context(&shared, &tools, &updated, used, window);
                 }
                 updated.trim(shared.config.history_max);
                 return Some(updated);
             }
             Err(e) => {
-                if let llm::LlmError::Turn {
-                    retry_after: Some(wait),
-                    ..
-                } = &e
-                {
-                    source.park(&model, *wait);
+                if let Some(setback) = e.setback() {
+                    source.set_back(&model, setback);
                 }
                 if !flags.acted.load(Ordering::SeqCst) {
                     shared.emit(Event::Notice {

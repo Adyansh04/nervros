@@ -25,18 +25,9 @@ tools = true
 privacy = { local = true }
 
 [[model]]
-id = "qwen3.8-27b-or"
+id = "nemotron-super-or"
 provider = "openrouter"
-model = "qwen/qwen3.8-27b:free"
-vision = true
-tools = true
-limits = { rpm = 20, pool = "openrouter_free" }
-
-[[model]]
-id = "inkling-or"
-provider = "openrouter"
-model = "thinkingmachines/inkling:free"
-vision = true
+model = "nvidia/nemotron-3-super-120b-a12b:free"
 tools = true
 limits = { rpm = 20, pool = "openrouter_free" }
 privacy = { trains = true }

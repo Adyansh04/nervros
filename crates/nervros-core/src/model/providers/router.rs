@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
-use super::ledger::{Ledger, Refused, ResetZone};
+use super::ledger::{Ledger, Refused, ResetZone, until_next_day};
 use super::{ModelConfig, ModelsConfig, ProviderKind, Role};
 
 /// What a call needs from a model.
@@ -147,16 +147,20 @@ impl Router {
             .filter(|m| !opt_in && m.privacy.local && !chain.contains(&m.id))
             .map(|m| m.id.as_str());
         let mut take = Vec::new();
+        let mut silent = Vec::new();
         let mut skipped = Vec::new();
         for id in chain.iter().map(String::as_str).chain(local_tail) {
             let Some(model) = self.config.model(id) else {
                 continue;
             };
             match self.skip_reason(model, need, now) {
+                None if self.ledger().silent(&model.id, now) => silent.push(model),
                 None => take.push(model),
                 Some(reason) => skipped.push((model.id.clone(), reason)),
             }
         }
+        // A server that did not answer a moment ago may be up again: tried last, not left out.
+        take.append(&mut silent);
         (take, skipped)
     }
 
@@ -180,7 +184,8 @@ impl Router {
         Ok(())
     }
 
-    /// Parks a model after a 429; persists the ledger.
+    /// Parks a model for `for_how_long`, at most until its provider's next daily reset; persists
+    /// the ledger.
     ///
     /// # Errors
     ///
@@ -191,9 +196,42 @@ impl Router {
         now: SystemTime,
         for_how_long: Duration,
     ) -> std::io::Result<()> {
+        // A spent daily quota comes back at the provider's midnight, whatever its Retry-After said:
+        // Gemini's ran to UTC midnight, 17 hours past its own Pacific reset.
+        let zone = self
+            .config
+            .model(model_id)
+            .map_or(ResetZone::Utc, |m| self.zone(m));
+        let for_how_long = for_how_long.min(until_next_day(now, zone));
         let mut ledger = self.ledger();
         ledger.park(model_id, now, for_how_long);
         ledger.save()
+    }
+
+    /// Tries a model whose server did not answer last for `for_how_long`, in this process only.
+    pub fn set_aside(&self, model_id: &str, now: SystemTime, for_how_long: Duration) {
+        self.ledger().set_aside(model_id, now, for_how_long);
+    }
+
+    /// How long until the first model for a call that its per-minute limit or a 429 holds back
+    /// may take a request again; none when nothing holds a model back that briefly.
+    #[must_use]
+    pub fn ready_in(&self, role: Role, need: Need, now: SystemTime) -> Option<Duration> {
+        let (_, skipped) = self.candidates(role, need, now);
+        skipped
+            .iter()
+            .filter(|(_, skip)| matches!(skip, Skip::Refused(Refused::Minute | Refused::Parked(_))))
+            .filter_map(|(id, _)| {
+                let model = self.config.model(id)?;
+                let (pool, zone) = (self.pool_of(model), self.zone(model));
+                let ledger = self.ledger();
+                ledger.lifts(id, now).into_iter().find(|d| {
+                    ledger
+                        .check(id, &model.limits, pool, now + *d, zone)
+                        .is_ok()
+                })
+            })
+            .min()
     }
 
     /// Sets a pool's count from the provider's own figure; persists the ledger.
@@ -368,6 +406,41 @@ mod tests {
         assert_eq!(ids(&take), ["text", "local9b"]);
         let later = now + Duration::from_secs(61);
         let (take, _) = r.candidates(Role::Routine, Need::default(), later);
+        assert_eq!(ids(&take), ["big", "text", "local9b"]);
+    }
+
+    #[test]
+    fn says_when_a_short_limit_lifts_but_not_a_daily_one() {
+        let r = router(PrivacyMode::Sim);
+        let now = SystemTime::now();
+        assert_eq!(r.ready_in(Role::Routine, Need::default(), now), None);
+        r.park("big", now, Duration::from_secs(30)).unwrap();
+        r.set_aside("text", now, Duration::from_secs(10));
+        let (take, _) = r.candidates(Role::Routine, Need::default(), now);
+        assert_eq!(
+            ids(&take),
+            ["local9b", "text"],
+            "a silent server is tried last"
+        );
+        assert_eq!(
+            r.ready_in(Role::Routine, Need::default(), now),
+            Some(Duration::from_secs(30))
+        );
+        // The pool is spent by the time the park ends: waiting for it would be for nothing.
+        r.take_request("text", now).unwrap();
+        r.take_request("text", now).unwrap();
+        assert_eq!(r.ready_in(Role::Routine, Need::default(), now), None);
+    }
+
+    #[test]
+    fn a_park_ends_at_the_providers_midnight_whatever_it_asked() {
+        let r = router(PrivacyMode::Sim);
+        let late = std::time::UNIX_EPOCH + Duration::from_hours(20_000 * 24 + 23);
+        r.park("big", late, Duration::from_hours(20)).unwrap();
+        let (take, _) = r.candidates(Role::Routine, Need::default(), late);
+        assert_eq!(ids(&take), ["text", "local9b"]);
+        let past_midnight = late + Duration::from_secs(3601);
+        let (take, _) = r.candidates(Role::Routine, Need::default(), past_midnight);
         assert_eq!(ids(&take), ["big", "text", "local9b"]);
     }
 }

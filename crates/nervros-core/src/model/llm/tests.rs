@@ -193,3 +193,98 @@ fn a_provider_error_keeps_its_words_and_loses_its_body() {
         "oops: details withheld"
     );
 }
+
+#[test]
+fn a_failure_says_how_the_model_fares() {
+    use super::client::setback;
+    use reqwest::StatusCode;
+    use rig::ErrorKind;
+    let reply = ErrorKind::ProviderResponse;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "retry-after",
+        reqwest::header::HeaderValue::from_static("30"),
+    );
+    assert_eq!(
+        setback(ErrorKind::Http, None, None),
+        Some(Setback::Unreachable)
+    );
+    assert_eq!(
+        setback(reply, Some(StatusCode::TOO_MANY_REQUESTS), Some(&headers)),
+        Some(Setback::Limited(Duration::from_secs(30)))
+    );
+    assert_eq!(
+        setback(reply, Some(StatusCode::TOO_MANY_REQUESTS), None),
+        Some(Setback::Limited(Duration::from_mins(1)))
+    );
+    assert_eq!(
+        setback(reply, Some(StatusCode::SERVICE_UNAVAILABLE), None),
+        Some(Setback::Busy)
+    );
+    assert_eq!(setback(reply, Some(StatusCode::BAD_REQUEST), None), None);
+}
+
+#[test]
+fn a_429_parks_a_silent_server_goes_last_and_a_busy_one_stays() {
+    #[derive(Default)]
+    struct Kept(std::sync::Mutex<Vec<String>>);
+    impl AgentSource for Kept {
+        fn candidates(&self, _: Role, _: crate::providers::router::Need) -> Vec<String> {
+            Vec::new()
+        }
+        fn builder(&self, id: &str) -> Result<AgentBuilder, LlmError> {
+            Err(LlmError::Client {
+                provider: String::new(),
+                message: id.to_owned(),
+            })
+        }
+        fn take_request(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn park(&self, id: &str, wait: Duration) {
+            crate::lock(&self.0).push(format!("park {id} {}", wait.as_secs()));
+        }
+        fn set_aside(&self, id: &str, wait: Duration) {
+            crate::lock(&self.0).push(format!("last {id} {}", wait.as_secs()));
+        }
+    }
+    let kept = Kept::default();
+    kept.set_back("a", Setback::Limited(Duration::from_secs(30)));
+    kept.set_back("b", Setback::Unreachable);
+    kept.set_back("c", Setback::Busy);
+    assert_eq!(*crate::lock(&kept.0), ["park a 30", "last b 60"]);
+}
+
+#[test]
+fn earlier_reasoning_is_dropped_and_turns_left_empty_go_with_it() {
+    use rig::message::{Issuer, Reasoning, Sealed};
+    let thought = |text: &str| {
+        AssistantContent::Reasoning(Sealed::new(
+            Issuer::from("gcp.gemini"),
+            Reasoning::new(text),
+        ))
+    };
+    let mut history = History(vec![
+        Message::User {
+            content: vec![UserContent::text("where is the mug?")],
+        },
+        Message::Assistant {
+            id: None,
+            content: vec![
+                thought("the kitchen, probably"),
+                AssistantContent::text("In the kitchen."),
+            ],
+        },
+        Message::Assistant {
+            id: None,
+            content: vec![thought("nothing to add")],
+        },
+    ]);
+    history.drop_reasoning();
+    assert_eq!(history.0.len(), 2);
+    assert!(matches!(
+        &history.0[1],
+        Message::Assistant { content, .. } if content.len() == 1
+            && matches!(&content[0], AssistantContent::Text(t) if t.text == "In the kitchen.")
+    ));
+}
