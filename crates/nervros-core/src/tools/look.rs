@@ -20,8 +20,8 @@ use crate::llm::ImageInput;
 use crate::profile::LookConfig;
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 use crate::vision::{
-    Camera, Cameras, DETECTION_MATCH_S, Detections, Instance, SnapshotStore, close_up, draw_marks,
-    marks_json, parse_detections,
+    Camera, Cameras, Detections, Instance, SnapshotStore, close_up, draw_marks, marks_json,
+    parse_detections,
 };
 
 /// What `look` asks when the model gave no question.
@@ -210,7 +210,8 @@ impl LookTool {
             let dets = parse_detections(&msg);
             // Either way: detections much newer than the newest frame mean a stalled camera.
             let age = newest.stamp_s - dets.stamp_s;
-            if age.abs() > self.config.max_age.as_secs_f64() {
+            let stale = age.abs() > self.config.max_age.as_secs_f64();
+            if stale && (age < 0.0 || camera.detected.is_none()) {
                 let why = format!(
                     "the detections are {:.1} s apart from the camera's newest frame; the \
                      detector or the camera may be stopped",
@@ -218,19 +219,22 @@ impl LookTool {
                 );
                 return unmarked(newest, Some(why));
             }
-            let frame = camera
-                .detected
-                .iter()
-                .chain(std::iter::once(&camera.history))
-                .find_map(|frames| frames.closest(dets.stamp_s, DETECTION_MATCH_S));
-            if let Some(frame) = frame {
+            if let Some(frame) = camera.frame_of(dets.stamp_s).filter(|_| !stale) {
                 return (dets, frame, age, None);
             }
             if tokio::time::Instant::now() >= deadline {
-                return unmarked(
-                    newest,
-                    Some("the frame the detections came from is no longer kept".to_owned()),
-                );
+                // A detector of frames of its own, such as a still base's, has none while the
+                // robot moves: old masks are what to expect then, not a fault.
+                let why = if stale {
+                    format!(
+                        "the newest detections are {age:.1} s old: this camera's detector marks \
+                         only the frames it reads, such as ones taken while the robot stands \
+                         still"
+                    )
+                } else {
+                    "the frame the detections came from is no longer kept".to_owned()
+                };
+                return unmarked(newest, Some(why));
             }
             tokio::time::sleep(DETECTION_POLL).await;
         }
@@ -355,7 +359,7 @@ impl Tool for LookTool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
@@ -363,7 +367,7 @@ mod tests {
     use bytes::Bytes;
     use nervros_ros::fake::FakeRobot;
 
-    fn frame(stamp_s: f64) -> Frame {
+    pub(crate) fn frame(stamp_s: f64) -> Frame {
         Frame {
             stamp_s,
             frame_id: "camera".into(),
@@ -376,7 +380,7 @@ mod tests {
         }
     }
 
-    fn masks(stamp_s: f64) -> Value {
+    pub(crate) fn masks(stamp_s: f64) -> Value {
         json!({
             "header": {"stamp": {"sec": stamp_s.floor(), "nanosec": 0}, "frame_id": "camera"},
             "image_width": 64, "image_height": 48, "model": "mock",
@@ -537,6 +541,53 @@ mod tests {
         let out = look.call(json!({})).await;
         assert_eq!(out.data["marks"][0]["label"], "dustbin", "{}", out.data);
         assert_eq!(out.data["age_s"], 8.0);
+    }
+
+    fn still_frames(max_age: &str) -> LookConfig {
+        toml::from_str(&format!(
+            "image = \"/camera\"\ndetection_image = \"/still\"\nmax_age = \"{max_age}\"\n\
+             detections = {{ topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }}\n"
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn old_masks_of_a_still_base_are_waited_out_and_said_to_be_expected() {
+        let fake = Arc::new(
+            FakeRobot::new()
+                .with_frame("/camera", frame(20.0))
+                .with_frame("/still", frame(4.0))
+                .with_topic("/masks", masks(4.0)),
+        );
+        let robot: Arc<dyn RobotPort> = fake.clone();
+        let look = start(
+            still_frames("1s"),
+            robot,
+            Arc::new(SnapshotStore::default()),
+            None,
+        );
+        tokio::task::yield_now().await;
+        let out = look.call(json!({})).await;
+        assert_eq!(out.data["marks"], json!([]));
+        let why = out.data["no_marks"].as_str().unwrap_or_default();
+        assert!(why.contains("only the frames it reads"), "{why}");
+
+        // The base stops: its next still frame's masks are drawn.
+        let robot: Arc<dyn RobotPort> = fake.clone();
+        let look = start(
+            still_frames("12s"),
+            robot,
+            Arc::new(SnapshotStore::default()),
+            None,
+        );
+        tokio::task::yield_now().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            fake.set_frame("/still", frame(20.0));
+            fake.set_topic("/masks", masks(20.0));
+        });
+        let out = look.call(json!({})).await;
+        assert_eq!(out.data["marks"][0]["label"], "dustbin", "{}", out.data);
     }
 
     #[tokio::test]

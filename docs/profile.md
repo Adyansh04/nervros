@@ -179,7 +179,7 @@ vision model available, `look` returns the marks alone and says why.
 | `name` | `"main"` | The camera's name, as `look` and `segment` take it in `camera`. |
 | `image` | required | A `sensor_msgs/msg/Image` topic. |
 | `detections` | required | `{ topic, type }`, where the type is `canopy_msgs/msg/InstanceMaskArray` or `vision_msgs/msg/Detection2DArray`. |
-| `detection_image` | none | The image topic the detector reads, when it is not `image`, such as frames from a still base. Its frames are kept apart, so the marks are drawn on the frame they were cut from. |
+| `detection_image` | none | The image topic the detector reads, when it is not `image`, such as frames from a still base. Its frames are kept apart, so the marks are drawn on the frame they were cut from; while it sends none, as when the base moves, `look` waits up to `max_age` for new masks and says why there are none. |
 | `max_marks` | `12` | |
 | `max_age` | `"5s"` | Older detections are left out, and `look` waits this long for the first. A slow detector needs more. |
 | `about` | none | What the vision model should know about the camera, such as where it points and how far it sees. |
@@ -398,7 +398,7 @@ The rest are the checks you would run yourself before blaming the model:
 | `recall` | With `[mission]`: what the robot did lately, from the mission ledger, what happened to an object, from `[world] history` and the robot's own missions with it, and the operator's notes. |
 | `plans` | With `[mission]`: saves a plan that worked by name ("evening check"), lists them, and runs one again. |
 | `skill_gap` | With `[mission]`: logs a request no skill can do, and why; planning that gives up logs one itself. The Mission tab and `nervros-cli gaps` list them. |
-| `point` | With a `segment` model in the models file: points at what the operator names in a camera's newest frame, including things no detector marks, and says which mark a point lands on. |
+| `point` | With a `segment` model in the models file: points at what the operator names in a camera's newest frame, or the one its newest marks were cut from when that is within `max_age`, including things no detector marks, and says which mark a point lands on. |
 | `skill` | With `skills`: reads one skill's procedure. |
 | `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each asks for approval when supervised, like a world edit. |
 

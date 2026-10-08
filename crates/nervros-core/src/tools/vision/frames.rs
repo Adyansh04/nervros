@@ -69,6 +69,8 @@ pub struct Camera {
     pub(crate) history: Arc<History>,
     /// The frames its detector reads, when they are not `history`'s.
     pub(crate) detected: Option<Arc<History>>,
+    /// Detections of a frame older than this, against the newest, are of another moment.
+    pub(crate) max_age: Duration,
 }
 
 impl Camera {
@@ -93,6 +95,15 @@ impl Camera {
             )),
             _ => Ok(frame),
         }
+    }
+
+    /// The kept frame that detections stamped `stamp_s` were cut from: one its detector reads,
+    /// or one of its own.
+    pub(crate) fn frame_of(&self, stamp_s: f64) -> Option<Arc<Frame>> {
+        self.detected
+            .iter()
+            .chain(std::iter::once(&self.history))
+            .find_map(|frames| frames.closest(stamp_s, super::DETECTION_MATCH_S))
     }
 }
 
@@ -142,6 +153,7 @@ impl Cameras {
                 config,
                 history,
                 detected,
+                max_age: look.max_age,
             });
         }
         Ok(Arc::new(Self(cameras)))

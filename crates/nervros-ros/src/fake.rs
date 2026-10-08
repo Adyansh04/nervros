@@ -146,6 +146,13 @@ impl FakeRobot {
         lock(&self.topics).insert(name.to_owned(), value);
     }
 
+    /// Sends a new frame on an image topic added with [`FakeRobot::with_frame`].
+    pub fn set_frame(&self, topic: &str, frame: Frame) {
+        if let Some(tx) = self.frames.get(topic) {
+            tx.send_replace(Some(Arc::new(frame)));
+        }
+    }
+
     /// Every call and goal so far, as (name, request or goal).
     #[must_use]
     pub fn calls(&self) -> Vec<(String, Value)> {
