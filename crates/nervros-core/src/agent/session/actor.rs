@@ -141,6 +141,8 @@ pub(super) async fn actor(
                         }
                         shared.emit(Event::Restored { exchanges: earlier.exchanges() });
                         history = earlier;
+                        // Whose reasoning it holds is not kept: the next model starts without it.
+                        *lock(&shared.answered_by) = None;
                     }
                     Command::Approve(id) => shared.answer(id, Answer::Approve),
                     Command::AllowForSession(id) => shared.answer(id, Answer::AllowForSession),
