@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::client::{Llm, prompt_once_more, prompt_setback};
 use super::turn::{AgentSource, without_provider_body};
-use super::{Ask, ImageInput, Setback};
+use super::{Ask, ImageInput};
 use crate::providers::Role;
 use crate::providers::router::Need;
 
@@ -35,8 +35,8 @@ pub async fn summarise(source: &Arc<dyn AgentSource>, transcript: &str) -> Optio
             Ok(response) if !response.output.trim().is_empty() => return Some(response.output),
             Ok(_) => {}
             Err(e) => {
-                if let Some(wait) = prompt_setback(&e).and_then(Setback::park) {
-                    source.park(&model, wait);
+                if let Some(setback) = prompt_setback(&e) {
+                    source.set_back(&model, setback);
                 }
                 let said = without_provider_body(&e.to_string());
                 tracing::warn!(model = %model, error = %said, "the summary failed");

@@ -44,7 +44,7 @@ provider = "openrouter"
 model = "nvidia/nemotron-3-super-120b-a12b:free"  # the provider's own name
 tools = true
 limits = { rpm = 20, pool = "openrouter_free" }
-privacy = { trains = false }
+privacy = { trains = true }                     # free endpoints may train on what they get
 ```
 
 | Key | Default | |
@@ -110,7 +110,7 @@ refuses ends the turn there. Days roll over at midnight UTC, and for Gemini at m
 Pacific time, as the providers count them. A model answering 429 is set aside for as long as its
 `Retry-After` asks, a minute without one, and never past its provider's next midnight, when a
 spent daily quota comes back. A model whose server does not answer, such as a local model that is
-not running, is set aside for a minute by that process alone, so its turns meanwhile go to the
+not running, is tried last for a minute, by that process alone, so its turns meanwhile go to the
 next model quietly. A busy one (a 5xx, as Gemini's 503 under load) is asked once more two seconds
 later, unless part of the turn already came back. When every model of a turn is held back and the
 first per-minute limit or 429 lifts within a minute, as after a burst of calls on free tiers, the

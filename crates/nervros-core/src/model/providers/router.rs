@@ -147,16 +147,20 @@ impl Router {
             .filter(|m| !opt_in && m.privacy.local && !chain.contains(&m.id))
             .map(|m| m.id.as_str());
         let mut take = Vec::new();
+        let mut silent = Vec::new();
         let mut skipped = Vec::new();
         for id in chain.iter().map(String::as_str).chain(local_tail) {
             let Some(model) = self.config.model(id) else {
                 continue;
             };
             match self.skip_reason(model, need, now) {
+                None if self.ledger().silent(&model.id, now) => silent.push(model),
                 None => take.push(model),
                 Some(reason) => skipped.push((model.id.clone(), reason)),
             }
         }
+        // A server that did not answer a moment ago may be up again: tried last, not left out.
+        take.append(&mut silent);
         (take, skipped)
     }
 
@@ -204,7 +208,7 @@ impl Router {
         ledger.save()
     }
 
-    /// Sets a model whose server did not answer aside for `for_how_long`, in this process only.
+    /// Tries a model whose server did not answer last for `for_how_long`, in this process only.
     pub fn set_aside(&self, model_id: &str, now: SystemTime, for_how_long: Duration) {
         self.ledger().set_aside(model_id, now, for_how_long);
     }
@@ -406,12 +410,18 @@ mod tests {
     }
 
     #[test]
-    fn says_when_a_short_limit_lifts_but_not_a_daily_one_or_a_silent_server() {
+    fn says_when_a_short_limit_lifts_but_not_a_daily_one() {
         let r = router(PrivacyMode::Sim);
         let now = SystemTime::now();
         assert_eq!(r.ready_in(Role::Routine, Need::default(), now), None);
         r.park("big", now, Duration::from_secs(30)).unwrap();
-        r.set_aside("local9b", now, Duration::from_secs(10));
+        r.set_aside("text", now, Duration::from_secs(10));
+        let (take, _) = r.candidates(Role::Routine, Need::default(), now);
+        assert_eq!(
+            ids(&take),
+            ["local9b", "text"],
+            "a silent server is tried last"
+        );
         assert_eq!(
             r.ready_in(Role::Routine, Need::default(), now),
             Some(Duration::from_secs(30))

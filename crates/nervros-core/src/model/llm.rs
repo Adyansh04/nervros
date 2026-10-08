@@ -165,7 +165,7 @@ pub enum Setback {
     Unreachable,
 }
 
-/// How long a model whose server does not answer is passed over: its turns go to the next model
+/// How long a model whose server does not answer is tried last: its turns go to the next model
 /// without announcing the same failure each time.
 const UNREACHABLE_PARK: Duration = Duration::from_mins(1);
 
@@ -175,18 +175,6 @@ pub const BUSY_RETRY: Duration = Duration::from_secs(2);
 /// The longest a turn waits for a model's per-minute limit or 429 to lift, when every model is
 /// held back: free tiers count requests a minute, and a burst of calls spends them all.
 pub const MINUTE_WAIT: Duration = Duration::from_mins(1);
-
-impl Setback {
-    /// How long to set the model aside after this, if at all.
-    #[must_use]
-    pub fn park(self) -> Option<Duration> {
-        match self {
-            Self::Limited(wait) => Some(wait),
-            Self::Unreachable => Some(UNREACHABLE_PARK),
-            Self::Busy => None,
-        }
-    }
-}
 
 /// A user message with optional image content, image first as most vision models prefer, or
 /// after the text when `text_first`.

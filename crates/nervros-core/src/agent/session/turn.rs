@@ -79,7 +79,8 @@ pub(super) fn turn_span(turn: u64, origin: &Origin) -> tracing::Span {
 }
 
 /// Runs a turn under its time limit. A turn over it ends with an error, as a stopped one does;
-/// the operator's time on approvals is added back, and never runs out while one is open.
+/// the operator's time on approvals and a wait for a model's limit are added back, and it never
+/// runs out while an approval is open.
 pub(super) async fn limited(
     turn: u64,
     shared: Arc<Shared>,
@@ -243,6 +244,11 @@ async fn wait_for_a_model(
             wait.as_secs().max(1)
         ),
     });
+    // Not the turn's own time, as the operator's on approvals is not.
+    shared.waited_ms.fetch_add(
+        u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
     tokio::time::sleep(wait).await;
     let candidates = source.candidates(Role::Routine, need);
     fit_window(shared, source, &candidates, tools, history).await;
@@ -320,14 +326,8 @@ pub(super) async fn run_turn(
                 return Some(updated);
             }
             Err(e) => {
-                if let Some(setback) = e.setback()
-                    && let Some(wait) = setback.park()
-                {
-                    if setback == llm::Setback::Unreachable {
-                        source.set_aside(&model, wait);
-                    } else {
-                        source.park(&model, wait);
-                    }
+                if let Some(setback) = e.setback() {
+                    source.set_back(&model, setback);
                 }
                 if !flags.acted.load(Ordering::SeqCst) {
                     shared.emit(Event::Notice {

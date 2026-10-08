@@ -222,8 +222,37 @@ fn a_failure_says_how_the_model_fares() {
         Some(Setback::Busy)
     );
     assert_eq!(setback(reply, Some(StatusCode::BAD_REQUEST), None), None);
-    assert_eq!(Setback::Unreachable.park(), Some(Duration::from_mins(1)));
-    assert_eq!(Setback::Busy.park(), None);
+}
+
+#[test]
+fn a_429_parks_a_silent_server_goes_last_and_a_busy_one_stays() {
+    #[derive(Default)]
+    struct Kept(std::sync::Mutex<Vec<String>>);
+    impl AgentSource for Kept {
+        fn candidates(&self, _: Role, _: crate::providers::router::Need) -> Vec<String> {
+            Vec::new()
+        }
+        fn builder(&self, id: &str) -> Result<AgentBuilder, LlmError> {
+            Err(LlmError::Client {
+                provider: String::new(),
+                message: id.to_owned(),
+            })
+        }
+        fn take_request(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn park(&self, id: &str, wait: Duration) {
+            crate::lock(&self.0).push(format!("park {id} {}", wait.as_secs()));
+        }
+        fn set_aside(&self, id: &str, wait: Duration) {
+            crate::lock(&self.0).push(format!("last {id} {}", wait.as_secs()));
+        }
+    }
+    let kept = Kept::default();
+    kept.set_back("a", Setback::Limited(Duration::from_secs(30)));
+    kept.set_back("b", Setback::Unreachable);
+    kept.set_back("c", Setback::Busy);
+    assert_eq!(*crate::lock(&kept.0), ["park a 30", "last b 60"]);
 }
 
 #[test]

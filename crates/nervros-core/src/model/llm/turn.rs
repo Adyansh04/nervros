@@ -66,9 +66,19 @@ pub trait AgentSource: Send + Sync {
     /// Sets a model aside for `for_how_long` after a 429.
     fn park(&self, model_id: &str, for_how_long: Duration);
 
-    /// Sets a model whose server did not answer aside for `for_how_long`.
+    /// Tries a model whose server did not answer last, for `for_how_long`.
     fn set_aside(&self, model_id: &str, for_how_long: Duration) {
         self.park(model_id, for_how_long);
+    }
+
+    /// Sets a model back after a failure: a 429 parks it for every process that shares the quota
+    /// file, and a server that did not answer is tried last for a while, by this one alone.
+    fn set_back(&self, model_id: &str, setback: Setback) {
+        match setback {
+            Setback::Limited(wait) => self.park(model_id, wait),
+            Setback::Unreachable => self.set_aside(model_id, super::UNREACHABLE_PARK),
+            Setback::Busy => {}
+        }
     }
 
     /// How long until the first model for a call that its per-minute limit or a 429 holds back

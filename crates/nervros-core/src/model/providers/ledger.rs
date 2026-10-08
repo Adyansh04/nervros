@@ -89,7 +89,7 @@ pub struct Ledger {
     parked_until: BTreeMap<String, u64>,
     #[serde(skip)]
     minute: HashMap<String, VecDeque<u64>>,
-    /// Models whose server did not answer, set aside by this process alone: that one process
+    /// Models whose server did not answer, tried last by this process alone: that one process
     /// cannot reach a server says nothing of the model's quota.
     #[serde(skip)]
     silent_until: HashMap<String, u64>,
@@ -109,8 +109,6 @@ pub struct Ledger {
 pub enum Refused {
     /// Parked after a 429 until this Unix time.
     Parked(u64),
-    /// Set aside until this Unix time after its server did not answer.
-    Silent(u64),
     /// Its own daily limit is used up.
     Daily,
     /// Its shared pool's daily limit is used up.
@@ -123,7 +121,6 @@ impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parked(_) => f.write_str("set aside after a 429"),
-            Self::Silent(_) => f.write_str("set aside: its server did not answer"),
             Self::Daily => f.write_str("its daily limit is used up"),
             Self::Pool(pool) => write!(f, "the {pool} pool's daily limit is used up"),
             Self::Minute => f.write_str("its per-minute limit is used up"),
@@ -206,11 +203,6 @@ impl Ledger {
         {
             return Err(Refused::Parked(until));
         }
-        if let Some(&until) = self.silent_until.get(model)
-            && until > t
-        {
-            return Err(Refused::Silent(until));
-        }
         if limits
             .rpd
             .is_some_and(|rpd| self.used_today(model, now, zone) >= rpd)
@@ -263,10 +255,18 @@ impl Ledger {
             .insert(model.to_owned(), crate::unix_secs(now + for_how_long));
     }
 
-    /// Sets a model whose server did not answer aside for `for_how_long`, in this process only.
+    /// Tries a model whose server did not answer last for `for_how_long`, in this process only.
     pub fn set_aside(&mut self, model: &str, now: SystemTime, for_how_long: Duration) {
         self.silent_until
             .insert(model.to_owned(), crate::unix_secs(now + for_how_long));
+    }
+
+    /// Whether a model's server did not answer a moment ago.
+    #[must_use]
+    pub fn silent(&self, model: &str, now: SystemTime) -> bool {
+        self.silent_until
+            .get(model)
+            .is_some_and(|&until| until > crate::unix_secs(now))
     }
 
     /// When a model's park, and each request of its last minute, stop counting against it, as
@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn a_park_and_the_last_minutes_requests_lift_in_turn_and_a_silent_server_stays_out() {
+    fn a_park_and_the_last_minutes_requests_lift_in_turn_and_a_silent_server_is_not_refused() {
         let mut ledger = Ledger::default();
         let t = at(1_000_000);
         ledger.record("m", None, at(999_950), ResetZone::Utc);
@@ -413,9 +413,11 @@ mod tests {
         ledger.park("m", t, Duration::from_secs(25));
         assert_eq!(ledger.lifts("m", t), [10, 25, 40].map(Duration::from_secs));
         ledger.set_aside("s", t, Duration::from_secs(5));
-        assert_eq!(
-            ledger.check("s", &Limits::default(), None, t, ResetZone::Utc),
-            Err(Refused::Silent(1_000_005))
+        assert!(ledger.silent("s", t) && !ledger.silent("s", at(1_000_005)));
+        assert!(
+            ledger
+                .check("s", &Limits::default(), None, t, ResetZone::Utc)
+                .is_ok()
         );
         assert!(ledger.lifts("s", t).is_empty());
         assert_eq!(

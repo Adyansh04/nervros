@@ -218,8 +218,8 @@ impl Llm {
                     });
                 }
                 Err(e) => {
-                    if let Some(wait) = prompt_setback(&e).and_then(Setback::park) {
-                        self.park(&model.id, wait);
+                    if let Some(setback) = prompt_setback(&e) {
+                        self.set_back(&model.id, setback);
                     }
                     let said = without_provider_body(&e.to_string());
                     tracing::info!(model = %model.id, error = %said, "model failed, trying the next one");
