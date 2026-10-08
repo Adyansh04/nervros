@@ -181,7 +181,7 @@ vision model available, `look` returns the marks alone and says why.
 | `detections` | required | `{ topic, type }`, where the type is `canopy_msgs/msg/InstanceMaskArray` or `vision_msgs/msg/Detection2DArray`. |
 | `detection_image` | none | The image topic the detector reads, when it is not `image`, such as frames from a still base. Its frames are kept apart, so the marks are drawn on the frame they were cut from; while it sends none, as when the base moves, `look` and `point` wait up to `max_age` for new masks and say why there are none. |
 | `max_marks` | `12` | |
-| `max_age` | `"5s"` | Older detections are left out, and `look` waits this long for the first. A slow detector needs more. |
+| `max_age` | `"5s"` | Older detections are left out, and `look` and `point` wait this long for ones of a kept frame. A slow detector needs more. |
 | `about` | none | What the vision model should know about the camera, such as where it points and how far it sees. |
 
 More cameras go under `[look.cameras.<name>]` with `image`, `about` and, optionally, `detections`
