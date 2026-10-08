@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use nervros_ros::{Frame, RobotPort};
 use serde_json::{Value, json};
 
+use super::{Detections, parse_detections};
 use crate::profile::{CameraConfig, LookConfig};
 
 /// Frames kept for matching detection stamps: 4 s at 10 Hz, 1.3 s at 30 Hz.
@@ -16,6 +17,9 @@ const FRAME_HISTORY: usize = 40;
 
 /// A camera that has sent nothing for this long has stopped, whatever its last frame shows.
 const CAMERA_QUIET: Duration = Duration::from_secs(3);
+
+/// How often masks are looked for again while waiting for the ones of a kept frame.
+const DETECTION_POLL: Duration = Duration::from_millis(200);
 
 /// Recent frames of one camera, and when the newest arrived.
 #[derive(Debug, Default)]
@@ -94,6 +98,72 @@ impl Camera {
                 quiet.as_secs_f64()
             )),
             _ => Ok(frame),
+        }
+    }
+
+    /// The detections to draw and the frame they came from; without a detector, or with none
+    /// that match a kept frame within the age the profile allows, the newest frame unmarked and
+    /// why, rather than marks on a frame they were not cut from.
+    pub(crate) async fn marked(
+        &self,
+        robot: &dyn RobotPort,
+        newest: Arc<Frame>,
+    ) -> (Detections, Arc<Frame>, f64, Option<String>) {
+        let unmarked = |frame: Arc<Frame>, why: Option<String>| {
+            let dets = Detections {
+                stamp_s: frame.stamp_s,
+                instances: Vec::new(),
+            };
+            (dets, frame, 0.0, why)
+        };
+        let Some(topic) = &self.config.detections else {
+            return unmarked(newest, None);
+        };
+        // Just after start-up the newest masks can be of a frame taken before any was kept, and
+        // the detector's next ones match: wait for those while masks may still be that old.
+        let deadline = tokio::time::Instant::now() + self.max_age;
+        loop {
+            // Ages count from what the camera shows now, which the wait below moves on.
+            let newest = self.newest().unwrap_or_else(|_| Arc::clone(&newest));
+            // A detector may publish less often than any fixed wait; one older than max_age is
+            // refused anyway.
+            let msg = match robot
+                .latest_shared(&topic.topic, &topic.msg_type, self.max_age)
+                .await
+            {
+                Ok(msg) => msg,
+                Err(e) => return unmarked(newest, Some(format!("no detections ({e})"))),
+            };
+            let dets = parse_detections(&msg);
+            // Either way: detections much newer than the newest frame mean a stalled camera.
+            let age = newest.stamp_s - dets.stamp_s;
+            let stale = age.abs() > self.max_age.as_secs_f64();
+            if stale && (age < 0.0 || self.detected.is_none()) {
+                let why = format!(
+                    "the detections are {:.1} s apart from the camera's newest frame; the \
+                     detector or the camera may be stopped",
+                    age.abs()
+                );
+                return unmarked(newest, Some(why));
+            }
+            if let Some(frame) = self.frame_of(dets.stamp_s).filter(|_| !stale) {
+                return (dets, frame, age, None);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // A detector of frames of its own, such as a still base's, has none while the
+                // robot moves: old masks are what to expect then, not a fault.
+                let why = if stale {
+                    format!(
+                        "the newest detections are {age:.1} s old: this camera's detector marks \
+                         only the frames it reads, such as ones taken while the robot stands \
+                         still"
+                    )
+                } else {
+                    "the frame the detections came from is no longer kept".to_owned()
+                };
+                return unmarked(newest, Some(why));
+            }
+            tokio::time::sleep(DETECTION_POLL).await;
         }
     }
 

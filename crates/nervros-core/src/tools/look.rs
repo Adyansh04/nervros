@@ -9,27 +9,20 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use image::RgbImage;
-use nervros_ros::{Frame, RobotPort};
+use nervros_ros::RobotPort;
 use serde_json::{Value, json};
 
 use crate::llm::ImageInput;
 use crate::profile::LookConfig;
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
-use crate::vision::{
-    Camera, Cameras, Detections, Instance, SnapshotStore, close_up, draw_marks, marks_json,
-    parse_detections,
-};
+use crate::vision::{Cameras, Instance, SnapshotStore, close_up, draw_marks, marks_json};
 
 /// What `look` asks when the model gave no question.
 const DEFAULT_QUESTION: &str =
     "Describe what the robot sees, briefly, naming what matters for finding or handling things.";
-
-/// How often a look waiting for detections it can match checks for newer ones.
-const DETECTION_POLL: Duration = Duration::from_millis(200);
 
 /// A vision model that answers a question about one frame.
 #[async_trait]
@@ -109,7 +102,7 @@ impl LookTool {
     ) -> Result<Looked, String> {
         let camera = self.cameras.get(camera)?;
         let newest = camera.newest()?;
-        let (mut dets, frame, age, left_out) = self.marked(camera, newest).await;
+        let (mut dets, frame, age, left_out) = camera.marked(self.robot.as_ref(), newest).await;
         dets.instances.sort_by(|a, b| b.score.total_cmp(&a.score));
         dets.instances.truncate(self.config.max_marks);
         // Tens of milliseconds of pixels: off the threads that serve the stop.
@@ -171,73 +164,6 @@ impl LookTool {
         );
         out.images.push(looked.snapshot.image.clone());
         Ok(out)
-    }
-
-    /// The detections to draw and the frame they came from; without a detector, or with none
-    /// that match a kept frame within the age the profile allows, the newest frame unmarked and
-    /// why, rather than marks on a frame they were not cut from.
-    async fn marked(
-        &self,
-        camera: &Camera,
-        newest: Arc<Frame>,
-    ) -> (Detections, Arc<Frame>, f64, Option<String>) {
-        let unmarked = |frame: Arc<Frame>, why: Option<String>| {
-            let dets = Detections {
-                stamp_s: frame.stamp_s,
-                instances: Vec::new(),
-            };
-            (dets, frame, 0.0, why)
-        };
-        let Some(topic) = &camera.config.detections else {
-            return unmarked(newest, None);
-        };
-        // Just after start-up the newest masks can be of a frame taken before any was kept, and
-        // the detector's next ones match: wait for those while masks may still be that old.
-        let deadline = tokio::time::Instant::now() + self.config.max_age;
-        loop {
-            // Ages count from what the camera shows now, which the wait below moves on.
-            let newest = camera.newest().unwrap_or_else(|_| Arc::clone(&newest));
-            // A detector may publish less often than any fixed wait; one older than max_age is
-            // refused anyway.
-            let msg = match self
-                .robot
-                .latest_shared(&topic.topic, &topic.msg_type, self.config.max_age)
-                .await
-            {
-                Ok(msg) => msg,
-                Err(e) => return unmarked(newest, Some(format!("no detections ({e})"))),
-            };
-            let dets = parse_detections(&msg);
-            // Either way: detections much newer than the newest frame mean a stalled camera.
-            let age = newest.stamp_s - dets.stamp_s;
-            let stale = age.abs() > self.config.max_age.as_secs_f64();
-            if stale && (age < 0.0 || camera.detected.is_none()) {
-                let why = format!(
-                    "the detections are {:.1} s apart from the camera's newest frame; the \
-                     detector or the camera may be stopped",
-                    age.abs()
-                );
-                return unmarked(newest, Some(why));
-            }
-            if let Some(frame) = camera.frame_of(dets.stamp_s).filter(|_| !stale) {
-                return (dets, frame, age, None);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                // A detector of frames of its own, such as a still base's, has none while the
-                // robot moves: old masks are what to expect then, not a fault.
-                let why = if stale {
-                    format!(
-                        "the newest detections are {age:.1} s old: this camera's detector marks \
-                         only the frames it reads, such as ones taken while the robot stands \
-                         still"
-                    )
-                } else {
-                    "the frame the detections came from is no longer kept".to_owned()
-                };
-                return unmarked(newest, Some(why));
-            }
-            tokio::time::sleep(DETECTION_POLL).await;
-        }
     }
 
     /// The vision model's answer about a kept snapshot or an image the operator attached; the
@@ -362,6 +288,10 @@ impl Tool for LookTool {
 pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Duration;
+
+    use crate::vision::parse_detections;
+    use nervros_ros::Frame;
 
     use crate::vision::{CLOSE_UP_PX, PALETTE};
     use bytes::Bytes;

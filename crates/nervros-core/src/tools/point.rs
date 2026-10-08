@@ -4,7 +4,6 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use image::{Rgb, RgbImage};
@@ -14,10 +13,8 @@ use serde_json::{Value, json};
 use crate::llm::ImageInput;
 use crate::segment::{Outliner, inside};
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
-use crate::vision::{Cameras, Instance, SnapshotStore, draw_marks, marks_json, parse_detections};
+use crate::vision::{Cameras, Instance, SnapshotStore, draw_marks, marks_json};
 
-/// How long `point` waits for the detector's first message.
-const DETECTIONS_WAIT: Duration = Duration::from_millis(500);
 /// A point this near a mark's box centre, and inside no mark, is on that mark, px.
 const SNAP_PX: f64 = 40.0;
 const MAX_POINTS: usize = 5;
@@ -165,25 +162,10 @@ impl PointTool {
         }
         let camera = self.cameras.get(args["camera"].as_str())?;
         let newest = camera.newest()?;
-        // Points are found on the frame the newest marks were cut from, when it is recent and
-        // still kept, so they land on the marks they are reported with.
-        let (frame, marks) = match &camera.config.detections {
-            Some(topic) => {
-                let msg = self
-                    .robot
-                    .latest(&topic.topic, &topic.msg_type, DETECTIONS_WAIT)
-                    .await
-                    .unwrap_or(Value::Null);
-                let dets = parse_detections(&msg);
-                match camera.frame_of(dets.stamp_s) {
-                    Some(f) if newest.stamp_s - f.stamp_s <= camera.max_age.as_secs_f64() => {
-                        (f, dets.instances)
-                    }
-                    _ => (newest, Vec::new()),
-                }
-            }
-            None => (newest, Vec::new()),
-        };
+        // Points are found on the frame the marks were cut from, as look draws them, so they land
+        // on the marks they are reported with.
+        let (dets, frame, _, _) = camera.marked(self.robot.as_ref(), newest).await;
+        let marks = dets.instances;
         let img = frame.to_rgb().map_err(|e| e.to_string())?;
         let image = ImageInput::jpeg(&img)?;
         let (answer, model) = self.pointer.outline(&point_prompt(what), image).await?;
