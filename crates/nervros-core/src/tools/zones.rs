@@ -249,11 +249,7 @@ impl Zones {
     ///
     /// No such zone, the profile sets it, or the change could not be kept.
     pub fn remove(&self, name: &str) -> Result<(), String> {
-        if self.fixed.iter().any(|z| z.name.eq_ignore_ascii_case(name)) {
-            return Err(format!(
-                "`{name}` is set in the robot's profile; only an edit of the profile removes it"
-            ));
-        }
+        self.removable(name)?;
         let mut added = self.lock();
         let before = added.len();
         added.retain(|z| !z.name.eq_ignore_ascii_case(name));
@@ -264,6 +260,37 @@ impl Zones {
         drop(added);
         self.version.send_modify(|v| *v += 1);
         Ok(())
+    }
+
+    /// Why the zone `name` cannot be removed, if it cannot: none has that name, or the profile
+    /// sets it.
+    ///
+    /// # Errors
+    ///
+    /// The reason, for the model.
+    pub fn removable(&self, name: &str) -> Result<(), String> {
+        if self.fixed.iter().any(|z| z.name.eq_ignore_ascii_case(name)) {
+            return Err(format!(
+                "`{name}` is set in the robot's profile; only an edit of the profile removes it"
+            ));
+        }
+        if self
+            .lock()
+            .iter()
+            .any(|z| z.name.eq_ignore_ascii_case(name))
+        {
+            Ok(())
+        } else {
+            let names: Vec<String> = self.all().into_iter().map(|z| z.name).collect();
+            Err(format!(
+                "there is no zone called `{name}`; the zones are: {}",
+                if names.is_empty() {
+                    "none".to_owned()
+                } else {
+                    names.join(", ")
+                }
+            ))
+        }
     }
 }
 
@@ -551,6 +578,10 @@ impl Tool for GeofenceTool {
             return None;
         }
         let name = args["name"].as_str().unwrap_or_default();
+        // Nothing to ask the operator about a zone that is not there, or that only they can remove.
+        if let Err(why) = self.zones.removable(name) {
+            return Some(Err(ToolOutcome::failed(why)));
+        }
         Some(Ok(Assessment {
             risk: Risk::Annotate,
             resources: Vec::new(),
@@ -727,6 +758,18 @@ mod tests {
             refused.message
         );
         assert!(zones.all().is_empty());
+        // A zone that is not there is refused before the operator is asked anything.
+        let missing = tool
+            .assess(&json!({"action": "remove", "name": "kitchen"}))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            missing.message.contains("no zone called `kitchen`"),
+            "{}",
+            missing.message
+        );
+        tool.call(json!({"action": "add", "room": "kitchen"})).await;
         let assessed = tool
             .assess(&json!({"action": "remove", "name": "kitchen"}))
             .await
