@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{
-    BULK_TYPES, Ctx, MAX_ECHO, MAX_SAMPLE, count, endpoint_json, failed, name_arg, object, pick,
-    seconds, spec, summarize,
+    BULK_TYPES, Ctx, MAX_ECHO, MAX_SAMPLE, count, endpoint_json, failed, object, pick,
+    read_name_arg, seconds, spec, summarize,
 };
 use crate::guard::glob_match;
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
@@ -82,7 +82,7 @@ impl Tool for TopicSample {
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
-        let topic = match name_arg(&args, "topic") {
+        let topic = match read_name_arg(&args, "topic") {
             Ok(t) => t,
             Err(why) => return ToolOutcome::refused(why),
         };

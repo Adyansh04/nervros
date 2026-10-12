@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
-use super::{Ctx, PARAMS_MAX, failed, name_arg, object, spec, summarize};
+use super::{Ctx, PARAMS_MAX, failed, name_arg, object, read_name_arg, spec, summarize};
 use crate::guard::glob_match;
 use crate::tools::{Assessment, Risk, Tool, ToolOutcome, ToolSpec};
 
@@ -16,13 +16,16 @@ pub(super) fn tool(ctx: Arc<Ctx>) -> Arc<dyn Tool> {
     Arc::new(Params {
         spec: spec(
             "params",
-            "A node's parameters, like ros2 param list/get/describe.",
+            "A node's parameters, like ros2 param list/get/describe. list gives each \
+             parameter with its value and description, so a parameter can be told by what it \
+             holds as well as its name; narrow it with prefix or filter.",
             object(
                 json!({
                     "op": {"type": "string", "enum": ["list", "get", "describe"]},
                     "node": {"type": "string", "description": "Absolute node name"},
                     "names": {"type": "array", "items": {"type": "string"}},
                     "prefix": {"type": "string"},
+                    "filter": {"type": "string", "description": "Substring or glob of the name, for list"},
                 }),
                 &["node"],
             ),
@@ -160,6 +163,98 @@ impl Ctx {
     }
 }
 
+impl Params {
+    /// The node's parameters with their values and descriptions, at most [`PARAMS_MAX`].
+    async fn list(&self, node: &str, args: &Value) -> ToolOutcome {
+        let prefix = args["prefix"].as_str().unwrap_or_default();
+        let prefixes: Vec<&str> = if prefix.is_empty() {
+            vec![]
+        } else {
+            vec![prefix]
+        };
+        let filter = args["filter"].as_str().unwrap_or_default();
+        let listed = match self
+            .ctx
+            .param_call(
+                node,
+                "list_parameters",
+                "rcl_interfaces/srv/ListParameters",
+                json!({"prefixes": prefixes, "depth": 0}),
+            )
+            .await
+        {
+            Ok(out) => out,
+            Err(out) => return out,
+        };
+        let names: Vec<String> = listed["result"]["names"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .filter(|n| {
+                filter.is_empty()
+                    || if filter.contains('*') {
+                        glob_match(filter, n)
+                    } else {
+                        n.contains(filter)
+                    }
+            })
+            .collect();
+        let shown: Vec<String> = names.iter().take(PARAMS_MAX).cloned().collect();
+        // A node that lists but will not read or describe still gets its names back.
+        let values = self.ctx.param_values(node, &shown).await.ok();
+        let described = self
+            .ctx
+            .param_call(
+                node,
+                "describe_parameters",
+                "rcl_interfaces/srv/DescribeParameters",
+                json!({"names": shown}),
+            )
+            .await
+            .ok();
+        let descriptors = described
+            .as_ref()
+            .and_then(|d| d["descriptors"].as_array())
+            .cloned()
+            .unwrap_or_default();
+        let parameters: Vec<Value> = shown
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut entry = Map::new();
+                entry.insert("name".into(), json!(name));
+                if let Some((_, value, _)) = values.as_ref().and_then(|v| v.get(i)) {
+                    let shown_value = if self.ctx.masked(name) {
+                        json!("(hidden)")
+                    } else {
+                        summarize(value)
+                    };
+                    entry.insert("value".into(), shown_value);
+                }
+                let descriptor = descriptors.get(i).unwrap_or(&Value::Null);
+                if let Some(text) = descriptor["description"].as_str().filter(|t| !t.is_empty()) {
+                    entry.insert("description".into(), summarize(&json!(text)));
+                }
+                if descriptor["read_only"].as_bool() == Some(true) {
+                    entry.insert("read_only".into(), json!(true));
+                }
+                Value::Object(entry)
+            })
+            .collect();
+        let mut data = json!({
+            "node": node,
+            "total": names.len(),
+            "shown": parameters.len(),
+            "parameters": parameters,
+        });
+        if names.len() > shown.len() {
+            data["note"] = json!("more parameters than shown: narrow with prefix or filter");
+        }
+        ToolOutcome::ok(data)
+    }
+}
+
 #[async_trait]
 impl Tool for Params {
     fn spec(&self) -> Cow<'_, ToolSpec> {
@@ -167,7 +262,7 @@ impl Tool for Params {
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
-        let node = match name_arg(&args, "node") {
+        let node = match read_name_arg(&args, "node") {
             Ok(n) => n,
             Err(why) => return ToolOutcome::refused(why),
         };
@@ -183,29 +278,7 @@ impl Tool for Params {
             names.push(one.to_owned());
         }
         match args["op"].as_str().unwrap_or("list") {
-            "list" => {
-                let prefix = args["prefix"].as_str().unwrap_or_default();
-                let prefixes: Vec<&str> = if prefix.is_empty() {
-                    vec![]
-                } else {
-                    vec![prefix]
-                };
-                match self
-                    .ctx
-                    .param_call(
-                        &node,
-                        "list_parameters",
-                        "rcl_interfaces/srv/ListParameters",
-                        json!({"prefixes": prefixes, "depth": 0}),
-                    )
-                    .await
-                {
-                    Ok(out) => {
-                        ToolOutcome::ok(json!({"node": node, "names": out["result"]["names"]}))
-                    }
-                    Err(out) => out,
-                }
-            }
+            "list" => self.list(&node, &args).await,
             "get" => {
                 // No names asks for them all, which is what a model means by it.
                 if names.is_empty() {

@@ -9,9 +9,10 @@ use nervros_ros::GraphDetail;
 use serde_json::{Value, json};
 
 use super::{
-    Ctx, LIST_LIMIT, actions, endpoint_json, failed, find_type, object, qos_matches, spec,
+    Ctx, LIST_LIMIT, actions, endpoint_json, failed, find_type, object, qos_matches, read_name,
+    spec,
 };
-use crate::guard::{canonical_ros_name, glob_match};
+use crate::guard::glob_match;
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
 /// `ros_graph`.
@@ -21,9 +22,11 @@ pub(super) fn tool(ctx: Arc<Ctx>) -> Arc<dyn Tool> {
             "ros_graph",
             "Look at the ROS graph, like ros2 topic/service/action/node list and info. Without \
              name: lists topics, services, actions or nodes, optionally filtered by a substring \
-             or glob. With name: details of that topic (types, publishers, subscribers, QoS and \
-             mismatches), node (what it publishes, subscribes to, serves, calls), service (type, \
-             definition, reachable) or action (type, definition).",
+             or glob of the name. A component container in a node list or node details also \
+             shows the nodes it hosts: Nav2 often runs as one, and its servers' names need not \
+             match the filter. With name: details of that topic (types, publishers, \
+             subscribers, QoS and mismatches), node (what it publishes, subscribes to, serves, \
+             calls), service (type, definition, reachable) or action (type, definition).",
             object(
                 json!({
                     "kind": {"type": "string", "enum": ["topics", "services", "actions", "nodes"]},
@@ -44,8 +47,31 @@ struct RosGraph {
     ctx: Arc<Ctx>,
 }
 
+/// The service every rclcpp component container offers to list what it runs.
+const LIST_NODES: &str = "composition_interfaces/srv/ListNodes";
+
 impl RosGraph {
-    fn list(&self, graph: &GraphDetail, args: &Value) -> ToolOutcome {
+    /// The nodes `node` hosts when it is a component container; none when it is not, or does
+    /// not answer.
+    async fn hosted(&self, graph: &GraphDetail, node: &str) -> Option<Vec<String>> {
+        let service = format!("{node}/_container/list_nodes");
+        find_type(&graph.services, &service)?;
+        let out = self
+            .ctx
+            .robot
+            .call(&service, LIST_NODES, json!({}), Duration::from_secs(2))
+            .await
+            .ok()?;
+        Some(
+            out["full_node_names"]
+                .as_array()?
+                .iter()
+                .filter_map(|n| n.as_str().map(str::to_owned))
+                .collect(),
+        )
+    }
+
+    async fn list(&self, graph: &GraphDetail, args: &Value) -> ToolOutcome {
         let kind = args["kind"].as_str().unwrap_or("topics");
         let filter = args["filter"].as_str().unwrap_or_default();
         let all = args["all"].as_bool().unwrap_or(false);
@@ -84,17 +110,16 @@ impl RosGraph {
                     }
             })
             .collect();
-        let shown: Vec<Value> = matching
-            .iter()
-            .take(LIST_LIMIT)
-            .map(|(n, t)| {
-                if t.is_empty() {
-                    json!(n)
-                } else {
-                    json!({"name": n, "type": t})
-                }
-            })
-            .collect();
+        let mut shown = Vec::new();
+        for (n, t) in matching.iter().take(LIST_LIMIT) {
+            shown.push(if !t.is_empty() {
+                json!({"name": n, "type": t})
+            } else if let Some(hosts) = self.hosted(graph, n).await {
+                json!({"name": n, "hosts": hosts})
+            } else {
+                json!(n)
+            });
+        }
         ToolOutcome::ok(json!({
             "kind": kind,
             "total": matching.len(),
@@ -141,7 +166,7 @@ impl RosGraph {
         ToolOutcome::ok(data)
     }
 
-    async fn node(&self, name: &str) -> ToolOutcome {
+    async fn node(&self, graph: &GraphDetail, name: &str) -> ToolOutcome {
         match self.ctx.robot.node_entities(name).await {
             Ok(n) => {
                 let list = |items: &[(String, Vec<String>)]| {
@@ -151,13 +176,22 @@ impl RosGraph {
                         .map(|(n, t)| json!({"name": n, "type": t.join(", ")}))
                         .collect::<Vec<_>>()
                 };
-                ToolOutcome::ok(json!({
+                let mut data = json!({
                     "node": name,
                     "publishers": list(&n.publishers),
                     "subscribers": list(&n.subscribers),
                     "services": list(&n.services),
                     "clients": list(&n.clients),
-                }))
+                });
+                // A container's own entities are few; the work is its components'.
+                if let Some(hosts) = self.hosted(graph, name).await {
+                    data["hosts"] = json!(hosts);
+                    data["note"] = json!(
+                        "a component container: the nodes it hosts publish, subscribe and serve \
+                         under their own names"
+                    );
+                }
+                ToolOutcome::ok(data)
             }
             Err(e) => failed(&e),
         }
@@ -190,9 +224,9 @@ impl Tool for RosGraph {
             Err(out) => return out,
         };
         let Some(raw) = args["name"].as_str().filter(|n| !n.is_empty()) else {
-            return self.list(&graph, &args);
+            return self.list(&graph, &args).await;
         };
-        let name = match canonical_ros_name(raw) {
+        let name = match read_name(raw) {
             Ok(n) => n,
             Err(e) => return ToolOutcome::refused(e),
         };
@@ -200,7 +234,7 @@ impl Tool for RosGraph {
             return self.topic(&graph, &name).await;
         }
         if graph.nodes.contains(&name) {
-            return self.node(&name).await;
+            return self.node(&graph, &name).await;
         }
         if let Some(ty) = find_type(&graph.services, &name) {
             return self.service(&name, &ty).await;

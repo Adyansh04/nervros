@@ -190,6 +190,21 @@ fn name_arg(args: &Value, key: &str) -> Result<String, String> {
     canonical_ros_name(args[key].as_str().unwrap_or_default())
 }
 
+/// A name to read, where `controller_server` means `/controller_server`: only an act must be
+/// given absolute names, since its deny lists are written for them.
+fn read_name_arg(args: &Value, key: &str) -> Result<String, String> {
+    read_name(args[key].as_str().unwrap_or_default())
+}
+
+fn read_name(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.starts_with('/') {
+        canonical_ros_name(raw)
+    } else {
+        canonical_ros_name(&format!("/{raw}"))
+    }
+}
+
 fn seconds(args: &Value, key: &str, default: f64, max: Duration) -> Duration {
     let s = args[key].as_f64().unwrap_or(default);
     Duration::from_secs_f64(s.clamp(0.1, max.as_secs_f64()))
