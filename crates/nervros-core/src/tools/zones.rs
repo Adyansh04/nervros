@@ -433,7 +433,8 @@ impl GeofenceTool {
             .flatten()
             .filter_map(|p| Some([p["x"].as_f64()?, p["y"].as_f64()?]))
             .collect();
-        Ok((found["name"].as_str().unwrap_or(room).to_owned(), polygon))
+        let name = crate::places::room_label(found).unwrap_or(room);
+        Ok((name.to_owned(), polygon))
     }
 
     /// A square about an object from the world model, `margin` clear of it, and its label.
@@ -530,9 +531,10 @@ impl GeofenceTool {
         let area = zone.area();
         let name = zone.name.clone();
         match self.zones.add(zone) {
-            Ok(()) => {
-                ToolOutcome::ok(json!({"added": name, "area_m2": (area * 100.0).round() / 100.0}))
-            }
+            Ok(()) => ToolOutcome {
+                message: format!("added the keep-out zone `{name}`"),
+                ..ToolOutcome::ok(json!({"added": name, "area_m2": (area * 100.0).round() / 100.0}))
+            },
             Err(why) => ToolOutcome::failed(why),
         }
     }
@@ -579,7 +581,10 @@ impl Tool for GeofenceTool {
             "remove" => {
                 let name = args["name"].as_str().unwrap_or_default();
                 match self.zones.remove(name) {
-                    Ok(()) => ToolOutcome::ok(json!({"removed": name})),
+                    Ok(()) => ToolOutcome {
+                        message: format!("removed the keep-out zone `{name}`"),
+                        ..ToolOutcome::ok(json!({"removed": name}))
+                    },
                     Err(why) => ToolOutcome::failed(why),
                 }
             }
@@ -674,6 +679,7 @@ mod tests {
                 json!({"rooms": [
                     {"id": "R1", "name": "living room", "outline": {"points": square(0.0, 0.0)}},
                     {"id": "R2", "name": "kitchen", "outline": {"points": square(4.0, 0.0)}},
+                    {"id": "R3", "name": "room C", "type": "bedroom", "outline": {"points": square(0.0, 10.0)}},
                 ]}),
             )
             .with_topic(
@@ -694,13 +700,20 @@ mod tests {
             .await;
         assert_eq!(mug.data["added"], "mug", "{}", mug.message);
         let dock = tool.call(json!({"action": "add", "place": "dock"})).await;
-        assert!(dock.message.is_empty(), "{}", dock.message);
+        assert_eq!(dock.message, "added the keep-out zone `dock`");
         assert!(
             zones.at(8.6, 8.6).is_some(),
             "the place's square with its margin"
         );
+        // canopy's "room C" says nothing; the zone takes what the room is.
+        let bedroom = tool.call(json!({"action": "add", "room": "bedroom"})).await;
+        assert_eq!(bedroom.data["added"], "bedroom", "{}", bedroom.message);
         let listed = tool.call(json!({"action": "list"})).await;
-        assert_eq!(listed.data["zones"].as_array().unwrap().len(), 3);
+        assert_eq!(listed.data["zones"].as_array().unwrap().len(), 4);
+        let removed = tool
+            .call(json!({"action": "remove", "name": "bedroom"}))
+            .await;
+        assert_eq!(removed.message, "removed the keep-out zone `bedroom`");
     }
 
     #[tokio::test]

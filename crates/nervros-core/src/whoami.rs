@@ -154,7 +154,7 @@ pub async fn facts(profile: &Profile, robot: &dyn RobotPort) -> Value {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|r| r["name"].as_str())
+                .filter_map(crate::places::room_label)
                 .take(NAMES_MAX * 2)
                 .collect::<Vec<_>>()
         );

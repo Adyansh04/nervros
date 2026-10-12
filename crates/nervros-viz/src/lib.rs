@@ -202,7 +202,7 @@ mod tests {
     use crate::objects::object_colour;
     use crate::rooms::area;
     use crate::tasks::{ModelFrame, load_model, moved, pinhole, pose_model};
-    use crate::zones::triangles;
+    use crate::zones::hatch;
 
     #[test]
     fn a_urdf_gives_the_frames_tf_moves() {
@@ -382,28 +382,29 @@ mod tests {
     }
 
     #[test]
-    fn a_concave_zone_is_cut_into_triangles_that_cover_it() {
-        let covered = |cut: &[[u32; 3]], p: &[[f64; 2]]| -> f64 {
-            cut.iter()
-                .map(|t| {
-                    let [a, b, c] = t.map(|i| p[i as usize]);
-                    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0
-                })
-                .sum()
+    fn a_concave_zone_is_hatched_inside_its_outline_only() {
+        let l = nervros_core::zones::Zone {
+            name: "l".into(),
+            polygon: vec![
+                [0.0, 0.0],
+                [2.0, 0.0],
+                [2.0, 1.0],
+                [1.0, 1.0],
+                [1.0, 2.0],
+                [0.0, 2.0],
+            ],
+            fixed: false,
         };
-        // An L of 3 m²: six corners give four triangles, either way round.
-        let l = [
-            [0.0, 0.0],
-            [2.0, 0.0],
-            [2.0, 1.0],
-            [1.0, 1.0],
-            [1.0, 2.0],
-            [0.0, 2.0],
-        ];
-        for corners in [l.to_vec(), l.iter().rev().copied().collect()] {
-            let cut = triangles(&corners);
-            assert_eq!(cut.len(), 4, "{cut:?}");
-            assert!((covered(&cut, &corners) - 3.0).abs() < 1e-9, "{cut:?}");
+        let strokes = hatch(&l.polygon, 0.25);
+        for [a, b] in &strokes {
+            let middle = [f64::midpoint(a[0], b[0]), f64::midpoint(a[1], b[1])];
+            assert!(l.contains(middle[0], middle[1]), "{a:?} to {b:?}");
         }
+        // Lines 0.25 m apart over 3 m^2 come to about 12 m.
+        let length: f64 = strokes
+            .iter()
+            .map(|[a, b]| (b[0] - a[0]).hypot(b[1] - a[1]))
+            .sum();
+        assert!((length - 12.0).abs() < 1.5, "{length}");
     }
 }

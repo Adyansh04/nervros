@@ -104,6 +104,18 @@ impl Places {
 }
 
 /// Lowercase letters, digits and underscores.
+/// What to call a room from the world model: its name, or what it is (its `type`) while the name
+/// is only canopy's placeholder, such as "room C".
+pub(crate) fn room_label(room: &serde_json::Value) -> Option<&str> {
+    let name = room["name"].as_str().filter(|n| !n.is_empty());
+    let placeholder = name.is_none_or(|n| {
+        n.strip_prefix("room ")
+            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_uppercase()))
+    });
+    let kind = room["type"].as_str().filter(|t| !t.is_empty());
+    if placeholder { kind.or(name) } else { name }
+}
+
 pub(crate) fn slug(text: &str) -> String {
     let name: String = text
         .trim()

@@ -1,4 +1,4 @@
-//! Keep-out zones: a translucent red floor over each, outlined and named.
+//! Keep-out zones: outlined and hatched in red on the floor, and named at a corner.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -11,8 +11,9 @@ use crate::spawner::Layer;
 use crate::{OBJECTS_PERIOD, f32s, layers, put_static};
 
 const ZONE_RED: [u8; 3] = [230, 60, 60];
-/// Enough to tint the map under a zone without hiding its walls.
-const FILL_ALPHA: u8 = 90;
+/// Between the hatch's lines, in metres: lines rather than a fill, so the map shows through, and
+/// no transparency for the viewer to sort against the map's own layers.
+const HATCH_M: f64 = 0.25;
 /// Over the map, the coverage and the rooms' outlines.
 const ZONE_Z: f32 = 0.03;
 
@@ -39,38 +40,53 @@ pub(super) async fn zones(rec: RecordingStream, zones: Arc<Zones>, layer: Layer)
     }
 }
 
+fn on_floor(corner: [f64; 2]) -> [f32; 3] {
+    let xy = f32s(corner);
+    [xy[0], xy[1], ZONE_Z]
+}
+
 /// One entity per zone, so a click names it; zones removed since the last draw are cleared.
 fn draw_zones(rec: &RecordingStream, path: &str, zones: &[Zone], drawn: &mut BTreeSet<String>) {
-    let [r, g, b] = ZONE_RED;
+    let red = rerun::Color::from_rgb(ZONE_RED[0], ZONE_RED[1], ZONE_RED[2]);
     let mut now = BTreeSet::new();
     for zone in zones {
-        let corners: Vec<[f32; 3]> = zone
-            .polygon
-            .iter()
-            .map(|&corner| {
-                let xy = f32s(corner);
-                [xy[0], xy[1], ZONE_Z]
-            })
-            .collect();
-        let mut outline = corners.clone();
-        outline.extend(corners.first().copied());
+        let mut outline: Vec<[f32; 3]> = zone.polygon.iter().copied().map(on_floor).collect();
+        outline.extend(outline.first().copied());
         let entity = format!("{path}/{}", layers::slug(&zone.name));
-        let set_in = if zone.fixed { ", from the profile" } else { "" };
         put_static(
             rec,
             &entity,
             &rerun::LineStrips3D::new([outline])
-                .with_labels([format!("{}: keep out{set_in}", zone.name)])
-                .with_colors([rerun::Color::from_rgb(r, g, b)])
+                .with_colors([red])
                 .with_radii([0.04]),
         );
+        let strokes: Vec<[[f32; 3]; 2]> = hatch(&zone.polygon, HATCH_M)
+            .into_iter()
+            .map(|stroke| stroke.map(on_floor))
+            .collect();
         put_static(
             rec,
-            &format!("{entity}/fill"),
-            &rerun::Mesh3D::new(corners)
-                .with_triangle_indices(triangles(&zone.polygon))
-                .with_albedo_factor(rerun::Rgba32::from_unmultiplied_rgba(r, g, b, FILL_ALPHA)),
+            &format!("{entity}/hatch"),
+            &rerun::LineStrips3D::new(strokes)
+                .with_colors([red])
+                .with_radii([0.012]),
         );
+        // At its northernmost corner: a room's own name sits at its middle.
+        if let Some(&corner) = zone
+            .polygon
+            .iter()
+            .max_by(|one, other| one[1].total_cmp(&other[1]))
+        {
+            let set_in = if zone.fixed { ", from the profile" } else { "" };
+            put_static(
+                rec,
+                &format!("{entity}/name"),
+                &rerun::Points3D::new([on_floor(corner)])
+                    .with_labels([format!("{}: keep out{set_in}", zone.name)])
+                    .with_colors([red])
+                    .with_radii([0.06]),
+            );
+        }
         now.insert(entity);
     }
     for gone in drawn.difference(&now) {
@@ -79,47 +95,34 @@ fn draw_zones(rec: &RecordingStream, path: &str, zones: &[Zone], drawn: &mut BTr
     *drawn = now;
 }
 
-/// Twice the signed area of the triangle `a b c`: positive when it turns left.
-fn turn(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
-    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-}
-
-/// The polygon cut into triangles by ear clipping, since a room's outline can be concave.
-pub(super) fn triangles(polygon: &[[f64; 2]]) -> Vec<[u32; 3]> {
-    let count = polygon.len();
-    let winding = (0..count)
-        .map(|at| {
-            let ([x1, y1], [x2, y2]) = (polygon[at], polygon[(at + 1) % count]);
-            x1 * y2 - x2 * y1
-        })
-        .sum::<f64>()
-        .signum();
-    // Positive when three corners turn the polygon's own way, whichever way it was drawn.
-    let inward =
-        |[from, via, to]: [usize; 3]| winding * turn(polygon[from], polygon[via], polygon[to]);
-    let mut left: Vec<usize> = (0..count).collect();
-    let mut out = Vec::with_capacity(count.saturating_sub(2));
-    while left.len() >= 3 {
-        let len = left.len();
-        let around = |at: usize| [left[(at + len - 1) % len], left[at], left[(at + 1) % len]];
-        let ear = (0..len).find(|&at| {
-            let [prev, corner, next] = around(at);
-            inward([prev, corner, next]) > 0.0
-                && !left.iter().any(|&other| {
-                    ![prev, corner, next].contains(&other)
-                        && inward([prev, corner, other]) >= 0.0
-                        && inward([corner, next, other]) >= 0.0
-                        && inward([next, prev, other]) >= 0.0
-                })
-        });
-        // No ear only when the outline crosses itself; what was cut so far still shows.
-        let Some(ear) = ear else { break };
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "a zone has a handful of corners"
-        )]
-        out.push(around(ear).map(|corner| corner as u32));
-        left.remove(ear);
+/// Diagonal lines `spacing` metres apart across the polygon, clipped to it: the crossings of each
+/// line with the outline, paired in order along it, bound the stretches inside, concave or not.
+pub(super) fn hatch(polygon: &[[f64; 2]], spacing: f64) -> Vec<[[f64; 2]; 2]> {
+    // In these coordinates the lines are `across` = constant, and `along` runs down each one.
+    let turned: Vec<(f64, f64)> = polygon.iter().map(|&[px, py]| (px + py, px - py)).collect();
+    let (first, last) = turned.iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(lo, hi), &(across, _)| (lo.min(across), hi.max(across)),
+    );
+    let step = spacing * std::f64::consts::SQRT_2;
+    let back =
+        |across: f64, along: f64| [f64::midpoint(across, along), f64::midpoint(across, -along)];
+    let mut strokes = Vec::new();
+    let mut line = first + step / 2.0;
+    while step > 0.0 && line < last {
+        let mut crossings: Vec<f64> = (0..turned.len())
+            .filter_map(|index| {
+                let ((u1, v1), (u2, v2)) = (turned[index], turned[(index + 1) % turned.len()]);
+                ((u1 <= line) != (u2 <= line)).then(|| v1 + (line - u1) * (v2 - v1) / (u2 - u1))
+            })
+            .collect();
+        crossings.sort_by(f64::total_cmp);
+        strokes.extend(
+            crossings
+                .chunks_exact(2)
+                .map(|pair| [back(line, pair[0]), back(line, pair[1])]),
+        );
+        line += step;
     }
-    out
+    strokes
 }
