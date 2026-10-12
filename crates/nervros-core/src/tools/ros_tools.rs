@@ -117,6 +117,39 @@ impl Ctx {
             })
     }
 
+    /// A Nav2 goal to a pose inside a keep-out zone, refused with the zone's name. A goal in a
+    /// frame other than the zones' is left to Nav2's keepout filter.
+    fn zone_refusal(&self, ty: &str, goal: &Value) -> Option<ToolOutcome> {
+        let zones = self.guard.zones()?;
+        let poses: Vec<&Value> = match ty {
+            "nav2_msgs/action/NavigateToPose" | "nav2_msgs/action/ComputePathToPose" => {
+                vec![&goal["pose"]]
+            }
+            "nav2_msgs/action/NavigateThroughPoses"
+            | "nav2_msgs/action/ComputePathThroughPoses"
+            | "nav2_msgs/action/FollowWaypoints" => goal["poses"].as_array()?.iter().collect(),
+            _ => return None,
+        };
+        for stamped in poses {
+            let frame = stamped["header"]["frame_id"].as_str().unwrap_or_default();
+            if !frame.is_empty() && frame != zones.frame() {
+                continue;
+            }
+            let p = &stamped["pose"]["position"];
+            let (Some(x), Some(y)) = (p["x"].as_f64(), p["y"].as_f64()) else {
+                continue;
+            };
+            if let Some(zone) = zones.at(x, y) {
+                return Some(ToolOutcome::refused(format!(
+                    "({x:.2}, {y:.2}) is inside the keep-out zone `{}`: the robot may not go \
+                     there; geofence lists the zones, and only the operator removes one",
+                    zone.name
+                )));
+            }
+        }
+        None
+    }
+
     /// Why a model-given name or type may not be acted on, if it may not.
     fn deny_act(&self, name: &str, ty: &str) -> Option<ToolOutcome> {
         if name.contains("/_action/") {

@@ -298,6 +298,19 @@ join what the agent knows on every turn, and the Agent tab lists them with **For
 you done so far?" and "what happened to the mug?" read the mission ledger and the world model's
 history.
 
+## Keeping it out of places
+
+> **You:** Keep the robot out of the kitchen.
+>
+> **You:** Keep it half a metre away from the vase.
+
+Each request adds a keep-out zone around a room's outline, an object (its size and a margin), a
+place, or corners you give on the map. From then on the agent refuses a walk that would end in a
+zone or pass through one, and Nav2 plans around the zones when the robot's profile publishes their
+mask ([`[geofence]`](profile.md#geofence)). The 3D view draws them in red, and the World tab lists
+them: **Add** starts the request in the composer, and **Remove** asks the agent to remove a zone,
+which you approve. Zones set in the profile stay until the profile changes.
+
 ## Mapping a new building
 
 https://github.com/user-attachments/assets/90340180-66da-4bc3-a7d9-b2e6a1f24c7b
@@ -403,6 +416,7 @@ nervros-cli --profile my.toml ask "What can you see?" --image frame.jpg
 | `replay` | A session as it happened |
 | `eval`, `case` | Test suites against the live robot or a scripted one, and a session kept as a new case |
 | `record` | The live robot written as a scripted robot for `eval --robot` |
+| `whoami` | The robot's self-description drafted from the live robot into `<persona>.draft.md`; `--facts` prints what it gathered |
 | `models`, `skills`, `mcp` | The model chains with today's counts, the skills, and the MCP tools to approve |
 
 `doctor` checks the profile against the live graph, and `ros` runs one read tool with no model:

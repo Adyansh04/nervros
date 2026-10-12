@@ -52,6 +52,8 @@ pub struct Agent {
     pub notices: Vec<String>,
     /// Requests the last session ended waiting on the operator for, to offer again.
     pub unanswered: Vec<crate::session::Unanswered>,
+    /// The keep-out zones, for what draws them.
+    pub zones: Arc<crate::zones::Zones>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -254,6 +256,29 @@ fn place_tools(
         &places,
     ))))?;
     Ok(places)
+}
+
+/// The keep-out zones, the profile's and the operator's, kept beside the places: the guard
+/// checks every pose goal and plan against them, and Nav2 gets their mask when the profile names
+/// its topic.
+fn zone_tools(
+    profile: &Profile,
+    robot: &Arc<dyn RobotPort>,
+    ledger: &Path,
+    places: &Arc<crate::places::Places>,
+    guard: &Arc<Guard>,
+    registry: &mut Registry,
+) -> Result<Arc<crate::zones::Zones>, StartError> {
+    let zones = crate::zones::Zones::new(profile, robot_file(profile, ledger, "zones"));
+    guard.set_zones(Arc::clone(&zones));
+    registry.add(Arc::new(crate::zones::GeofenceTool::new(
+        profile,
+        Arc::clone(&zones),
+        Arc::clone(places),
+        Arc::clone(robot),
+    )))?;
+    crate::zones::spawn_mask(profile, Arc::clone(robot), Arc::clone(&zones));
+    Ok(zones)
 }
 
 /// `<kind>/<robot>.json` beside the quota ledger: what this robot keeps across sessions.
@@ -544,6 +569,7 @@ pub fn start_with(
     let snapshots = Arc::new(SnapshotStore::default());
     let seeing = seeing_tools(&profile, &robot, &llm, &snapshots, &mut registry)?;
     let places = place_tools(&profile, &robot, ledger, &mut registry)?;
+    let zones = zone_tools(&profile, &robot, ledger, &places, &guard, &mut registry)?;
     registry.add(Arc::new(RobotState::new(
         &profile,
         Arc::clone(&robot),
@@ -628,6 +654,7 @@ pub fn start_with(
         notices,
         mcp,
         unanswered,
+        zones,
     })
 }
 

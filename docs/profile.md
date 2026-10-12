@@ -345,6 +345,31 @@ near = ["charger_1"]                     # reached from here; see below
 detector's name for an object. A plan step that needs the robot near one of them walks to the
 place first, as it walks to any object the world model knows.
 
+### `[geofence]`
+
+Keep-out zones: polygons on the map the robot may not be sent into. The profile's zones are fixed;
+the operator adds more in chat with `geofence` ("keep the robot out of the kitchen", "keep it a
+metre from the vase"), around a room, an object, a place or corners on the map, kept per robot in
+the state directory beside the remembered places. Adding a zone only narrows where the robot goes,
+so it is free; removing one asks for approval, and only an edit of this file removes the profile's.
+
+```toml
+[geofence]
+mask = "/keepout_filter_mask"   # optional; needs [world] map
+
+[[geofence.zone]]
+name = "stairs"
+polygon = [[4.0, 0.0], [5.0, 0.0], [5.0, 2.5], [4.0, 2.5]]   # map frame, metres, in order
+```
+
+The guard refuses a Nav2 goal inside a zone (`NavigateToPose`, `NavigateThroughPoses`,
+`FollowWaypoints` and the path planners' actions), and the plan check a mission whose walk to a
+place, pose or target ends in one, or whose straight walk passes through one, followed from where
+the robot stands. Nav2 keeps its own paths out through `mask`: NervROS publishes an
+`OccupancyGrid` the size of `[world] map`, the zones' cells at 100 and latched (transient local),
+for Nav2's `KeepoutFilter` behind a `costmap_filter_info_server`. The viewer draws the zones in
+red, the World tab lists them, and its buttons add and remove them through the agent.
+
 ### `[models]`
 
 `file`: the [models file](models.md).
@@ -381,7 +406,7 @@ Doctor tab show a server that did not connect.
 
 ## Builtin tools
 
-Every robot gets `list_places`, `robot_state` and `stop`. `stop` is always allowed, armed or not,
+Every robot gets `list_places`, `robot_state`, `geofence` and `stop`. `stop` is always allowed, armed or not,
 because it only makes the robot do less. `look` comes with `[look]`, `segment` with `[segment]`,
 and `run_mission` with `[mission]`.
 
@@ -401,6 +426,7 @@ The rest are the checks you would run yourself before blaming the model:
 | `point` | With a `segment` model in the models file: points at what the operator names in the frame a camera's detector marks, found as `look` finds it, or the newest frame when there are no marks, including things no detector marks, and says which mark a point lands on. |
 | `skill` | With `skills`: reads one skill's procedure. |
 | `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each asks for approval when supervised, like a world edit. |
+| `geofence` | Lists, adds and removes keep-out zones (see `[geofence]`): around a room, an object (its size and a margin), a place, or corners on the map. Adding is free, and refused while the robot stands inside the new zone; removing asks for approval. |
 
 `look` can also answer about an earlier snapshot, and look closer at one mark: it crops the mark
 from the full frame at a higher resolution for the vision model, for a label or a small part.

@@ -446,7 +446,7 @@ pub struct Problem {
 }
 
 impl Problem {
-    fn new(step: &str, field: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(step: &str, field: &str, message: impl Into<String>) -> Self {
         Self {
             step: step.to_owned(),
             field: field.to_owned(),

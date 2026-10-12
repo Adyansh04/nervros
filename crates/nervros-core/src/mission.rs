@@ -37,6 +37,7 @@ use crate::session::{Event, SessionHandle};
 use crate::tools::Tool;
 
 mod execution;
+mod fence;
 mod planning;
 mod report;
 #[cfg(test)]

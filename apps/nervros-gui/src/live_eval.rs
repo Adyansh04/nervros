@@ -645,6 +645,7 @@ fn live_eval() {
         &rec,
         &agent.robot,
         &agent.profile,
+        &agent.zones,
         agent.session.subscribe(),
     );
     agent.session.send(nervros_core::session::Command::Arm);

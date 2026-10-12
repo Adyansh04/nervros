@@ -56,6 +56,7 @@ pub fn run(args: &Args) -> Result<()> {
         &rec,
         &agent.robot,
         &agent.profile,
+        &agent.zones,
         agent.session.subscribe(),
     );
 

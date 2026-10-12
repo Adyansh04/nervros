@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use super::catalog::Catalog;
 use super::check::Observed;
-use super::plan::{Author as By, Compiled, Plan, PlannedStep, Thing, World};
+use super::plan::{Author as By, Compiled, Plan, PlannedStep, Problem, Thing, World};
 use super::sanity::{Concern, Verdict};
 use super::tool::{concern_line, questioned};
 use super::{
@@ -222,6 +222,10 @@ impl Missions {
             Ok(c) => c,
             Err(problems) => return self.rejected(&json!(problems), &sent, by).await,
         };
+        let fenced = self.fenced(&compiled, &world, &catalog);
+        if !fenced.is_empty() {
+            return self.rejected(&json!(fenced), &sent, by).await;
+        }
         let reply = match self
             .robot
             .call(
@@ -261,6 +265,23 @@ impl Missions {
             .filter(|w| *w > 0.0)
             .unwrap_or(compiled.worst_case_s);
         self.checked(compiled, worst, concerns)
+    }
+
+    /// The steps of a plan that would take the robot into a keep-out zone.
+    fn fenced(&self, compiled: &Compiled, world: &World, catalog: &Catalog) -> Vec<Problem> {
+        let Some(zones) = self.guard.get().and_then(|g| g.zones()) else {
+            return Vec::new();
+        };
+        let (map, base) = (&self.profile.ros.map_frame, &self.profile.ros.base_frame);
+        let start = self.robot.transform(map, base).ok().map(|t| t.planar());
+        super::fence::check(
+            &compiled.steps,
+            start,
+            world,
+            catalog,
+            &self.config.checks,
+            zones,
+        )
     }
 
     /// Ways a plan may not do what the operator asked, and whether any is plain enough to send

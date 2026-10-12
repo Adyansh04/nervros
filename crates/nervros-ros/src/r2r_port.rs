@@ -97,6 +97,8 @@ enum Cmd {
     Publisher {
         topic: String,
         ty: String,
+        /// Transient local, depth 1: late subscribers get the last message.
+        latched: bool,
         reply: oneshot::Sender<r2r::Result<r2r::PublisherUntyped>>,
     },
     DestroyPublisher {
@@ -204,6 +206,43 @@ impl R2rPort {
         self.cmd
             .send(cmd)
             .map_err(|_| RosError::Middleware("the ROS node thread has stopped".to_owned()))
+    }
+
+    /// A publisher kept until its handle drops, each message sent as it is set.
+    async fn kept_publisher(
+        &self,
+        topic: &str,
+        ty: &str,
+        latched: bool,
+    ) -> Result<Publisher, RosError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::Publisher {
+            topic: topic.to_owned(),
+            ty: ty.to_owned(),
+            latched,
+            reply,
+        })?;
+        let publisher = rx.await.map_err(mw)?.map_err(|e| type_error(ty, &e))?;
+        let (handle, mut messages) = Publisher::channel();
+        let cmd = self.cmd.clone();
+        let topic = topic.to_owned();
+        tokio::spawn(async move {
+            let mut warned = false;
+            // Ends when the handle is dropped.
+            while messages.changed().await.is_ok() {
+                let Some(message) = messages.borrow_and_update().clone() else {
+                    continue;
+                };
+                if let Err(e) = publisher.publish(message)
+                    && !warned
+                {
+                    tracing::warn!(%topic, error = %e, "a kept publisher could not publish");
+                    warned = true;
+                }
+            }
+            let _ = cmd.send(Cmd::DestroyPublisher { publisher });
+        });
+        Ok(handle)
     }
 
     async fn client(&self, name: &str, ty: &str) -> Result<Arc<r2r::ClientUntyped>, RosError> {
@@ -576,9 +615,21 @@ fn handle(node: &mut r2r::Node, runtime: &tokio::runtime::Handle, cmd: Cmd) {
                 .map_err(|e| type_error(&ty, &e));
             let _ = reply.send(stream);
         }
-        Cmd::Publisher { topic, ty, reply } => {
+        Cmd::Publisher {
+            topic,
+            ty,
+            latched,
+            reply,
+        } => {
             // Our own QoS, never the caller's: a raw QoS could reach a DDS topic such as rt/lowcmd.
-            let qos = QosProfile::default().keep_last(10).reliable().volatile();
+            let qos = if latched {
+                QosProfile::default()
+                    .keep_last(1)
+                    .reliable()
+                    .transient_local()
+            } else {
+                QosProfile::default().keep_last(10).reliable().volatile()
+            };
             let _ = reply.send(node.create_publisher_untyped(&topic, &ty, qos));
         }
         Cmd::DestroyPublisher { publisher } => node.destroy_publisher_untyped(publisher),
@@ -937,33 +988,11 @@ impl RobotPort for R2rPort {
     }
 
     async fn publisher(&self, topic: &str, ty: &str) -> Result<Publisher, RosError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Cmd::Publisher {
-            topic: topic.to_owned(),
-            ty: ty.to_owned(),
-            reply,
-        })?;
-        let publisher = rx.await.map_err(mw)?.map_err(|e| type_error(ty, &e))?;
-        let (handle, mut messages) = Publisher::channel();
-        let cmd = self.cmd.clone();
-        let topic = topic.to_owned();
-        tokio::spawn(async move {
-            let mut warned = false;
-            // Ends when the handle is dropped.
-            while messages.changed().await.is_ok() {
-                let Some(message) = messages.borrow_and_update().clone() else {
-                    continue;
-                };
-                if let Err(e) = publisher.publish(message)
-                    && !warned
-                {
-                    tracing::warn!(%topic, error = %e, "a kept publisher could not publish");
-                    warned = true;
-                }
-            }
-            let _ = cmd.send(Cmd::DestroyPublisher { publisher });
-        });
-        Ok(handle)
+        self.kept_publisher(topic, ty, false).await
+    }
+
+    async fn latched_publisher(&self, topic: &str, ty: &str) -> Result<Publisher, RosError> {
+        self.kept_publisher(topic, ty, true).await
     }
 
     async fn publish(
@@ -978,6 +1007,7 @@ impl RobotPort for R2rPort {
         self.send(Cmd::Publisher {
             topic: topic.to_owned(),
             ty: ty.to_owned(),
+            latched: false,
             reply,
         })?;
         let publisher = rx.await.map_err(mw)?.map_err(|e| type_error(ty, &e))?;

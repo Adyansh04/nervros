@@ -90,6 +90,9 @@ impl ActionGoal {
                 .schemas
                 .validate(&ty, SchemaPart::Goal, &goal)
                 .map_err(|why| ToolOutcome::failed(format!("the goal does not fit {ty}: {why}")))?;
+            if let Some(refused) = self.ctx.zone_refusal(&ty, &goal) {
+                return Err(refused);
+            }
         }
         Ok(Prepared {
             name: action,

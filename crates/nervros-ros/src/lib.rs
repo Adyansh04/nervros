@@ -421,6 +421,16 @@ pub trait RobotPort: Send + Sync {
         unsupported("keeping a publisher")
     }
 
+    /// As [`RobotPort::publisher`], latched: transient local and reliable, so a subscriber that
+    /// joins later still gets the last message, as a costmap filter reading a mask needs.
+    async fn latched_publisher(
+        &self,
+        _topic: &str,
+        _msg_type: &str,
+    ) -> Result<Publisher, RosError> {
+        unsupported("keeping a latched publisher")
+    }
+
     /// Every frame link TF has seen.
     fn tf_links(&self) -> Vec<TfLink> {
         Vec::new()

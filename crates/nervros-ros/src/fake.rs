@@ -412,6 +412,10 @@ impl RobotPort for FakeRobot {
         Ok(handle)
     }
 
+    async fn latched_publisher(&self, topic: &str, ty: &str) -> Result<Publisher, RosError> {
+        self.publisher(topic, ty).await
+    }
+
     fn tf_links(&self) -> Vec<TfLink> {
         lock(&self.tf).links()
     }

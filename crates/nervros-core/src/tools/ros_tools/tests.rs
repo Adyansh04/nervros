@@ -390,6 +390,28 @@ async fn a_parameter_list_says_what_each_holds_and_narrows_by_filter() {
 }
 
 #[tokio::test]
+async fn a_nav2_goal_inside_a_keep_out_zone_is_refused() {
+    let (fake, tools, guard) = all_tools(&open(), true);
+    let profile: crate::profile::Profile = toml::from_str(
+        "[robot]\nname = \"x\"\n[models]\nfile = \"m.toml\"\n\
+         [[geofence.zone]]\nname = \"stairs\"\npolygon = [[2, -1], [3, -1], [3, 1], [2, 1]]\n",
+    )
+    .unwrap();
+    guard.set_zones(crate::zones::Zones::new(&profile, None));
+    let goal = |x: f64| {
+        json!({"action": "/navigate_to_pose", "type": "nav2_msgs/action/NavigateToPose",
+               "goal": {"pose": {"header": {"frame_id": "map"},
+                                 "pose": {"position": {"x": x, "y": 0.0}, "orientation": {"w": 1.0}}}}})
+    };
+    let refused = tool(&tools, "action_goal").call(goal(2.5)).await;
+    assert!(refused.message.contains("`stairs`"), "{}", refused.message);
+    assert!(
+        fake.calls().iter().all(|(n, _)| n != "/navigate_to_pose"),
+        "never sent"
+    );
+}
+
+#[tokio::test]
 async fn a_parameter_is_set_in_its_own_type_and_read_back() {
     let (fake, tools, _) = all_tools(&open(), true);
     let set = tool(&tools, "param_set");

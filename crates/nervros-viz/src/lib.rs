@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use nervros_core::profile::Profile;
 use nervros_core::session::Event;
+use nervros_core::zones::Zones;
 use nervros_ros::RobotPort;
 use rerun::external::re_log_channel::{self, LogReceiver, LogSource};
 use rerun::sink::CallbackSink;
@@ -26,6 +27,7 @@ mod plan;
 mod rooms;
 mod spawner;
 mod tasks;
+mod zones;
 
 pub use layers::Layers;
 
@@ -126,11 +128,12 @@ impl Bridge {
 }
 
 /// Starts the bridge: robot pose, cameras, map, rooms and objects from ROS, the profile's layers,
-/// and the agent's events.
+/// the keep-out zones and the agent's events.
 pub fn spawn(
     rec: &RecordingStream,
     robot: &Arc<dyn RobotPort>,
     profile: &Profile,
+    zones: &Arc<Zones>,
     events: broadcast::Receiver<Event>,
 ) -> Bridge {
     put_static(rec, "world", &rerun::ViewCoordinates::RIGHT_HAND_Z_UP());
@@ -150,6 +153,7 @@ pub fn spawn(
     let layout = Arc::new(Layout::new(rec.clone(), bridge.cameras(profile)));
     layout.send();
     bridge.world(profile, &layout);
+    bridge.zones(zones);
     bridge.profile_layers(profile);
     bridge.tasks.spawn(agent(
         rec.clone(),
@@ -198,6 +202,7 @@ mod tests {
     use crate::objects::object_colour;
     use crate::rooms::area;
     use crate::tasks::{ModelFrame, load_model, moved, pinhole, pose_model};
+    use crate::zones::triangles;
 
     #[test]
     fn a_urdf_gives_the_frames_tf_moves() {
@@ -374,5 +379,31 @@ mod tests {
     #[test]
     fn objects_keep_their_colour_by_label() {
         assert_eq!(object_colour("mug", 255), object_colour("mug", 255));
+    }
+
+    #[test]
+    fn a_concave_zone_is_cut_into_triangles_that_cover_it() {
+        let covered = |cut: &[[u32; 3]], p: &[[f64; 2]]| -> f64 {
+            cut.iter()
+                .map(|t| {
+                    let [a, b, c] = t.map(|i| p[i as usize]);
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0
+                })
+                .sum()
+        };
+        // An L of 3 m²: six corners give four triangles, either way round.
+        let l = [
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 1.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [0.0, 2.0],
+        ];
+        for corners in [l.to_vec(), l.iter().rev().copied().collect()] {
+            let cut = triangles(&corners);
+            assert_eq!(cut.len(), 4, "{cut:?}");
+            assert!((covered(&cut, &corners) - 3.0).abs() < 1e-9, "{cut:?}");
+        }
     }
 }
