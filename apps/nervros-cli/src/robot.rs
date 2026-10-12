@@ -496,3 +496,25 @@ pub(crate) async fn doctor(profile_path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Drafts the robot's self-description from the live robot, or prints the facts it would use.
+pub(crate) async fn whoami(profile_path: &Path, only_facts: bool) -> Result<()> {
+    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let robot = nervros_core::app::connect(&profile)?;
+    // Discovery needs a moment after the node starts.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let facts = nervros_core::whoami::facts(&profile, robot.as_ref()).await;
+    if only_facts {
+        println!("{}", serde_json::to_string_pretty(&facts)?);
+        return Ok(());
+    }
+    let llm = nervros_core::llm::Llm::new(crate::router(profile_path)?);
+    let text = nervros_core::whoami::draft(&llm, &profile, &facts).await?;
+    let path = nervros_core::whoami::save(&profile, &text).map_err(anyhow::Error::msg)?;
+    println!("{text}");
+    eprintln!(
+        "drafted {}; read it, edit it, and make it the persona when it is right",
+        path.display()
+    );
+    Ok(())
+}

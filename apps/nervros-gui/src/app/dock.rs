@@ -249,6 +249,76 @@ impl Gui {
                 }
             }
         }
+        ui.add_space(18.0);
+        self.self_description(ui);
+    }
+
+    /// Drafting what the robot is told about itself, from what it is now.
+    fn self_description(&self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Self-description").strong());
+        ui.label(
+            RichText::new(
+                "Drafts the persona from the robot as it is now (its skills, sensors, body, rooms \
+                 and places), in the persona's own style, into a .draft.md beside it. Read it and \
+                 keep what is right; the persona itself is never changed.",
+            )
+            .color(theme::DIM),
+        );
+        ui.add_space(6.0);
+        if self.live().drafting {
+            ui.horizontal(|ui| {
+                crate::chat::spinner(ui);
+                ui.label("Drafting…");
+            });
+        } else if ui
+            .add(ReButton::new("Draft from the robot").small().secondary())
+            .clicked()
+        {
+            self.live().drafting = true;
+            let (llm, robot, profile) = (
+                std::sync::Arc::clone(&self.agent.llm),
+                std::sync::Arc::clone(&self.agent.robot),
+                self.agent.profile.clone(),
+            );
+            let (live, wake) = (std::sync::Arc::clone(&self.live), ui.ctx().clone());
+            tokio::spawn(async move {
+                let facts = nervros_core::whoami::facts(&profile, robot.as_ref()).await;
+                let drafted = match nervros_core::whoami::draft(&llm, &profile, &facts).await {
+                    Ok(text) => nervros_core::whoami::save(&profile, &text).map(|p| (p, text)),
+                    Err(e) => Err(e.to_string()),
+                };
+                let mut l = live
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                l.drafting = false;
+                l.draft = Some(drafted);
+                drop(l);
+                wake.request_repaint();
+            });
+        }
+        let draft = self.live().draft.clone();
+        match draft {
+            Some(Ok((path, text))) => {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Drafted {}", path.display())).color(theme::DIM),
+                    );
+                    if ui.add(ReButton::new("Copy").small().secondary()).clicked() {
+                        ui.ctx().copy_text(text.clone());
+                    }
+                });
+                theme::status_card(ui, theme::FAINT, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(text).monospace().size(11.5));
+                });
+            }
+            Some(Err(why)) => {
+                ui.add_space(8.0);
+                ui.label(RichText::new(format!("No draft: {why}")).color(theme::ERROR));
+            }
+            None => {}
+        }
     }
 }
 

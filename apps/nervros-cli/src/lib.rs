@@ -148,6 +148,14 @@ enum Command {
         /// The file to write.
         out: PathBuf,
     },
+    /// Draft the robot's self-description from the live robot (its skills, sensors, body, rooms
+    /// and places) in the persona's style, into `<persona>.draft.md` beside it, for you to edit.
+    #[cfg(feature = "ros")]
+    Whoami {
+        /// Print the gathered facts as JSON and draft nothing.
+        #[arg(long)]
+        facts: bool,
+    },
     /// Look through the robot's camera: print the marks and save the marked image.
     #[cfg(feature = "ros")]
     Look {
@@ -282,6 +290,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Doctor => robot::doctor(&cli.profile).await,
         #[cfg(feature = "ros")]
         Command::Record { out } => record::record(&cli.profile, &out).await,
+        #[cfg(feature = "ros")]
+        Command::Whoami { facts } => robot::whoami(&cli.profile, facts).await,
         #[cfg(feature = "ros")]
         Command::Ros { tool, args } => robot::ros(&cli.profile, &tool, &args).await,
     }

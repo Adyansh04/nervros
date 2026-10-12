@@ -66,6 +66,10 @@ struct Live {
     pub battery: Option<Value>,
     /// Its motor diagnostics, when the profile names their topic.
     pub motors: Option<Value>,
+    /// A self-description is being drafted.
+    pub drafting: bool,
+    /// The last draft and where it was saved, or why none came.
+    pub draft: Option<Result<(std::path::PathBuf, String), String>>,
 }
 
 /// What the operator clicked in the viewer, when it is something the agent can act on.

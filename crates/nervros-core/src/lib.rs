@@ -12,6 +12,7 @@ pub mod model;
 mod persist;
 pub mod telemetry;
 pub mod tools;
+pub mod whoami;
 
 pub(crate) use agent::{argcheck, context};
 pub use agent::{evalcase, guard, log, session};
