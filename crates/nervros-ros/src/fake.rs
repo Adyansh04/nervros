@@ -1,4 +1,5 @@
-//! A scripted robot for tests: services, actions, topics, frames and TF from closures and values.
+//! A robot of scripts: services, actions, topics, frames and TF from closures and values, for
+//! tests and for the robot a file describes (`scripted`).
 //!
 //! Every call and goal is recorded, so a test can assert what the agent asked the robot to do.
 

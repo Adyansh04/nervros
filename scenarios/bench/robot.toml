@@ -1,0 +1,80 @@
+# The bench's robot, over scenarios/robot/robot.toml: a graph like a Nav2 robot's, with Nav2
+# composed into one container as launch files often do, a laser at 10 Hz, the controller's
+# parameters and the robot standing at (3.25, -1.75) on the map.
+
+[graph]
+nodes = ["/robot_state_publisher", "/laser_driver", "/x"]
+
+[graph.topics]
+"/scan" = "sensor_msgs/msg/LaserScan"
+"/map" = "nav_msgs/msg/OccupancyGrid"
+"/amcl_pose" = "geometry_msgs/msg/PoseWithCovarianceStamped"
+"/cmd_vel" = "geometry_msgs/msg/Twist"
+"/odom" = "nav_msgs/msg/Odometry"
+"/tf" = "tf2_msgs/msg/TFMessage"
+"/rosout" = "rcl_interfaces/msg/Log"
+"/x/robot_state" = "nervros_interfaces/msg/RobotState"
+"/x/execute_mission/_action/feedback" = "nervros_interfaces/action/ExecuteMission_FeedbackMessage"
+"/x/execute_mission/_action/status" = "action_msgs/msg/GoalStatusArray"
+"/navigate_to_pose/_action/feedback" = "nav2_msgs/action/NavigateToPose_FeedbackMessage"
+"/navigate_to_pose/_action/status" = "action_msgs/msg/GoalStatusArray"
+
+[graph.services]
+"/x/validate_mission" = "nervros_interfaces/srv/ValidateMission"
+"/x/get_catalog" = "nervros_interfaces/srv/GetCatalog"
+"/x/stop_all" = "nervros_interfaces/srv/StopAll"
+"/x/preview_mission" = "nervros_interfaces/srv/PreviewMission"
+"/x/teleop" = "nervros_interfaces/srv/Teleop"
+"/lifecycle_manager_navigation/is_active" = "std_srvs/srv/Trigger"
+
+[containers]
+"/nav2_container" = [
+    "/amcl",
+    "/map_server",
+    "/lifecycle_manager_localization",
+    "/controller_server",
+    "/planner_server",
+    "/behavior_server",
+    "/bt_navigator",
+    "/lifecycle_manager_navigation",
+]
+
+[nodes."/x"]
+services = { "/x/validate_mission" = "nervros_interfaces/srv/ValidateMission", "/x/get_catalog" = "nervros_interfaces/srv/GetCatalog", "/x/stop_all" = "nervros_interfaces/srv/StopAll", "/x/preview_mission" = "nervros_interfaces/srv/PreviewMission", "/x/teleop" = "nervros_interfaces/srv/Teleop" }
+publishers = { "/x/robot_state" = "nervros_interfaces/msg/RobotState" }
+
+[nodes."/laser_driver"]
+publishers = { "/scan" = "sensor_msgs/msg/LaserScan" }
+
+[nodes."/controller_server"]
+publishers = { "/cmd_vel" = "geometry_msgs/msg/Twist" }
+subscribers = { "/odom" = "nav_msgs/msg/Odometry" }
+
+[params."/controller_server"]
+controller_frequency = { value = 20.0, description = "How often the controller runs, Hz." }
+"FollowPath.plugin" = "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+"FollowPath.desired_linear_vel" = { value = 0.6, description = "The forward speed the controller drives at, m/s." }
+"FollowPath.lookahead_dist" = { value = 0.6, description = "How far ahead on the path to aim, m." }
+"FollowPath.max_robot_pose_search_dist" = { value = 1.4875, description = "How far along the path to look for the robot's pose, m." }
+"FollowPath.rotate_to_heading_angular_vel" = { value = 1.57, description = "Turning speed when rotating to a heading, rad/s." }
+"FollowPath.use_rotate_to_heading" = true
+use_sim_time = false
+
+[params."/amcl"]
+base_frame_id = "base_footprint"
+max_particles = 2000
+min_particles = 500
+
+[rates]
+"/scan" = { hz = 10.0, bytes = 7280 }
+"/odom" = { hz = 50.0, bytes = 720 }
+
+[topics."/amcl_pose"]
+header = { frame_id = "map" }
+pose = { pose = { position = { x = 3.25, y = -1.75, z = 0.0 }, orientation = { x = 0.0, y = 0.0, z = 0.0, w = 1.0 } } }
+
+[[transforms]]
+parent = "map"
+child = "base_footprint"
+x = 3.25
+y = -1.75

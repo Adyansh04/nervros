@@ -1,0 +1,43 @@
+# The model bench's profile: the scenarios' robot on a scripted graph, with the generic ROS tools
+# open as on a real robot, so a model is judged on the same tasks the agent bench gave every tool.
+#   nervros-cli --profile scenarios/bench/nervros.toml eval scenarios/bench/suite.toml \
+#     --robot scenarios/robot/robot.toml --robot scenarios/bench/robot.toml --models a,b
+# The models are the example profile's; point `[models] file` at your own to compare yours.
+
+[robot]
+name = "A humanoid test robot in a two-room flat"
+
+[ros]
+interfaces = ["/opt/ros/jazzy", "../robot/interfaces"]
+
+[policy]
+start_armed = false
+
+[world]
+rooms = { topic = "/canopy/rooms", type = "canopy_msgs/msg/RoomArray" }
+objects = { topic = "/canopy/objects", type = "canopy_msgs/msg/WorldObjectArray" }
+
+[mission]
+execute = "/x/execute_mission"
+validate = "/x/validate_mission"
+catalog = "/x/get_catalog"
+stop = "/x/stop_all"
+state = "/x/robot_state"
+
+[mission.checks]
+turn = { skill = "TurnInPlace", degrees = "degrees" }
+walk = { skill = "WalkStraight", metres = "distance_m", direction = "direction", max_m = 2.0 }
+arm = "arm"
+
+[[place]]
+name = "dock"
+pose = { x = 0.5, y = 0.5 }
+
+[ros_tools]
+service_call = ["*"]
+action_send = ["*"]
+publish = ["*"]
+param_set = ["*:*"]
+
+[models]
+file = "../../profiles/example/models.toml"

@@ -15,8 +15,9 @@ workspace = true
 default = ["rcl"]
 # The r2r backend: links rcl, so building needs a sourced ROS environment (scripts/ros-env.sh).
 rcl = ["dep:r2r"]
-# `fake::FakeRobot`, for other crates' tests; production builds leave it out.
-test-support = []
+# A robot of scripts (`fake::FakeRobot`) and of a file (`scripted`): other crates' tests, and
+# `nervros-cli eval --robot`, which compares models without a simulator.
+scripted = []
 
 [dependencies]
 async-trait.workspace = true

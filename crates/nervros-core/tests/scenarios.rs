@@ -25,7 +25,6 @@
 //! A scenario passes when it meets its expectations and the model's script is used up exactly.
 //! `NERVROS_SCENARIO=<text>` runs only the scenarios whose file names hold it.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,8 +34,8 @@ use nervros_core::llm::{AgentBuilder, AgentSource, LlmError};
 use nervros_core::providers::Role;
 use nervros_core::providers::router::Need;
 use nervros_core::session::Command;
-use nervros_ros::fake::{FakeRobot, ScriptedRun};
-use nervros_ros::{GoalResult, GoalStatus, RobotPort, Transform};
+use nervros_ros::scripted::ScriptedRobot;
+use nervros_ros::{RobotPort, Transform};
 use rig::test_utils::{MockCompletionModel, MockTurn};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -59,7 +58,7 @@ struct Scenario {
     #[serde(default)]
     model: Vec<Turn>,
     #[serde(default)]
-    robot: Robot,
+    robot: ScriptedRobot,
     #[serde(default)]
     expect: Expect,
 }
@@ -74,67 +73,6 @@ struct Turn {
     call: Option<String>,
     args: Option<Value>,
     reply: Option<String>,
-}
-
-/// Services by name with their response, actions with how they run, topics with their message.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Robot {
-    #[serde(default)]
-    services: BTreeMap<String, Value>,
-    #[serde(default)]
-    actions: BTreeMap<String, Run>,
-    #[serde(default)]
-    topics: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Run {
-    #[serde(default)]
-    feedback: Vec<Value>,
-    /// `succeeded`, `aborted` or `canceled`.
-    status: String,
-    #[serde(default)]
-    result: Value,
-}
-
-impl Robot {
-    /// This robot with `other`'s services, actions and topics in place of its own.
-    fn with(mut self, other: Self) -> Self {
-        self.services.extend(other.services);
-        self.actions.extend(other.actions);
-        self.topics.extend(other.topics);
-        self
-    }
-
-    fn build(self) -> Result<FakeRobot, String> {
-        let mut robot =
-            FakeRobot::new().with_transform("map", "base_footprint", Transform::IDENTITY);
-        for (name, response) in self.services {
-            robot = robot.with_service(&name, move |_| Ok(response.clone()));
-        }
-        for (name, run) in self.actions {
-            let status = match run.status.as_str() {
-                "succeeded" => GoalStatus::Succeeded,
-                "aborted" => GoalStatus::Aborted,
-                "canceled" => GoalStatus::Canceled,
-                other => return Err(format!("{name}: no status {other}")),
-            };
-            robot = robot.with_action(&name, move |_| ScriptedRun {
-                feedback: run.feedback.clone(),
-                result: Ok(GoalResult {
-                    status,
-                    result: run.result.clone(),
-                }),
-                ..ScriptedRun::default()
-            });
-        }
-        for (name, message) in self.topics {
-            robot = robot.with_topic(&name, message);
-        }
-        Ok(robot)
-    }
 }
 
 /// The scenario's model: every role asks it, and it answers from its script.
@@ -173,9 +111,13 @@ fn script(turns: &[Turn]) -> Result<Vec<MockTurn>, String> {
 async fn run(path: &Path) -> Result<Vec<String>, String> {
     let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
     let scenario: Scenario = toml::from_str(&read(path)?).map_err(|e| e.to_string())?;
-    let shared: Robot =
+    let shared: ScriptedRobot =
         toml::from_str(&read(&root().join("robot/robot.toml"))?).map_err(|e| e.to_string())?;
-    let robot: Arc<dyn RobotPort> = Arc::new(shared.with(scenario.robot).build()?);
+    let robot: Arc<dyn RobotPort> = Arc::new(shared.with(scenario.robot).build()?.with_transform(
+        "map",
+        "base_footprint",
+        Transform::IDENTITY,
+    ));
     let model = MockCompletionModel::from_turns(script(&scenario.model)?);
     let state = tempfile::tempdir().map_err(|e| e.to_string())?;
     let options = nervros_core::app::StartOptions {
@@ -268,4 +210,18 @@ async fn every_scenario_does_what_it_expects() {
         paths.len(),
         failed.join("\n")
     );
+}
+
+/// The model bench runs on a real model, so CI cannot run it; it can keep its files loading.
+#[tokio::test]
+async fn the_model_bench_files_load_and_answer() {
+    let read = |p: &str| std::fs::read_to_string(root().join(p)).unwrap();
+    let shared: ScriptedRobot = toml::from_str(&read("robot/robot.toml")).unwrap();
+    let bench: ScriptedRobot = toml::from_str(&read("bench/robot.toml")).unwrap();
+    let robot = shared.with(bench).build().unwrap();
+    let graph = robot.graph_detail().await.unwrap();
+    assert!(graph.nodes.contains(&"/controller_server".to_owned()));
+    let suite: nervros_core::evalcase::Suite = toml::from_str(&read("bench/suite.toml")).unwrap();
+    assert_eq!(suite.cases.len(), 10);
+    nervros_core::profile::Profile::load(&root().join("bench/nervros.toml")).unwrap();
 }

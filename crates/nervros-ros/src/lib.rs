@@ -15,11 +15,13 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "scripted"))]
 pub mod fake;
 pub mod image;
 #[cfg(feature = "rcl")]
 mod r2r_port;
+#[cfg(any(test, feature = "scripted"))]
+pub mod scripted;
 pub mod tf;
 
 #[cfg(feature = "rcl")]

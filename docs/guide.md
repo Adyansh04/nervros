@@ -401,7 +401,8 @@ nervros-cli --profile my.toml ask "What can you see?" --image frame.jpg
 | `doctor` | The profile's tools, topics and mission services against the live graph |
 | `missions`, `gaps` | The mission ledger, and the requests no skill could do |
 | `replay` | A session as it happened |
-| `eval`, `case` | Test suites against the live robot, and a session kept as a new case |
+| `eval`, `case` | Test suites against the live robot or a scripted one, and a session kept as a new case |
+| `record` | The live robot written as a scripted robot for `eval --robot` |
 | `models`, `skills`, `mcp` | The model chains with today's counts, the skills, and the MCP tools to approve |
 
 `doctor` checks the profile against the live graph, and `ros` runs one read tool with no model:
@@ -463,6 +464,20 @@ $ nervros-cli --profile nervros.toml eval eval/apartment.toml --out eval-r3
 
 `--repeat k` runs each case k times for pass^k, `--models a,b` compares models, and
 `nervros-cli case last --id my-case --append suite.toml` keeps a session as a new case.
+
+`--robot <file>` runs a suite against a robot a file describes instead of the live graph: its
+graph, the nodes in each component container, parameters, topic rates and messages, frames, and
+a mission executor that accepts every plan. Nothing moves, so it judges what the model says and
+plans, and a model comparison takes seconds with no simulator running. `nervros-cli record
+robot.toml` writes one from the live robot; `scenarios/bench` holds the agent bench's ten tasks on a
+generic robot:
+
+```text
+$ nervros-cli --profile scenarios/bench/nervros.toml eval scenarios/bench/suite.toml \
+    --robot scenarios/robot/robot.toml --robot scenarios/bench/robot.toml --models qwen3.5-9b-local
+...
+10 of 10 trials passed; report ~/.local/state/nervros/evals/.../report.md
+```
 
 ## Keys
 
