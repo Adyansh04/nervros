@@ -396,6 +396,8 @@ pub struct MissionConfig {
     pub catalog: String,
     /// `StopAll` service.
     pub stop: String,
+    /// `PauseMission` service, for pausing and resuming a mission from the chat and the window.
+    pub pause: Option<String>,
     /// `PreviewMission` service, for the picture of a plan beside its approval card.
     pub preview: Option<String>,
     /// `RobotState` topic.

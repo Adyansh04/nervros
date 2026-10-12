@@ -48,3 +48,5 @@ float32 elapsed_s
 string[] running_nodes
 # Status transitions since the previous feedback message.
 NodeEvent[] events
+# True while the mission is paused (PauseMission), or waiting to pause at the end of its step.
+bool paused

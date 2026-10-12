@@ -22,7 +22,7 @@ it, and turns it away when:
   The leaves inside the macros are the executor's own and never appear in a mission;
 - a node carries an attribute starting with `_` (pre- and post-conditions, `_autoremap`), or an
   argument is missing, unknown, longer than 200 characters, not one of its `enum` values, or holds
-  a `{blackboard}` reference;
+  a `{blackboard}` reference that is not an earlier step's output of a fitting kind (below);
 - a `Timeout` is not a positive whole number of milliseconds, or a retry is outside 1 to 3
   attempts;
 - it is too big, or its worst case (the sum of its steps' limits times their attempts) is over
@@ -39,6 +39,7 @@ it, and turns it away when:
 | `stop` | `StopAll` service | Halts the tree, cancels every goal on every action server the skills use, whoever sent it, and holds posture while the hands keep their grip. The reference executor also cancels the arm trajectory controller's goal, which holds the arm where it is, and leaves the hand controllers alone. Safe to call at any time, with or without a mission. |
 | `state` | `RobotState` topic | Transient local, on change and at 1 Hz: the running mission and step, the resources held, what each hand holds, whether a stop is in force, and whether the robot can walk (its tilt, and why not when it cannot). |
 | `preview` | `PreviewMission` service | Optional. Where each step of a tree would end the robot and the path Nav2's planner finds there, chained from the robot's pose now, with a note when there is none; only the planner runs. The app draws it beside the plan's approval card. |
+| `pause` | `PauseMission` service | Optional. Pauses the running mission, or resumes it; see below. |
 | `heartbeat` | `Heartbeat` topic | Optional. The agent's heartbeats while a mission runs; see the deadman below. |
 | `teleop` | `Teleop` service | Optional. Hands the base to the operator: while on, the executor refuses missions and forwards each `geometry_msgs/Twist` on its `~/teleop_cmd` within its speed limits, stops the base when they pause, and `StopAll` ends it. |
 
@@ -54,15 +55,29 @@ diagnostics in `diagnostics_json`.
 | `SUCCESS` | The tree succeeded. |
 | `FAILURE` | The tree failed. `failed_node` is the path of the leaf that failed last before the tree gave up; `failure_reason` is the skill server's own words. |
 | `TIMEOUT` | A step's `Timeout` ran out (`failed_node` is its path), or the mission's watchdog fired. |
-| `CANCELED` | The client cancelled the goal, `StopAll` stopped it (`failure_reason` starts with "stopped:"), or the executor shut down. `failed_node` names the step that was running. |
+| `CANCELED` | The client cancelled the goal, `StopAll` stopped it (`failure_reason` starts with "stopped:"), a pause ran past the executor's limit ("paused for longer than ..."), or the executor shut down. `failed_node` names the step that was running. |
 | `REJECTED` | The tree failed its checks, or the executor was busy or shutting down. |
 | `ERROR` | The executor could not run it, for instance because the arms could not be taken. |
 
 `failed_step_id` is the step the failed node belongs to, such as `s2`. The goal's own status is
 `CANCELED` only when the client cancelled it; any other outcome but success arrives as aborted.
 The watchdog is the goal's `max_duration_s`, or the tree's worst case times 1.2, and never more
-than the executor's cap. Feedback carries the running nodes and the transitions since the last
-message, for the mission's steps and the skills' leaves.
+than the executor's cap; time paused does not count. Feedback carries the running nodes and the
+transitions since the last message, for the mission's steps and the skills' leaves, and whether
+the mission is paused.
+
+## Pause and resume
+
+`PauseMission` with `pause: true` halts the running step: its goals are cancelled, so the base
+stops and the arms hold where they are, and the hands keep their grip. A step that handles an
+object (`risk: manipulation`, a pick or a place) is let finish first, and the pause takes the next
+step before it sends anything. While paused the executor ticks nothing, keeps the authority it
+holds, and still stops for `StopAll`, a cancel, the deadman and the robot's health; `RobotState`
+says `paused`. `pause: false` resumes: the halted step starts again from its beginning, so a walk
+to a place sets out again, while the reference executor's straight walk and turn do only what was
+left of them. A pause longer than the executor's limit (600 s in the reference executor) ends the
+mission. NervROS pauses on a plain "pause", "wait" or "hold on" while a mission runs, and on the
+window's Pause button, and resumes on "resume", "continue", "carry on" or "go on".
 
 ## Deadman and health
 
@@ -91,22 +106,25 @@ and whether the balance controller is active, with some hysteresis, and says why
 ```xml
 <root BTCPP_format="4" main_tree_to_execute="Mission">
   <BehaviorTree ID="Mission">
-    <Timeout msec="1296000">
-      <Sequence name="mission">
-        <Timeout msec="240000"><SubTree ID="GoToTarget" name="s1_GoToPlace" target="O17"/></Timeout>
-        <RetryUntilSuccessful num_attempts="2"><Timeout msec="420000"><SubTree ID="PickObject" name="s2_PickObject" object_id="O17" phrase="red mug" arm="right"/></Timeout></RetryUntilSuccessful>
-      </Sequence>
-    </Timeout>
+    <Sequence name="mission">
+      <Timeout msec="240000"><SubTree ID="GoToTarget" name="s1_GoToPlace" target="red mug" target_id="{s1_target_id}"/></Timeout>
+      <RetryUntilSuccessful num_attempts="2"><Timeout msec="420000"><SubTree ID="PickObject" name="s2_PickObject" object_id="{s1_target_id}" phrase="red mug" arm="right"/></Timeout></RetryUntilSuccessful>
+    </Sequence>
   </BehaviorTree>
 </root>
 ```
 
 - Each step is a `SubTree` reference to a macro in the executor's own library, which it registers
   in every mission's factory. The agent never sends macro bodies.
-- Every argument is a literal attribute.
+- Every argument is a literal attribute, or what an earlier step hands on. A step gives an output
+  under its own step's key, `target_id="{s1_target_id}"`, and a later step takes that key as an
+  argument. The executor checks that the key is written once, by a step before it in the
+  document, and that the output fits the argument: an id from the world model for a `world_id`,
+  an id for an `id`, the same format otherwise, never a catalog `enum`. Here the walk goes to the
+  nearest red mug and the pick takes the one it went to.
 - A step is wrapped in its `Timeout`, and in `RetryUntilSuccessful` and `ForceSuccess` when the
-  plan asks for them. The whole mission is wrapped in a `Timeout` of its worst case times 1.2:
-  here (240 + 2 × 420) s × 1.2.
+  plan asks for them. The mission itself has no `Timeout`: the executor's watchdog, its worst case
+  times 1.2, is its limit, and that does not run down while it is paused.
 - Step nodes are named `s<N>_<Skill>`. Feedback paths start with that name, which is how the
   agent maps transitions onto steps. Transitions back to idle are resets, which it ignores.
 
@@ -123,6 +141,7 @@ and whether the balance controller is active, with some hysteresis, and says why
      {"name": "object_id", "type": "string", "description": "...", "enum": []},
      {"name": "phrase", "type": "string", "description": "...", "enum": [], "default_from": "label(object_id)"},
      {"name": "arm", "type": "string", "description": "Which hand", "enum": ["left", "right"]}],
+   "outputs": [],
    "requires": ["near(object_id)", "hand_empty(arm)"],
    "effects": ["holding(arm, object_id)"],
    "resources": ["base", "left_arm", "right_arm"],
@@ -138,7 +157,14 @@ and whether the balance controller is active, with some hysteresis, and says why
   `default_from`. `default_from: "label(<arg>)"` lets the planner fill the value with the world
   model's label for what the other argument names, or with the words of an id it does not know
   (`red_block` gives "red block"). The model never sees such an argument, but the mission still
-  carries it.
+  carries it. `format` (`id`, `phrase`, `station`, `number`) is how the executor checks the value;
+  a `world_id` with `phrase` also takes plain words the world model searches for. `narrowed`
+  marks an `enum` the robot narrowed to what it can do where it is, such as the only names a
+  simulated detector knows: what an earlier step found may stand in for one.
+- **Outputs.** `outputs` lists what a skill hands on, typed like an argument; plans give the
+  step an `id` and a later argument the whole value `{id.output}`, which the planner compiles to
+  the step's key. The reference executor's `GoToTarget` hands on `target_id`, and `FindInView`
+  the `object_id` the detector reports what it found under.
 - **Needs and effects.** The planner understands these predicates in `requires` and `effects`:
   - `near(x)`: within about half a metre of object or room `x`, judged only for ids the world
     model knows;

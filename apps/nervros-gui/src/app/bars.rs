@@ -9,7 +9,7 @@ use rerun::external::egui::{Align, Color32, CornerRadius, Frame, Layout, Margin,
 use rerun::external::re_ui::{ReButton, UiExt as _};
 use rerun::external::{eframe, egui, re_memory};
 
-use super::{Gui, STOP_HINT, Tab};
+use super::{Gui, PAUSE_HINT, STOP_HINT, Tab};
 use crate::theme;
 
 impl Gui {
@@ -47,6 +47,24 @@ impl Gui {
                 .min_size(egui::vec2(0.0, 30.0));
                 if ui.add(stop).on_hover_text(STOP_HINT).clicked() {
                     self.agent.session.send(Command::StopMission);
+                }
+                if self.mission_running()
+                    && self
+                        .agent
+                        .profile
+                        .mission
+                        .as_ref()
+                        .is_some_and(|m| m.pause.is_some())
+                {
+                    let paused = self.mission_paused();
+                    let pause = egui::Button::new(
+                        RichText::new(if paused { "Resume" } else { "Pause" }).strong(),
+                    )
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(egui::vec2(0.0, 30.0));
+                    if ui.add(pause).on_hover_text(PAUSE_HINT).clicked() {
+                        self.pause(!paused, "button");
+                    }
                 }
                 ui.add_space(4.0);
                 self.view_buttons(ui);
@@ -143,6 +161,9 @@ impl Gui {
             } else {
                 chip(ui, theme::WARN, "Executor offline");
             }
+        }
+        if self.mission_paused() {
+            chip(ui, theme::WARN, "Mission paused");
         }
         let (model, quota) = self.model_status();
         chip(ui, theme::INFO, format!("{model} · {quota}"));

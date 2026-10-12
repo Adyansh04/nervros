@@ -295,6 +295,7 @@ app, and the agent never asks first in the chat. `check_only` only checks a plan
 | `validate` | required | The `ValidateMission` service. |
 | `catalog` | required | The `GetCatalog` service. |
 | `stop` | required | The `StopAll` service, which the Stop button and `stop` call. |
+| `pause` | none | The `PauseMission` service: "pause" and "resume" in the chat while a mission runs, `/pause` and `/resume`, and the Pause buttons pause the mission and let it go on. |
 | `state` | required | The `RobotState` topic. |
 | `max_replans` | `2` | Failed missions for one request, counted until the operator speaks again, before the agent must hand back to the operator. |
 | `preview` | none | The `PreviewMission` service: the viewer draws where a plan's walks end and the paths to them beside its approval card, and the card marks a step the preview cannot reach. |

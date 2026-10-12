@@ -78,7 +78,7 @@ pub async fn run(profile: &Profile, robot: &dyn RobotPort) -> Vec<Check> {
         );
     }
     if let Some(m) = &profile.mission {
-        let services = [
+        let mut services = vec![
             (
                 "validate",
                 &m.validate,
@@ -87,6 +87,9 @@ pub async fn run(profile: &Profile, robot: &dyn RobotPort) -> Vec<Check> {
             ("catalog", &m.catalog, "nervros_interfaces/srv/GetCatalog"),
             ("stop", &m.stop, "nervros_interfaces/srv/StopAll"),
         ];
+        if let Some(pause) = &m.pause {
+            services.push(("pause", pause, "nervros_interfaces/srv/PauseMission"));
+        }
         let answered = futures::future::join_all(
             services
                 .iter()

@@ -455,6 +455,76 @@ async fn a_plan_runs_and_reports_with_goal_checks() {
 }
 
 #[tokio::test]
+async fn a_pause_is_reported_from_the_feedback_and_asked_of_the_executor() {
+    let run = ScriptedRun {
+        feedback: vec![
+            json!({"elapsed_s": 1.0, "events": [], "paused": true}),
+            json!({"elapsed_s": 2.0, "events": [], "paused": false}),
+        ],
+        result: Ok(GoalResult {
+            status: GoalStatus::Succeeded,
+            result: json!({"outcome": 0, "failed_step_id": "", "failure_reason": ""}),
+        }),
+        ..ScriptedRun::default()
+    };
+    let robot: Arc<dyn RobotPort> = Arc::new(robot(run).with_service("/x/pause", |req| {
+        Ok(json!({"ok": true, "message": if req["pause"] == true { "pausing" } else { "resuming" }}))
+    }));
+    let profile = profile_with(r#"pause = "/x/pause""#);
+    let missions = Missions::new(&profile, Places::new(&profile, None), robot).unwrap();
+    let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut rx) = tokio::sync::broadcast::channel(64);
+    missions.attach(SessionHandle::for_tests(&tx, events));
+
+    let planned = missions.plan(steps(), By::Model).await;
+    let hash = planned.data["hash"].as_str().unwrap().to_owned();
+    assert_eq!(
+        missions.run(&json!({"hash": hash})).await.status,
+        Status::Accepted
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(5), commands.recv()).await;
+    missions.pause(true, "test").await;
+
+    let mut seen = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        seen.push(e);
+    }
+    let paused: Vec<bool> = seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::MissionPaused { paused, .. } => Some(*paused),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(paused, [true, false]);
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, Event::Notice { text } if text == "pausing")),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_robot_whose_executor_cannot_pause_says_so() {
+    let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+    let (tx, _commands) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut rx) = tokio::sync::broadcast::channel(64);
+    missions.attach(SessionHandle::for_tests(&tx, events));
+
+    missions.pause(true, "test").await;
+
+    let said = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|e| match e {
+        Event::Notice { text } => Some(text),
+        _ => None,
+    });
+    assert!(
+        said.as_deref().is_some_and(|t| t.contains("cannot pause")),
+        "{said:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_walk_is_refused_while_the_robot_cannot_move_and_not_counted_as_the_models() {
     let robot = robot(ScriptedRun::default()).with_topic(
         "/x/state",

@@ -83,7 +83,7 @@ impl Gui {
         let mut actions = Vec::new();
         match self.chat.latest_plan() {
             Some(p) => {
-                crate::chat::plan_card(ui, p, &mut actions);
+                crate::chat::plan_card(ui, p, self.chat.can_pause, &mut actions);
                 crate::chat::tree_panel(ui, p);
             }
             None => empty(

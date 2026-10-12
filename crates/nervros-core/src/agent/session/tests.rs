@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use super::approval::{Unanswered, take_unanswered};
 use super::config::SessionConfig;
-use super::event::{Command, Event, is_stop_word};
+use super::event::{Command, Event, is_stop_word, pause_word};
 use super::*;
 use crate::guard::{Guard, Policy};
 use crate::llm::{AgentBuilder, AgentSource, History, LlmError};
@@ -857,6 +857,24 @@ fn a_plain_order_to_stop_is_known_and_a_sentence_about_stopping_is_not() {
     }
     for text in ["stop at the kitchen", "don't stop", "bus stop", "stopwatch"] {
         assert!(!is_stop_word(text), "{text}");
+    }
+}
+
+#[test]
+fn plain_words_pause_and_resume_and_sentences_go_to_the_model() {
+    for word in ["pause", "Wait!", " hold on ", "please pause", "/pause"] {
+        assert_eq!(pause_word(word), Some(true), "{word}");
+    }
+    for word in ["resume", "Continue.", "carry on", "go on!", "/resume"] {
+        assert_eq!(pause_word(word), Some(false), "{word}");
+    }
+    for text in [
+        "wait for me at the door",
+        "continue to the kitchen",
+        "pause music",
+        "go",
+    ] {
+        assert_eq!(pause_word(text), None, "{text}");
     }
 }
 

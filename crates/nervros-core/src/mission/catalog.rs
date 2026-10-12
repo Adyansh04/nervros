@@ -31,6 +31,9 @@ pub struct Skill {
     /// Its inputs, all required.
     #[serde(default)]
     pub args: Vec<Arg>,
+    /// What it hands on, which a later step of the same mission can take as an argument.
+    #[serde(default)]
+    pub outputs: Vec<Arg>,
     /// Predicates that must hold before it runs.
     #[serde(default)]
     pub requires: Vec<String>,
@@ -46,7 +49,7 @@ pub struct Skill {
     pub template: String,
 }
 
-/// One input of a skill.
+/// One input of a skill, or one of its outputs.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Arg {
     /// The port name.
@@ -54,12 +57,20 @@ pub struct Arg {
     /// `world_id` for an id from the world model, else `string`.
     #[serde(default, rename = "type")]
     pub kind: String,
+    /// How the executor checks the value: `id`, `phrase`, `station`, `number`, or empty for any
+    /// text. A `world_id` with `phrase` also takes plain words the world model searches for.
+    #[serde(default)]
+    pub format: String,
     /// For the model.
     #[serde(default)]
     pub description: String,
     /// Allowed values; empty means any.
     #[serde(default, rename = "enum")]
     pub choices: Vec<String>,
+    /// The robot narrowed `choices` to what it can do where it is, as the only names a simulated
+    /// detector knows: what an earlier step found may stand in for one.
+    #[serde(default)]
+    pub narrowed: bool,
     /// Filled in by the planner instead of the model, as `label(<arg>)`: the world model's label
     /// of the object another argument names.
     #[serde(default)]
@@ -149,10 +160,19 @@ impl Catalog {
     pub fn describe(&self) -> String {
         let mut out = Vec::new();
         if self.can_travel() {
-            out.push(format!(
+            let mut text = format!(
                 "- {GO_TO_PLACE}(place): walk to a named place, a room, or up to an object.\n    \
                  place: a place or room from list_places, or an object id from find_objects"
-            ));
+            );
+            for o in self.skill(GO_TO_TARGET).iter().flat_map(|s| &s.outputs) {
+                let _ = write!(
+                    text,
+                    "; or what an object is (red mug), for the nearest one, when a later step \
+                     takes its {}\n    hands on {} (to a room or an object): {}",
+                    o.name, o.name, o.description
+                );
+            }
+            out.push(text);
         }
         for (s, signature) in self.plan_facing().zip(
             self.signatures()
@@ -170,6 +190,9 @@ impl Catalog {
                     a.choices.join(" or ")
                 };
                 let _ = write!(text, "\n    {}: {what}", a.name);
+            }
+            for o in &s.outputs {
+                let _ = write!(text, "\n    hands on {}: {}", o.name, o.description);
             }
             out.push(text);
         }

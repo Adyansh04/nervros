@@ -58,6 +58,8 @@ pub enum Action {
     Prefill(String),
     /// Show the 3D view as it was at this time.
     ShowAt(SystemTime),
+    /// Pause the running mission, or with false let it go on.
+    Pause(bool),
 }
 
 /// One tool call, from its start to its end.
@@ -178,6 +180,8 @@ pub struct PlanCard {
     replaced: bool,
     /// Each tree node seen so far, by path, with its latest status, in the order they started.
     nodes: Vec<(String, String)>,
+    /// Paused, or waiting to pause once a pick or place ends.
+    paused: bool,
 }
 
 /// What a session's model calls cost, summed.
@@ -195,6 +199,8 @@ pub struct Spent {
 pub struct Chat {
     /// Items, oldest first.
     pub items: Vec<Item>,
+    /// The robot's executor can pause a mission, so a running plan offers it.
+    pub can_pause: bool,
     /// When the running turn started.
     pub turn: Option<Instant>,
     /// The model of the last reply.
@@ -325,6 +331,7 @@ impl Chat {
             | Event::MissionPreview { .. }
             | Event::MissionStarted { .. }
             | Event::MissionProgress { .. }
+            | Event::MissionPaused { .. }
             | Event::MissionFinished { .. } => self.apply_mission(event),
             // The viewer draws it; the tool's card already says what.
             Event::Plot { .. } => {}
@@ -525,6 +532,7 @@ impl Chat {
                 concerns: concerns.clone(),
                 replaced: false,
                 nodes: Vec::new(),
+                paused: false,
             })),
             Event::MissionPreview { hash, steps } => {
                 if let Some(p) = self.plan_mut(|p| p.hash == *hash) {
@@ -560,6 +568,11 @@ impl Chat {
                     }
                 }
             }
+            Event::MissionPaused { id, paused } => {
+                if let Some(p) = self.plan_mut(|p| p.mission.as_ref() == Some(id)) {
+                    p.paused = *paused;
+                }
+            }
             Event::MissionFinished {
                 id,
                 outcome,
@@ -569,6 +582,7 @@ impl Chat {
             } => {
                 if let Some(p) = self.plan_mut(|p| p.mission.as_ref() == Some(id)) {
                     p.finished = Some((*outcome, failed_step.clone(), reason.clone(), *elapsed_s));
+                    p.paused = false;
                 }
             }
             _ => {}
@@ -687,7 +701,7 @@ impl Chat {
                             error_card(ui, text, retry.as_deref(), actions);
                         }
                         Item::Report(text) => report(ui, text),
-                        Item::Plan(p) => plan_card(ui, p, actions),
+                        Item::Plan(p) => plan_card(ui, p, self.can_pause, actions),
                         Item::Unanswered(u, done) => unanswered_card(ui, u, done, actions),
                     }
                 })

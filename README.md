@@ -33,11 +33,15 @@ when it was last seen. "Point at the tray" and "Outline the desk" find what no d
 
 **Give it a task.** "Walk to the bedroom" or "Bring the mug to the tray": the agent plans with the
 robot's own skills, checks the plan against your words (left or right, how far, which hand) and
-waits for your approval. Each step is tracked live, and the report comes back checked against the
-world model and the camera.
+waits for your approval. A step can take what an earlier one found, so "find a red mug and pick it
+up" is one mission. Each step is tracked live, and the report comes back checked against the world
+model and the camera.
 
-**Stop it at once.** "Stop", the Stop button or Ctrl+Shift+S halts the robot without waiting on a
-model.
+**Stop or pause it at once.** "Stop", the Stop button or Ctrl+Shift+S halts the robot without
+waiting on a model; "pause" holds the mission where it is, and "resume" lets it go on.
+
+**Keep it out of places.** "Keep the robot out of the kitchen" adds a keep-out zone, drawn in red
+in the 3D view: plans and navigation goals into it are refused, and Nav2 plans around it.
 
 **Keep an eye on it.** "Tell me if the camera drops below 5 Hz", "plot the robot's speed", "every
 ten minutes, walk to the bedroom": watches, live plots and schedules run while you do other things.
@@ -104,6 +108,8 @@ OpenTelemetry spans for each turn, model call, tool call and mission.
   tree, and NervROS checks the plan against what you asked.
 - **Stop always works.** "Stop", the Stop button or Ctrl+Shift+S halts the robot without a
   model, and a mission whose window closed or hung stops by itself.
+- **Keep-out zones hold.** A plan or a navigation goal into a zone is refused before the robot
+  sees it, and removing a zone needs your approval.
 - **The robot's data stays data.** What the cameras, topics and world model say reaches the
   model fenced as data, never as instructions, and hard deny lists keep every tool off motor and
   controller topics.
@@ -144,6 +150,9 @@ Without a window:
 cargo run -p nervros-cli -- --profile profiles/example/nervros.toml chat
 cargo run -p nervros-cli -- --profile profiles/example/nervros.toml doctor
 cargo run -p nervros-cli -- --profile profiles/example/nervros.toml eval suite.toml --repeat 3
+# A model against a scripted robot: no ROS graph, nothing moves.
+cargo run -p nervros-cli -- --profile scenarios/bench/nervros.toml eval scenarios/bench/suite.toml \
+  --robot scenarios/bench/robot.toml
 ```
 
 The core needs neither ROS nor the viewer: `cargo build` builds it, and

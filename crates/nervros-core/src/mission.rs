@@ -400,6 +400,31 @@ impl Missions {
         lock(&self.running).is_some()
     }
 
+    /// Pauses the running mission, or with `on` false lets it go on, through the executor's
+    /// `PauseMission`; what the executor answered goes to the session as a notice.
+    pub async fn pause(&self, on: bool, reason: &str) {
+        let text = match &self.config.pause {
+            None => "this robot's executor cannot pause a mission; stop it instead".to_owned(),
+            Some(service) => match self
+                .robot
+                .call(
+                    service,
+                    "nervros_interfaces/srv/PauseMission",
+                    json!({"pause": on, "reason": reason}),
+                    SERVICE_TIMEOUT,
+                )
+                .await
+            {
+                Ok(r) => r["message"].as_str().unwrap_or_default().to_owned(),
+                Err(e) => format!(
+                    "the robot did not answer the {}: {e}",
+                    if on { "pause" } else { "resume" }
+                ),
+            },
+        };
+        self.emit(Event::Notice { text });
+    }
+
     /// What the operator said last.
     pub(crate) fn request(&self) -> String {
         lock(&self.request).clone()

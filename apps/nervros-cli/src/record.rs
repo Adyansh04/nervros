@@ -386,6 +386,12 @@ async fn executor(robot: &Arc<dyn RobotPort>, profile: &Profile) -> (Value, Valu
             json!({"ok": true, "message": "", "steps": []}),
         );
     }
+    if let Some(pause) = &m.pause {
+        services.insert(
+            pause.clone(),
+            json!({"ok": false, "message": "no mission is running"}),
+        );
+    }
     if let Some(teleop) = &m.teleop {
         services.insert(teleop.clone(), json!({"ok": true, "message": ""}));
     }

@@ -10,5 +10,6 @@ grove-g1's `g1_orchestration`.
 | `ValidateMission` | service | Load and check a tree exactly as `ExecuteMission` would, without running it |
 | `GetCatalog` | service | The robot's skills, with args, requires, effects, resources, risk and durations, plus BehaviorTree.CPP's node model |
 | `StopAll` | service | Halt the mission, cancel outstanding goals, wait for them, hold posture. A hand that holds an object keeps its grip |
-| `RobotState` | message | What the robot holds and does: mission, step, resources held, object in each hand |
+| `PauseMission` | service | Pause the running mission (the base stops, the arms hold, the hands keep their grip; a pick or place finishes first) or resume it, re-running the halted step |
+| `RobotState` | message | What the robot holds and does: mission, step, whether it is paused, resources held, object in each hand |
 | `NodeEvent` | message | One behaviour-tree node's status change |

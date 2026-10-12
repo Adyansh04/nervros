@@ -25,10 +25,15 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
         } else {
             node_look(&status)
         };
+        // The plan's own id names the step later steps take what it found from.
+        let named = s
+            .name
+            .as_ref()
+            .map_or_else(|| s.summary.clone(), |n| format!("{n}: {}", s.summary));
         let text = if status == "running" && !node.is_empty() {
-            format!("{} · {node}", s.summary)
+            format!("{named} · {node}")
         } else {
-            s.summary.clone()
+            named
         };
         let preview_note = p
             .preview
@@ -148,7 +153,7 @@ pub(super) fn minutes(seconds: f64) -> String {
 }
 
 /// A plan and its mission: steps with live state, and one action while it runs.
-pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
+pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut Vec<Action>) {
     let colour = match &p.finished {
         Some((Outcome::Success, ..)) => theme::SUCCESS,
         Some(_) => theme::ERROR,
@@ -189,11 +194,12 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
                 }
                 (None, Some(since)) => {
                     ui.ctx().request_repaint_after(Duration::from_secs(1));
-                    RichText::new(format!(
-                        "Running {}",
-                        minutes(since.elapsed().as_secs_f64())
-                    ))
-                    .color(theme::INFO)
+                    let elapsed = minutes(since.elapsed().as_secs_f64());
+                    if p.paused {
+                        RichText::new(format!("Paused · started {elapsed} ago")).color(theme::WARN)
+                    } else {
+                        RichText::new(format!("Running {elapsed}")).color(theme::INFO)
+                    }
                 }
                 (None, None) if p.replaced => {
                     RichText::new("Replaced by an edited plan").color(theme::FAINT)
@@ -209,6 +215,10 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, actions: &mut Vec<Action>) {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.add(ReButton::new("Stop").small().secondary()).clicked() {
                         actions.push(Action::Send(Command::StopMission));
+                    }
+                    let label = if p.paused { "Resume" } else { "Pause" };
+                    if can_pause && ui.add(ReButton::new(label).small().secondary()).clicked() {
+                        actions.push(Action::Pause(!p.paused));
                     }
                 });
             }

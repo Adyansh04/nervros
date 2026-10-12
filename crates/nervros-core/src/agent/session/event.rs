@@ -314,6 +314,13 @@ pub enum Event {
         /// Since the mission started.
         elapsed_s: f64,
     },
+    /// A mission was paused, or went on again.
+    MissionPaused {
+        /// Mission id.
+        id: String,
+        /// Paused now, or waiting to pause once a pick or a place ends; false once resumed.
+        paused: bool,
+    },
     /// A mission ended.
     MissionFinished {
         /// Mission id.
@@ -338,6 +345,27 @@ impl From<&crate::tools::ImageArtifact> for Event {
             height: image.height,
             marks: image.marks.clone(),
         }
+    }
+}
+
+/// Whether the operator's message is a plain order to pause the running mission (`Some(true)`)
+/// or to carry on with it (`Some(false)`), which never waits on a model: "pause", "wait", "hold
+/// on"; "resume", "continue", "carry on", "go on". Only while a mission runs: otherwise these are
+/// words for the model.
+#[must_use]
+pub fn pause_word(text: &str) -> Option<bool> {
+    let text = text
+        .trim()
+        .trim_end_matches(['!', '.'])
+        .trim()
+        .to_lowercase();
+    let text = text.strip_prefix("please ").unwrap_or(&text);
+    match text {
+        "pause" | "/pause" | "wait" | "hold on" | "pause the mission" => Some(true),
+        "resume" | "/resume" | "continue" | "carry on" | "go on" | "resume the mission" => {
+            Some(false)
+        }
+        _ => None,
     }
 }
 

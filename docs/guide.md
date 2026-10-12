@@ -183,6 +183,34 @@ Esc stops only the reply;
 mug keeps it. While a mission runs, the window sends the executor a heartbeat, so a mission
 whose window closed or hung stops by itself.
 
+### Pausing
+
+> **You:** Pause.
+>
+> **You:** Resume.
+
+While a mission runs, a plain "pause" (or "wait", "hold on") pauses it without asking a model: the
+robot stops where it is, the arms hold and the hands keep their grip, and a pick or a place
+finishes first. "resume" (or "continue", "carry on", "go on") goes on: a walk to a place sets out
+again, and a straight walk or a turn does only what was left of it. The window's **Pause** button
+and the plan card's do the same, and a pause of more than ten minutes ends the mission. With no
+mission running, these words go to the model as any others.
+
+### One step's answer in the next
+
+Some skills hand on what they find: `FindInView` the name the detector reports an object under,
+and a walk to what an object is, among several, the id of the one it walked to (the nearest). The
+model gives that step an id and takes its answer in a later step:
+
+```json
+{"steps": [
+  {"id": "look", "skill": "FindInView", "args": {"phrase": "red mug"}},
+  {"skill": "PickObject", "args": {"object_id": "{look.object_id}", "arm": "right"}}]}
+```
+
+The plan is checked before it runs: the id must be an earlier step's, the answer one that step
+gives, and of a kind the argument takes. The plan card shows the id before its step.
+
 ### Doing it again
 
 - "Save that as the evening check" keeps a plan that worked; "Run the evening check" runs it
@@ -400,7 +428,7 @@ as a test** turns the session into an eval case.
 `nervros-cli` runs the same agent without a window, from the same profile:
 
 ```bash
-nervros-cli --profile my.toml chat                     # /arm, /yes N, /no N, /stop, /compact, /quit
+nervros-cli --profile my.toml chat                     # /arm, /yes N, /no N, /stop, /pause, /resume, /compact, /quit
 nervros-cli --profile my.toml chat --resume last
 nervros-cli --profile my.toml ask "What can you see?" --image frame.jpg
 ```

@@ -200,6 +200,12 @@ fn print_mission(e: &Event) {
             }
         }
         Event::MissionStarted { id, .. } => println!("  [mission {id} started]"),
+        Event::MissionPaused { id, paused } => {
+            println!(
+                "  [mission {id} {}]",
+                if *paused { "paused" } else { "resumed" }
+            );
+        }
         Event::MissionProgress {
             step, node, status, ..
         } => {
@@ -288,6 +294,7 @@ fn print_event(e: &Event, logs: &Path) {
         | Event::MissionPreview { .. }
         | Event::MissionStarted { .. }
         | Event::MissionProgress { .. }
+        | Event::MissionPaused { .. }
         | Event::MissionFinished { .. } => print_mission(e),
         // Plots are drawn by the app's viewer; the tool's reply already says what it plots.
         Event::User { .. }
@@ -472,6 +479,14 @@ async fn interactive(
                 tool: u.tool.clone(),
                 args: u.args.clone(),
             });
+            continue;
+        }
+        // Pause words act only on a running mission; otherwise they are words for the model.
+        if let (Some(on), Some(missions)) = (
+            nervros_core::session::pause_word(&line),
+            agent.missions.as_ref().filter(|m| m.busy()),
+        ) {
+            missions.pause(on, "chat").await;
             continue;
         }
         if let Some(cmd) = parse_line(&line) {

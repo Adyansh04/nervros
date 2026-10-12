@@ -268,9 +268,16 @@ impl Missions {
         alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         alive.tick().await;
         let mut unheard = 0;
+        let mut paused = false;
         let result = loop {
             tokio::select! {
-                Some(fb) = feedback.recv() => self.progress(id, &fb, times),
+                Some(fb) = feedback.recv() => {
+                    self.progress(id, &fb, times);
+                    if fb["paused"].as_bool().unwrap_or(false) != paused {
+                        paused = !paused;
+                        self.emit(Event::MissionPaused { id: id.to_owned(), paused });
+                    }
+                }
                 r = &mut result => {
                     break r
                         .map_err(|_| RosError::Middleware("the goal was dropped".into()))

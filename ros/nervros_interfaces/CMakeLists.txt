@@ -14,6 +14,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RobotState.msg"
   "msg/StepPreview.msg"
   "srv/GetCatalog.srv"
+  "srv/PauseMission.srv"
   "srv/PreviewMission.srv"
   "srv/StopAll.srv"
   "srv/Teleop.srv"
