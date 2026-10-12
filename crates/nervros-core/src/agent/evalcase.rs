@@ -80,6 +80,9 @@ pub struct Expect {
     /// The last reply holds one of these, case aside.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_has: Vec<String>,
+    /// The last reply holds every one of these, case aside.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reply_has_all: Vec<String>,
     /// The last reply holds none of these, case aside.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_lacks: Vec<String>,
@@ -336,6 +339,15 @@ fn judge_reply(expect: &Expect, seen: &Seen, problems: &mut Vec<String>) {
     {
         problems.push(format!("the reply has none of {:?}", expect.reply_has));
     }
+    let missing: Vec<&str> = expect
+        .reply_has_all
+        .iter()
+        .filter(|w| !last.contains(&w.to_lowercase()))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        problems.push(format!("the reply lacks {missing:?}"));
+    }
     // Offering a follow-up is fine; asking leave for a plan the approval card asks about is not.
     let planned = !seen.skills.is_empty() || !seen.missions.is_empty();
     let asks = ASKS_FIRST.iter().copied().filter(|_| planned);
@@ -521,6 +533,22 @@ mod tests {
                 && problems.contains("moved m 0.00")
                 && problems.contains("2 approvals"),
             "{problems}"
+        );
+    }
+
+    #[test]
+    fn a_reply_wanting_every_word_names_the_ones_it_lacks() {
+        let expect: Expect =
+            toml::from_str("reply_has_all = [\"amcl\", \"controller_server\"]\n").unwrap();
+        let mut seen = Seen {
+            replies: vec!["Running: /amcl and /controller_server.".into()],
+            ..Seen::default()
+        };
+        assert!(judge(&expect, &seen).is_empty());
+        seen.replies = vec!["Only /nav2_container (AMCL inside).".into()];
+        assert_eq!(
+            judge(&expect, &seen),
+            ["the reply lacks [\"controller_server\"]"]
         );
     }
 
