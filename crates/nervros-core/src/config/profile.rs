@@ -679,12 +679,14 @@ impl Profile {
                     name: z.name.clone(),
                 });
             }
-            if z.polygon.len() < 3 || z.polygon.iter().flatten().any(|v| !v.is_finite()) {
-                return Err(ProfileError::Invalid(format!(
-                    "[[geofence.zone]] `{}`: a zone needs at least three [x, y] corners",
-                    z.name
-                )));
-            }
+            let zone = crate::zones::Zone {
+                name: z.name.clone(),
+                polygon: z.polygon.clone(),
+                fixed: true,
+            };
+            zone.check().map_err(|why| {
+                ProfileError::Invalid(format!("[[geofence.zone]] `{}`: {why}", z.name))
+            })?;
         }
         if self.geofence.mask.is_some() && self.world.as_ref().is_none_or(|w| w.map.is_none()) {
             return Err(ProfileError::Invalid(

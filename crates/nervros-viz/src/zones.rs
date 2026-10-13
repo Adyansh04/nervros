@@ -52,7 +52,11 @@ fn draw_zones(rec: &RecordingStream, path: &str, zones: &[Zone], drawn: &mut BTr
     for zone in zones {
         let mut outline: Vec<[f32; 3]> = zone.polygon.iter().copied().map(on_floor).collect();
         outline.extend(outline.first().copied());
-        let entity = format!("{path}/{}", layers::slug(&zone.name));
+        // Names that differ only in what a slug drops would share an entity, and one go undrawn.
+        let mut entity = format!("{path}/{}", layers::slug(&zone.name));
+        while now.contains(&entity) {
+            entity.push('_');
+        }
         put_static(
             rec,
             &entity,

@@ -86,6 +86,12 @@ impl ActionGoal {
         }
         let goal = payload(args, "goal");
         if !Self::cancelling(args) {
+            if ty == "nervros_interfaces/action/ExecuteMission" {
+                return Err(ToolOutcome::refused(
+                    "a mission goes through run_mission, which checks it against the keep-out \
+                     zones and asks the operator",
+                ));
+            }
             self.ctx
                 .schemas
                 .validate(&ty, SchemaPart::Goal, &goal)

@@ -388,6 +388,12 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether the model's call with these arguments goes to the operator in every autonomy and
+    /// is never allowed for the session: one that widens where the robot may go.
+    fn always_asks(&self, _args: &Value) -> bool {
+        false
+    }
+
     /// Waits until the spec is complete, as a mission tool's skill list once the robot has
     /// answered; the session asks before each turn. Most specs are complete from the start.
     async fn ready(&self) {}

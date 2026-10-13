@@ -100,6 +100,21 @@ pub async fn run(profile: &Profile, robot: &dyn RobotPort) -> Vec<Check> {
             report(ok, format!("mission {what} {name}"));
         }
     }
+    // Published for nothing, the mask would leave the zones to the agent's own checks.
+    if let Some(mask) = &profile.geofence.mask {
+        let read = robot
+            .endpoints(mask)
+            .await
+            .is_ok_and(|e| !e.subscribers.is_empty());
+        report(
+            read,
+            if read {
+                format!("keep-out mask {mask}: Nav2 reads it")
+            } else {
+                format!("keep-out mask {mask}: nothing reads it; is Nav2's keepout filter on?")
+            },
+        );
+    }
     out
 }
 
@@ -258,5 +273,46 @@ mod tests {
         let line = |w: &str| checks.iter().find(|c| c.what.contains(w)).unwrap().ok;
         assert!(!line("/cam"));
         assert!(line("/det"));
+    }
+
+    #[tokio::test]
+    async fn a_keep_out_mask_nothing_reads_fails_its_line() {
+        let profile = Profile::from_toml(
+            r#"
+            [robot]
+            name = "t"
+            [world]
+            map = { topic = "/map", type = "nav_msgs/msg/OccupancyGrid" }
+            [geofence]
+            mask = "/keepout_filter_mask"
+            [models]
+            file = "m.toml"
+            "#,
+            std::path::Path::new("nervros.toml"),
+        )
+        .unwrap();
+        let unread = run(&profile, &FakeRobot::new()).await;
+        assert!(
+            unread
+                .iter()
+                .any(|c| !c.ok && c.what.contains("nothing reads it"))
+        );
+        let filter = nervros_ros::Endpoint {
+            node: "/global_costmap/global_costmap".into(),
+            topic_type: "nav_msgs/msg/OccupancyGrid".into(),
+            ..nervros_ros::Endpoint::default()
+        };
+        let robot = FakeRobot::new().with_endpoints(
+            "/keepout_filter_mask",
+            nervros_ros::TopicEndpoints {
+                publishers: Vec::new(),
+                subscribers: vec![filter],
+            },
+        );
+        let read = run(&profile, &robot).await;
+        assert!(
+            read.iter()
+                .any(|c| c.ok && c.what.contains("Nav2 reads it"))
+        );
     }
 }

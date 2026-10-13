@@ -264,12 +264,12 @@ fn place_tools(
 fn zone_tools(
     profile: &Profile,
     robot: &Arc<dyn RobotPort>,
-    ledger: &Path,
+    file: Option<PathBuf>,
     places: &Arc<crate::places::Places>,
     guard: &Arc<Guard>,
     registry: &mut Registry,
 ) -> Result<Arc<crate::zones::Zones>, StartError> {
-    let zones = crate::zones::Zones::new(profile, robot_file(profile, ledger, "zones"));
+    let zones = crate::zones::Zones::new(profile, file);
     guard.set_zones(Arc::clone(&zones));
     registry.add(Arc::new(crate::zones::GeofenceTool::new(
         profile,
@@ -277,7 +277,7 @@ fn zone_tools(
         Arc::clone(places),
         Arc::clone(robot),
     )))?;
-    crate::zones::spawn_mask(profile, Arc::clone(robot), Arc::clone(&zones));
+    crate::zones::spawn_mask(profile, Arc::clone(robot), &zones);
     Ok(zones)
 }
 
@@ -342,6 +342,9 @@ pub struct StartOptions {
     /// What the session talks to in place of `models.toml`'s models, such as a scripted model
     /// for a scenario; the profile's other roles (plan checks, vision) keep theirs.
     pub source: Option<Arc<dyn crate::llm::AgentSource>>,
+    /// Where the operator's keep-out zones are kept in place of the robot's own file: an eval's,
+    /// so its cases neither find the operator's zones nor leave theirs behind.
+    pub zones: Option<PathBuf>,
 }
 
 /// A session for the window or the terminal: its conversation saved after every turn and its
@@ -569,7 +572,10 @@ pub fn start_with(
     let snapshots = Arc::new(SnapshotStore::default());
     let seeing = seeing_tools(&profile, &robot, &llm, &snapshots, &mut registry)?;
     let places = place_tools(&profile, &robot, ledger, &mut registry)?;
-    let zones = zone_tools(&profile, &robot, ledger, &places, &guard, &mut registry)?;
+    let zones_file = options
+        .zones
+        .or_else(|| robot_file(&profile, ledger, "zones"));
+    let zones = zone_tools(&profile, &robot, zones_file, &places, &guard, &mut registry)?;
     registry.add(Arc::new(RobotState::new(
         &profile,
         Arc::clone(&robot),

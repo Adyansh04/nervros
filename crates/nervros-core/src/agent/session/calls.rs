@@ -163,6 +163,7 @@ impl Shared {
         args: &Value,
         caller: Caller,
         rule: Option<crate::guard::ArgRule>,
+        always_asks: bool,
     ) -> Decision {
         if let Some(r) = rule.as_ref().filter(|r| r.then == RuleAction::Deny) {
             return Decision::Deny(Refusal::new("rule", r.reason.clone()));
@@ -171,11 +172,16 @@ impl Shared {
             Caller::Model => self.guard.decide(spec, args),
             Caller::Operator => self.guard.decide_operator(spec),
         };
+        let always_asks = always_asks && caller == Caller::Model;
         let decision = match (decision, rule) {
             (Decision::Allow, Some(r)) => Decision::NeedApproval { reason: r.reason },
-            // Allowed for the session, unless this call moves the robot.
+            (Decision::Allow, None) if always_asks => Decision::NeedApproval {
+                reason: format!("`{}` asks the operator first", spec.name),
+            },
+            // Allowed for the session, unless this call moves the robot or always asks.
             (Decision::NeedApproval { .. }, None)
                 if caller == Caller::Model
+                    && !always_asks
                     && !matches!(spec.risk, Risk::Motion | Risk::Manipulation)
                     && lock(&self.allowed).contains(&spec.name) =>
             {
@@ -262,7 +268,7 @@ impl Shared {
                 self.guard.note_stop();
                 tool.call(args).await
             }
-            None => match self.decide(&spec, &args, caller, rule) {
+            None => match self.decide(&spec, &args, caller, rule, tool.always_asks(&args)) {
                 Decision::Deny(r) => ToolOutcome::refused(r.message),
                 Decision::NeedApproval { reason } => {
                     // What the call does, and why the profile asks when it does.

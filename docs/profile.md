@@ -123,9 +123,9 @@ relative name in a `[[tool]]` is checked as the node resolves it, under `/`. The
 `geometry_msgs/msg/Twist`, `geometry_msgs/msg/TwistStamped`, `trajectory_msgs/msg/*`,
 `control_msgs/action/*`, `control_msgs/msg/JointJog`, `controller_manager_msgs/srv/*`,
 `lifecycle_msgs/srv/ChangeState` and `rcl_interfaces/srv/SetParameters*` (only `param_set` sets
-parameters); a type written `pkg/Name` is checked as every kind it could be. A name from the
-model must be absolute: `cmd_vel` would otherwise reach `/cmd_vel` past a list written for
-absolute names.
+parameters); a type written `pkg/Name` is checked as every kind it could be. A name the model
+gives an act must be absolute: `cmd_vel` would otherwise reach `/cmd_vel` past a list written for
+absolute names. The read tools take `odom` as `/odom`, and the rules see it so.
 
 ### `[ros_tools]`
 
@@ -352,7 +352,8 @@ Keep-out zones: polygons on the map the robot may not be sent into. The profile'
 the operator adds more in chat with `geofence` ("keep the robot out of the kitchen", "keep it a
 metre from the vase"), around a room, an object, a place or corners on the map, kept per robot in
 the state directory beside the remembered places. Adding a zone only narrows where the robot goes,
-so it is free; removing one asks for approval, and only an edit of this file removes the profile's.
+so it is free; removing one always asks the operator, in every autonomy and never allowed for the
+session, and only an edit of this file removes the profile's.
 
 ```toml
 [geofence]
@@ -364,9 +365,14 @@ polygon = [[4.0, 0.0], [5.0, 0.0], [5.0, 2.5], [4.0, 2.5]]   # map frame, metres
 ```
 
 The guard refuses a Nav2 goal inside a zone (`NavigateToPose`, `NavigateThroughPoses`,
-`FollowWaypoints` and the path planners' actions), and the plan check a mission whose walk to a
-place, pose or target ends in one, or whose straight walk passes through one, followed from where
-the robot stands. Nav2 keeps its own paths out through `mask`: NervROS publishes an
+`FollowWaypoints`, `FollowPath` and the path planners' actions) and a `PoseStamped` published
+inside one, a pose in another frame taken through TF and refused when TF cannot place it; while
+zones are set it refuses Nav2's straight moves (`DriveOnHeading`, `BackUp`), which only a mission
+step checks, and `action_goal` never starts a mission past `run_mission`. The plan check refuses a
+mission whose walk to a place, pose or target ends in one (for a label several objects share, any
+of them), or whose straight walk passes through one, followed from where the robot stands; a walk
+out of a zone the robot stands in is allowed. A plan run later, by its hash or a schedule, is
+checked again as it starts. Nav2 keeps its own paths out through `mask`: NervROS publishes an
 `OccupancyGrid` the size of `[world] map`, the zones' cells at 100 and latched (transient local),
 for Nav2's `KeepoutFilter` behind a `costmap_filter_info_server`. The viewer draws the zones in
 red, the World tab lists them, and its buttons add and remove them through the agent.
@@ -427,7 +433,7 @@ The rest are the checks you would run yourself before blaming the model:
 | `point` | With a `segment` model in the models file: points at what the operator names in the frame a camera's detector marks, found as `look` finds it, or the newest frame when there are no marks, including things no detector marks, and says which mark a point lands on. |
 | `skill` | With `skills`: reads one skill's procedure. |
 | `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each asks for approval when supervised, like a world edit. |
-| `geofence` | Lists, adds and removes keep-out zones (see `[geofence]`): around a room, an object (its size and a margin), a place, or corners on the map. Adding is free, and refused while the robot stands inside the new zone; removing asks for approval. |
+| `geofence` | Lists, adds and removes keep-out zones (see `[geofence]`): around a room, an object (its size and a margin), a place, or corners on the map. Adding is free, and refused while the robot stands inside the new zone or when a type names several rooms; removing always asks the operator. |
 
 `look` can also answer about an earlier snapshot, and look closer at one mark: it crops the mark
 from the full frame at a higher resolution for the vision model, for a label or a small part.

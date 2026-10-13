@@ -1,5 +1,6 @@
-//! `nervros-cli eval`: runs a suite of requests against the live robot, each in a fresh session,
-//! approving every request, and checks what the agent did against what each case expects.
+//! `nervros-cli eval`: runs a suite of requests against the live robot, or a scripted one, each in
+//! a fresh session, approving every request, and checks what the agent did against what each case
+//! expects.
 //!
 //! Each case runs `repeat` times on each model asked for, the models taking turns so a change in
 //! the world falls on all of them alike. The report gives pass^k, what the calls cost, and where
@@ -93,7 +94,7 @@ pub(crate) async fn run(
         anyhow::bail!("models.toml has no model {m}");
     }
     let robot = robot_for(&profile, &options.robot).await?;
-    std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
+    prepare(out)?;
     let ledger = nervros_core::app::state_dir().join("quota.json");
     let arms: Vec<Option<&str>> = if options.models.is_empty() {
         vec![None]
@@ -303,6 +304,18 @@ fn pose(robot: &Arc<dyn RobotPort>, profile: &Profile) -> Option<(f64, f64, f64)
 }
 
 /// What every trial shares.
+/// Makes `out`, and empties the zones a run there kept before. Each model and trial keeps its
+/// own: a case that adds one is followed by the case that removes it, and neither touches the
+/// operator's.
+fn prepare(out: &Path) -> Result<()> {
+    std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
+    let zones = out.join("zones");
+    if zones.exists() {
+        std::fs::remove_dir_all(&zones).with_context(|| format!("clearing {}", zones.display()))?;
+    }
+    Ok(())
+}
+
 struct Run<'a> {
     profile_path: &'a Path,
     profile: &'a Profile,
@@ -332,8 +345,10 @@ fn travel(a: (f64, f64, f64), b: (f64, f64, f64)) -> (f64, f64) {
 }
 
 async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize) -> Result<Seen> {
+    let lane = format!("{}-{trial}", model.unwrap_or("chain"));
     let options = nervros_core::app::StartOptions {
         model: model.map(str::to_owned),
+        zones: Some(run.out.join("zones").join(format!("{lane}.json"))),
         ..Default::default()
     };
     let agent =

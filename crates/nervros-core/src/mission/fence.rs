@@ -18,6 +18,15 @@ fn number(step: &PlannedStep, name: &str) -> Option<f64> {
     arg(&step.args, name)?.parse().ok()
 }
 
+/// What a walk to a place or a target heads for: a place's name, an id, or a label.
+fn target(step: &PlannedStep) -> Option<String> {
+    if step.skill == GO_TO_TARGET {
+        arg(&step.args, "target").map(str::to_owned)
+    } else {
+        step.target.clone()
+    }
+}
+
 /// Where a walk to a place, a pose or a target leaves the robot.
 fn destination(step: &PlannedStep, world: &World) -> Option<Pose> {
     if step.skill == GO_TO_POSE {
@@ -31,11 +40,7 @@ fn destination(step: &PlannedStep, world: &World) -> Option<Pose> {
             _ => None,
         };
     }
-    let target = if step.skill == GO_TO_TARGET {
-        arg(&step.args, "target")?.to_owned()
-    } else {
-        step.target.clone()?
-    };
+    let target = target(step)?;
     if let Some(p) = world.places.iter().find(|p| p.name == target) {
         return Some((p.pose.x, p.pose.y, Some(p.pose.yaw)));
     }
@@ -75,6 +80,27 @@ pub(crate) fn check(
                     ),
                 ));
             }
+            // A label several objects share: the walk ends at the nearest, known only as it runs.
+            let label = target(step).filter(|_| pose.is_none()).unwrap_or_default();
+            let inside = world
+                .objects
+                .iter()
+                .filter(|o| !label.is_empty() && o.name.eq_ignore_ascii_case(&label))
+                .find_map(|o| {
+                    let (x, y) = o.xy?;
+                    zones.at(x, y).map(|zone| (o, zone))
+                });
+            if let Some((object, zone)) = inside {
+                problems.push(Problem::new(
+                    &step.id,
+                    "",
+                    format!(
+                        "{} may end at {}, inside the keep-out zone `{}`: name one outside it by \
+                         its id, or ask the operator to remove the zone",
+                        step.summary, object.id, zone.name
+                    ),
+                ));
+            }
             continue;
         }
         if let Some(walk) = checks.walk.as_ref().filter(|w| w.skill == step.skill) {
@@ -84,15 +110,20 @@ pub(crate) fn check(
                     let along = if back { -metres } else { metres };
                     let end = (x + along * yaw.cos(), y + along * yaw.sin());
                     if let Some((zone, d)) = zones.crossed((x, y), end) {
-                        problems.push(Problem::new(
-                            &step.id,
-                            &walk.metres,
+                        let why = if zone.contains(x, y) && zone.contains(end.0, end.1) {
+                            format!(
+                                "{} stays inside the keep-out zone `{}`, where the robot stands: \
+                                 walk it out",
+                                step.summary, zone.name
+                            )
+                        } else {
                             format!(
                                 "{} would enter the keep-out zone `{}` after {d:.1} m: walk less, \
                                  or around it",
                                 step.summary, zone.name
-                            ),
-                        ));
+                            )
+                        };
+                        problems.push(Problem::new(&step.id, &walk.metres, why));
                     }
                     Some((end.0, end.1, Some(yaw)))
                 }
@@ -251,6 +282,58 @@ mod tests {
             None,
         )];
         assert!(check(&back, start, &world(), &catalog(), &checks(), &zones()).is_empty());
+    }
+
+    #[test]
+    fn a_walk_to_a_label_is_refused_when_any_object_it_names_is_in_a_zone() {
+        let mut world = world();
+        world.objects.push(Thing {
+            id: "O31".into(),
+            name: "Red mug".into(),
+            xy: Some((1.0, 1.0)),
+        });
+        let to_mugs = [step(
+            "s1",
+            "GoToPlace",
+            &[("place", "red mug")],
+            Some("red mug"),
+        )];
+        let problems = check(&to_mugs, None, &world, &catalog(), &checks(), &zones());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0]
+                .message
+                .contains("may end at O17, inside the keep-out zone `kitchen`"),
+            "{}",
+            problems[0].message
+        );
+        world.objects.remove(0);
+        assert!(check(&to_mugs, None, &world, &catalog(), &checks(), &zones()).is_empty());
+    }
+
+    #[test]
+    fn a_robot_standing_in_a_zone_may_walk_out_of_it() {
+        let inside = Some((2.5, 0.0, 0.0));
+        let out = [step(
+            "s1",
+            "WalkStraight",
+            &[("direction", "forward"), ("distance_m", "1.0")],
+            None,
+        )];
+        assert!(check(&out, inside, &world(), &catalog(), &checks(), &zones()).is_empty());
+        let stay = [step(
+            "s1",
+            "WalkStraight",
+            &[("direction", "forward"), ("distance_m", "0.2")],
+            None,
+        )];
+        let problems = check(&stay, inside, &world(), &catalog(), &checks(), &zones());
+        assert!(
+            problems[0]
+                .message
+                .contains("stays inside the keep-out zone `stairs`"),
+            "{problems:?}"
+        );
     }
 
     #[test]

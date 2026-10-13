@@ -72,6 +72,9 @@ impl TopicPublish {
             .schemas
             .validate(&ty, SchemaPart::Message, &message)
             .map_err(|why| ToolOutcome::failed(format!("the message does not fit {ty}: {why}")))?;
+        if let Some(refused) = self.ctx.zone_refusal(&ty, &message) {
+            return Err(refused);
+        }
         Ok(Prepared {
             name: topic,
             ty,

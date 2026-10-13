@@ -63,31 +63,38 @@ impl Zone {
         inside
     }
 
-    /// How far along a straight move from `from` to `to` it first enters this zone: 0 when
-    /// `from` is already inside, none when the move never enters.
+    /// How far along a straight move from `from` to `to` it first enters this zone, none when it
+    /// never does. A move that starts inside is the way out: it enters only where it comes back
+    /// in, or at 0 when it never leaves.
     #[must_use]
     pub fn entered(&self, from: (f64, f64), to: (f64, f64)) -> Option<f64> {
-        if self.contains(from.0, from.1) {
-            return Some(0.0);
-        }
         let (dx, dy) = (to.0 - from.0, to.1 - from.1);
         let corners = self.polygon.len();
-        let mut first: Option<f64> = None;
-        for i in 0..corners {
-            let ([x1, y1], [x2, y2]) = (self.polygon[i], self.polygon[(i + 1) % corners]);
-            let (ex, ey) = (x2 - x1, y2 - y1);
-            let denom = dx * ey - dy * ex;
-            if denom.abs() < f64::EPSILON {
-                continue;
-            }
-            // Where the move meets the edge, as shares of the move and of the edge.
-            let along = ((x1 - from.0) * ey - (y1 - from.1) * ex) / denom;
-            let on_edge = ((x1 - from.0) * dy - (y1 - from.1) * dx) / denom;
-            if (0.0..=1.0).contains(&along) && (0.0..=1.0).contains(&on_edge) {
-                first = Some(first.map_or(along, |f| f.min(along)));
-            }
+        let mut crossings: Vec<f64> = (0..corners)
+            .filter_map(|i| {
+                let ([x1, y1], [x2, y2]) = (self.polygon[i], self.polygon[(i + 1) % corners]);
+                let (ex, ey) = (x2 - x1, y2 - y1);
+                let denom = dx * ey - dy * ex;
+                if denom.abs() < f64::EPSILON {
+                    return None;
+                }
+                // Where the move meets the edge, as shares of the move and of the edge.
+                let along = ((x1 - from.0) * ey - (y1 - from.1) * ex) / denom;
+                let on_edge = ((x1 - from.0) * dy - (y1 - from.1) * dx) / denom;
+                ((0.0..=1.0).contains(&along) && (0.0..=1.0).contains(&on_edge)).then_some(along)
+            })
+            .collect();
+        crossings.sort_by(f64::total_cmp);
+        // Through a corner the move meets both its edges at once.
+        crossings.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        let length = dx.hypot(dy);
+        if self.contains(from.0, from.1) {
+            return match crossings.get(1) {
+                Some(back_in) => Some(back_in * length),
+                None => self.contains(to.0, to.1).then_some(0.0),
+            };
         }
-        first.map(|share| share * dx.hypot(dy))
+        crossings.first().map(|share| share * length)
     }
 
     /// Its area, by the shoelace formula.
@@ -103,7 +110,8 @@ impl Zone {
         twice.abs() / 2.0
     }
 
-    fn check(&self) -> Result<(), String> {
+    /// Why this is not a usable zone, if it is not; the profile's are held to it too.
+    pub(crate) fn check(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("a zone needs a name".to_owned());
         }
@@ -233,11 +241,14 @@ impl Zones {
             return Err(format!("there is already a zone called `{}`", zone.name));
         }
         let mut added = self.lock();
-        added.push(Zone {
+        let mut next = added.clone();
+        next.push(Zone {
             fixed: false,
             ..zone
         });
-        self.save(&added)?;
+        // Kept first: a zone that could not be kept is not in force either.
+        self.save(&next)?;
+        *added = next;
         drop(added);
         self.version.send_modify(|v| *v += 1);
         Ok(())
@@ -251,12 +262,14 @@ impl Zones {
     pub fn remove(&self, name: &str) -> Result<(), String> {
         self.removable(name)?;
         let mut added = self.lock();
-        let before = added.len();
-        added.retain(|z| !z.name.eq_ignore_ascii_case(name));
-        if added.len() == before {
+        let mut next = added.clone();
+        next.retain(|z| !z.name.eq_ignore_ascii_case(name));
+        if next.len() == added.len() {
             return Err(format!("there is no zone called `{name}`"));
         }
-        self.save(&added)?;
+        // Kept first: a removal that could not be kept leaves the zone in force.
+        self.save(&next)?;
+        *added = next;
         drop(added);
         self.version.send_modify(|v| *v += 1);
         Ok(())
@@ -296,8 +309,7 @@ impl Zones {
 
 /// The keep-out mask for Nav2's keepout filter: `map` (a `nav_msgs/msg/OccupancyGrid` as JSON)
 /// with every cell whose centre is in a zone occupied, and every other free.
-#[must_use]
-pub fn mask(map: &Value, zones: &[Zone]) -> Option<Value> {
+fn mask(map: &Value, zones: &[Zone]) -> Option<Value> {
     let info = &map["info"];
     let resolution = info["resolution"].as_f64().filter(|r| *r > 0.0)?;
     let width = usize::try_from(info["width"].as_u64()?).ok()?;
@@ -333,14 +345,17 @@ pub fn mask(map: &Value, zones: &[Zone]) -> Option<Value> {
 
 /// Publishes the keep-out mask on `topic`, latched, whenever the zones or the map change: Nav2's
 /// keepout filter reads it as one more layer of its costmaps. Starts with the map, and an empty
-/// mask is published too, so the filter never waits for one.
-pub fn spawn_mask(profile: &Profile, robot: Arc<dyn RobotPort>, zones: Arc<Zones>) {
+/// mask is published too, so the filter never waits for one. Ends with the session the zones are
+/// of.
+pub(crate) fn spawn_mask(profile: &Profile, robot: Arc<dyn RobotPort>, zones: &Arc<Zones>) {
     let (Some(topic), Some(map)) = (
         profile.geofence.mask.clone(),
         profile.world.as_ref().and_then(|w| w.map.clone()),
     ) else {
         return;
     };
+    let mut changes = zones.changes();
+    let zones = Arc::downgrade(zones);
     tokio::spawn(async move {
         let publisher = match robot
             .latched_publisher(&topic, "nav_msgs/msg/OccupancyGrid")
@@ -352,24 +367,33 @@ pub fn spawn_mask(profile: &Profile, robot: Arc<dyn RobotPort>, zones: Arc<Zones
                 return;
             }
         };
-        let mut changes = zones.changes();
-        // The map it was built on is kept, so a new map is never taken for it at the same address.
-        let mut sent_for: Option<(Arc<Value>, u64)> = None;
+        // The grid the last mask was laid on, and the zones' version: a map that only fills in,
+        // as one being mapped does every few seconds, needs no new mask.
+        let mut sent_for: Option<(Value, u64)> = None;
         loop {
             if let Ok(grid) = robot
                 .latest_shared(&map.topic, &map.msg_type, WORLD_WAIT)
                 .await
             {
                 let version = *changes.borrow_and_update();
-                let sent = sent_for
-                    .as_ref()
-                    .is_some_and(|(on, v)| Arc::ptr_eq(on, &grid) && *v == version);
-                if !sent {
-                    let (on, all) = (Arc::clone(&grid), zones.all());
-                    let built = tokio::task::spawn_blocking(move || mask(&on, &all)).await;
+                let info = &grid["info"];
+                let laid_on = json!([
+                    grid["header"]["frame_id"],
+                    info["resolution"],
+                    info["width"],
+                    info["height"],
+                    info["origin"]
+                ]);
+                if sent_for.as_ref() != Some(&(laid_on.clone(), version)) {
+                    let Some(zones) = zones.upgrade() else {
+                        return;
+                    };
+                    let all = zones.all();
+                    drop(zones);
+                    let built = tokio::task::spawn_blocking(move || mask(&grid, &all)).await;
                     if let Ok(Some(message)) = built {
                         publisher.send(message);
-                        sent_for = Some((grid, version));
+                        sent_for = Some((laid_on, version));
                     }
                 }
             }
@@ -444,15 +468,35 @@ impl GeofenceTool {
     async fn room(&self, room: &str) -> Result<(String, Vec<[f64; 2]>), String> {
         let topic = self.profile.world.as_ref().and_then(|w| w.rooms.as_ref());
         let rooms = self.latest(topic).await;
-        let found = rooms["rooms"].as_array().into_iter().flatten().find(|r| {
-            ["id", "name", "type"]
+        let rooms: Vec<&Value> = rooms["rooms"].as_array().into_iter().flatten().collect();
+        // By id, else name, else type; a type several rooms share must not fence only one.
+        let tier = ["id", "name", "type"].iter().find_map(|key| {
+            let hits: Vec<&Value> = rooms
                 .iter()
-                .any(|k| r[k].as_str().is_some_and(|v| v.eq_ignore_ascii_case(room)))
+                .copied()
+                .filter(|r| {
+                    r[key]
+                        .as_str()
+                        .is_some_and(|v| v.eq_ignore_ascii_case(room))
+                })
+                .collect();
+            (!hits.is_empty()).then_some(hits)
         });
-        let Some(found) = found else {
-            return Err(format!(
-                "the world model has no room `{room}`; list_places names them"
-            ));
+        let found = match tier.as_deref() {
+            Some([one]) => *one,
+            Some(many) => {
+                let ids: Vec<&str> = many.iter().filter_map(|r| r["id"].as_str()).collect();
+                return Err(format!(
+                    "`{room}` is {} rooms ({}): add each by its id, with a name of its own",
+                    many.len(),
+                    ids.join(", ")
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "the world model has no room `{room}`; list_places names them"
+                ));
+            }
         };
         let polygon = found["outline"]["points"]
             .as_array()
@@ -590,6 +634,10 @@ impl Tool for GeofenceTool {
         }))
     }
 
+    fn always_asks(&self, args: &Value) -> bool {
+        args["action"].as_str() == Some("remove")
+    }
+
     async fn call(&self, args: Value) -> ToolOutcome {
         match args["action"].as_str().unwrap_or("list") {
             "list" => {
@@ -668,11 +716,11 @@ mod tests {
         assert_eq!(box_.entered((0.0, 0.0), (1.5, 0.0)), None, "stops short");
         let d = box_.entered((0.0, 0.0), (5.0, 0.0)).unwrap();
         assert!((d - 2.0).abs() < 1e-9, "{d}");
-        assert_eq!(
-            box_.entered((2.5, 0.0), (5.0, 0.0)),
-            Some(0.0),
-            "starts inside"
-        );
+        assert_eq!(box_.entered((2.5, 0.0), (5.0, 0.0)), None, "walks out");
+        assert_eq!(box_.entered((2.5, 0.0), (2.8, 0.0)), Some(0.0), "stays in");
+        // Out of one arm of the L, across its notch, and back in through the other.
+        let back_in = l_shape().entered((0.5, 3.5), (3.5, 0.5)).unwrap();
+        assert!((back_in - 2.5 * 2_f64.sqrt()).abs() < 1e-9, "{back_in}");
     }
 
     #[test]
@@ -776,11 +824,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(assessed.risk, Risk::Annotate);
+        assert!(tool.always_asks(&json!({"action": "remove", "name": "kitchen"})));
         assert!(
             tool.assess(&json!({"action": "add", "room": "R2"}))
                 .await
                 .is_none()
         );
+        assert!(!tool.always_asks(&json!({"action": "add", "room": "R2"})));
+    }
+
+    #[tokio::test]
+    async fn a_type_several_rooms_share_is_refused_until_each_is_named() {
+        let square = |x: f64| json!([{"x": x, "y": 10.0}, {"x": x + 4.0, "y": 10.0}, {"x": x + 4.0, "y": 14.0}, {"x": x, "y": 14.0}]);
+        let robot = nervros_ros::fake::FakeRobot::new()
+            .with_topic(
+                "/rooms",
+                json!({"rooms": [
+                    {"id": "R3", "name": "room C", "type": "bedroom", "outline": {"points": square(0.0)}},
+                    {"id": "R4", "name": "room D", "type": "bedroom", "outline": {"points": square(5.0)}},
+                ]}),
+            )
+            .with_transform("map", "base_footprint", nervros_ros::Transform::IDENTITY);
+        let (tool, zones) = tool_on(robot);
+        let both = tool.call(json!({"action": "add", "room": "bedroom"})).await;
+        assert!(
+            both.message.contains("2 rooms (R3, R4)"),
+            "{}",
+            both.message
+        );
+        assert!(zones.all().is_empty());
+        let one = tool
+            .call(json!({"action": "add", "room": "R4", "name": "guest bedroom"}))
+            .await;
+        assert_eq!(one.data["added"], "guest bedroom", "{}", one.message);
     }
 
     #[test]
@@ -809,6 +885,20 @@ mod tests {
                 .is_err()
         );
         assert!(zones.remove("stairs").unwrap_err().contains("profile"));
+        // A change that cannot be kept is not made.
+        let unkept = Zones::new(
+            &profile,
+            Some(dir.path().join("missing").join("zones.json")),
+        );
+        std::fs::write(dir.path().join("missing"), b"a file, not a folder").unwrap();
+        let before = unkept.changes();
+        assert!(
+            unkept
+                .add(zone("hall", &[[5.0, 5.0], [6.0, 5.0], [6.0, 6.0]]))
+                .is_err()
+        );
+        assert_eq!(unkept.all().len(), 1);
+        assert!(!before.has_changed().unwrap());
         // A new session finds the operator's zone, and the profile's.
         let again = Zones::new(&profile, Some(file));
         let names: Vec<String> = again.all().into_iter().map(|z| z.name).collect();
