@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use super::{
     BULK_TYPES, Ctx, MAX_ECHO, MAX_SAMPLE, count, endpoint_json, failed, object, pick,
-    read_name_arg, seconds, spec, summarize,
+    read_name_arg, resolved_view, seconds, spec, summarize,
 };
 use crate::guard::glob_match;
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
@@ -79,6 +79,10 @@ fn rate_stats(arrivals: &[(Duration, usize)], window: Duration) -> Value {
 impl Tool for TopicSample {
     fn spec(&self) -> Cow<'_, ToolSpec> {
         Cow::Borrowed(&self.spec)
+    }
+
+    fn rule_view(&self, args: &Value) -> Option<Value> {
+        resolved_view(args, "topic")
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {

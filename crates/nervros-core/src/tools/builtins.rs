@@ -245,6 +245,9 @@ impl Tool for RobotState {
                     "holding_right": held_by(&state, "right"),
                     "resources_held": field("resources_held"),
                     "stopped": field("stopped"),
+                    // A pause is the operator's, made without the model: it reads it here.
+                    "paused": field("paused"),
+                    "note": field("message"),
                     "can_move": field("can_move"),
                     "cannot_move_reason": field("cannot_move_reason"),
                     "tilt_deg": field("tilt_deg"),

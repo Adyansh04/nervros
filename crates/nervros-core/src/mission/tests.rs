@@ -525,6 +525,28 @@ async fn a_robot_whose_executor_cannot_pause_says_so() {
 }
 
 #[tokio::test]
+async fn pause_words_are_orders_only_for_a_mission_that_can_take_them() {
+    let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
+    let cannot = Missions::new(
+        &profile(),
+        Places::new(&profile(), None),
+        Arc::clone(&robot),
+    )
+    .unwrap();
+    *lock(&cannot.running) = Some(Running { id: "m1".into() });
+    assert_eq!(cannot.pause_order("wait"), None, "no pause service");
+    let profile = profile_with(r#"pause = "/x/pause""#);
+    let can = Missions::new(&profile, Places::new(&profile, None), robot).unwrap();
+    assert_eq!(can.pause_order("pause"), None, "nothing runs");
+    *lock(&can.running) = Some(Running { id: "m1".into() });
+    assert_eq!(can.pause_order("Wait."), Some(true));
+    assert_eq!(can.pause_order("go on"), None, "not paused");
+    can.paused.store(true, Ordering::SeqCst);
+    assert_eq!(can.pause_order("go on"), Some(false));
+    assert_eq!(can.pause_order("pause"), None);
+}
+
+#[tokio::test]
 async fn a_walk_is_refused_while_the_robot_cannot_move_and_not_counted_as_the_models() {
     let robot = robot(ScriptedRun::default()).with_topic(
         "/x/state",
@@ -961,6 +983,35 @@ async fn the_same_plan_twice_runs_by_its_hash() {
     let second = missions.plan(steps(), By::Model).await.data["hash"].clone();
     assert_eq!(first, second);
     assert!(missions.find(first.as_str().unwrap()).is_ok());
+}
+
+#[tokio::test]
+async fn a_plan_checked_before_a_zone_was_added_is_refused_when_it_runs() {
+    let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
+    let guard = Arc::new(crate::guard::Guard::new(crate::guard::Policy::default()));
+    let zones = crate::zones::Zones::new(&profile(), None);
+    guard.set_zones(Arc::clone(&zones));
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot)
+        .unwrap()
+        .with_guard(guard);
+    let planned = missions.plan(steps(), By::Model).await;
+    let hash = planned.data["hash"].clone();
+    assert!(hash.is_string(), "{}", planned.message);
+    zones
+        .add(crate::zones::Zone {
+            name: "dock".into(),
+            polygon: vec![[0.5, 1.5], [1.5, 1.5], [1.5, 2.5], [0.5, 2.5]],
+            fixed: false,
+        })
+        .unwrap();
+    let ran = missions.run(&json!({"hash": hash})).await;
+    assert_eq!(ran.status, Status::Failed, "{}", ran.message);
+    assert!(
+        ran.message.contains("inside the keep-out zone `dock`"),
+        "{}",
+        ran.message
+    );
+    assert!(lock(&missions.running).is_none());
 }
 
 #[tokio::test]

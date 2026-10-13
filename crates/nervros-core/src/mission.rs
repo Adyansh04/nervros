@@ -202,6 +202,8 @@ pub struct Missions {
     /// Whether a plan for this request already went back for not matching the operator's words:
     /// once is a hint, twice would argue with a model that may be right.
     questioned: AtomicBool,
+    /// Whether the running mission is paused, as its feedback last said.
+    paused: AtomicBool,
 }
 
 impl crate::session::Pulse for Missions {
@@ -258,6 +260,7 @@ impl Missions {
             vision: OnceLock::new(),
             guard: OnceLock::new(),
             questioned: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
         }))
     }
 
@@ -398,6 +401,15 @@ impl Missions {
     #[must_use]
     pub fn busy(&self) -> bool {
         lock(&self.running).is_some()
+    }
+
+    /// The pause, or with false the resume, `text` orders when it applies now: the executor can
+    /// pause, a mission runs, and it is not so already. Otherwise the words are the model's.
+    #[must_use]
+    pub fn pause_order(&self, text: &str) -> Option<bool> {
+        let on = crate::session::pause_word(text)?;
+        (self.config.pause.is_some() && self.busy() && on != self.paused.load(Ordering::SeqCst))
+            .then_some(on)
     }
 
     /// Pauses the running mission, or with `on` false lets it go on, through the executor's

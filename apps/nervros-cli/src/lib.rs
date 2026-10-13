@@ -52,9 +52,10 @@ enum Command {
         image: Option<PathBuf>,
     },
     /// Chat with the robot. Lines starting with `/` are commands: `/arm`, `/disarm`, `/stop`,
-    /// `/yes N`, `/allow N` (yes, and no more asking for that tool this session unless it moves
-    /// the robot), `/no N`, `/again N` (a request the last session left waiting), `/compact`,
-    /// `/quit`; a plain `stop` (or `halt`, `freeze`, `stop!`) also stops the robot.
+    /// `/pause`, `/resume`, `/yes N`, `/allow N` (yes, and no more asking for that tool this
+    /// session unless it moves the robot), `/no N`, `/again N` (a request the last session left
+    /// waiting), `/compact`, `/quit`; a plain `stop` (or `halt`, `freeze`, `stop!`) also stops the
+    /// robot, and a plain `pause` or `resume` pauses or resumes a mission that can be.
     #[cfg(feature = "ros")]
     Chat {
         /// Send these messages in order and exit, instead of reading stdin.
@@ -70,8 +71,8 @@ enum Command {
         #[arg(long)]
         resume: Option<String>,
     },
-    /// Run a suite of requests against the live robot, each in a fresh session approving every
-    /// request, and report which cases did what they expect.
+    /// Run a suite of requests against the live robot, or with `--robot` a scripted one, each in
+    /// a fresh session approving every request, and report which cases did what they expect.
     #[cfg(feature = "ros")]
     Eval {
         /// The suite, a TOML file of `[[case]]`s.

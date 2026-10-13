@@ -94,7 +94,9 @@ pub fn reference(value: &str) -> Option<(&str, &str)> {
 /// Why an earlier step's output cannot be argument `arg`, as the executor judges it too.
 fn mismatch(arg: &Arg, out: &Arg) -> Option<String> {
     let name = &arg.name;
-    if !arg.choices.is_empty() && !arg.narrowed {
+    // Narrowed to the robot's own names, an argument takes what a step found on the robot, but
+    // not a world model's id.
+    if !arg.choices.is_empty() && (!arg.narrowed || out.kind == "world_id") {
         return Some(format!(
             "`{name}` takes only {}, not what a step hands on",
             arg.choices.join(", ")
@@ -497,6 +499,11 @@ pub struct PlannedStep {
     /// For a walk: the place's name, or the room's or object's id, that its `place` resolved to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// What its arguments may turn out to be when they are known only as it runs, for the
+    /// profile's rules: each object a walk to a label may reach, and what a step it takes an
+    /// output from went for.
+    #[serde(skip)]
+    pub may_take: Vec<StepArg>,
 }
 
 impl PlannedStep {
@@ -512,6 +519,11 @@ impl PlannedStep {
         if let Some(target) = &self.target {
             args.push(serde_json::json!({"name": "place", "value": target}));
         }
+        args.extend(
+            self.may_take
+                .iter()
+                .map(|a| serde_json::json!({"name": a.name, "value": a.value})),
+        );
         serde_json::json!({"skill": self.skill, "args": args})
     }
 }
@@ -628,6 +640,7 @@ pub fn compile(
                         );
                     }
                     let target = spot.as_ref().map(|s| s.id.clone());
+                    let may_take = may_take(step, spot.as_ref(), world, &steps);
                     if let Some(spot) = spot {
                         sim.at = Some(spot.id);
                         sim.xy = spot.xy;
@@ -653,6 +666,7 @@ pub fn compile(
                         added,
                         track: None,
                         target,
+                        may_take,
                     });
                 }
                 Err(mut p) => problems.append(&mut p),
@@ -679,6 +693,49 @@ pub fn compile(
         catalog_version: catalog.catalog_version.clone(),
         goal: sim.end_state(),
     })
+}
+
+/// What `step`'s arguments may turn out to be as it runs: each object a walk to a label may
+/// reach, and for an output taken from an earlier step, what that step went for.
+fn may_take(
+    step: &Step,
+    spot: Option<&Spot>,
+    world: &World,
+    before: &[PlannedStep],
+) -> Vec<StepArg> {
+    let mut out: Vec<StepArg> = spot
+        .filter(|s| s.xy.is_none())
+        .into_iter()
+        .flat_map(|s| {
+            world
+                .objects
+                .iter()
+                .filter(|o| o.name.eq_ignore_ascii_case(&s.id))
+        })
+        .map(|o| StepArg {
+            name: "place".into(),
+            value: o.id.clone(),
+        })
+        .collect();
+    for a in &step.args {
+        let Some((from, _)) = reference(&a.value) else {
+            continue;
+        };
+        let Some(by) = before.iter().find(|p| p.name.as_deref() == Some(from)) else {
+            continue;
+        };
+        let went_for = by
+            .may_take
+            .iter()
+            .map(|m| m.value.clone())
+            .chain(by.target.clone())
+            .chain(arg(&by.args, "phrase").map(str::to_owned));
+        out.extend(went_for.map(|value| StepArg {
+            name: a.name.clone(),
+            value,
+        }));
+    }
+    out
 }
 
 /// A step's `SubTree` element, its timeout in seconds, where a `GoToPlace` leaves the robot, and
@@ -825,6 +882,12 @@ fn taken_port(
             }
         )));
     };
+    if producer.step.optional {
+        return Err(problem(format!(
+            "{from} is optional, so it may hand on nothing: make it required, or take {out} \
+             from a step that must succeed"
+        )));
+    }
     if let Some(why) = mismatch(arg, output) {
         return Err(problem(why));
     }
@@ -950,12 +1013,14 @@ fn derive(rule: &str, step: &Step, world: &World, links: &Links<'_>) -> Option<S
     };
     let from = args.first()?;
     let id = arg(&step.args, from)?;
-    if let Some((producer, _)) = reference(id) {
-        let by = &links.produced.get(producer)?.step.args;
-        return arg(by, "phrase")
-            .or_else(|| arg(by, "place"))
-            .map(str::to_owned);
-    }
+    // Taken from an earlier step: what that step was sent for names it, an id as well as words.
+    let id = match reference(id) {
+        Some((producer, _)) => {
+            let by = &links.produced.get(producer)?.step.args;
+            arg(by, "phrase").or_else(|| arg(by, "place"))?
+        }
+        None => id,
+    };
     let label = world
         .objects
         .iter()
@@ -1223,6 +1288,11 @@ mod tests {
     /// The test catalog as the executor serves it now: `GoToTarget` takes words too and hands on
     /// what it walked to, and `FindInView` hands on what the detector found.
     fn catalog_with_outputs() -> Catalog {
+        Catalog::parse(&outputs_json().to_string()).unwrap()
+    }
+
+    /// [`catalog_with_outputs`] as JSON, for a test to change before it is parsed.
+    fn outputs_json() -> Value {
         let mut c: Value = serde_json::from_str(CATALOG).unwrap();
         let skills = c["skills"].as_array_mut().unwrap();
         for s in skills.iter_mut() {
@@ -1242,7 +1312,7 @@ mod tests {
             "outputs": [{"name": "object_id", "type": "string", "format": "id", "description": "the detector's name"}],
             "requires": [], "effects": [], "resources": [], "idempotent": true, "risk": "observe",
             "max_duration_s": 60, "template": "FindInView"}));
-        Catalog::parse(&c.to_string()).unwrap()
+        c
     }
 
     #[test]
@@ -1315,6 +1385,52 @@ mod tests {
             {"id": "look", "skill": "FindInView", "args": {"phrase": "basket"}}
         ]));
         assert!(twice.contains("two steps have the id `look`"), "{twice}");
+        let optional = problem(json!([
+            {"id": "look", "skill": "FindInView", "args": {"phrase": "red mug"}, "optional": true},
+            {"skill": "PickObject", "args": {"object_id": "{look.object_id}", "arm": "right"}}
+        ]));
+        assert!(optional.contains("look is optional"), "{optional}");
+    }
+
+    #[test]
+    fn a_walk_by_id_names_what_a_later_step_takes_from_it() {
+        let p = plan(&json!([
+            {"id": "walk", "skill": "GoToPlace", "args": {"place": "O17"}},
+            {"skill": "PickObject", "args": {"object_id": "{walk.target_id}", "arm": "right"}}
+        ]));
+        let c = compile(&p, &catalog_with_outputs(), &world(), Author::Model).unwrap();
+        assert!(
+            c.xml
+                .contains(r#"object_id="{s1_target_id}" phrase="red mug""#),
+            "{}",
+            c.xml
+        );
+    }
+
+    #[test]
+    fn a_narrowed_argument_takes_a_name_found_on_the_robot_but_not_a_world_id() {
+        let mut c = outputs_json();
+        for s in c["skills"].as_array_mut().unwrap() {
+            if s["name"] == "PickObject" {
+                s["args"][0]["enum"] = json!(["mug_4"]);
+                s["args"][0]["narrowed"] = json!(true);
+            }
+        }
+        let narrowed = Catalog::parse(&c.to_string()).unwrap();
+        let found = plan(&json!([
+            {"id": "look", "skill": "FindInView", "args": {"phrase": "mug"}},
+            {"skill": "PickObject", "args": {"object_id": "{look.object_id}", "arm": "right"}}
+        ]));
+        assert!(compile(&found, &narrowed, &world(), Author::Model).is_ok());
+        let walked = plan(&json!([
+            {"id": "walk", "skill": "GoToPlace", "args": {"place": "O17"}},
+            {"skill": "PickObject", "args": {"object_id": "{walk.target_id}", "arm": "right"}}
+        ]));
+        let problems = compile(&walked, &narrowed, &world(), Author::Model).unwrap_err();
+        assert!(
+            problems[0].message.contains("takes only mug_4"),
+            "{problems:?}"
+        );
     }
 
     #[test]
@@ -1339,6 +1455,11 @@ mod tests {
             "{}",
             c.xml
         );
+        // The profile's rules see each mug the walk may reach, there and where it is taken.
+        for step in &c.steps {
+            let rules = step.for_rules().to_string();
+            assert!(rules.contains("O17") && rules.contains("O18"), "{rules}");
+        }
         // With nothing taking which one, the plan has to say.
         let alone = plan(&json!([{"skill": "GoToPlace", "args": {"place": "red mug"}}]));
         assert!(compile(&alone, &catalog_with_outputs(), &w, Author::Model).is_err());

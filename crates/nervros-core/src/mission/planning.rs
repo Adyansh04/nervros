@@ -267,6 +267,20 @@ impl Missions {
         self.checked(compiled, worst, concerns)
     }
 
+    /// Why a plan checked earlier may not run now, if it may not: a zone added since, or a
+    /// straight walk that now starts somewhere else.
+    pub(super) async fn still_clear(&self, compiled: &Compiled) -> Result<(), String> {
+        if self.guard.get().and_then(|g| g.zones()).is_none() {
+            return Ok(());
+        }
+        let catalog = self.catalog().await?;
+        let world = self.world_of(&self.observe().await);
+        match self.fenced(compiled, &world, &catalog).first() {
+            Some(problem) => Err(problem.message.clone()),
+            None => Ok(()),
+        }
+    }
+
     /// The steps of a plan that would take the robot into a keep-out zone.
     fn fenced(&self, compiled: &Compiled, world: &World, catalog: &Catalog) -> Vec<Problem> {
         let Some(zones) = self.guard.get().and_then(|g| g.zones()) else {

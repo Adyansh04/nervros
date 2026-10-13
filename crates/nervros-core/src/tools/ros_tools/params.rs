@@ -7,7 +7,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
-use super::{Ctx, PARAMS_MAX, failed, name_arg, object, read_name_arg, spec, summarize};
+use super::{
+    Ctx, PARAMS_MAX, failed, name_arg, object, read_name_arg, resolved_view, spec, summarize,
+};
 use crate::guard::glob_match;
 use crate::tools::{Assessment, Risk, Tool, ToolOutcome, ToolSpec};
 
@@ -259,6 +261,10 @@ impl Params {
 impl Tool for Params {
     fn spec(&self) -> Cow<'_, ToolSpec> {
         Cow::Borrowed(&self.spec)
+    }
+
+    fn rule_view(&self, args: &Value) -> Option<Value> {
+        resolved_view(args, "node")
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {

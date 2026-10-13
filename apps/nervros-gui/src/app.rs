@@ -527,8 +527,11 @@ impl Gui {
             self.agent.session.send(Command::StopMission);
             return;
         }
+        // Only on a mission that can take it: otherwise "wait" or "go on" is for the model.
         if let Some(on) = nervros_core::session::pause_word(text)
+            && self.chat.can_pause
             && self.mission_running()
+            && on != self.mission_paused()
         {
             self.pause(on, "chat");
             return;
@@ -748,10 +751,11 @@ impl eframe::App for Gui {
         }
         let (editor, viewing) = (self.editor.is_some(), self.viewing.is_some());
         let (running, paused) = (self.mission_running(), self.mission_paused());
+        let can_pause = self.chat.can_pause;
         let available = move |cmd: &Cmd| match cmd {
             Cmd::EditWorld => editor,
             Cmd::Live => viewing,
-            Cmd::Pause(on) => running && *on != paused,
+            Cmd::Pause(on) => can_pause && running && *on != paused,
             _ => true,
         };
         let mut provider = palette::Provider {

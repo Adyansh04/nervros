@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::{
     Ctx, LIST_LIMIT, actions, endpoint_json, failed, find_type, object, qos_matches, read_name,
-    spec,
+    resolved_view, spec,
 };
 use crate::guard::glob_match;
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
@@ -22,16 +22,17 @@ pub(super) fn tool(ctx: Arc<Ctx>) -> Arc<dyn Tool> {
             "ros_graph",
             "Look at the ROS graph, like ros2 topic/service/action/node list and info. Without \
              name: lists topics, services, actions or nodes, optionally filtered by a substring \
-             or glob of the name. A component container in a node list or node details also \
-             shows the nodes it hosts: Nav2 often runs as one, and its servers' names need not \
-             match the filter. With name: details of that topic (types, publishers, \
+             or glob of the name. A filter sees names only: a stack's nodes rarely share one \
+             (Nav2's are controller_server, planner_server, bt_navigator, amcl and the like), so \
+             list them unfiltered. A component container in a node list or node details also \
+             shows the nodes it hosts. With name: details of that topic (types, publishers, \
              subscribers, QoS and mismatches), node (what it publishes, subscribes to, serves, \
              calls), service (type, definition, reachable) or action (type, definition).",
             object(
                 json!({
                     "kind": {"type": "string", "enum": ["topics", "services", "actions", "nodes"]},
                     "filter": {"type": "string", "description": "Substring or glob such as /canopy/*"},
-                    "name": {"type": "string", "description": "An absolute name to describe"},
+                    "name": {"type": "string", "description": "A name to describe, such as /odom"},
                     "all": {"type": "boolean", "description": "Include hidden names such as parameter services"},
                 }),
                 &[],
@@ -216,6 +217,10 @@ impl RosGraph {
 impl Tool for RosGraph {
     fn spec(&self) -> Cow<'_, ToolSpec> {
         Cow::Borrowed(&self.spec)
+    }
+
+    fn rule_view(&self, args: &Value) -> Option<Value> {
+        resolved_view(args, "name")
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {

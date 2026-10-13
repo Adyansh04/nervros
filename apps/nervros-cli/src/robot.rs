@@ -481,12 +481,15 @@ async fn interactive(
             });
             continue;
         }
-        // Pause words act only on a running mission; otherwise they are words for the model.
-        if let (Some(on), Some(missions)) = (
-            nervros_core::session::pause_word(&line),
-            agent.missions.as_ref().filter(|m| m.busy()),
-        ) {
-            missions.pause(on, "chat").await;
+        // Pause words act only on a mission that can take them; otherwise they are the model's.
+        if let Some((missions, on)) = agent
+            .missions
+            .as_ref()
+            .and_then(|m| Some((m, m.pause_order(&line)?)))
+        {
+            // Off the loop, so a `stop` typed while the executor is slow to answer is read at once.
+            let missions = Arc::clone(missions);
+            tokio::spawn(async move { missions.pause(on, "chat").await });
             continue;
         }
         if let Some(cmd) = parse_line(&line) {

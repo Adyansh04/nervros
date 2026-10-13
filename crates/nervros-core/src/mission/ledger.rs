@@ -156,11 +156,20 @@ impl std::fmt::Debug for Ledger {
 /// whichever mission it was part of.
 #[must_use]
 pub fn target_of(args: &[StepArg]) -> String {
-    ["place", "object_id", "container_id", "target", "direction"]
-        .iter()
-        .find_map(|key| super::plan::arg(args, key))
-        .unwrap_or_default()
-        .to_owned()
+    // An output taken from an earlier step is known only as it runs; what it is called is not.
+    [
+        "place",
+        "object_id",
+        "container_id",
+        "target",
+        "direction",
+        "phrase",
+    ]
+    .iter()
+    .filter_map(|key| super::plan::arg(args, key))
+    .find(|value| super::plan::reference(value).is_none())
+    .unwrap_or_default()
+    .to_owned()
 }
 
 impl Ledger {

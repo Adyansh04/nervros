@@ -94,6 +94,14 @@ fn robot() -> FakeRobot {
             },
         )
         .with_rate("/odom", 50.0, 700)
+        .with_transform(
+            "map",
+            "odom",
+            nervros_ros::Transform {
+                translation: [1.0, 0.0, 0.0],
+                ..nervros_ros::Transform::IDENTITY
+            },
+        )
         .with_topic(
             "/status",
             json!({"data": "x".repeat(300), "list": (0..20).collect::<Vec<_>>()}),
@@ -389,6 +397,28 @@ async fn a_parameter_list_says_what_each_holds_and_narrows_by_filter() {
     assert_eq!(globbed.data["total"], 1, "{}", globbed.data);
 }
 
+#[test]
+fn the_profiles_rules_see_a_relative_name_as_the_read_resolves_it() {
+    let (_, tools, _) = all_tools(&RosToolsConfig::default(), false);
+    for (name, key) in [
+        ("topic_sample", "topic"),
+        ("params", "node"),
+        ("ros_graph", "name"),
+    ] {
+        let view = tool(&tools, name).rule_view(&json!({key: "camera/image", "mode": "echo"}));
+        assert_eq!(
+            view,
+            Some(json!({key: "/camera/image", "mode": "echo"})),
+            "{name}"
+        );
+        assert_eq!(
+            tool(&tools, name).rule_view(&json!({key: "/odom"})),
+            None,
+            "{name}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_nav2_goal_inside_a_keep_out_zone_is_refused() {
     let (fake, tools, guard) = all_tools(&open(), true);
@@ -408,6 +438,79 @@ async fn a_nav2_goal_inside_a_keep_out_zone_is_refused() {
     assert!(
         fake.calls().iter().all(|(n, _)| n != "/navigate_to_pose"),
         "never sent"
+    );
+    let at = |frame: &str, position: Value| json!({"header": {"frame_id": frame}, "pose": {"position": position}});
+    let send = |action: &str, ty: &str, goal: Value| json!({"action": action, "type": format!("nav2_msgs/action/{ty}"), "goal": goal});
+    let goals = [
+        // y left out goes as 0; odom sits 1 m along the map's x.
+        send(
+            "/compute_path_to_pose",
+            "ComputePathToPose",
+            json!({"goal": at("map", json!({"x": 2.5}))}),
+        ),
+        send(
+            "/navigate_to_pose",
+            "NavigateToPose",
+            json!({"pose": at("odom", json!({"x": 1.5, "y": 0.0}))}),
+        ),
+        send(
+            "/compute_path_through_poses",
+            "ComputePathThroughPoses",
+            json!({"goals": [at("map", json!({"x": 0.0})), at("map", json!({"x": 2.5}))]}),
+        ),
+        send(
+            "/follow_path",
+            "FollowPath",
+            json!({"path": {"poses": [at("map", json!({"x": 2.2}))]}}),
+        ),
+    ];
+    for goal in goals {
+        let out = tool(&tools, "action_goal").call(goal.clone()).await;
+        assert!(out.message.contains("`stairs`"), "{goal}: {}", out.message);
+    }
+    let unknown = tool(&tools, "action_goal")
+        .call(send(
+            "/navigate_to_pose",
+            "NavigateToPose",
+            json!({"pose": at("camera", json!({"x": 0.0}))}),
+        ))
+        .await;
+    assert!(
+        unknown.message.contains("cannot be checked"),
+        "{}",
+        unknown.message
+    );
+    let straight = tool(&tools, "action_goal")
+        .call(send(
+            "/drive_on_heading",
+            "DriveOnHeading",
+            json!({"target": {"x": 0.5}}),
+        ))
+        .await;
+    assert!(
+        straight.message.contains("run_mission"),
+        "{}",
+        straight.message
+    );
+    let mission = tool(&tools, "action_goal")
+        .call(json!({"action": "/x/execute_mission", "type": "nervros_interfaces/action/ExecuteMission",
+                     "goal": {"tree_xml": "<root/>"}}))
+        .await;
+    assert!(
+        mission.message.contains("run_mission"),
+        "{}",
+        mission.message
+    );
+    let published = tool(&tools, "topic_publish")
+        .call(
+            json!({"topic": "/goal_pose", "type": "geometry_msgs/msg/PoseStamped",
+                     "message": at("map", json!({"x": 2.5, "y": 0.5}))}),
+        )
+        .await;
+    assert!(
+        published.message.contains("`stairs`"),
+        "{}",
+        published.message
     );
 }
 
