@@ -189,7 +189,7 @@ whose window closed or hung stops by itself.
 
 ### Pausing
 
-<!-- video: 16-pause-resume.mp4 -->
+https://github.com/user-attachments/assets/d6e4dc59-a2c3-4b54-87cb-25c1abc4c190
 
 > **You:** Walk to the living room, room R1.
 >
@@ -209,7 +209,7 @@ while a mission runs and the profile names the executor's pause service (`pause`
 
 ### One step's answer in the next
 
-<!-- video: 17-find-and-pick.mp4 -->
+https://github.com/user-attachments/assets/9b4cfc4f-5355-43bb-a4c8-de9aff755d4a
 
 > **You:** Walk to the red mug, look for a mug there, and pick up the one you find with your left
 > hand.
@@ -356,7 +356,7 @@ history.
 
 ## Keeping it out of places
 
-<!-- video: 15-keep-out.mp4 -->
+https://github.com/user-attachments/assets/696fc57c-44bb-4984-a8cc-5d2f2e68e7ce
 
 > **You:** Keep the robot out of the bedroom.
 >
@@ -382,7 +382,7 @@ zone was added is checked again when it runs, from a schedule or by its hash.
 
 ## The robot's self-description
 
-<!-- video: 18-self-description.mp4 -->
+https://github.com/user-attachments/assets/cdadbd00-b26b-4e14-a006-65d56f2dea02
 
 The persona tells the model what the robot is. **Draft from the robot** in the Doctor tab, or
 `nervros-cli whoami`, writes a new one from the robot as it is now: the executor's skills as the
