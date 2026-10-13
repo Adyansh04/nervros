@@ -1,6 +1,6 @@
 # Using NervROS
 
-Every way to use NervROS, each with a short clip and the exact words typed. The clips are real
+Every way to use NervROS, most with a short clip, and the exact words typed. The clips are real
 runs: a simulated Unitree G1 in a six-room apartment ([grove-g1](https://github.com/Adyansh04/grove-g1)),
 answered by the local Qwen3.5-9B model. Missions play three or four times faster, and the
 23-minute mapping run keeps only its start and end; the rest is real time. Setup is in the [README](../README.md); every setting is in the [profile](profile.md),
@@ -14,6 +14,8 @@ answered by the local Qwen3.5-9B model. Missions play three or four times faster
 - [Driving by hand](#driving-by-hand)
 - [Keeping an eye on it](#keeping-an-eye-on-it)
 - [Remembering](#remembering)
+- [Keeping it out of places](#keeping-it-out-of-places)
+- [The robot's self-description](#the-robots-self-description)
 - [Mapping a new building](#mapping-a-new-building)
 - [Finishing the map](#finishing-the-map)
 - [Sessions and models](#sessions-and-models)
@@ -31,14 +33,16 @@ cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 
 - **Top bar:** the robot, then the state of ROS, the mission executor and the model. On the
   right: the arming switch (until it is on, the agent can look and answer but not act),
-  **Reset layout**, **Follow robot**, **Edit world**, **Dock** and **Stop mission**, which is
-  always there.
+  **Reset layout**, **Follow robot**, **Edit world** (with a world editor in the profile),
+  **Dock**, **Pause** or **Resume** while a mission runs (when the executor can pause one) and
+  **Stop mission**, which is always there. A **Mission paused** chip shows while one is.
 - **Chat, left:** Enter sends, Shift+Enter adds a line, Esc stops the reply.
 - **Viewer, middle:** the 3D world (map, rooms, objects, the robot, where it walked and is about
   to walk), the cameras with what the detector marks, and below them the mission's steps over
   time, the agent's log and plots. It is one timeline you can scrub back.
 - **Dock, right:** Mission, World, Layers, Approvals, Events, Agent, Doctor and Robot
-  (Ctrl+1 to Ctrl+8). A waiting approval turns its tab amber.
+  (Ctrl+1 to Ctrl+8). A waiting approval turns its tab amber. Doctor also drafts the robot's
+  self-description.
 - **Status bar:** whether the agent is working, how full the model's context is, and how much of
   it came from the model server's cache.
 
@@ -183,6 +187,52 @@ Esc stops only the reply;
 mug keeps it. While a mission runs, the window sends the executor a heartbeat, so a mission
 whose window closed or hung stops by itself.
 
+### Pausing
+
+https://github.com/user-attachments/assets/d6e4dc59-a2c3-4b54-87cb-25c1abc4c190
+
+> **You:** Walk to the living room, room R1.
+>
+> **You:** Pause.
+>
+> **You:** Resume.
+
+While a mission runs, a plain "pause" (or "wait", "hold on") pauses it without asking a model: the
+robot stops where it is, the arms hold and the hands keep their grip, and a pick or a place
+finishes first. "resume" (or "continue", "carry on", "go on") goes on: a walk to a place sets out
+again, and a straight walk or a turn does only what was left of it. The window's **Pause** button
+and the plan card's do the same, as in the clip: the card reads "Paused · started 12 s ago" and
+the top bar shows **Mission paused**. Time spent paused is not counted in a step's time, and the
+executor ends a mission paused for too long (ten minutes on grove-g1's). The words count only
+while a mission runs and the profile names the executor's pause service (`pause` under
+[`[mission]`](profile.md#mission)); otherwise they go to the model as any others.
+
+### One step's answer in the next
+
+https://github.com/user-attachments/assets/9b4cfc4f-5355-43bb-a4c8-de9aff755d4a
+
+> **You:** Walk to the red mug, look for a mug there, and pick up the one you find with your left
+> hand.
+
+One mission walks, looks and picks. In the clip the plan check sent the first plan back: on this
+demo robot a look is only for `mug` or `tray`, the names its mock detector knows, and the model
+had planned it for "red mug".
+
+Some skills hand on what they find. `FindInView` hands on `object_id`, the name the detector
+reports an object under. A walk to what several objects are (`GoToPlace(place="red mug")`) hands
+on `target_id`, the id of the nearest, and is allowed only when a later step takes it. The model
+gives the step an id and takes its answer in a later step:
+
+```json
+{"steps": [
+  {"id": "look", "skill": "FindInView", "args": {"phrase": "mug"}},
+  {"skill": "PickObject", "args": {"object_id": "{look.object_id}", "arm": "right"}}]}
+```
+
+The plan is checked before it runs: the id (a letter, then letters, digits or `_`, at most 24)
+must be an earlier step's that is not optional, the answer one that step gives, and of a kind the
+argument takes. The plan card shows the id before its step: `look: FindInView(phrase=mug)`.
+
 ### Doing it again
 
 - "Save that as the evening check" keeps a plan that worked; "Run the evening check" runs it
@@ -198,7 +248,7 @@ https://github.com/user-attachments/assets/a6f03d25-e631-441d-940b-dda37a833435
 Click a room, an object or a point on the floor in the 3D view: it lights up, and a bar above the
 message box offers what the agent can do with it. **Go there** plans the walk at once, for you to approve;
 the other buttons fill in a message for you to send. In the clip: the office, **Go there**; then
-the desk, **What is it?**, which sends "Tell me about O47 (desk).":
+the desk, **What is it?**, which fills in "Tell me about O47 (desk)." to send:
 
 > **NervROS:** O47 is a large grey metal desk with multiple drawers on both sides. It measures 2m
 > x 0.95m and is about 0.88m tall.
@@ -220,6 +270,7 @@ robot; `/look`, `/places` and `/explore` send their request to the agent. In the
 | `/look` | Ask the agent to look through the camera |
 | `/places` | Ask which places it can go to |
 | `/stop` | Stop the robot |
+| `/pause`, `/resume` | Pause the running mission, or let it go on |
 | `/arm`, `/disarm` | Let the agent act, or only observe |
 | `/explore` | Ask it to explore the building |
 | `/compact` | Condense the conversation |
@@ -227,7 +278,10 @@ robot; `/look`, `/places` and `/explore` send their request to the agent. In the
 | `/layout` | Put the viewer's panes back |
 | `/edit` | The world editor |
 | `/live` | Back to the live view after **Show in 3D** |
-| `/doctor`, `/robot`, `/models`, `/missions`, `/world`, `/approvals`, `/events`, `/layers`, `/dock` | Open that tab of the dock |
+| `/robot`, `/world`, `/approvals`, `/events`, `/layers` | Open that tab of the dock |
+| `/doctor` | Check the setup again, and open Doctor |
+| `/models`, `/missions` | Open Agent, or Mission |
+| `/dock` | Show or hide the dock |
 
 ## Driving by hand
 
@@ -277,8 +331,10 @@ mission runs.
 
 With a `[ros_tools]` table the agent reads the graph as `ros2` does: "what is publishing the
 map?", "is the chest camera dropping frames?", "show me the controller's parameters", "any errors
-in the logs?". Acting through ROS (a service call, an action goal, a parameter, a publish) needs
-the profile to allow it, and your approval each time.
+in the logs?". Nodes composed into a container are listed under it, `params` gives each
+parameter's value with its description, and the read tools take `odom` for `/odom`. Acting through
+ROS (a service call, an action goal, a parameter, a publish) needs the profile to allow it, an
+absolute name, and your approval each time.
 
 ## Remembering
 
@@ -297,6 +353,43 @@ A named place works from then on, in this session and the next: "go to the charg
 join what the agent knows on every turn, and the Agent tab lists them with **Forget**. "What have
 you done so far?" and "what happened to the mug?" read the mission ledger and the world model's
 history.
+
+## Keeping it out of places
+
+https://github.com/user-attachments/assets/696fc57c-44bb-4984-a8cc-5d2f2e68e7ce
+
+> **You:** Keep the robot out of the bedroom.
+>
+> **You:** Go to the bedroom.
+>
+> **You:** Keep it half a metre away from the vase.
+
+`geofence` adds a keep-out zone around a room's outline, an object (its size and a margin, 0.3 m
+unless you say), a place, or corners you give on the map, and names it after what it surrounds.
+From then on the agent refuses a walk that would end in a zone, a straight walk that would enter
+one, and a navigation goal inside one. When the profile names a `mask` topic
+([`[geofence]`](profile.md#geofence)), NervROS publishes the zones there for Nav2's keepout
+filter, so Nav2 plans around them too, and `doctor` says whether anything reads it. Without it, a
+walk whose route crosses a zone, driving by hand, and skills that move the base themselves
+(exploring, a pick backing off) are not held back at a zone.
+
+The 3D view draws the zones in red (the Layers tab can hide them), and the World tab lists them:
+**Add** starts the request in the composer, and **Remove** asks the agent to remove one, which you
+approve every time. Adding is refused while the robot stands inside the zone, and for a room type
+several rooms share until you name one by its id. Zones added in chat are kept for the robot
+across sessions, and those set in the profile stay until the profile changes. A plan made before a
+zone was added is checked again when it runs, from a schedule or by its hash.
+
+## The robot's self-description
+
+https://github.com/user-attachments/assets/cdadbd00-b26b-4e14-a006-65d56f2dea02
+
+The persona tells the model what the robot is. **Draft from the robot** in the Doctor tab, or
+`nervros-cli whoami`, writes a new one from the robot as it is now: the executor's skills as the
+planner offers them, the cameras and sensors on the graph, the stacks it runs, the URDF's body,
+the rooms the world model knows and the named places. The routine model drafts it in the current
+persona's style into `<persona>.draft.md` beside it (or `persona.draft.md` beside the profile);
+the persona itself is never changed. `whoami --facts` prints what it gathered, without a model.
 
 ## Mapping a new building
 
@@ -387,7 +480,8 @@ as a test** turns the session into an eval case.
 `nervros-cli` runs the same agent without a window, from the same profile:
 
 ```bash
-nervros-cli --profile my.toml chat                     # /arm, /yes N, /no N, /stop, /compact, /quit
+# In chat: /arm, /disarm, /yes N, /allow N, /no N, /again N, /stop, /pause, /resume, /compact, /quit
+nervros-cli --profile my.toml chat
 nervros-cli --profile my.toml chat --resume last
 nervros-cli --profile my.toml ask "What can you see?" --image frame.jpg
 ```
@@ -401,20 +495,25 @@ nervros-cli --profile my.toml ask "What can you see?" --image frame.jpg
 | `doctor` | The profile's tools, topics and mission services against the live graph |
 | `missions`, `gaps` | The mission ledger, and the requests no skill could do |
 | `replay` | A session as it happened |
-| `eval`, `case` | Test suites against the live robot, and a session kept as a new case |
+| `eval`, `case` | Test suites against the live robot or a scripted one, and a session kept as a new case |
+| `record` | The live robot written as a scripted robot for `eval --robot` |
+| `whoami` | The robot's self-description drafted from the live robot into `<persona>.draft.md`; `--facts` prints what it gathered |
 | `models`, `skills`, `mcp` | The model chains with today's counts, the skills, and the MCP tools to approve |
 
-`doctor` checks the profile against the live graph, and `ros` runs one read tool with no model:
+`doctor` checks the profile against the live graph, and `ros` runs one read tool with no model
+(its output abridged here):
 
 ```text
 $ nervros-cli --profile nervros.toml doctor
-ok      657 interface definitions loaded
+ok      674 interface definitions loaded
 ok      tool find_objects -> /canopy/find_objects (canopy_msgs/srv/FindObjects)
 ok      look image /chest_camera/color/image_raw
 ok      look detections /detector_chest/instance_masks
 ok      mission validate /nervros_executor/validate_mission
 ok      mission catalog /nervros_executor/get_catalog
 ok      mission stop /nervros_executor/stop_all
+ok      mission pause /nervros_executor/pause_mission
+ok      keep-out mask /keepout_filter_mask: Nav2 reads it
 
 $ nervros-cli --profile nervros.toml ros topic_sample \
     '{"topic": "/chest_camera/color/image_raw", "mode": "hz", "seconds": 3}'
@@ -447,7 +546,9 @@ $ nervros-cli --profile nervros.toml missions --limit 3
 `eval` runs a suite of requests against the live robot, each in a fresh session with every
 approval granted, and judges what happened: the tools and skills used, the missions' outcomes,
 the approvals asked for, the reply, and how far and which way the robot moved on the simulator's
-own pose. The apartment suite in grove-g1 has 44 cases:
+own pose. Each model and trial keeps its own keep-out zones in the run's folder, so a suite
+neither finds the operator's zones nor leaves its own behind. The apartment suite in grove-g1 has
+46 cases:
 
 ```text
 $ nervros-cli --profile nervros.toml eval eval/apartment.toml --out eval-r3
@@ -461,8 +562,35 @@ $ nervros-cli --profile nervros.toml eval eval/apartment.toml --out eval-r3
 42 of 44 trials passed; report eval-r3/report.md
 ```
 
-`--repeat k` runs each case k times for pass^k, `--models a,b` compares models, and
-`nervros-cli case last --id my-case --append suite.toml` keeps a session as a new case.
+That run was on the suite's first 44 cases.
+
+`--only <text>` runs the cases whose ids hold it, `--repeat k` runs each case k times for pass^k,
+`--models a,b` compares models, and `nervros-cli case last --id my-case --append suite.toml` keeps
+a session as a new case. A suite is TOML: each `[[case]]` has an `id`, the `say` messages,
+optional `setup` and `max_s`, and an `expect` table (`tools`, `not_tools`, `tool_said`, `skills`,
+`mission`, `approvals_max`, `reply_has`, `reply_has_all`, `reply_lacks`, `moved_m`, `turned_deg`,
+`compacted`); `scenarios/bench/suite.toml` is a small one.
+
+`--robot <file>` runs a suite against a robot a file describes instead of the live graph. The
+flag repeats, and a later file replaces an earlier one's entries key by key. A file scripts the
+graph, the nodes each component container hosts, what each node publishes and subscribes to,
+parameters with their descriptions, topic rates and messages, frames, and fixed answers for
+services and actions; `scenarios/robot/robot.toml` has a mission executor that accepts every plan
+and finishes every mission. Nothing moves and no camera gives an image, so it judges what the
+model says and plans (a case that measures the robot's motion cannot pass there), and a model
+comparison takes minutes with no simulator running; the model server must still be up.
+`nervros-cli record robot.toml` writes one from the live robot: the graph, the containers, each
+node's topics and services, the parameters (those `param_read_deny` hides written as
+`(hidden)`), the rates and last messages of the topics the profile names, the robot's pose on the
+map and the executor's catalog, but no images, clouds, maps or TF. `scenarios/bench` holds ten
+generic tasks on a generic Nav2 robot:
+
+```text
+$ nervros-cli --profile scenarios/bench/nervros.toml eval scenarios/bench/suite.toml \
+    --robot scenarios/robot/robot.toml --robot scenarios/bench/robot.toml --models qwen3.5-9b-local
+...
+10 of 10 trials passed; report ~/.local/state/nervros/evals/.../report.md
+```
 
 ## Keys
 

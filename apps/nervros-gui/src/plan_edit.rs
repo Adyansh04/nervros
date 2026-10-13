@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 /// A step being edited. The planner's own walks are left out: it adds them again where needed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EditStep {
+    /// The plan's id for it, which later steps take what it hands on by.
+    id: Option<String>,
     skill: String,
     args: Vec<(String, String)>,
     retries: u8,
@@ -25,6 +27,7 @@ pub fn editable(steps: &[PlannedStep]) -> Vec<EditStep> {
         .iter()
         .filter(|s| !s.added)
         .map(|s| EditStep {
+            id: s.name.clone(),
             skill: s.skill.clone(),
             args: s
                 .args
@@ -63,13 +66,17 @@ pub fn plan_args(intent: &str, steps: &[EditStep]) -> Value {
     let steps: Vec<Value> = steps
         .iter()
         .map(|s| {
-            json!({
+            let mut step = json!({
                 "skill": s.skill,
                 "args": s.args.iter().map(|(name, value)| json!({"name": name, "value": value})).collect::<Vec<_>>(),
                 "retries": s.retries,
                 "optional": s.optional,
                 "timeout_s": s.timeout_s,
-            })
+            });
+            if let Some(id) = &s.id {
+                step["id"] = json!(id);
+            }
+            step
         })
         .collect();
     json!({"intent": intent, "steps": steps})

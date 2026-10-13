@@ -34,7 +34,10 @@ impl Missions {
              starts, so never ask them yourself. Each step names a skill and gives every one of its \
              arguments as {{name, value}}, such as {{\"skill\": \"GoToPlace\", \"args\": \
              [{{\"name\": \"place\", \"value\": \"kitchen\"}}]}}. Use ids from list_places and \
-             find_objects. A walk up to an object that a step must be near is added for you. \
+             find_objects. A walk up to an object that a step must be near is added for you. A \
+             step that hands something on gets an id, and a later step takes it as the whole \
+             value {{id.name}}: {{\"id\": \"look\", \"skill\": \"FindInView\", ...}} then \
+             {{\"name\": \"object_id\", \"value\": \"{{look.object_id}}\"}}. \
              check_only: true only checks it, for when the operator asks to see a plan; hash runs a \
              plan checked before. Skills, by their exact names: {listing}"
         );
@@ -48,6 +51,7 @@ impl Missions {
                 "steps": {"type": "array", "minItems": 1, "maxItems": plan::MAX_STEPS, "items": {
                     "type": "object",
                     "properties": {
+                        "id": {"type": "string", "description": "Optional; a name later steps use to take what this one hands on"},
                         "skill": skills,
                         "args": {"type": "array", "items": {"type": "object",
                             "properties": {"name": {"type": "string"}, "value": {"type": "string"}},

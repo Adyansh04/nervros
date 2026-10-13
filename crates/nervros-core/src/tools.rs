@@ -16,6 +16,7 @@ pub mod segment;
 pub mod skills;
 pub mod vision;
 pub mod watch;
+pub mod zones;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -385,6 +386,12 @@ pub trait Tool: Send + Sync {
     /// the arguments say it all.
     fn rule_view(&self, _args: &Value) -> Option<Value> {
         None
+    }
+
+    /// Whether the model's call with these arguments goes to the operator in every autonomy and
+    /// is never allowed for the session: one that widens where the robot may go.
+    fn always_asks(&self, _args: &Value) -> bool {
+        false
     }
 
     /// Waits until the spec is complete, as a mission tool's skill list once the robot has

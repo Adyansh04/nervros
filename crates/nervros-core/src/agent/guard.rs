@@ -284,6 +284,8 @@ struct State {
 pub struct Guard {
     policy: Policy,
     state: Arc<Mutex<State>>,
+    /// The keep-out zones, once the session has them.
+    zones: std::sync::OnceLock<Arc<crate::zones::Zones>>,
 }
 
 /// `*` matches any run of characters, including none; everything else matches itself.
@@ -319,7 +321,20 @@ impl Guard {
         Self {
             policy,
             state: Arc::new(Mutex::new(state)),
+            zones: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Gives the guard the keep-out zones every pose goal and plan is checked against; the first
+    /// set stays.
+    pub fn set_zones(&self, zones: Arc<crate::zones::Zones>) {
+        let _ = self.zones.set(zones);
+    }
+
+    /// The keep-out zones, when the session has them.
+    #[must_use]
+    pub fn zones(&self) -> Option<&Arc<crate::zones::Zones>> {
+        self.zones.get()
     }
 
     /// The policy it enforces.

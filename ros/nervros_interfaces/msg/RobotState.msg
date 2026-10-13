@@ -27,3 +27,6 @@ string cannot_move_reason
 float32 tilt_deg
 # True while the executor drives the base from Teleop commands.
 bool teleop
+# True while the running mission is paused: the base stopped, the arms held, the hands as they
+# were.
+bool paused

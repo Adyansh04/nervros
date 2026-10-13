@@ -82,9 +82,13 @@ impl Places {
             ));
         }
         let mut tagged = self.lock();
-        tagged.retain(|p| p.name != place.name);
-        tagged.push(place);
-        self.save(&tagged)
+        let mut next = tagged.clone();
+        next.retain(|p| p.name != place.name);
+        next.push(place);
+        // Kept first, so what is remembered is what the file says.
+        self.save(&next)?;
+        *tagged = next;
+        Ok(())
     }
 
     /// Forgets a remembered place; `false` when there was none of that name.
@@ -94,13 +98,27 @@ impl Places {
     /// The file cannot be written.
     pub fn forget(&self, name: &str) -> Result<bool, String> {
         let mut tagged = self.lock();
-        let before = tagged.len();
-        tagged.retain(|p| p.name != name);
-        if tagged.len() == before {
+        let mut next = tagged.clone();
+        next.retain(|p| p.name != name);
+        if next.len() == tagged.len() {
             return Ok(false);
         }
-        self.save(&tagged).map(|()| true)
+        self.save(&next)?;
+        *tagged = next;
+        Ok(true)
     }
+}
+
+/// What to call a room from the world model: its name, or what it is (its `type`) while the name
+/// is only canopy's placeholder, such as "room C".
+pub(crate) fn room_label(room: &serde_json::Value) -> Option<&str> {
+    let name = room["name"].as_str().filter(|n| !n.is_empty());
+    let placeholder = name.is_none_or(|n| {
+        n.strip_prefix("room ")
+            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_uppercase()))
+    });
+    let kind = room["type"].as_str().filter(|t| !t.is_empty());
+    if placeholder { kind.or(name) } else { name }
 }
 
 /// Lowercase letters, digits and underscores.

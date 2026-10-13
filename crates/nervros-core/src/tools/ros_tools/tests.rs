@@ -94,6 +94,14 @@ fn robot() -> FakeRobot {
             },
         )
         .with_rate("/odom", 50.0, 700)
+        .with_transform(
+            "map",
+            "odom",
+            nervros_ros::Transform {
+                translation: [1.0, 0.0, 0.0],
+                ..nervros_ros::Transform::IDENTITY
+            },
+        )
         .with_topic(
             "/status",
             json!({"data": "x".repeat(300), "list": (0..20).collect::<Vec<_>>()}),
@@ -112,6 +120,25 @@ fn robot() -> FakeRobot {
         })
         .with_service("/detector/set_parameters", |_| {
             Ok(json!({"results": [{"successful": true, "reason": ""}]}))
+        })
+        .with_service("/detector/list_parameters", |_| {
+            Ok(json!({"result": {"names": ["confidence", "model_path", "use_sim_time"], "prefixes": []}}))
+        })
+        .with_service("/detector/describe_parameters", |req| {
+            let descriptors: Vec<Value> = req["names"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|n| {
+                    let text = if n == "confidence" {
+                        "Detections scored below this are dropped."
+                    } else {
+                        ""
+                    };
+                    json!({"name": n, "description": text, "read_only": n == "model_path"})
+                })
+                .collect();
+            Ok(json!({"descriptors": descriptors}))
         })
 }
 
@@ -189,6 +216,45 @@ async fn the_graph_lists_hides_internals_and_derives_actions() {
 }
 
 #[tokio::test]
+async fn a_container_in_a_node_list_names_the_nodes_it_hosts() {
+    let graph = GraphDetail {
+        services: vec![(
+            "/nav2_container/_container/list_nodes".into(),
+            vec!["composition_interfaces/srv/ListNodes".into()],
+        )],
+        nodes: vec![
+            "/nav2_container".into(),
+            "/amcl".into(),
+            "/controller_server".into(),
+        ],
+        ..GraphDetail::default()
+    };
+    let fake = FakeRobot::new()
+        .with_graph(graph)
+        .with_node("/nav2_container", NodeEntities::default())
+        .with_service("/nav2_container/_container/list_nodes", |_| {
+            Ok(json!({"full_node_names": ["/amcl", "/controller_server"], "unique_ids": [1, 2]}))
+        });
+    let robot: Arc<dyn RobotPort> = Arc::new(fake);
+    let schemas: Arc<dyn SchemaSource> = Arc::new(Schemas);
+    let guard = Arc::new(Guard::new(Policy::default()));
+    let tools = tools(&RosToolsConfig::default(), &robot, &schemas, &guard);
+    let graph = tool(&tools, "ros_graph");
+    // Nav2's servers do not hold "nav2" in their names; the container that runs them does.
+    let listed = graph.call(json!({"kind": "nodes", "filter": "nav2"})).await;
+    assert_eq!(
+        listed.data["items"],
+        json!([{"name": "/nav2_container", "hosts": ["/amcl", "/controller_server"]}]),
+        "{}",
+        listed.data
+    );
+    let plain = graph.call(json!({"kind": "nodes", "filter": "amcl"})).await;
+    assert_eq!(plain.data["items"], json!(["/amcl"]));
+    let detail = graph.call(json!({"name": "/nav2_container"})).await;
+    assert_eq!(detail.data["hosts"], json!(["/amcl", "/controller_server"]));
+}
+
+#[tokio::test]
 async fn topic_info_finds_the_qos_mismatch_that_drops_every_message() {
     let (_, tools, _) = all_tools(&RosToolsConfig::default(), false);
     let info = tool(&tools, "ros_graph")
@@ -226,12 +292,11 @@ async fn hz_and_echo_measure_and_summarise() {
     );
     let map = sample.call(json!({"topic": "/map"})).await;
     assert!(map.message.contains("too large"), "{}", map.message);
-    let relative = sample.call(json!({"topic": "odom"})).await;
-    assert!(
-        relative.message.contains("absolute"),
-        "{}",
-        relative.message
-    );
+    // A read takes `odom` as `/odom`, as a model means it.
+    let relative = sample
+        .call(json!({"topic": "odom", "mode": "hz", "seconds": 2}))
+        .await;
+    assert_eq!(relative.data["rate_hz"], 50.0, "{}", relative.message);
 }
 
 #[tokio::test]
@@ -281,6 +346,15 @@ async fn publishing_refuses_command_topics_and_types() {
         .call(json!({"topic": "/cmd_vel", "message": {}}))
         .await;
     assert!(cmd.message.contains("hard deny"), "{}", cmd.message);
+    // An act is never resolved: a deny list is written for absolute names.
+    let relative = publish
+        .call(json!({"topic": "cmd_vel", "message": {}}))
+        .await;
+    assert!(
+        relative.message.contains("absolute"),
+        "{}",
+        relative.message
+    );
     let twist = publish
         .call(json!({"topic": "/teleop", "type": "geometry_msgs/msg/Twist", "message": {}}))
         .await;
@@ -294,6 +368,150 @@ async fn publishing_refuses_command_topics_and_types() {
         .await;
     assert_eq!(ok.data["published"], 3, "{}", ok.message);
     assert_eq!(fake.published().len(), 3);
+}
+
+#[tokio::test]
+async fn a_parameter_list_says_what_each_holds_and_narrows_by_filter() {
+    let (_, tools, _) = all_tools(&RosToolsConfig::default(), false);
+    let params = tool(&tools, "params");
+    let all = params
+        .call(json!({"op": "list", "node": "/detector"}))
+        .await;
+    assert_eq!(all.data["total"], 3, "{}", all.data);
+    assert_eq!(
+        all.data["parameters"][1],
+        json!({"name": "model_path", "value": 0.5, "read_only": true})
+    );
+    let narrowed = params
+        .call(json!({"op": "list", "node": "/detector", "filter": "conf"}))
+        .await;
+    assert_eq!(
+        narrowed.data["parameters"],
+        json!([{"name": "confidence", "value": 0.5, "description": "Detections scored below this are dropped."}]),
+        "{}",
+        narrowed.data
+    );
+    let globbed = params
+        .call(json!({"op": "list", "node": "/detector", "filter": "*_time"}))
+        .await;
+    assert_eq!(globbed.data["total"], 1, "{}", globbed.data);
+}
+
+#[test]
+fn the_profiles_rules_see_a_relative_name_as_the_read_resolves_it() {
+    let (_, tools, _) = all_tools(&RosToolsConfig::default(), false);
+    for (name, key) in [
+        ("topic_sample", "topic"),
+        ("params", "node"),
+        ("ros_graph", "name"),
+    ] {
+        let view = tool(&tools, name).rule_view(&json!({key: "camera/image", "mode": "echo"}));
+        assert_eq!(
+            view,
+            Some(json!({key: "/camera/image", "mode": "echo"})),
+            "{name}"
+        );
+        assert_eq!(
+            tool(&tools, name).rule_view(&json!({key: "/odom"})),
+            None,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_nav2_goal_inside_a_keep_out_zone_is_refused() {
+    let (fake, tools, guard) = all_tools(&open(), true);
+    let profile: crate::profile::Profile = toml::from_str(
+        "[robot]\nname = \"x\"\n[models]\nfile = \"m.toml\"\n\
+         [[geofence.zone]]\nname = \"stairs\"\npolygon = [[2, -1], [3, -1], [3, 1], [2, 1]]\n",
+    )
+    .unwrap();
+    guard.set_zones(crate::zones::Zones::new(&profile, None));
+    let goal = |x: f64| {
+        json!({"action": "/navigate_to_pose", "type": "nav2_msgs/action/NavigateToPose",
+               "goal": {"pose": {"header": {"frame_id": "map"},
+                                 "pose": {"position": {"x": x, "y": 0.0}, "orientation": {"w": 1.0}}}}})
+    };
+    let refused = tool(&tools, "action_goal").call(goal(2.5)).await;
+    assert!(refused.message.contains("`stairs`"), "{}", refused.message);
+    assert!(
+        fake.calls().iter().all(|(n, _)| n != "/navigate_to_pose"),
+        "never sent"
+    );
+    let at = |frame: &str, position: Value| json!({"header": {"frame_id": frame}, "pose": {"position": position}});
+    let send = |action: &str, ty: &str, goal: Value| json!({"action": action, "type": format!("nav2_msgs/action/{ty}"), "goal": goal});
+    let goals = [
+        // y left out goes as 0; odom sits 1 m along the map's x.
+        send(
+            "/compute_path_to_pose",
+            "ComputePathToPose",
+            json!({"goal": at("map", json!({"x": 2.5}))}),
+        ),
+        send(
+            "/navigate_to_pose",
+            "NavigateToPose",
+            json!({"pose": at("odom", json!({"x": 1.5, "y": 0.0}))}),
+        ),
+        send(
+            "/compute_path_through_poses",
+            "ComputePathThroughPoses",
+            json!({"goals": [at("map", json!({"x": 0.0})), at("map", json!({"x": 2.5}))]}),
+        ),
+        send(
+            "/follow_path",
+            "FollowPath",
+            json!({"path": {"poses": [at("map", json!({"x": 2.2}))]}}),
+        ),
+    ];
+    for goal in goals {
+        let out = tool(&tools, "action_goal").call(goal.clone()).await;
+        assert!(out.message.contains("`stairs`"), "{goal}: {}", out.message);
+    }
+    let unknown = tool(&tools, "action_goal")
+        .call(send(
+            "/navigate_to_pose",
+            "NavigateToPose",
+            json!({"pose": at("camera", json!({"x": 0.0}))}),
+        ))
+        .await;
+    assert!(
+        unknown.message.contains("cannot be checked"),
+        "{}",
+        unknown.message
+    );
+    let straight = tool(&tools, "action_goal")
+        .call(send(
+            "/drive_on_heading",
+            "DriveOnHeading",
+            json!({"target": {"x": 0.5}}),
+        ))
+        .await;
+    assert!(
+        straight.message.contains("run_mission"),
+        "{}",
+        straight.message
+    );
+    let mission = tool(&tools, "action_goal")
+        .call(json!({"action": "/x/execute_mission", "type": "nervros_interfaces/action/ExecuteMission",
+                     "goal": {"tree_xml": "<root/>"}}))
+        .await;
+    assert!(
+        mission.message.contains("run_mission"),
+        "{}",
+        mission.message
+    );
+    let published = tool(&tools, "topic_publish")
+        .call(
+            json!({"topic": "/goal_pose", "type": "geometry_msgs/msg/PoseStamped",
+                     "message": at("map", json!({"x": 2.5, "y": 0.5}))}),
+        )
+        .await;
+    assert!(
+        published.message.contains("`stairs`"),
+        "{}",
+        published.message
+    );
 }
 
 #[tokio::test]

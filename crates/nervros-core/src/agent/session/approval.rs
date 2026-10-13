@@ -94,7 +94,8 @@ impl Shared {
         risk: Risk,
         mut approved: Approved,
     ) -> Option<Approved> {
-        let can_allow = !matches!(risk, Risk::Motion | Risk::Manipulation);
+        let can_allow =
+            !matches!(risk, Risk::Motion | Risk::Manipulation) && !tool.always_asks(&approved.args);
         let acts = risk.lane() == Lane::Act;
         let id = self.next_approval.fetch_add(1, Ordering::Relaxed) + 1;
         let mut asking = Asking {
@@ -127,8 +128,12 @@ impl Shared {
                             "`{name}` runs without asking for the rest of this session, except \
                              what moves the robot"
                         )
-                    } else {
+                    } else if acts {
                         format!("`{name}` moves the robot, so it still asks every time")
+                    } else {
+                        format!(
+                            "`{name}` widens where the robot may go, so it still asks every time"
+                        )
                     };
                     self.emit(Event::Notice { text });
                     break true;

@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use super::approval::{Unanswered, take_unanswered};
 use super::config::SessionConfig;
-use super::event::{Command, Event, is_stop_word};
+use super::event::{Command, Event, is_stop_word, pause_word};
 use super::*;
 use crate::guard::{Guard, Policy};
 use crate::llm::{AgentBuilder, AgentSource, History, LlmError};
@@ -688,6 +688,58 @@ async fn a_tool_allowed_for_the_session_stops_asking_unless_it_moves_the_robot()
     }
 }
 
+/// Asks every time, as removing a keep-out zone does.
+struct AlwaysAsks(ToolSpec);
+
+#[async_trait]
+impl Tool for AlwaysAsks {
+    fn spec(&self) -> Cow<'_, ToolSpec> {
+        Cow::Borrowed(&self.0)
+    }
+    fn always_asks(&self, _args: &Value) -> bool {
+        true
+    }
+    async fn call(&self, _args: Value) -> ToolOutcome {
+        ToolOutcome::ok(json!({}))
+    }
+}
+
+#[tokio::test]
+async fn a_call_that_always_asks_is_asked_every_time_even_when_autonomous() {
+    let guard = Arc::new(Guard::new(Policy {
+        autonomy: crate::guard::Autonomy::Autonomous,
+        ..Policy::default()
+    }));
+    let spec = ToolSpec::new(
+        "find_objects",
+        "Finds things.",
+        json!({"type": "object"}),
+        Risk::Annotate,
+    );
+    let session = Session::start(
+        Arc::new(Scripted::new(twice())),
+        one_tool(Arc::new(AlwaysAsks(spec))),
+        guard,
+        None,
+        SessionConfig::default(),
+    );
+    let mut rx = session.subscribe();
+    session.send(Command::User("go".into()));
+    let allow = |e: &Event| match e {
+        Event::ApprovalRequested { id, .. } => Some(Command::AllowForSession(*id)),
+        _ => None,
+    };
+    let events = collect_until_finished(&mut rx, allow, &session).await;
+    let offered: Vec<bool> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ApprovalRequested { can_allow, .. } => Some(*can_allow),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(offered, [false, false], "{events:?}");
+}
+
 #[tokio::test]
 async fn a_request_left_waiting_is_kept_for_the_next_session_and_dropped_once_answered() {
     let dir = tempfile::tempdir().unwrap();
@@ -857,6 +909,24 @@ fn a_plain_order_to_stop_is_known_and_a_sentence_about_stopping_is_not() {
     }
     for text in ["stop at the kitchen", "don't stop", "bus stop", "stopwatch"] {
         assert!(!is_stop_word(text), "{text}");
+    }
+}
+
+#[test]
+fn plain_words_pause_and_resume_and_sentences_go_to_the_model() {
+    for word in ["pause", "Wait!", " hold on ", "please pause", "/pause"] {
+        assert_eq!(pause_word(word), Some(true), "{word}");
+    }
+    for word in ["resume", "Continue.", "carry on", "go on!", "/resume"] {
+        assert_eq!(pause_word(word), Some(false), "{word}");
+    }
+    for text in [
+        "wait for me at the door",
+        "continue to the kitchen",
+        "pause music",
+        "go",
+    ] {
+        assert_eq!(pause_word(text), None, "{text}");
     }
 }
 

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use nervros_core::profile::Profile;
 use nervros_core::session::Event;
+use nervros_core::zones::Zones;
 use nervros_ros::RobotPort;
 use rerun::external::re_log_channel::{self, LogReceiver, LogSource};
 use rerun::sink::CallbackSink;
@@ -26,6 +27,7 @@ mod plan;
 mod rooms;
 mod spawner;
 mod tasks;
+mod zones;
 
 pub use layers::Layers;
 
@@ -126,11 +128,12 @@ impl Bridge {
 }
 
 /// Starts the bridge: robot pose, cameras, map, rooms and objects from ROS, the profile's layers,
-/// and the agent's events.
+/// the keep-out zones and the agent's events.
 pub fn spawn(
     rec: &RecordingStream,
     robot: &Arc<dyn RobotPort>,
     profile: &Profile,
+    zones: &Arc<Zones>,
     events: broadcast::Receiver<Event>,
 ) -> Bridge {
     put_static(rec, "world", &rerun::ViewCoordinates::RIGHT_HAND_Z_UP());
@@ -150,6 +153,7 @@ pub fn spawn(
     let layout = Arc::new(Layout::new(rec.clone(), bridge.cameras(profile)));
     layout.send();
     bridge.world(profile, &layout);
+    bridge.zones(zones);
     bridge.profile_layers(profile);
     bridge.tasks.spawn(agent(
         rec.clone(),
@@ -198,6 +202,7 @@ mod tests {
     use crate::objects::object_colour;
     use crate::rooms::area;
     use crate::tasks::{ModelFrame, load_model, moved, pinhole, pose_model};
+    use crate::zones::hatch;
 
     #[test]
     fn a_urdf_gives_the_frames_tf_moves() {
@@ -374,5 +379,32 @@ mod tests {
     #[test]
     fn objects_keep_their_colour_by_label() {
         assert_eq!(object_colour("mug", 255), object_colour("mug", 255));
+    }
+
+    #[test]
+    fn a_concave_zone_is_hatched_inside_its_outline_only() {
+        let l = nervros_core::zones::Zone {
+            name: "l".into(),
+            polygon: vec![
+                [0.0, 0.0],
+                [2.0, 0.0],
+                [2.0, 1.0],
+                [1.0, 1.0],
+                [1.0, 2.0],
+                [0.0, 2.0],
+            ],
+            fixed: false,
+        };
+        let strokes = hatch(&l.polygon, 0.25);
+        for [a, b] in &strokes {
+            let middle = [f64::midpoint(a[0], b[0]), f64::midpoint(a[1], b[1])];
+            assert!(l.contains(middle[0], middle[1]), "{a:?} to {b:?}");
+        }
+        // Lines 0.25 m apart over 3 m^2 come to about 12 m.
+        let length: f64 = strokes
+            .iter()
+            .map(|[a, b]| (b[0] - a[0]).hypot(b[1] - a[1]))
+            .sum();
+        assert!((length - 12.0).abs() < 1.5, "{length}");
     }
 }

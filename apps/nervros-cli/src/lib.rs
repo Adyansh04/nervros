@@ -14,6 +14,8 @@ use nervros_core::providers::{Role, free_only, openrouter};
 #[cfg(feature = "ros")]
 mod eval;
 mod mcp;
+#[cfg(feature = "ros")]
+mod record;
 mod records;
 #[cfg(feature = "ros")]
 mod robot;
@@ -50,9 +52,10 @@ enum Command {
         image: Option<PathBuf>,
     },
     /// Chat with the robot. Lines starting with `/` are commands: `/arm`, `/disarm`, `/stop`,
-    /// `/yes N`, `/allow N` (yes, and no more asking for that tool this session unless it moves
-    /// the robot), `/no N`, `/again N` (a request the last session left waiting), `/compact`,
-    /// `/quit`; a plain `stop` (or `halt`, `freeze`, `stop!`) also stops the robot.
+    /// `/pause`, `/resume`, `/yes N`, `/allow N` (yes, and no more asking for that tool this
+    /// session unless it moves the robot), `/no N`, `/again N` (a request the last session left
+    /// waiting), `/compact`, `/quit`; a plain `stop` (or `halt`, `freeze`, `stop!`) also stops the
+    /// robot, and a plain `pause` or `resume` pauses or resumes a mission that can be.
     #[cfg(feature = "ros")]
     Chat {
         /// Send these messages in order and exit, instead of reading stdin.
@@ -68,8 +71,8 @@ enum Command {
         #[arg(long)]
         resume: Option<String>,
     },
-    /// Run a suite of requests against the live robot, each in a fresh session approving every
-    /// request, and report which cases did what they expect.
+    /// Run a suite of requests against the live robot, or with `--robot` a scripted one, each in
+    /// a fresh session approving every request, and report which cases did what they expect.
     #[cfg(feature = "ros")]
     Eval {
         /// The suite, a TOML file of `[[case]]`s.
@@ -87,6 +90,10 @@ enum Command {
         /// Where the report goes (default: the state directory's `evals/`).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Run against the robot these files describe, merged in order, instead of the live
+        /// graph: models compared in seconds, without a simulator (`record` writes one).
+        #[arg(long)]
+        robot: Vec<PathBuf>,
     },
     /// Print a session log as it happened: a `.ndjson` path, or `last`.
     Replay {
@@ -135,6 +142,21 @@ enum Command {
     /// Check the profile's tools, topics and mission services against the live graph.
     #[cfg(feature = "ros")]
     Doctor,
+    /// Write the live robot as a scripted robot file for `eval --robot`: its graph, nodes,
+    /// parameters, the profile's topics and the executor's catalog.
+    #[cfg(feature = "ros")]
+    Record {
+        /// The file to write.
+        out: PathBuf,
+    },
+    /// Draft the robot's self-description from the live robot (its skills, sensors, body, rooms
+    /// and places) in the persona's style, into `<persona>.draft.md` beside it, for you to edit.
+    #[cfg(feature = "ros")]
+    Whoami {
+        /// Print the gathered facts as JSON and draft nothing.
+        #[arg(long)]
+        facts: bool,
+    },
     /// Look through the robot's camera: print the marks and save the marked image.
     #[cfg(feature = "ros")]
     Look {
@@ -240,12 +262,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             repeat,
             models,
             out,
+            robot,
         } => {
             let out = out.unwrap_or_else(eval::default_out);
             let options = eval::Options {
                 only,
                 repeat: usize::from(repeat),
                 models,
+                robot,
             };
             let failed = eval::run(&cli.profile, &suite, &options, &out).await?;
             if failed > 0 {
@@ -265,6 +289,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Skills => skills(&cli.profile),
         #[cfg(feature = "ros")]
         Command::Doctor => robot::doctor(&cli.profile).await,
+        #[cfg(feature = "ros")]
+        Command::Record { out } => record::record(&cli.profile, &out).await,
+        #[cfg(feature = "ros")]
+        Command::Whoami { facts } => robot::whoami(&cli.profile, facts).await,
         #[cfg(feature = "ros")]
         Command::Ros { tool, args } => robot::ros(&cli.profile, &tool, &args).await,
     }

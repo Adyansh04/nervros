@@ -1,7 +1,9 @@
-//! The World and Layers tabs: the world model's rooms and objects, and the viewer's layers.
+//! The World and Layers tabs: the world model's rooms and objects, the keep-out zones, and the
+//! viewer's layers.
 
 use std::fmt::Write as _;
 
+use nervros_core::zones::Zone;
 use rerun::external::egui;
 use rerun::external::egui::{Align, CornerRadius, Layout, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _};
@@ -30,15 +32,17 @@ impl Gui {
             let l = self.live();
             (l.rooms.clone(), l.objects)
         };
-        let Some(rooms) = rooms else {
+        let zones = self.agent.zones.all();
+        let actions = if let Some(rooms) = rooms {
+            world_view(ui, &rooms, objects, &zones)
+        } else {
             empty(
                 ui,
                 "No world model yet. With one running, its rooms and how much of each the camera \
                  has seen appear here.",
             );
-            return;
+            zones_view(ui, &zones)
         };
-        let actions = world_view(ui, &rooms, objects);
         self.act(ui.ctx(), actions);
     }
 
@@ -47,9 +51,14 @@ impl Gui {
     }
 }
 
-/// The World tab: the world model's rooms, how much of each the camera has seen, and a button that
-/// asks the agent to explore.
-pub(super) fn world_view(ui: &mut egui::Ui, rooms: &Value, objects: Option<usize>) -> Vec<Action> {
+/// The World tab: the world model's rooms, how much of each the camera has seen, a button that
+/// asks the agent to explore, and the keep-out zones.
+pub(super) fn world_view(
+    ui: &mut egui::Ui,
+    rooms: &Value,
+    objects: Option<usize>,
+    zones: &[Zone],
+) -> Vec<Action> {
     let list = rooms["rooms"].as_array().cloned().unwrap_or_default();
     let fraction = |r: &Value, k: &str| r[k].as_f64().map(|v| v.clamp(0.0, 1.0));
     let seen: Vec<f64> = list
@@ -150,7 +159,73 @@ pub(super) fn world_view(ui: &mut egui::Ui, rooms: &Value, objects: Option<usize
                     ui.end_row();
                 }
             });
+        actions.extend(zones_view(ui, zones));
     });
+    actions
+}
+
+/// The keep-out zones, the profile's and the operator's. Zones change only through the agent, so
+/// the buttons ask it: removing one widens where the robot may go, and the operator approves that.
+pub(super) fn zones_view(ui: &mut egui::Ui, zones: &[Zone]) -> Vec<Action> {
+    let mut actions = Vec::new();
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        theme::section(ui, "Keep-out zones");
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .add(ReButton::new("Add").small().secondary())
+                .on_hover_text(
+                    "Say where the robot must not go: a room, an object, a place, or corners on \
+                     the map",
+                )
+                .clicked()
+            {
+                actions.push(Action::Prefill("Keep the robot out of ".to_owned()));
+            }
+        });
+    });
+    if zones.is_empty() {
+        ui.label(RichText::new("None: the robot may go anywhere on the map.").color(theme::DIM));
+        return actions;
+    }
+    ui.add_space(6.0);
+    for zone in zones {
+        ui.horizontal(|ui| {
+            // The swatch is the 3D view's colour for a zone.
+            let (swatch, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(swatch, CornerRadius::same(2), theme::ERROR);
+            let corners = zone
+                .polygon
+                .iter()
+                .map(|[x, y]| format!("({x:.2}, {y:.2})"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            ui.label(RichText::new(&zone.name).size(13.5))
+                .on_hover_text(format!("Corners on the map: {corners}"));
+            ui.label(RichText::new(format!("{:.1} m²", zone.area())).color(theme::DIM));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if zone.fixed {
+                    ui.label(
+                        RichText::new("from the profile")
+                            .small()
+                            .color(theme::FAINT),
+                    )
+                    .on_hover_text("Only an edit of the robot's profile removes this zone");
+                } else if ui
+                    .add(ReButton::new("Remove").small().secondary())
+                    .on_hover_text("Ask the agent to remove it; you approve")
+                    .clicked()
+                {
+                    actions.push(Action::Say(format!(
+                        "Remove the keep-out zone \"{}\".",
+                        zone.name
+                    )));
+                }
+            });
+        });
+        ui.add_space(2.0);
+    }
     actions
 }
 

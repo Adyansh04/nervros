@@ -39,6 +39,9 @@ pub struct Profile {
     /// Named places beyond the world model's rooms.
     #[serde(rename = "place", default)]
     pub places: Vec<PlaceConfig>,
+    /// Keep-out zones, and where Nav2 reads them.
+    #[serde(default)]
+    pub geofence: GeofenceConfig,
     /// Tools declared by ROS name and type.
     #[serde(rename = "tool", default)]
     pub tools: Vec<ToolConfig>,
@@ -59,6 +62,29 @@ pub struct Profile {
     pub models: ModelsRef,
     #[serde(skip)]
     dir: PathBuf,
+}
+
+/// Keep-out zones the robot may not be sent into (more are added in chat), and the topic their
+/// keep-out mask goes out on for Nav2's keepout filter.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeofenceConfig {
+    /// A `nav_msgs/msg/OccupancyGrid` on the map's grid, latched, every cell in a zone occupied;
+    /// needs `[world] map`. Without it only the agent's own checks keep the robot out.
+    pub mask: Option<String>,
+    /// The fixed zones.
+    #[serde(rename = "zone", default)]
+    pub zones: Vec<ZoneConfig>,
+}
+
+/// A keep-out zone the profile sets.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZoneConfig {
+    /// What the operator calls it.
+    pub name: String,
+    /// Its corners in the map frame, metres, in order around it.
+    pub polygon: Vec<[f64; 2]>,
 }
 
 /// An MCP server: how to reach it, and which of its tools the agent may use.
@@ -370,6 +396,8 @@ pub struct MissionConfig {
     pub catalog: String,
     /// `StopAll` service.
     pub stop: String,
+    /// `PauseMission` service, for pausing and resuming a mission from the chat and the window.
+    pub pause: Option<String>,
     /// `PreviewMission` service, for the picture of a plan beside its approval card.
     pub preview: Option<String>,
     /// `RobotState` topic.
@@ -642,6 +670,28 @@ impl Profile {
                     name: p.name.clone(),
                 });
             }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for z in &self.geofence.zones {
+            if !seen.insert(z.name.to_lowercase()) {
+                return Err(ProfileError::Duplicate {
+                    kind: "zone",
+                    name: z.name.clone(),
+                });
+            }
+            let zone = crate::zones::Zone {
+                name: z.name.clone(),
+                polygon: z.polygon.clone(),
+                fixed: true,
+            };
+            zone.check().map_err(|why| {
+                ProfileError::Invalid(format!("[[geofence.zone]] `{}`: {why}", z.name))
+            })?;
+        }
+        if self.geofence.mask.is_some() && self.world.as_ref().is_none_or(|w| w.map.is_none()) {
+            return Err(ProfileError::Invalid(
+                "[geofence] mask needs [world] map: the mask is drawn on the map's grid".to_owned(),
+            ));
         }
         for layer in self.viz.iter().flat_map(|v| &v.layers) {
             if !LAYER_TYPES.contains(&layer.msg_type.as_str()) {

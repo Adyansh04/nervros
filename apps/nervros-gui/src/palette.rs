@@ -30,6 +30,8 @@ pub enum Cmd {
     Live,
     /// Keep the 3D view on the robot, or frame the whole map again.
     Follow,
+    /// Pause the running mission, or with false let it go on.
+    Pause(bool),
 }
 
 /// One command: what the palette lists, the `/name` that runs it from the chat, and its keys.
@@ -71,6 +73,8 @@ pub fn entries() -> Vec<Entry> {
             "Ctrl+Shift+S",
             Cmd::Send(Command::StopMission),
         ),
+        entry("Pause the mission", "/pause", "", Cmd::Pause(true)),
+        entry("Resume the mission", "/resume", "", Cmd::Pause(false)),
         entry("Check the robot", "/doctor", "", Cmd::Doctor),
         entry(
             "Robot: its state, and driving by hand",

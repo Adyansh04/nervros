@@ -3,8 +3,9 @@
 //!
 //! Reads are free. Every act goes through the guard like any other: armed, approved when
 //! supervised, with the exact target and payload in the approval, after the hard deny lists. Every
-//! name from the model must be absolute, and every payload is checked against its interface
-//! before it reaches r2r, which would panic on a wrong array length.
+//! name an act takes from the model must be absolute (a read takes `odom` as `/odom`), and every
+//! payload is checked against its interface before it reaches r2r, which would panic on a wrong
+//! array length.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -117,6 +118,68 @@ impl Ctx {
             })
     }
 
+    /// A goal or a message that would send the robot into a keep-out zone, refused with the
+    /// zone's name: Nav2's pose goals and paths, and a pose published for Nav2 to go to. A move
+    /// relative to where the robot stands is checked only as a mission step, so while there are
+    /// zones Nav2's own is refused.
+    fn zone_refusal(&self, ty: &str, payload: &Value) -> Option<ToolOutcome> {
+        fn list(v: &Value) -> Vec<&Value> {
+            v.as_array().map(|a| a.iter().collect()).unwrap_or_default()
+        }
+        let zones = self.guard.zones()?;
+        let poses: Vec<&Value> = match ty {
+            "nav2_msgs/action/NavigateToPose" => vec![&payload["pose"]],
+            "nav2_msgs/action/ComputePathToPose" => vec![&payload["goal"]],
+            "nav2_msgs/action/NavigateThroughPoses" | "nav2_msgs/action/FollowWaypoints" => {
+                list(&payload["poses"])
+            }
+            "nav2_msgs/action/ComputePathThroughPoses" => list(&payload["goals"]),
+            "nav2_msgs/action/FollowPath" => list(&payload["path"]["poses"]),
+            "geometry_msgs/msg/PoseStamped" => vec![payload],
+            "nav2_msgs/action/DriveOnHeading" | "nav2_msgs/action/BackUp"
+                if !zones.all().is_empty() =>
+            {
+                return Some(ToolOutcome::refused(
+                    "with keep-out zones set, a straight move is checked against them only as a \
+                     mission step: walk with run_mission",
+                ));
+            }
+            _ => return None,
+        };
+        for stamped in poses {
+            let frame = stamped["header"]["frame_id"].as_str().unwrap_or_default();
+            let p = &stamped["pose"]["position"];
+            // A field left out goes as 0 on the wire, so it is checked as 0.
+            let at = [
+                p["x"].as_f64().unwrap_or(0.0),
+                p["y"].as_f64().unwrap_or(0.0),
+                p["z"].as_f64().unwrap_or(0.0),
+            ];
+            let at = if frame.is_empty() || frame == zones.frame() {
+                at
+            } else {
+                match self.robot.transform(zones.frame(), frame) {
+                    Ok(t) => t.apply(at),
+                    Err(_) => {
+                        return Some(ToolOutcome::refused(format!(
+                            "a pose in `{frame}` cannot be checked against the keep-out zones: \
+                             give it in `{}`",
+                            zones.frame()
+                        )));
+                    }
+                }
+            };
+            if let Some(zone) = zones.at(at[0], at[1]) {
+                return Some(ToolOutcome::refused(format!(
+                    "({:.2}, {:.2}) is inside the keep-out zone `{}`: the robot may not go \
+                     there; geofence lists the zones, and only the operator removes one",
+                    at[0], at[1], zone.name
+                )));
+            }
+        }
+        None
+    }
+
     /// Why a model-given name or type may not be acted on, if it may not.
     fn deny_act(&self, name: &str, ty: &str) -> Option<ToolOutcome> {
         if name.contains("/_action/") {
@@ -188,6 +251,32 @@ fn actions(graph: &GraphDetail) -> Vec<(String, String)> {
 /// The ROS name under `key`, or the refusal to answer with.
 fn name_arg(args: &Value, key: &str) -> Result<String, String> {
     canonical_ros_name(args[key].as_str().unwrap_or_default())
+}
+
+/// A name to read, where `controller_server` means `/controller_server`: only an act must be
+/// given absolute names, since its deny lists are written for them.
+fn read_name_arg(args: &Value, key: &str) -> Result<String, String> {
+    read_name(args[key].as_str().unwrap_or_default())
+}
+
+/// The arguments with the name under `key` as a read resolves it, for the profile's rules: a rule
+/// on `/camera/*` holds for `camera/image` too. `None` when they already say it.
+fn resolved_view(args: &Value, key: &str) -> Option<Value> {
+    let name = read_name_arg(args, key).ok()?;
+    (args[key].as_str() != Some(name.as_str())).then(|| {
+        let mut view = args.clone();
+        view[key] = json!(name);
+        view
+    })
+}
+
+fn read_name(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.starts_with('/') {
+        canonical_ros_name(raw)
+    } else {
+        canonical_ros_name(&format!("/{raw}"))
+    }
 }
 
 fn seconds(args: &Value, key: &str, default: f64, max: Duration) -> Duration {

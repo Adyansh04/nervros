@@ -1,0 +1,14 @@
+# Pause the running mission, or resume it. A pause halts the running step at once: the base stops
+# and the arms hold where they are; a hand keeps its grip. A step that handles an object (a pick or
+# a place) is let finish first, and the pause starts before the next one. Resuming runs the halted
+# step again: a walk to a place sets out again, and a straight walk or a turn does only what was
+# left of it. A pause longer than the executor allows ends the mission.
+
+# True pauses, false resumes.
+bool pause
+# Why, such as "button" or "chat".
+string reason
+---
+bool ok
+# What happened, such as "paused during s2_GoToTarget" or "no mission is running".
+string message

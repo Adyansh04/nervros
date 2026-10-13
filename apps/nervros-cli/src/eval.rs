@@ -1,5 +1,6 @@
-//! `nervros-cli eval`: runs a suite of requests against the live robot, each in a fresh session,
-//! approving every request, and checks what the agent did against what each case expects.
+//! `nervros-cli eval`: runs a suite of requests against the live robot, or a scripted one, each in
+//! a fresh session, approving every request, and checks what the agent did against what each case
+//! expects.
 //!
 //! Each case runs `repeat` times on each model asked for, the models taking turns so a change in
 //! the world falls on all of them alike. The report gives pass^k, what the calls cost, and where
@@ -18,6 +19,7 @@ use nervros_core::profile::Profile;
 use nervros_core::providers::{ModelsConfig, ProviderKind};
 use nervros_core::session::Command;
 use nervros_ros::RobotPort;
+use nervros_ros::scripted::ScriptedRobot;
 use nervros_ros::tf::Transform;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -36,6 +38,8 @@ pub(crate) struct Options {
     /// The models the routine role runs on, one after another, by `models.toml` id; none for the
     /// profile's chain.
     pub models: Vec<String>,
+    /// Files describing a scripted robot, merged in order; none for the live graph.
+    pub robot: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,6 +63,9 @@ struct Provenance {
     profile: String,
     suite: String,
     suite_sha256: String,
+    /// The scripted robot's files, when the suite ran against one rather than the live graph.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    robot: Vec<PathBuf>,
     repeat: usize,
     /// The routine role's models as run, each with its provider's settings and server.
     models: Vec<Value>,
@@ -86,8 +93,8 @@ pub(crate) async fn run(
     if let Some(m) = options.models.iter().find(|m| models.model(m).is_none()) {
         anyhow::bail!("models.toml has no model {m}");
     }
-    let robot = nervros_core::app::connect(&profile)?;
-    std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
+    let robot = robot_for(&profile, &options.robot).await?;
+    prepare(out)?;
     let ledger = nervros_core::app::state_dir().join("quota.json");
     let arms: Vec<Option<&str>> = if options.models.is_empty() {
         vec![None]
@@ -100,11 +107,10 @@ pub(crate) async fn run(
         profile: profile_path.display().to_string(),
         suite: suite_path.display().to_string(),
         suite_sha256: hex(&Sha256::digest(text.as_bytes()))[..12].to_owned(),
+        robot: options.robot.clone(),
         repeat: options.repeat,
         models: describe_models(&models, &options.models).await,
     };
-    // Discovery and the cameras need a moment after the node starts.
-    tokio::time::sleep(Duration::from_secs(3)).await;
     let run = Run {
         profile_path,
         profile: &profile,
@@ -173,6 +179,30 @@ pub(crate) async fn run(
         out.join("report.md").display()
     );
     Ok(failed)
+}
+
+/// The live robot, once discovery and the cameras have had a moment; or, with `files`, the
+/// scripted robot they describe.
+async fn robot_for(profile: &Profile, files: &[PathBuf]) -> Result<Arc<dyn RobotPort>> {
+    if files.is_empty() {
+        let robot = nervros_core::app::connect(profile)?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        return Ok(robot);
+    }
+    scripted_robot(files)
+}
+
+/// The robot `files` describe, each over the one before, key by key.
+fn scripted_robot(files: &[PathBuf]) -> Result<Arc<dyn RobotPort>> {
+    let mut robot = ScriptedRobot::default();
+    for file in files {
+        let text =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let next: ScriptedRobot =
+            toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
+        robot = robot.with(next);
+    }
+    Ok(Arc::new(robot.build().map_err(anyhow::Error::msg)?))
 }
 
 fn save(out: &Path, provenance: &Provenance, trials: &[Trial]) -> Result<()> {
@@ -274,6 +304,18 @@ fn pose(robot: &Arc<dyn RobotPort>, profile: &Profile) -> Option<(f64, f64, f64)
 }
 
 /// What every trial shares.
+/// Makes `out`, and empties the zones a run there kept before. Each model and trial keeps its
+/// own: a case that adds one is followed by the case that removes it, and neither touches the
+/// operator's.
+fn prepare(out: &Path) -> Result<()> {
+    std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
+    let zones = out.join("zones");
+    if zones.exists() {
+        std::fs::remove_dir_all(&zones).with_context(|| format!("clearing {}", zones.display()))?;
+    }
+    Ok(())
+}
+
 struct Run<'a> {
     profile_path: &'a Path,
     profile: &'a Profile,
@@ -303,8 +345,10 @@ fn travel(a: (f64, f64, f64), b: (f64, f64, f64)) -> (f64, f64) {
 }
 
 async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize) -> Result<Seen> {
+    let lane = format!("{}-{trial}", model.unwrap_or("chain"));
     let options = nervros_core::app::StartOptions {
         model: model.map(str::to_owned),
+        zones: Some(run.out.join("zones").join(format!("{lane}.json"))),
         ..Default::default()
     };
     let agent =
@@ -432,6 +476,18 @@ fn report(provenance: &Provenance, trials: &[Trial]) -> String {
         provenance.suite_sha256,
         provenance.repeat
     );
+    if !provenance.robot.is_empty() {
+        let _ = writeln!(
+            out,
+            "On the scripted robot of {}, not the live graph: nothing moved.\n",
+            provenance
+                .robot
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        );
+    }
     for m in &provenance.models {
         let _ = writeln!(out, "- `{m}`");
     }
@@ -620,6 +676,7 @@ mod tests {
             profile: "g1.toml".into(),
             suite: "apartment.toml".into(),
             suite_sha256: "0123456789ab".into(),
+            robot: Vec::new(),
             repeat: 2,
             models: vec![json!({"id": "qwen"})],
         };

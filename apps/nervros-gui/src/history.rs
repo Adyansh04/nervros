@@ -51,11 +51,15 @@ impl History {
 
 /// The plan of a recorded mission, to run it again as the operator's own.
 fn again(m: &MissionRecord) -> Value {
-    let steps: Vec<Value> = m
-        .steps
-        .iter()
-        .map(|s| json!({"skill": s.skill, "args": s.args}))
-        .collect();
+    // A mission from before plans were kept runs again from its steps, without their ids.
+    let steps = if m.plan.is_array() {
+        m.plan.clone()
+    } else {
+        m.steps
+            .iter()
+            .map(|s| json!({"skill": s.skill, "args": s.args}))
+            .collect()
+    };
     json!({"intent": m.intent, "steps": steps})
 }
 
@@ -242,8 +246,12 @@ mod tests {
     use nervros_core::mission::ledger::StepRecord;
 
     #[test]
-    fn a_mission_runs_again_as_its_recorded_steps() {
-        let m = MissionRecord {
+    fn a_mission_runs_again_as_its_plan() {
+        let plan = json!([
+            {"id": "look", "skill": "FindInView", "args": {"phrase": "mug"}, "optional": true},
+            {"skill": "PickObject", "args": {"object_id": "{look.object_id}"}}
+        ]);
+        let mut m = MissionRecord {
             intent: "fetch the mug".to_owned(),
             steps: vec![StepRecord {
                 id: "s1".to_owned(),
@@ -251,12 +259,17 @@ mod tests {
                 args: json!({"object_id": "O17", "arm": "left"}),
                 ..StepRecord::default()
             }],
+            plan: plan.clone(),
             ..MissionRecord::default()
         };
+        assert_eq!(again(&m), json!({"intent": "fetch the mug", "steps": plan}));
+
+        m.plan = Value::Null;
         assert_eq!(
             again(&m),
             json!({"intent": "fetch the mug", "steps": [
-                {"skill": "PickObject", "args": {"object_id": "O17", "arm": "left"}}]})
+                {"skill": "PickObject", "args": {"object_id": "O17", "arm": "left"}}]}),
+            "a mission from before plans were kept, from its steps"
         );
     }
 

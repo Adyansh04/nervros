@@ -5,21 +5,21 @@
 //! executor's own macros, each wrapped in its step's timeout, retries and optional flag. The
 //! executor validates the tree again; the hash of the exact XML is what the operator approves.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::catalog::{Catalog, GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, Skill};
+use super::catalog::{Arg, Catalog, GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, Skill};
 use crate::profile::PlaceConfig;
 
 /// Plans longer than this are split by the model into several missions.
 pub const MAX_STEPS: usize = 12;
 const MAX_RETRIES: u8 = 2;
-/// The mission's own timeout over its worst case, so a step's timeout fires first.
-const SLACK: f64 = 1.2;
+/// The longest id a plan may give a step.
+const MAX_ID: usize = 24;
 /// How near the robot must already stand for a skill that needs it near an object; the executor's
 /// skills ask for about half a metre.
 const NEAR_M: f64 = 0.6;
@@ -42,6 +42,10 @@ pub struct Plan {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
+    /// The plan's own name for it, by which a later step takes what it hands on: an argument
+    /// whose value is `{look.object_id}` takes the `object_id` of the step with id `look`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// A catalog skill, or `GoToPlace`.
     pub skill: String,
     /// The skill's arguments. A list of `{name, value}` or an object both work.
@@ -75,6 +79,108 @@ pub struct StepArg {
 #[must_use]
 pub fn arg<'a>(args: &'a [StepArg], name: &str) -> Option<&'a str> {
     args.iter().find(|a| a.name == name).map(|a| a.value.trim())
+}
+
+/// The step id and output a value that is wholly `{look.object_id}` takes, if it is one.
+#[must_use]
+pub fn reference(value: &str) -> Option<(&str, &str)> {
+    value
+        .trim()
+        .strip_prefix('{')?
+        .strip_suffix('}')?
+        .split_once('.')
+}
+
+/// Why an earlier step's output cannot be argument `arg`, as the executor judges it too.
+fn mismatch(arg: &Arg, out: &Arg) -> Option<String> {
+    let name = &arg.name;
+    // Narrowed to the robot's own names, an argument takes what a step found on the robot, but
+    // not a world model's id.
+    if !arg.choices.is_empty() && (!arg.narrowed || out.kind == "world_id") {
+        return Some(format!(
+            "`{name}` takes only {}, not what a step hands on",
+            arg.choices.join(", ")
+        ));
+    }
+    if arg.kind == "world_id" && out.kind != "world_id" {
+        return Some(format!(
+            "`{name}` takes an id from the world model, and {} is not one",
+            out.name
+        ));
+    }
+    if arg.format == "id" && out.kind != "world_id" && out.format != "id" {
+        return Some(format!("`{name}` takes an id, and {} is not one", out.name));
+    }
+    if arg.kind != "world_id"
+        && arg.format != "id"
+        && !arg.format.is_empty()
+        && arg.format != out.format
+    {
+        return Some(format!(
+            "`{name}` takes a {}, and {} is not one",
+            arg.format, out.name
+        ));
+    }
+    None
+}
+
+/// A step that hands something on, as the steps after it see it.
+struct Producer<'a> {
+    /// Its id in the tree, such as `s3`.
+    compiled: String,
+    /// The skill it compiled to: `GoToPlace` becomes `GoToTarget` or `GoToPose`.
+    skill: &'a Skill,
+    step: &'a Step,
+}
+
+/// What a step needs to know of the others: the earlier ones that hand things on, by their
+/// plan ids, and which of its own outputs later steps take.
+struct Links<'a> {
+    produced: BTreeMap<String, Producer<'a>>,
+    taken: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Links<'_> {
+    fn taken(&self, step: &Step) -> Option<&BTreeSet<String>> {
+        step.id.as_ref().and_then(|id| self.taken.get(id))
+    }
+}
+
+/// Checks the plan's step ids, and gathers which outputs later steps take from each.
+fn links<'a>(plan: &Plan, problems: &mut Vec<Problem>) -> Links<'a> {
+    let mut ids = BTreeSet::new();
+    for (i, step) in plan.steps.iter().enumerate() {
+        let Some(id) = &step.id else { continue };
+        let shaped = id.len() <= MAX_ID
+            && id.starts_with(|c: char| c.is_ascii_alphabetic())
+            && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !shaped {
+            problems.push(Problem::new(
+                &format!("step {}", i + 1),
+                "id",
+                format!("an id is a letter, then letters, digits or _, at most {MAX_ID}"),
+            ));
+        } else if !ids.insert(id.clone()) {
+            problems.push(Problem::new(
+                &format!("step {}", i + 1),
+                "id",
+                format!("two steps have the id `{id}`"),
+            ));
+        }
+    }
+    let mut taken: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for a in plan.steps.iter().flat_map(|s| &s.args) {
+        if let Some((from, out)) = reference(&a.value) {
+            taken
+                .entry(from.to_owned())
+                .or_default()
+                .insert(out.to_owned());
+        }
+    }
+    Links {
+        produced: BTreeMap::new(),
+        taken,
+    }
 }
 
 // Small models often send `{"arm": "right"}` for the list form; both mean the same.
@@ -308,6 +414,8 @@ impl Sim {
                 .map(|(arm, held)| format!("holding({arm}, {held})")),
         );
         out.extend(self.inside.iter().map(|(o, c)| format!("inside({o}, {c})")));
+        // What a step finds is known only once it runs, so nothing can be checked against it.
+        out.retain(|p| !p.contains('{'));
         out
     }
 
@@ -337,6 +445,7 @@ impl Sim {
                     .clone()
             };
             Some(Step {
+                id: None,
                 skill: GO_TO_PLACE.to_owned(),
                 args: vec![StepArg {
                     name: "place".to_owned(),
@@ -363,6 +472,9 @@ pub(crate) fn predicate(text: &str) -> Option<(&str, Vec<&str>)> {
 pub struct PlannedStep {
     /// `s1`, `s2`, ...: the executor's events carry it.
     pub id: String,
+    /// The plan's own id for it, which later steps take its outputs by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// The skill as planned, such as `GoToPlace`.
     pub skill: String,
     /// One line, such as `PickObject(object_id=O17, arm=right)`.
@@ -387,6 +499,11 @@ pub struct PlannedStep {
     /// For a walk: the place's name, or the room's or object's id, that its `place` resolved to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// What its arguments may turn out to be when they are known only as it runs, for the
+    /// profile's rules: each object a walk to a label may reach, and what a step it takes an
+    /// output from went for.
+    #[serde(skip)]
+    pub may_take: Vec<StepArg>,
 }
 
 impl PlannedStep {
@@ -402,6 +519,11 @@ impl PlannedStep {
         if let Some(target) = &self.target {
             args.push(serde_json::json!({"name": "place", "value": target}));
         }
+        args.extend(
+            self.may_take
+                .iter()
+                .map(|a| serde_json::json!({"name": a.name, "value": a.value})),
+        );
         serde_json::json!({"skill": self.skill, "args": args})
     }
 }
@@ -446,7 +568,7 @@ pub struct Problem {
 }
 
 impl Problem {
-    fn new(step: &str, field: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(step: &str, field: &str, message: impl Into<String>) -> Self {
         Self {
             step: step.to_owned(),
             field: field.to_owned(),
@@ -498,15 +620,27 @@ pub fn compile(
         holding: world.holding.clone(),
         inside: Vec::new(),
     };
+    let mut links = links(plan, &mut problems);
     let mut n = 0;
     for planned in &plan.steps {
         let walk = sim.walk_for(planned, catalog, world);
         for (step, added) in walk.iter().map(|w| (w, true)).chain([(planned, false)]) {
             n += 1;
             let id = format!("s{n}");
-            match compile_step(&id, step, catalog, world, author) {
-                Ok((node, timeout_s, spot)) => {
+            match compile_step(&id, step, catalog, world, author, &links) {
+                Ok((node, timeout_s, spot, skill)) => {
+                    if let (Some(name), false) = (&planned.id, added) {
+                        links.produced.insert(
+                            name.clone(),
+                            Producer {
+                                compiled: id.clone(),
+                                skill,
+                                step: planned,
+                            },
+                        );
+                    }
                     let target = spot.as_ref().map(|s| s.id.clone());
+                    let may_take = may_take(step, spot.as_ref(), world, &steps);
                     if let Some(spot) = spot {
                         sim.at = Some(spot.id);
                         sim.xy = spot.xy;
@@ -522,6 +656,7 @@ pub fn compile(
                     }
                     steps.push(PlannedStep {
                         id,
+                        name: if added { None } else { step.id.clone() },
                         skill: step.skill.clone(),
                         summary: text,
                         args: step.args.clone(),
@@ -531,6 +666,7 @@ pub fn compile(
                         added,
                         track: None,
                         target,
+                        may_take,
                     });
                 }
                 Err(mut p) => problems.append(&mut p),
@@ -540,11 +676,12 @@ pub fn compile(
     if !problems.is_empty() {
         return Err(problems);
     }
+    // No Timeout around the whole: the executor's watchdog is the mission's limit, and it does
+    // not count a pause, which a Timeout would.
     let xml = format!(
         "<root BTCPP_format=\"4\" main_tree_to_execute=\"Mission\">\n  \
-         <BehaviorTree ID=\"Mission\">\n    <Timeout msec=\"{}\">\n      <Sequence name=\"mission\">\n\
-         {body}      </Sequence>\n    </Timeout>\n  </BehaviorTree>\n</root>\n",
-        msec(worst * SLACK),
+         <BehaviorTree ID=\"Mission\">\n    <Sequence name=\"mission\">\n\
+         {body}    </Sequence>\n  </BehaviorTree>\n</root>\n",
     );
     let sha256 = format!("{:x}", Sha256::digest(xml.as_bytes()));
     Ok(Compiled {
@@ -558,15 +695,63 @@ pub fn compile(
     })
 }
 
-/// The step's `SubTree` element, its timeout in seconds and, for `GoToPlace`, where it leaves
-/// the robot.
-fn compile_step(
+/// What `step`'s arguments may turn out to be as it runs: each object a walk to a label may
+/// reach, and for an output taken from an earlier step, what that step went for.
+fn may_take(
+    step: &Step,
+    spot: Option<&Spot>,
+    world: &World,
+    before: &[PlannedStep],
+) -> Vec<StepArg> {
+    let mut out: Vec<StepArg> = spot
+        .filter(|s| s.xy.is_none())
+        .into_iter()
+        .flat_map(|s| {
+            world
+                .objects
+                .iter()
+                .filter(|o| o.name.eq_ignore_ascii_case(&s.id))
+        })
+        .map(|o| StepArg {
+            name: "place".into(),
+            value: o.id.clone(),
+        })
+        .collect();
+    for a in &step.args {
+        let Some((from, _)) = reference(&a.value) else {
+            continue;
+        };
+        let Some(by) = before.iter().find(|p| p.name.as_deref() == Some(from)) else {
+            continue;
+        };
+        let went_for = by
+            .may_take
+            .iter()
+            .map(|m| m.value.clone())
+            .chain(by.target.clone())
+            .chain(arg(&by.args, "phrase").map(str::to_owned));
+        out.extend(went_for.map(|value| StepArg {
+            name: a.name.clone(),
+            value,
+        }));
+    }
+    out
+}
+
+/// A step's `SubTree` element, its timeout in seconds, where a `GoToPlace` leaves the robot, and
+/// the skill it runs.
+type CompiledStep<'c> = (String, f64, Option<Spot>, &'c Skill);
+
+/// The step's `SubTree` element, with the outputs later steps take, its timeout in seconds and,
+/// for `GoToPlace`, where it leaves the robot.
+fn compile_step<'c>(
     id: &str,
     step: &Step,
-    catalog: &Catalog,
+    catalog: &'c Catalog,
     world: &World,
     author: Author,
-) -> Result<(String, f64, Option<Spot>), Vec<Problem>> {
+    links: &Links<'_>,
+) -> Result<CompiledStep<'c>, Vec<Problem>> {
     let mut problems = Vec::new();
     // The tree is XML read by the executor, and the goal a ROS string: neither takes these.
     for a in step
@@ -591,8 +776,10 @@ fn compile_step(
         ));
     }
     let mut spot = None;
-    let (skill, ports) = if step.skill == GO_TO_PLACE {
-        match go_to_place(id, step, catalog, world) {
+    let taken = links.taken(step);
+    let (skill, mut ports) = if step.skill == GO_TO_PLACE {
+        let label_ok = taken.is_some_and(|t| t.contains("target_id"));
+        match go_to_place(id, step, catalog, world, label_ok) {
             Ok((skill, ports, to)) => {
                 spot = Some(to);
                 (skill, ports)
@@ -613,7 +800,7 @@ fn compile_step(
         ));
         return Err(problems);
     } else if let Some(skill) = catalog.skill(&step.skill) {
-        match ports_for(id, step, skill, world) {
+        match ports_for(id, step, skill, world, links) {
             Ok(ports) => (skill, ports),
             Err(mut p) => {
                 problems.append(&mut p);
@@ -643,6 +830,12 @@ fn compile_step(
         }
         None => skill.max_duration_s,
     };
+    // What later steps take goes under this step's own key, which their arguments name.
+    for out in taken.into_iter().flatten() {
+        if skill.outputs.iter().any(|o| o.name == *out) {
+            ports.push((out.clone(), format!("{{{id}_{out}}}")));
+        }
+    }
     if !problems.is_empty() {
         return Err(problems);
     }
@@ -655,15 +848,60 @@ fn compile_step(
         let _ = write!(node, " {name}=\"{}\"", escape(&value));
     }
     node.push_str("/>");
-    Ok((node, timeout_s, spot))
+    Ok((node, timeout_s, spot, skill))
 }
 
-/// Checks a skill's arguments: all given, none unknown, enums respected, ids known.
+/// An argument that takes what an earlier step hands on: that step, the output, and a fit.
+fn taken_port(
+    id: &str,
+    arg: &Arg,
+    (from, out): (&str, &str),
+    links: &Links<'_>,
+) -> Result<String, Problem> {
+    let problem = |text: String| Problem::new(id, &arg.name, text);
+    let Some(producer) = links.produced.get(from) else {
+        return Err(problem(format!(
+            "`{{{from}.{out}}}` names no earlier step: give the step that hands it on \
+             \"id\": \"{from}\", before this one"
+        )));
+    };
+    let Some(output) = producer.skill.outputs.iter().find(|o| o.name == out) else {
+        let names: Vec<&str> = producer
+            .skill
+            .outputs
+            .iter()
+            .map(|o| o.name.as_str())
+            .collect();
+        return Err(problem(format!(
+            "{from} ({}) hands on {}, not {out}",
+            producer.step.skill,
+            if names.is_empty() {
+                "nothing".to_owned()
+            } else {
+                names.join(", ")
+            }
+        )));
+    };
+    if producer.step.optional {
+        return Err(problem(format!(
+            "{from} is optional, so it may hand on nothing: make it required, or take {out} \
+             from a step that must succeed"
+        )));
+    }
+    if let Some(why) = mismatch(arg, output) {
+        return Err(problem(why));
+    }
+    Ok(format!("{{{}_{out}}}", producer.compiled))
+}
+
+/// Checks a skill's arguments: all given, none unknown, enums respected, ids known, and what
+/// earlier steps hand on fitting where it is taken.
 fn ports_for(
     id: &str,
     step: &Step,
     skill: &Skill,
     world: &World,
+    links: &Links<'_>,
 ) -> Result<Vec<(String, String)>, Vec<Problem>> {
     let mut problems = Vec::new();
     for a in &step.args {
@@ -693,7 +931,7 @@ fn ports_for(
             // One allowed value is the value, whatever a rule would derive.
             (None, Some(only), _) => only,
             (None, None, Some(rule)) => {
-                if let Some(v) = derive(rule, step, world) {
+                if let Some(v) = derive(rule, step, world, links) {
                     derived = v;
                     derived.as_str()
                 } else {
@@ -717,6 +955,13 @@ fn ports_for(
                 continue;
             }
         };
+        if let Some(taken) = reference(value) {
+            match taken_port(id, arg, taken, links) {
+                Ok(key) => ports.push((arg.name.clone(), key)),
+                Err(p) => problems.push(p),
+            }
+            continue;
+        }
         if !arg.choices.is_empty() && !arg.choices.iter().any(|c| c == value) {
             problems.push(Problem::new(
                 id,
@@ -732,7 +977,13 @@ fn ports_for(
                 format!("`{}` may not contain {{ or }}", arg.name),
             ));
         }
-        if arg.is_world_id() && !world.knows(value) {
+        // Plain words where the argument takes them, as GoToTarget does, are for the world model
+        // to search; only an id has to be one it holds.
+        let id_shaped = value.len() >= 2
+            && value.starts_with(|c: char| c.is_ascii_uppercase())
+            && value[1..].chars().all(|c| c.is_ascii_digit());
+        let words = arg.format == "phrase" && !id_shaped;
+        if arg.is_world_id() && !words && !world.knows(value) {
             problems.push(Problem::new(
                 id,
                 &arg.name,
@@ -754,13 +1005,22 @@ fn ports_for(
 type Resolved<'c> = (&'c Skill, Vec<(String, String)>, Spot);
 
 /// A derived argument's value: `label(x)` is the world model's label of what argument `x` names,
-/// or, for something it does not know, such as a detector's `red_block`, that name in words.
-fn derive(rule: &str, step: &Step, world: &World) -> Option<String> {
+/// or, for something it does not know, such as a detector's `red_block`, that name in words. For
+/// what an earlier step hands on, it is the words that step searched by.
+fn derive(rule: &str, step: &Step, world: &World, links: &Links<'_>) -> Option<String> {
     let ("label", args) = predicate(rule)? else {
         return None;
     };
     let from = args.first()?;
     let id = arg(&step.args, from)?;
+    // Taken from an earlier step: what that step was sent for names it, an id as well as words.
+    let id = match reference(id) {
+        Some((producer, _)) => {
+            let by = &links.produced.get(producer)?.step.args;
+            arg(by, "phrase").or_else(|| arg(by, "place"))?
+        }
+        None => id,
+    };
     let label = world
         .objects
         .iter()
@@ -772,12 +1032,14 @@ fn derive(rule: &str, step: &Step, world: &World) -> Option<String> {
 }
 
 /// `GoToPlace(place)`: a profile place becomes `GoToPose` at its pose; a room or object id, or a
-/// room's name, becomes `GoToTarget`.
+/// room's name, becomes `GoToTarget`. With `label_ok`, when a later step takes the id it walks
+/// to, what several objects are becomes `GoToTarget` too, for the world model's nearest one.
 fn go_to_place<'c>(
     id: &str,
     step: &Step,
     catalog: &'c Catalog,
     world: &World,
+    label_ok: bool,
 ) -> Result<Resolved<'c>, Problem> {
     let Some(place) = arg(&step.args, "place") else {
         return Err(Problem::new(id, "place", "GoToPlace needs `place`"));
@@ -806,6 +1068,15 @@ fn go_to_place<'c>(
         match named.as_slice() {
             [] => {}
             [one] => target = Some(one),
+            [_, ..] if label_ok => {
+                if let Some(skill) = catalog.skill(GO_TO_TARGET) {
+                    let spot = Spot {
+                        id: place.to_owned(),
+                        xy: None,
+                    };
+                    return Ok((skill, vec![(port(skill, "target"), place.to_owned())], spot));
+                }
+            }
             many => {
                 let ids: Vec<&str> = many.iter().take(8).map(|o| o.id.as_str()).collect();
                 return Err(Problem::new(
@@ -853,7 +1124,7 @@ fn wrap(node: &str, step: &Step, timeout_s: f64) -> String {
     if step.optional {
         inner = format!("<ForceSuccess>{inner}</ForceSuccess>");
     }
-    format!("        {inner}\n")
+    format!("      {inner}\n")
 }
 
 fn summary(step: &Step) -> String {
@@ -1002,11 +1273,203 @@ mod tests {
             r#"<ForceSuccess><Timeout msec="60000"><SubTree ID="GoToPose" name="s3_GoToPlace" station="1.5;-2;0.5"/></Timeout></ForceSuccess>"#
         ));
         assert!((c.worst_case_s - (300.0 + 840.0 + 60.0)).abs() < 1e-9);
-        assert!(c.xml.contains(r#"<Timeout msec="1440000">"#));
+        // The executor's watchdog is the limit, which a pause does not run down.
+        assert!(
+            c.xml
+                .contains("<BehaviorTree ID=\"Mission\">\n    <Sequence name=\"mission\">")
+        );
         assert_eq!(c.sha256, format!("{:x}", Sha256::digest(c.xml.as_bytes())));
         assert_eq!(
             c.steps[1].summary,
             "PickObject(arm=right, object_id=O17, phrase=red mug)"
+        );
+    }
+
+    /// The test catalog as the executor serves it now: `GoToTarget` takes words too and hands on
+    /// what it walked to, and `FindInView` hands on what the detector found.
+    fn catalog_with_outputs() -> Catalog {
+        Catalog::parse(&outputs_json().to_string()).unwrap()
+    }
+
+    /// [`catalog_with_outputs`] as JSON, for a test to change before it is parsed.
+    fn outputs_json() -> Value {
+        let mut c: Value = serde_json::from_str(CATALOG).unwrap();
+        let skills = c["skills"].as_array_mut().unwrap();
+        for s in skills.iter_mut() {
+            if s["name"] == "GoToTarget" {
+                s["args"][0]["type"] = json!("world_id");
+                s["args"][0]["format"] = json!("phrase");
+                s["outputs"] = json!([{"name": "target_id", "type": "world_id",
+                    "description": "what it walked to"}]);
+            }
+            if s["name"] == "PickObject" {
+                s["args"][0]["format"] = json!("id");
+                s["args"][1]["default_from"] = json!("label(object_id)");
+            }
+        }
+        skills.push(json!({"name": "FindInView", "description": "Look for something.",
+            "args": [{"name": "phrase", "type": "string", "format": "phrase", "description": "words", "enum": []}],
+            "outputs": [{"name": "object_id", "type": "string", "format": "id", "description": "the detector's name"}],
+            "requires": [], "effects": [], "resources": [], "idempotent": true, "risk": "observe",
+            "max_duration_s": 60, "template": "FindInView"}));
+        c
+    }
+
+    #[test]
+    fn a_step_takes_what_an_earlier_step_hands_on() {
+        let p = plan(&json!([
+            {"id": "look", "skill": "FindInView", "args": {"phrase": "red mug"}},
+            {"skill": "PickObject", "args": {"object_id": "{look.object_id}", "arm": "right"}}
+        ]));
+        let c = compile(&p, &catalog_with_outputs(), &world(), Author::Model).unwrap();
+        assert!(
+            c.xml.contains(
+                r#"<SubTree ID="FindInView" name="s1_FindInView" phrase="red mug" object_id="{s1_object_id}"/>"#
+            ),
+            "{}",
+            c.xml
+        );
+        // The phrase is the words the look searched by.
+        assert!(
+            c.xml.contains(
+                r#"<SubTree ID="PickObject" name="s2_PickObject" object_id="{s1_object_id}" phrase="red mug" arm="right"/>"#
+            ),
+            "{}",
+            c.xml
+        );
+        assert_eq!(c.steps[0].name.as_deref(), Some("look"));
+        assert_eq!(
+            c.steps.len(),
+            2,
+            "no walk is added up to what is not known yet"
+        );
+        assert!(
+            c.goal.iter().all(|g| !g.contains('{')),
+            "nothing found at run time is checked afterwards: {:?}",
+            c.goal
+        );
+    }
+
+    #[test]
+    fn a_reference_names_an_earlier_step_and_something_it_hands_on_that_fits() {
+        let problem = |steps: Value| {
+            let problems = compile(
+                &plan(&steps),
+                &catalog_with_outputs(),
+                &world(),
+                Author::Model,
+            )
+            .unwrap_err();
+            problems[0].message.clone()
+        };
+        let later = problem(json!([
+            {"skill": "PickObject", "args": {"object_id": "{look.object_id}", "phrase": "mug", "arm": "right"}},
+            {"id": "look", "skill": "FindInView", "args": {"phrase": "red mug"}}
+        ]));
+        assert!(later.contains("names no earlier step"), "{later}");
+        let other = problem(json!([
+            {"id": "look", "skill": "FindInView", "args": {"phrase": "red mug"}},
+            {"skill": "PickObject", "args": {"object_id": "{look.target_id}", "phrase": "mug", "arm": "right"}}
+        ]));
+        assert!(
+            other.contains("look (FindInView) hands on object_id, not target_id"),
+            "{other}"
+        );
+        let arm = problem(json!([
+            {"id": "look", "skill": "FindInView", "args": {"phrase": "red mug"}},
+            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "mug", "arm": "{look.object_id}"}}
+        ]));
+        assert!(arm.contains("`arm` takes only left, right"), "{arm}");
+        let twice = problem(json!([
+            {"id": "look", "skill": "FindInView", "args": {"phrase": "red mug"}},
+            {"id": "look", "skill": "FindInView", "args": {"phrase": "basket"}}
+        ]));
+        assert!(twice.contains("two steps have the id `look`"), "{twice}");
+        let optional = problem(json!([
+            {"id": "look", "skill": "FindInView", "args": {"phrase": "red mug"}, "optional": true},
+            {"skill": "PickObject", "args": {"object_id": "{look.object_id}", "arm": "right"}}
+        ]));
+        assert!(optional.contains("look is optional"), "{optional}");
+    }
+
+    #[test]
+    fn a_walk_by_id_names_what_a_later_step_takes_from_it() {
+        let p = plan(&json!([
+            {"id": "walk", "skill": "GoToPlace", "args": {"place": "O17"}},
+            {"skill": "PickObject", "args": {"object_id": "{walk.target_id}", "arm": "right"}}
+        ]));
+        let c = compile(&p, &catalog_with_outputs(), &world(), Author::Model).unwrap();
+        assert!(
+            c.xml
+                .contains(r#"object_id="{s1_target_id}" phrase="red mug""#),
+            "{}",
+            c.xml
+        );
+    }
+
+    #[test]
+    fn a_narrowed_argument_takes_a_name_found_on_the_robot_but_not_a_world_id() {
+        let mut c = outputs_json();
+        for s in c["skills"].as_array_mut().unwrap() {
+            if s["name"] == "PickObject" {
+                s["args"][0]["enum"] = json!(["mug_4"]);
+                s["args"][0]["narrowed"] = json!(true);
+            }
+        }
+        let narrowed = Catalog::parse(&c.to_string()).unwrap();
+        let found = plan(&json!([
+            {"id": "look", "skill": "FindInView", "args": {"phrase": "mug"}},
+            {"skill": "PickObject", "args": {"object_id": "{look.object_id}", "arm": "right"}}
+        ]));
+        assert!(compile(&found, &narrowed, &world(), Author::Model).is_ok());
+        let walked = plan(&json!([
+            {"id": "walk", "skill": "GoToPlace", "args": {"place": "O17"}},
+            {"skill": "PickObject", "args": {"object_id": "{walk.target_id}", "arm": "right"}}
+        ]));
+        let problems = compile(&walked, &narrowed, &world(), Author::Model).unwrap_err();
+        assert!(
+            problems[0].message.contains("takes only mug_4"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_walk_to_what_several_objects_are_takes_the_nearest_when_a_later_step_uses_which() {
+        let mut w = world();
+        w.objects.push(thing("O18", "red mug", 1.0, 1.0));
+        let p = plan(&json!([
+            {"id": "walk", "skill": "GoToPlace", "args": {"place": "red mug"}},
+            {"skill": "PickObject", "args": {"object_id": "{walk.target_id}", "arm": "right"}}
+        ]));
+        let c = compile(&p, &catalog_with_outputs(), &w, Author::Model).unwrap();
+        assert!(
+            c.xml.contains(
+                r#"<SubTree ID="GoToTarget" name="s1_GoToPlace" target="red mug" target_id="{s1_target_id}"/>"#
+            ),
+            "{}",
+            c.xml
+        );
+        assert!(
+            c.xml
+                .contains(r#"object_id="{s1_target_id}" phrase="red mug" arm="right""#),
+            "{}",
+            c.xml
+        );
+        // The profile's rules see each mug the walk may reach, there and where it is taken.
+        for step in &c.steps {
+            let rules = step.for_rules().to_string();
+            assert!(rules.contains("O17") && rules.contains("O18"), "{rules}");
+        }
+        // With nothing taking which one, the plan has to say.
+        let alone = plan(&json!([{"skill": "GoToPlace", "args": {"place": "red mug"}}]));
+        assert!(compile(&alone, &catalog_with_outputs(), &w, Author::Model).is_err());
+        // One red mug: walked to by its id, which it still hands on.
+        let one = compile(&p, &catalog_with_outputs(), &world(), Author::Model).unwrap();
+        assert!(
+            one.xml
+                .contains(r#"target="O17" target_id="{s1_target_id}""#),
+            "{}",
+            one.xml
         );
     }
 

@@ -33,8 +33,8 @@ does not declare, is for the generic tools of [`[ros_tools]`](#ros_tools), behin
 | `kind` | required | `service` or `topic`. |
 | `ros_name` | required | The service or topic. |
 | `type` | required | `pkg/srv/Name` or `pkg/msg/Name`. |
-| `description` | from the interface | Replaces the interface file's comment. |
-| `risk` | required for a service; `observe` for a topic | `observe`, `annotate`, `world_edit`, `motion` or `manipulation`. `annotate` changes only what the robot knows, such as the world model: no arming, the operator's approval when supervised. The rest are acts: they need the robot armed and, when supervised, approval. A service can act on the robot, so a service tool without it fails the start instead of running as a read. |
+| `description` | generated | Replaces the generated one: "Calls `ros_name` (`type`)." and the interface file's comment for a service, "Reads the newest message on `ros_name`" for a topic. |
+| `risk` | required for a service; `observe` for a topic | `observe`, `annotate`, `world_edit`, `motion` or `manipulation`. `annotate` changes only what the robot knows, such as the world model: no arming, the operator's approval when supervised. `world_edit` changes stored state the robot acts on, such as a parameter. It and the rest are acts: they need the robot armed and, when supervised, approval. A service can act on the robot, so a service tool without it fails the start instead of running as a read. |
 | `resources` | none | `base`, `left_arm`, `right_arm`: two calls holding the same one cannot run at once. |
 | `timeout` | `"5s"` | Per call. |
 | `hide_fields` | none | Request fields the model neither sees nor fills, such as an embedding. |
@@ -51,7 +51,7 @@ A name on the policy's `hard_deny` list cannot become a tool at all: the start f
 | Key | Default | |
 |---|---|---|
 | `name` | required | Shown in the app and told to the model. |
-| `persona` | none | A markdown file about the robot, its abilities and limits, added to the system prompt. |
+| `persona` | none | A markdown file about the robot, its abilities and limits, added to the system prompt. `nervros-cli whoami` drafts a new one from the robot into `<persona>.draft.md` beside it. |
 | `battery` | none | A `sensor_msgs/msg/BatteryState` topic, shown in the Robot tab. |
 | `diagnostics` | none | A `diagnostic_msgs/msg/DiagnosticArray` topic with motor temperatures; the Robot tab shows the hottest. |
 
@@ -69,7 +69,7 @@ says what could not be read.
 | `domain_id` | `0` | Must equal `ROS_DOMAIN_ID`, which ROS reads when the node starts; the agent refuses to start otherwise. |
 | `transport` | `default` | `udp` turns Fast DDS shared memory off, for a graph run by another user, such as a root container: shared memory between users fails without an error. The agent then needs `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`, which `scripts/ros-env.sh` exports with `NERVROS_UDP_ONLY=1`. |
 | `node_name` | `nervros` | The agent's node. |
-| `discovery_timeout` | `"20s"` | How long start-up checks wait for the graph. |
+| `discovery_timeout` | `"20s"` | How long `nervros-cli doctor` waits for the graph, at most 5 s. |
 | `interfaces` | none | Where interface packages are: an install prefix such as `/opt/ros/jazzy`, or a package's source directory. Tool schemas come from these. |
 | `remap` | none | Path prefixes to rewrite, for an install tree whose links point at another machine's paths. |
 | `map_frame` | `map` | The frame of places and poses. |
@@ -85,7 +85,7 @@ models, and sends text only to models that are local or do not train on it.
 | Key | Default | |
 |---|---|---|
 | `start_armed` | `false` | Whether acts are allowed from the start; the app's switch changes it. |
-| `autonomy` | `supervised` | `observe` refuses every act; `supervised` asks the operator for each; `autonomous` runs them. |
+| `autonomy` | `supervised` | `observe` refuses every act and every edit; `supervised` asks the operator for each; `autonomous` runs them. |
 | `approval_ttl` | `"60s"` | An unanswered approval is a no after this. |
 | `budgets.model_calls` | `10` | Model calls per turn. Once a mission has started in a turn, the model is offered no more tools and answers; after a call that finished, it can check what it did. |
 | `budgets.tool_calls` | `12` | Tool calls per turn. |
@@ -103,7 +103,7 @@ not.
 tool = "run_mission"            # or "*" for every tool
 arg = "steps.*.args.*.value"    # a dotted path; * is every entry of a list
 matches = "R5"                  # globbed like hard_deny; a number or a flag as its text
-then = "deny"                   # or "ask": the operator approves it first, armed or not
+then = "deny"                   # or "ask": the operator approves it first, whatever the autonomy
 reason = "the bedroom is private"
 ```
 
@@ -123,9 +123,9 @@ relative name in a `[[tool]]` is checked as the node resolves it, under `/`. The
 `geometry_msgs/msg/Twist`, `geometry_msgs/msg/TwistStamped`, `trajectory_msgs/msg/*`,
 `control_msgs/action/*`, `control_msgs/msg/JointJog`, `controller_manager_msgs/srv/*`,
 `lifecycle_msgs/srv/ChangeState` and `rcl_interfaces/srv/SetParameters*` (only `param_set` sets
-parameters); a type written `pkg/Name` is checked as every kind it could be. A name from the
-model must be absolute: `cmd_vel` would otherwise reach `/cmd_vel` past a list written for
-absolute names.
+parameters); a type written `pkg/Name` is checked as every kind it could be. A name the model
+gives an act must be absolute: `cmd_vel` would otherwise reach `/cmd_vel` past a list written for
+absolute names. The read tools take `odom` as `/odom`, and the rules see it so.
 
 ### `[ros_tools]`
 
@@ -134,31 +134,31 @@ without a shell. With the table present, six read tools are always there:
 
 | Tool | Does |
 |---|---|
-| `ros_graph` | Lists topics, services, actions or nodes (filtered by a substring or a glob), or describes one name: a topic's publishers and subscribers with their QoS, and which subscribers receive nothing because they ask for more than a publisher gives; a node's topics, services and clients; a service's or action's type and definition. |
+| `ros_graph` | Lists topics, services, actions or nodes (filtered by a substring or a glob of the name; a component container's entry lists the nodes it hosts), or describes one name: a topic's publishers and subscribers with their QoS, and which subscribers receive nothing because they ask for more than a publisher gives; a node's topics, services and clients; a service's or action's type and definition. |
 | `topic_sample` | `echo` up to 10 messages, long arrays and strings shortened, `fields` to pick some; `hz` for the rate and its jitter; `bw` for bytes per second. Images, point clouds and maps are too large to echo. |
 | `interface_show` | A message, service or action definition. |
 | `tf` | Where one frame is in another, or every link with its parent, whether it is static and its age. |
-| `params` | A node's parameters: names, values (all of them when none are named) and descriptions. |
+| `params` | A node's parameters: names, values (all of them when none are named) and descriptions, at most 80 a call, narrowed by `prefix` or `filter`. |
 | `log_tail` | Recent `/rosout` lines, warnings and errors by default. |
 
-Four act tools exist only when their list names something. Each call needs the robot armed and,
-when supervised, the operator's approval of the resolved target, type and payload. It is checked
-against the interface, the hard deny lists and the profile's list before anyone is asked, and it
-holds every resource while it runs. A running mission holds them all until it ends, so neither
-can overlap the other: the second is refused as busy.
+Four act tools exist only when their list names something. Each call needs the robot armed and, when
+supervised, the operator's approval of the resolved target, type and payload. It is checked against
+the interface, the hard deny lists and the profile's list before anyone is asked, and, but for
+`param_set`, it holds every resource while it runs. A running mission holds them all until it ends,
+so neither can overlap the other: the second is refused as busy.
 
 | Tool | Does |
 |---|---|
 | `service_call` | Calls a service; its type is looked up when not given. |
 | `action_goal` | Sends a goal and waits for the result, up to 120 s, then cancels it; or cancels every goal of an action. A goal is cancelled too when its turn is stopped. |
-| `param_set` | Sets one parameter, converted to its current type, and reads it back. A world edit: approval, no arming. |
+| `param_set` | Sets one parameter, converted to its current type, and reads it back. Risk `world_edit`: it needs the robot armed and, when supervised, approval, and holds no resource. |
 | `topic_publish` | Publishes a message up to 10 times, at up to 10 Hz, with the agent's own QoS. |
 
 | Key | Default | |
 |---|---|---|
 | `hidden` | action internals, `/rosout`, `/parameter_events`, parameter services | Left out of listings unless `all` is asked; not a boundary. |
-| `read_deny` | none | Topics never sampled or echoed. |
-| `param_read_deny` | `*key*`, `*token*`, `*secret*`, `*password*` | Parameter values shown as hidden. |
+| `read_deny` | none | Topics never sampled, echoed, watched, plotted or used to start a schedule. |
+| `param_read_deny` | `*key*`, `*token*`, `*secret*`, `*password*` | Parameter values shown as hidden, matched on the name whatever its case: in `params`, `param_set`'s answer, a `service_call` reply, and the files `nervros-cli record` writes. |
 | `service_observe` | `get_*`, `list_*`, `describe_*` | Services that only read: `service_call` runs them unarmed and unapproved. A pattern without `/` matches the last part of the name, so `get_*` covers `/map_server/get_map` but not `/arm/get_ready/execute`. |
 | `service_call` | none | Services `service_call` may call. |
 | `action_send` | none | Actions `action_goal` may reach. |
@@ -279,8 +279,8 @@ hidden = false                            # starts hidden
 | `sensor_msgs/msg/LaserScan` | Points in the map, by TF from the scan's frame. |
 
 The Layers tab also switches the viewer's own drawings: the map, coverage, rooms, objects, trail,
-plan, the robot model and the detector's boxes. Object names start hidden, since a furnished room
-buries the map in them; hovering a box names it either way.
+plan, keep-out zones, the robot model and the detector's boxes. Object names start hidden, since a
+furnished room buries the map in them; hovering a box names it either way.
 
 ### `[mission]`
 
@@ -295,10 +295,11 @@ app, and the agent never asks first in the chat. `check_only` only checks a plan
 | `validate` | required | The `ValidateMission` service. |
 | `catalog` | required | The `GetCatalog` service. |
 | `stop` | required | The `StopAll` service, which the Stop button and `stop` call. |
+| `pause` | none | The `PauseMission` service: "pause" and "resume" in the chat while a mission runs, `/pause` and `/resume`, and the Pause buttons pause the mission and let it go on. |
 | `state` | required | The `RobotState` topic. |
-| `max_replans` | `2` | Failed missions for one request, counted until the operator speaks again, before the agent must hand back to the operator. |
+| `max_replans` | `2` | Plans after a failed mission for one request, counted until the operator speaks again: after `max_replans + 1` failed missions the agent hands back to the operator. |
 | `preview` | none | The `PreviewMission` service: the viewer draws where a plan's walks end and the paths to them beside its approval card, and the card marks a step the preview cannot reach. |
-| `heartbeat` | none | Where the agent publishes `nervros_interfaces/msg/Heartbeat` while a mission runs, from the session's own loop: the executor stops a mission whose agent is gone, crashed or hung. Without it a mission runs on alone. |
+| `heartbeat` | none | Where the agent publishes `nervros_interfaces/msg/Heartbeat` from the session's own loop, as long as the session runs; the executor listens while a mission runs and stops one whose agent is gone, crashed or hung. Without it a mission runs on alone. |
 | `heartbeat_timeout_s` | `2.0` | How long a mission may go without a heartbeat; the executor clamps it to its own limit. |
 | `teleop` | none | The `Teleop` service: Drive in the Robot tab hands the base to the operator while no mission runs and the robot is armed; disarming hands it back. W S walk, A D turn, Q E step sideways. |
 | `teleop_cmd` | none | Where the hand-driving `geometry_msgs/msg/Twist` commands go; the executor caps their speed and stops the base when they pause. |
@@ -345,6 +346,49 @@ near = ["charger_1"]                     # reached from here; see below
 detector's name for an object. A plan step that needs the robot near one of them walks to the
 place first, as it walks to any object the world model knows.
 
+### `[geofence]`
+
+Keep-out zones: polygons on the map the robot may not be sent into. The profile's zones are fixed;
+the operator adds more in chat with `geofence` ("keep the robot out of the kitchen", "keep it a
+metre from the vase"), around a room, an object, a place or corners on the map, kept per robot in
+the state directory beside the remembered places. Adding a zone only narrows where the robot goes,
+so it is free; removing one asks the operator every time, supervised or autonomous and never
+allowed for the session (an `observe` profile refuses it), and only an edit of this file removes
+the profile's.
+
+```toml
+[geofence]
+mask = "/keepout_filter_mask"   # optional; needs [world] map
+
+[[geofence.zone]]
+name = "stairs"
+polygon = [[4.0, 0.0], [5.0, 0.0], [5.0, 2.5], [4.0, 2.5]]   # map frame, metres, in order
+```
+
+The guard refuses a Nav2 goal inside a zone (`NavigateToPose`, `NavigateThroughPoses`,
+`FollowWaypoints`, `FollowPath` and the path planners' actions) and a `PoseStamped` published
+inside one, a pose in another frame taken through TF and refused when TF cannot place it; while
+zones are set it refuses Nav2's straight moves (`DriveOnHeading`, `BackUp`), which only a mission
+step checks, and `action_goal` never starts a mission past `run_mission`. The plan check refuses a
+mission whose walk to a place, pose or target ends in one (for a label several objects share, any
+of them), or whose straight walk passes through one, followed from where the robot stands; a walk
+out of a zone the robot stands in is allowed. A plan run later, by its hash or a schedule, is
+checked again as it starts. Nav2 keeps its own paths out through `mask`: NervROS publishes an
+`OccupancyGrid` the size of `[world] map`, the zones' cells at 100 and latched (transient local),
+for Nav2's `KeepoutFilter` behind a `costmap_filter_info_server`, again whenever the zones or the
+map's grid change; `nervros-cli doctor` says whether anything reads it. Without `mask` Nav2 knows
+nothing of the zones, so only the agent's own checks hold them: a walk whose route crosses a
+zone, driving by hand and skills that move the base themselves are not held back. The straight-walk
+check covers the skill `[mission.checks] walk` names. The viewer draws the zones in red, the World
+tab lists them, and its buttons add and remove them through the agent.
+
+A zone needs a name, at least three corners and an area of 0.05 m² or more, and names are unique,
+whatever their case, across the profile's zones and the chat's; a bad zone in the profile stops
+the start. In chat a room is found by its id, then its name, then its type, and a type several
+rooms share is refused until one is named by id; an object or a place gets a margin of 0.3 m
+unless the operator says otherwise, and a place is a square reaching half a metre out from it,
+plus the margin.
+
 ### `[models]`
 
 `file`: the [models file](models.md).
@@ -381,7 +425,7 @@ Doctor tab show a server that did not connect.
 
 ## Builtin tools
 
-Every robot gets `list_places`, `robot_state` and `stop`. `stop` is always allowed, armed or not,
+Every robot gets `list_places`, `robot_state`, `geofence` and `stop`. `stop` is always allowed, armed or not,
 because it only makes the robot do less. `look` comes with `[look]`, `segment` with `[segment]`,
 and `run_mission` with `[mission]`.
 
@@ -400,7 +444,8 @@ The rest are the checks you would run yourself before blaming the model:
 | `skill_gap` | With `[mission]`: logs a request no skill can do, and why; planning that gives up logs one itself. The Mission tab and `nervros-cli gaps` list them. |
 | `point` | With a `segment` model in the models file: points at what the operator names in the frame a camera's detector marks, found as `look` finds it, or the newest frame when there are no marks, including things no detector marks, and says which mark a point lands on. |
 | `skill` | With `skills`: reads one skill's procedure. |
-| `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each asks for approval when supervised, like a world edit. |
+| `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each is an `annotate` call: approval when supervised, no arming. |
+| `geofence` | Lists, adds and removes keep-out zones (see `[geofence]`): around a room, an object (its size and a margin), a place, or corners on the map. Adding is free, and refused while the robot stands inside the new zone or when a type names several rooms; removing always asks the operator. |
 
 `look` can also answer about an earlier snapshot, and look closer at one mark: it crops the mark
 from the full frame at a higher resolution for the vision model, for a label or a small part.

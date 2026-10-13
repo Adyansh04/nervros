@@ -1,6 +1,7 @@
 //! Running a mission: launching it on the executor, watching it, and keeping how it went.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use nervros_ros::{Frame, Goal, GoalResult, RosError};
@@ -56,6 +57,9 @@ impl Missions {
     /// Sends a checked plan to the executor and watches it; its id. The slot is claimed before the
     /// goal goes out, so two launches at once cannot both pass.
     async fn launch(self: &Arc<Self>, compiled: Compiled) -> Result<String, String> {
+        // Run by its hash or on a schedule, a plan was checked when it was made: a zone may have
+        // been added since, and a straight walk starts from where the robot stands now.
+        self.still_clear(&compiled).await?;
         let id = uuid::Uuid::now_v7().to_string();
         {
             let mut running = lock(&self.running);
@@ -204,6 +208,7 @@ impl Missions {
                 .iter()
                 .map(|s| times.record(s, &step, &reason))
                 .collect(),
+            plan: json!(compiled.plan.steps),
         });
         let seen = self.observe().await;
         // What happened to what the failed step was about: often it was moved, not missed. The
@@ -268,9 +273,18 @@ impl Missions {
         alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         alive.tick().await;
         let mut unheard = 0;
+        let mut paused = false;
         let result = loop {
             tokio::select! {
-                Some(fb) = feedback.recv() => self.progress(id, &fb, times),
+                Some(fb) = feedback.recv() => {
+                    if fb["paused"].as_bool().unwrap_or(false) != paused {
+                        paused = !paused;
+                        times.pause(paused, fb["elapsed_s"].as_f64().unwrap_or(0.0));
+                        self.paused.store(paused, Ordering::SeqCst);
+                        self.emit(Event::MissionPaused { id: id.to_owned(), paused });
+                    }
+                    self.progress(id, &fb, times);
+                }
                 r = &mut result => {
                     break r
                         .map_err(|_| RosError::Middleware("the goal was dropped".into()))
@@ -288,6 +302,7 @@ impl Missions {
                 }
             }
         };
+        self.paused.store(false, Ordering::SeqCst);
         // The executor's last word on the steps can come just behind its result.
         while let Ok(Some(fb)) =
             tokio::time::timeout(Duration::from_millis(50), feedback.recv()).await
@@ -393,14 +408,30 @@ struct StepTime {
     end: Option<(f64, &'static str)>,
 }
 
-/// Each step's [`StepTime`], from the executor's events, for the ledger.
+/// Each step's [`StepTime`], from the executor's events, for the ledger; time spent paused is
+/// no step's.
 #[derive(Debug, Default)]
-struct StepTimes(std::collections::BTreeMap<String, StepTime>);
+struct StepTimes {
+    steps: std::collections::BTreeMap<String, StepTime>,
+    /// Seconds paused so far, and since when it is paused now.
+    paused: f64,
+    paused_at: Option<f64>,
+}
 
 impl StepTimes {
+    /// Notes that the mission paused, or went on, `elapsed` seconds in.
+    fn pause(&mut self, on: bool, elapsed: f64) {
+        match (on, self.paused_at.take()) {
+            (true, at) => self.paused_at = at.or(Some(elapsed)),
+            (false, Some(at)) => self.paused += (elapsed - at).max(0.0),
+            (false, None) => {}
+        }
+    }
+
     /// Notes a step event: its first one starts the step, a success or failure ends it.
     fn note(&mut self, step: &str, status: &'static str, elapsed: f64) {
-        let time = self.0.entry(step.to_owned()).or_insert(StepTime {
+        let elapsed = elapsed - self.paused;
+        let time = self.steps.entry(step.to_owned()).or_insert(StepTime {
             start: elapsed,
             end: None,
         });
@@ -411,7 +442,7 @@ impl StepTimes {
 
     /// A planned step as it went; `failed` is the step the mission failed at, with `reason`.
     fn record(&self, step: &PlannedStep, failed: &str, reason: &str) -> StepRecord {
-        let (seconds, outcome) = match self.0.get(&step.id) {
+        let (seconds, outcome) = match self.steps.get(&step.id) {
             Some(&StepTime {
                 start,
                 end: Some((end, status)),
@@ -452,4 +483,21 @@ pub(super) fn step_of(text: &str) -> Option<String> {
                 .then(|| format!("s{digits}"))
         })
         .next_back()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_spent_paused_is_no_steps() {
+        let mut times = StepTimes::default();
+        times.note("s1", "running", 1.0);
+        times.pause(true, 3.0);
+        times.pause(false, 303.0);
+        times.note("s1", "success", 304.0);
+        let s1 = &times.steps["s1"];
+        let end = s1.end.map_or(f64::NAN, |(at, _)| at);
+        assert!((end - s1.start - 3.0).abs() < 1e-9, "{s1:?}");
+    }
 }

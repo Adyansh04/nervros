@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nervros_core::profile::{LayerConfig, LookConfig, Profile, TopicRef};
+use nervros_core::zones::Zones;
 use nervros_ros::{RobotPort, Transform};
 use rerun::RecordingStream;
 use tokio::task::JoinSet;
@@ -15,6 +16,7 @@ use crate::objects::{draw_object_names, draw_objects};
 use crate::plan::{draw_plan, draw_trail};
 use crate::rooms::draw_rooms;
 use crate::tasks::{Drawer, camera, draw_detections, robot_model, sample, scan};
+use crate::zones::zones;
 use crate::{
     CAMERA_PATH, CAMERA_PERIOD, Layers, MODEL_PATH, OBJECT_PALETTE, OBJECTS_PERIOD, POSE_PERIOD,
     SLOW_PERIOD, layers, put, put_static,
@@ -178,6 +180,13 @@ impl Spawner {
         let plan = self.layer("Plan", "world/plan", true);
         let topic = profile.viz.as_ref().and_then(|v| v.plan.clone());
         self.watch(topic, POSE_PERIOD * 5, plan, Box::new(draw_plan));
+    }
+
+    /// The keep-out zones, redrawn as the operator adds or removes them.
+    pub(super) fn zones(&mut self, all: &Arc<Zones>) {
+        let layer = self.layer("Keep-out zones", "world/zones", true);
+        self.tasks
+            .spawn(zones(self.rec.clone(), Arc::clone(all), layer));
     }
 
     pub(super) fn profile_layers(&mut self, profile: &Profile) {

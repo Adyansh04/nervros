@@ -2,8 +2,9 @@
 //! trait.
 //!
 //! [`RobotPort`] is what the agent core talks to. [`R2rPort`] implements it over r2r (feature
-//! `rcl`, which needs a sourced ROS environment), and `fake::FakeRobot` (feature `test-support`)
-//! implements it from a script for tests that run without ROS.
+//! `rcl`, which needs a sourced ROS environment), and `fake::FakeRobot` and
+//! `scripted::ScriptedRobot` (feature `scripted`) implement it from a script or a file, for tests
+//! and `nervros-cli eval --robot`, which run without ROS.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,11 +16,13 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "scripted"))]
 pub mod fake;
 pub mod image;
 #[cfg(feature = "rcl")]
 mod r2r_port;
+#[cfg(any(test, feature = "scripted"))]
+pub mod scripted;
 pub mod tf;
 
 #[cfg(feature = "rcl")]
@@ -417,6 +420,16 @@ pub trait RobotPort: Send + Sync {
     /// discovery every time.
     async fn publisher(&self, _topic: &str, _msg_type: &str) -> Result<Publisher, RosError> {
         unsupported("keeping a publisher")
+    }
+
+    /// As [`RobotPort::publisher`], latched: transient local and reliable, so a subscriber that
+    /// joins later still gets the last message, as a costmap filter reading a mask needs.
+    async fn latched_publisher(
+        &self,
+        _topic: &str,
+        _msg_type: &str,
+    ) -> Result<Publisher, RosError> {
+        unsupported("keeping a latched publisher")
     }
 
     /// Every frame link TF has seen.

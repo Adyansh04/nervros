@@ -86,10 +86,19 @@ impl ActionGoal {
         }
         let goal = payload(args, "goal");
         if !Self::cancelling(args) {
+            if ty == "nervros_interfaces/action/ExecuteMission" {
+                return Err(ToolOutcome::refused(
+                    "a mission goes through run_mission, which checks it against the keep-out \
+                     zones and asks the operator",
+                ));
+            }
             self.ctx
                 .schemas
                 .validate(&ty, SchemaPart::Goal, &goal)
                 .map_err(|why| ToolOutcome::failed(format!("the goal does not fit {ty}: {why}")))?;
+            if let Some(refused) = self.ctx.zone_refusal(&ty, &goal) {
+                return Err(refused);
+            }
         }
         Ok(Prepared {
             name: action,

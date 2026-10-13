@@ -200,6 +200,12 @@ fn print_mission(e: &Event) {
             }
         }
         Event::MissionStarted { id, .. } => println!("  [mission {id} started]"),
+        Event::MissionPaused { id, paused } => {
+            println!(
+                "  [mission {id} {}]",
+                if *paused { "paused" } else { "resumed" }
+            );
+        }
         Event::MissionProgress {
             step, node, status, ..
         } => {
@@ -288,6 +294,7 @@ fn print_event(e: &Event, logs: &Path) {
         | Event::MissionPreview { .. }
         | Event::MissionStarted { .. }
         | Event::MissionProgress { .. }
+        | Event::MissionPaused { .. }
         | Event::MissionFinished { .. } => print_mission(e),
         // Plots are drawn by the app's viewer; the tool's reply already says what it plots.
         Event::User { .. }
@@ -474,6 +481,17 @@ async fn interactive(
             });
             continue;
         }
+        // Pause words act only on a mission that can take them; otherwise they are the model's.
+        if let Some((missions, on)) = agent
+            .missions
+            .as_ref()
+            .and_then(|m| Some((m, m.pause_order(&line)?)))
+        {
+            // Off the loop, so a `stop` typed while the executor is slow to answer is read at once.
+            let missions = Arc::clone(missions);
+            tokio::spawn(async move { missions.pause(on, "chat").await });
+            continue;
+        }
         if let Some(cmd) = parse_line(&line) {
             agent.session.send(cmd);
         }
@@ -494,5 +512,27 @@ pub(crate) async fn doctor(profile_path: &Path) -> Result<()> {
     if bad > 0 {
         bail!("{bad} checks failed");
     }
+    Ok(())
+}
+
+/// Drafts the robot's self-description from the live robot, or prints the facts it would use.
+pub(crate) async fn whoami(profile_path: &Path, only_facts: bool) -> Result<()> {
+    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let robot = nervros_core::app::connect(&profile)?;
+    // Discovery needs a moment after the node starts.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let facts = nervros_core::whoami::facts(&profile, robot.as_ref()).await;
+    if only_facts {
+        println!("{}", serde_json::to_string_pretty(&facts)?);
+        return Ok(());
+    }
+    let llm = nervros_core::llm::Llm::new(crate::router(profile_path)?);
+    let text = nervros_core::whoami::draft(&llm, &profile, &facts).await?;
+    let path = nervros_core::whoami::save(&profile, &text).map_err(anyhow::Error::msg)?;
+    println!("{text}");
+    eprintln!(
+        "drafted {}; read it, edit it, and make it the persona when it is right",
+        path.display()
+    );
     Ok(())
 }

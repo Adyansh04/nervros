@@ -42,6 +42,10 @@ const COMPOSER: &str = "nervros_composer";
 const STOP_HINT: &str = "Halts the mission and cancels every goal; the hands keep their grip. \
                          The e-stop on the robot's remote is the real emergency stop.";
 
+const PAUSE_HINT: &str = "Halts the running step: the robot stops where it is, the arms hold and \
+                          the hands keep their grip; a pick or place finishes first. Resume runs \
+                          the rest. Typing pause or resume does the same.";
+
 /// What the World tab's Explore button says to the agent.
 pub(crate) const EXPLORE_REQUEST: &str = "Explore the building to fill in the map.";
 
@@ -66,6 +70,12 @@ struct Live {
     pub battery: Option<Value>,
     /// Its motor diagnostics, when the profile names their topic.
     pub motors: Option<Value>,
+    /// A self-description is being drafted.
+    pub drafting: bool,
+    /// The last draft and where it was saved, or why none came.
+    pub draft: Option<Result<(std::path::PathBuf, String), String>>,
+    /// The draft has just landed, below the checks: brought into view once.
+    pub draft_fresh: bool,
 }
 
 /// What the operator clicked in the viewer, when it is something the agent can act on.
@@ -332,6 +342,11 @@ impl Gui {
         let live = Arc::new(Mutex::new(Live::default()));
         let recheck = watch(&agent, &live, &cc.egui_ctx);
         let mut chat = Chat::default();
+        chat.can_pause = agent
+            .profile
+            .mission
+            .as_ref()
+            .is_some_and(|m| m.pause.is_some());
         chat.items
             .extend(agent.notices.iter().cloned().map(crate::chat::Item::Notice));
         chat.items.extend(
@@ -383,6 +398,25 @@ impl Gui {
             .as_ref()
             .and_then(|s| s["mission_id"].as_str())
             .is_some_and(|id| !id.is_empty())
+    }
+
+    /// Whether the running mission is paused, or waits to pause once a pick or place ends.
+    fn mission_paused(&self) -> bool {
+        self.mission_running()
+            && self
+                .live()
+                .executor
+                .as_ref()
+                .and_then(|s| s["paused"].as_bool())
+                .unwrap_or(false)
+    }
+
+    /// Pauses the running mission, or lets it go on; the executor's answer comes back as a
+    /// notice in the chat.
+    fn pause(&self, on: bool, reason: &'static str) {
+        if let Some(missions) = self.agent.missions.clone() {
+            tokio::spawn(async move { missions.pause(on, reason).await });
+        }
     }
 
     /// Closing the window with a mission running asks first: the mission would go on unwatched.
@@ -495,6 +529,15 @@ impl Gui {
             self.agent.session.send(Command::StopMission);
             return;
         }
+        // Only on a mission that can take it: otherwise "wait" or "go on" is for the model.
+        if let Some(on) = nervros_core::session::pause_word(text)
+            && self.chat.can_pause
+            && self.mission_running()
+            && on != self.mission_paused()
+        {
+            self.pause(on, "chat");
+            return;
+        }
         if text.starts_with('/') {
             if let Some(cmd) = palette::slash(&self.commands, text).cloned() {
                 self.run(cmd);
@@ -543,6 +586,7 @@ impl Gui {
                 }
             }
             Cmd::Live => self.follow_live(),
+            Cmd::Pause(on) => self.pause(on, "chat"),
         }
     }
 
@@ -589,6 +633,7 @@ impl Gui {
                     ctx.memory_mut(|m| m.request_focus(egui::Id::new(COMPOSER)));
                 }
                 Action::ShowAt(at) => self.show_at(at),
+                Action::Pause(on) => self.pause(on, "button"),
             }
         }
     }
@@ -707,9 +752,12 @@ impl eframe::App for Gui {
             _ => self.viewer.ui(ui, frame),
         }
         let (editor, viewing) = (self.editor.is_some(), self.viewing.is_some());
+        let (running, paused) = (self.mission_running(), self.mission_paused());
+        let can_pause = self.chat.can_pause;
         let available = move |cmd: &Cmd| match cmd {
             Cmd::EditWorld => editor,
             Cmd::Live => viewing,
+            Cmd::Pause(on) => can_pause && running && *on != paused,
             _ => true,
         };
         let mut provider = palette::Provider {
@@ -861,16 +909,33 @@ mod tests {
             {"id": "R2", "name": "", "type": "living room", "floor_coverage": 0.61, "face_coverage": 0.34, "object_count": 4},
             {"id": "R3", "name": "bedroom", "type": "bedroom", "floor_coverage": 0.05, "face_coverage": 0.0, "object_count": 0}
         ]});
+        let zone = |name: &str, polygon: Vec<[f64; 2]>, fixed| nervros_core::zones::Zone {
+            name: name.into(),
+            polygon,
+            fixed,
+        };
+        let zones = [
+            zone(
+                "stairs",
+                vec![[4.0, 0.0], [5.0, 0.0], [5.0, 2.5], [4.0, 2.5]],
+                true,
+            ),
+            zone(
+                "server rack",
+                vec![[1.0, 1.0], [2.2, 1.0], [2.2, 2.0], [1.0, 2.0]],
+                false,
+            ),
+        ];
         let mut harness = Harness::builder()
             .wgpu()
-            .with_size(egui::vec2(420.0, 300.0))
+            .with_size(egui::vec2(420.0, 420.0))
             .build_ui(move |ui| {
                 theme::apply(ui);
                 Frame::new()
                     .fill(theme::BG)
                     .inner_margin(Margin::same(14))
                     .show(ui, |ui| {
-                        let _ = world_view(ui, &rooms, Some(13));
+                        let _ = world_view(ui, &rooms, Some(13), &zones);
                     });
             });
         crate::testkit::style_for_tests(&harness.ctx);
@@ -935,6 +1000,7 @@ mod tests {
             &rec,
             &agent.robot,
             &agent.profile,
+            &agent.zones,
             agent.session.subscribe(),
         );
         let handle = runtime.handle().clone();
