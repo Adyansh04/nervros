@@ -159,6 +159,8 @@ pub struct Seen {
 pub struct Exchange {
     mine: Option<u64>,
     open: u32,
+    /// Jobs running, such as a program: their report comes when they end.
+    jobs: u32,
     awaiting_report: bool,
 }
 
@@ -172,11 +174,17 @@ impl Exchange {
                 self.open = self.open.saturating_sub(1);
                 self.awaiting_report = true;
             }
+            Event::JobStarted { .. } => self.jobs += 1,
+            Event::JobFinished { .. } => {
+                self.jobs = self.jobs.saturating_sub(1);
+                self.awaiting_report = true;
+            }
             Event::Report { .. } => self.awaiting_report = false,
             Event::User { turn, text: sent } if sent == text => self.mine = Some(*turn),
             Event::TurnFinished { turn } => {
                 return self.mine.is_some_and(|m| *turn >= m)
                     && self.open == 0
+                    && self.jobs == 0
                     && !self.awaiting_report;
             }
             _ => {}

@@ -18,6 +18,7 @@ use serde_json::Value;
 use crate::theme;
 
 mod approval;
+mod job;
 mod plan;
 mod report;
 #[cfg(test)]
@@ -60,6 +61,8 @@ pub enum Action {
     ShowAt(SystemTime),
     /// Pause the running mission, or with false let it go on.
     Pause(bool),
+    /// Stop a job, by its id.
+    StopJob(String),
 }
 
 /// One tool call, from its start to its end.
@@ -155,6 +158,8 @@ pub enum Item {
     Report(String),
     /// A plan, and the mission that runs it.
     Plan(PlanCard),
+    /// A program or a search the operator approved once.
+    Job(job::JobCard),
     /// A request the last session ended waiting on, and whether it was taken up or put aside.
     Unanswered(Unanswered, Cell<bool>),
 }
@@ -236,6 +241,7 @@ impl Item {
                 | Self::Image { .. }
                 | Self::Approval(_)
                 | Self::Plan(_)
+                | Self::Job(_)
         )
     }
 }
@@ -333,6 +339,17 @@ impl Chat {
             | Event::MissionProgress { .. }
             | Event::MissionPaused { .. }
             | Event::MissionFinished { .. } => self.apply_mission(event),
+            Event::JobStarted { job } => self.items.push(Item::Job(job::JobCard::new(job.clone()))),
+            Event::JobLog { id, line } => {
+                if let Some(card) = self.job_mut(id) {
+                    card.log(line);
+                }
+            }
+            Event::JobFinished { job } => {
+                if let Some(card) = self.job_mut(&job.id) {
+                    card.ended(job);
+                }
+            }
             // The viewer draws it; the tool's card already says what.
             Event::Plot { .. } => {}
             Event::ModelCall {
@@ -579,6 +596,7 @@ impl Chat {
                 failed_step,
                 reason,
                 elapsed_s,
+                ..
             } => {
                 if let Some(p) = self.plan_mut(|p| p.mission.as_ref() == Some(id)) {
                     p.finished = Some((*outcome, failed_step.clone(), reason.clone(), *elapsed_s));
@@ -587,6 +605,14 @@ impl Chat {
             }
             _ => {}
         }
+    }
+
+    /// The card of job `id`.
+    fn job_mut(&mut self, id: &str) -> Option<&mut job::JobCard> {
+        self.items.iter_mut().rev().find_map(|i| match i {
+            Item::Job(card) if card.job.id == id => Some(card),
+            _ => None,
+        })
     }
 
     /// The newest plan matching `which`.
@@ -702,6 +728,7 @@ impl Chat {
                         }
                         Item::Report(text) => report(ui, text),
                         Item::Plan(p) => plan_card(ui, p, self.can_pause, actions),
+                        Item::Job(card) => job::job_card(ui, card, actions),
                         Item::Unanswered(u, done) => unanswered_card(ui, u, done, actions),
                     }
                 })

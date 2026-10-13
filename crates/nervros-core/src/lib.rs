@@ -7,6 +7,7 @@ pub mod agent;
 pub mod app;
 pub mod config;
 pub mod doctor;
+pub mod job;
 pub mod mission;
 pub mod model;
 mod persist;

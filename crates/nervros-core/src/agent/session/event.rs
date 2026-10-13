@@ -333,6 +333,26 @@ pub enum Event {
         reason: String,
         /// How long it ran.
         elapsed_s: f64,
+        /// What its steps handed on, by key (`s2_object_id`), when the executor says.
+        #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+        outputs: serde_json::Map<String, Value>,
+    },
+    /// A job the operator approved started, such as a robot program or a search.
+    JobStarted {
+        /// The job as it started.
+        job: crate::job::JobInfo,
+    },
+    /// One line of what a job does.
+    JobLog {
+        /// The job's id.
+        id: String,
+        /// What it did.
+        line: String,
+    },
+    /// A job ended.
+    JobFinished {
+        /// The job as it ended.
+        job: crate::job::JobInfo,
     },
 }
 

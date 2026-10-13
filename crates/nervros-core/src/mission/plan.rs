@@ -587,6 +587,9 @@ pub enum Author {
     Model,
     /// The operator, in the window.
     Operator,
+    /// A job the operator approved once, such as a program the model wrote: held to the model's
+    /// rules, but a failed check is the job's to handle, not one of the model's attempts.
+    Job,
 }
 
 /// Compiles a plan.
@@ -789,7 +792,8 @@ fn compile_step<'c>(
                 return Err(problems);
             }
         }
-    } else if (step.skill == GO_TO_POSE || step.skill == GO_TO_TARGET) && author == Author::Model {
+    } else if (step.skill == GO_TO_POSE || step.skill == GO_TO_TARGET) && author != Author::Operator
+    {
         problems.push(Problem::new(
             id,
             "skill",

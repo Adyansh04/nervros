@@ -501,6 +501,7 @@ impl Gui {
             failed_step,
             reason,
             elapsed_s,
+            ..
         } = e
         else {
             return;
@@ -634,6 +635,9 @@ impl Gui {
                 }
                 Action::ShowAt(at) => self.show_at(at),
                 Action::Pause(on) => self.pause(on, "button"),
+                Action::StopJob(id) => {
+                    self.agent.jobs.stop(&id);
+                }
             }
         }
     }

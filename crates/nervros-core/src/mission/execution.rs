@@ -42,7 +42,7 @@ impl Missions {
         {
             return refusal;
         }
-        match self.launch(compiled).await {
+        match self.launch(compiled, Reported::ToModel).await {
             Ok(id) => ToolOutcome {
                 status: Status::Accepted,
                 data: json!({"mission_id": id}),
@@ -56,7 +56,11 @@ impl Missions {
 
     /// Sends a checked plan to the executor and watches it; its id. The slot is claimed before the
     /// goal goes out, so two launches at once cannot both pass.
-    async fn launch(self: &Arc<Self>, compiled: Compiled) -> Result<String, String> {
+    pub(super) async fn launch(
+        self: &Arc<Self>,
+        compiled: Compiled,
+        reported: Reported,
+    ) -> Result<String, String> {
         // Run by its hash or on a schedule, a plan was checked when it was made: a zone may have
         // been added since, and a straight walk starts from where the robot stands now.
         self.still_clear(&compiled).await?;
@@ -115,7 +119,13 @@ impl Missions {
         let request = self.request();
         tokio::spawn(
             Arc::clone(self)
-                .watch(id.clone(), compiled, goal, (before, held), request)
+                .watch(
+                    id.clone(),
+                    compiled,
+                    goal,
+                    (before, held),
+                    (request, reported),
+                )
                 .instrument(span),
         );
         Ok(id)
@@ -136,7 +146,7 @@ impl Missions {
             return Err(format!("mission {} was still running", r.id));
         }
         compiled.plan.intent = label.to_owned();
-        self.launch(compiled).await
+        self.launch(compiled, Reported::ToModel).await
     }
 
     /// Checks a plan for a schedule: its hash, and its steps as the operator reads them.
@@ -169,13 +179,14 @@ impl Missions {
         compiled: Compiled,
         goal: Goal,
         (before, held): (Option<Arc<Frame>>, Option<crate::guard::ResourceLock>),
-        request: String,
+        (request, reported): (String, Reported),
     ) {
         let started = Instant::now();
         let started_s = crate::now_s();
         let mut times = StepTimes::default();
         let result = self.outcome_of(&id, goal, &mut times).await;
         let elapsed = started.elapsed().as_secs_f64();
+        let outputs = outputs_of(&result);
         let (outcome, step, reason) = summarise(result);
         drop(held);
         self.release(&id);
@@ -192,6 +203,7 @@ impl Missions {
             failed_step: step.clone(),
             reason: reason.clone(),
             elapsed_s: elapsed,
+            outputs,
         });
         self.keep(MissionRecord {
             id: id.clone(),
@@ -250,7 +262,7 @@ impl Missions {
             elapsed,
             (&seen, &story, &moves, &camera.lines),
         );
-        if let Some(s) = self.session.get() {
+        if let Some(s) = self.session.get().filter(|_| reported == Reported::ToModel) {
             s.send(Command::Report(report));
         }
     }
@@ -373,6 +385,31 @@ impl Missions {
 }
 
 /// `(outcome, failed step, reason)` from the executor's result.
+/// Who hears how a mission ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Reported {
+    /// The model, which answers the report.
+    ToModel,
+    /// The job that ran it, which reports once it ends: a model answering each of a search's
+    /// missions would spend its calls on what the job's own report says.
+    ToJob,
+}
+
+/// What a mission's steps handed on, from the executor's `outputs_json`; none from an executor
+/// that does not send it.
+fn outputs_of(result: &Result<GoalResult, RosError>) -> serde_json::Map<String, Value> {
+    result
+        .as_ref()
+        .ok()
+        .and_then(|r| r.result["outputs_json"].as_str())
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|v| match v {
+            Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 fn summarise(result: Result<GoalResult, RosError>) -> (Outcome, String, String) {
     match result {
         Ok(r) => {

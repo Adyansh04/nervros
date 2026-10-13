@@ -212,7 +212,7 @@ impl RunMission {
         // Marked as the operator's only here: a model's call by hash has its arguments replaced.
         let args = match by {
             By::Operator => json!({"hash": hash, "by": "operator"}),
-            By::Model => json!({"hash": hash}),
+            By::Model | By::Job => json!({"hash": hash}),
         };
         Ok(Assessment {
             risk: Risk::Manipulation,

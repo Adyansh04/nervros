@@ -419,7 +419,7 @@ impl Missions {
                 })
             })
             .collect();
-        if by == By::Operator {
+        if by != By::Model {
             return ToolOutcome::failed(if lines.is_empty() {
                 "the edited plan failed its checks".to_owned()
             } else {

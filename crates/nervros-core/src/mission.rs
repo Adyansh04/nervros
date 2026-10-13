@@ -36,6 +36,7 @@ use crate::profile::{MissionConfig, Profile};
 use crate::session::{Event, SessionHandle};
 use crate::tools::Tool;
 
+mod awaited;
 mod execution;
 mod fence;
 mod planning;
@@ -44,6 +45,7 @@ mod report;
 mod tests;
 mod tool;
 
+pub use awaited::MissionEnd;
 use tool::RunMission;
 
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -440,6 +442,11 @@ impl Missions {
     /// What the operator said last.
     pub(crate) fn request(&self) -> String {
         lock(&self.request).clone()
+    }
+
+    /// Whether mission `id` holds the mission slot.
+    fn runs(&self, id: &str) -> bool {
+        lock(&self.running).as_ref().is_some_and(|r| r.id == id)
     }
 
     /// Frees the mission slot, if mission `id` still holds it.

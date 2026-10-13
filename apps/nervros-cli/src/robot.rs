@@ -296,6 +296,22 @@ fn print_event(e: &Event, logs: &Path) {
         | Event::MissionProgress { .. }
         | Event::MissionPaused { .. }
         | Event::MissionFinished { .. } => print_mission(e),
+        Event::JobStarted { job } => println!(
+            "  [{} {} started: {}; it {}]",
+            job.kind.as_str(),
+            job.id,
+            job.name,
+            job.allows
+        ),
+        Event::JobLog { id, line } => println!("  [{id}] {line}"),
+        Event::JobFinished { job } => {
+            println!(
+                "  [{} {} {}]",
+                job.kind.as_str(),
+                job.id,
+                job.state.as_str()
+            );
+        }
         // Plots are drawn by the app's viewer; the tool's reply already says what it plots.
         Event::User { .. }
         | Event::TurnStarted { .. }

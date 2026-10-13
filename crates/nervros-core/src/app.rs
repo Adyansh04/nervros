@@ -54,6 +54,8 @@ pub struct Agent {
     pub unanswered: Vec<crate::session::Unanswered>,
     /// The keep-out zones, for what draws them.
     pub zones: Arc<crate::zones::Zones>,
+    /// Programs and searches the operator approved once, for the window's list and its Stop.
+    pub jobs: Arc<crate::job::Jobs>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -606,21 +608,14 @@ pub fn start_with(
         seeing.vision,
     );
     let schedules = mission_tools(missions.as_ref(), &guard, &mut registry)?;
+    let jobs = crate::job::Jobs::new(Arc::clone(&guard));
     check_rules(&profile, &registry)?;
     let tools = registry.iter().map(|t| t.spec().name.clone()).collect();
     let config = SessionConfig {
-        preamble: system_prompt(&profile, &skills),
-        max_model_calls: usize::try_from(profile.policy.budgets.model_calls).unwrap_or(6),
-        approval_ttl: profile.policy.approval_ttl,
-        turn_time: profile.policy.budgets.wall_time,
         pending_file,
         history_file: options.history,
         resume: options.resume,
-        notes: Some(Arc::clone(&memory) as Arc<dyn crate::memory::Notes>),
-        pulse: missions
-            .as_ref()
-            .map(|m| Arc::clone(m) as Arc<dyn crate::session::Pulse>),
-        ..SessionConfig::default()
+        ..session_config(&profile, &skills, &memory, missions.as_ref())
     };
     let source = options
         .source
@@ -639,6 +634,7 @@ pub fn start_with(
         s.attach(session.handle());
     }
     watches.attach(session.handle());
+    jobs.attach(session.handle());
     say_orphan(&profile, &robot, session.handle());
     let notices = llm
         .missing_keys()
@@ -661,7 +657,26 @@ pub fn start_with(
         mcp,
         unanswered,
         zones,
+        jobs,
     })
+}
+
+/// The session's prompt, budgets and the parts of the agent it calls on, from the profile.
+fn session_config(
+    profile: &Profile,
+    skills: &[crate::skills::Skill],
+    memory: &Arc<crate::memory::Memory>,
+    missions: Option<&Arc<Missions>>,
+) -> SessionConfig {
+    SessionConfig {
+        preamble: system_prompt(profile, skills),
+        max_model_calls: usize::try_from(profile.policy.budgets.model_calls).unwrap_or(6),
+        approval_ttl: profile.policy.approval_ttl,
+        turn_time: profile.policy.budgets.wall_time,
+        notes: Some(Arc::clone(memory) as Arc<dyn crate::memory::Notes>),
+        pulse: missions.map(|m| Arc::clone(m) as Arc<dyn crate::session::Pulse>),
+        ..SessionConfig::default()
+    }
 }
 
 /// Each `[[policy.rule]]` names a tool of this agent and an argument it takes: a rule that can

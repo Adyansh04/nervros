@@ -454,6 +454,7 @@ fn snapshot_mission() {
         failed_step: "s2".to_owned(),
         reason: "the grasp slipped".to_owned(),
         elapsed_s: 94.0,
+        outputs: serde_json::Map::new(),
     });
     chat.apply(&Event::Report {
         turn: 2,

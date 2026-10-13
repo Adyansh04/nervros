@@ -1042,3 +1042,74 @@ fn steps_are_found_in_names_and_paths() {
     assert_eq!(step_of("sequence_1"), None);
     assert_eq!(step_of("Pick"), None);
 }
+
+#[tokio::test]
+async fn a_job_runs_only_what_its_envelope_covers_and_hears_the_end() {
+    use crate::job::{Approval, Envelope, JobKind, JobState, Jobs};
+    let run = ScriptedRun {
+        result: Ok(GoalResult {
+            status: GoalStatus::Succeeded,
+            result: json!({"outcome": 0, "failed_step_id": "", "failure_reason": "",
+                           "outputs_json": "{\"s1_target_id\": \"O17\"}"}),
+        }),
+        ..ScriptedRun::default()
+    };
+    let robot: Arc<dyn RobotPort> = Arc::new(robot(run));
+    let guard = Arc::new(crate::guard::Guard::new(crate::guard::Policy {
+        start_armed: true,
+        ..crate::guard::Policy::default()
+    }));
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot)
+        .unwrap()
+        .with_guard(Arc::clone(&guard));
+    let (tx, _commands) = tokio::sync::mpsc::unbounded_channel();
+    let (events, _rx) = tokio::sync::broadcast::channel(64);
+    let handle = SessionHandle::for_tests(&tx, events.clone());
+    missions.attach(handle.clone());
+    let jobs = Jobs::new(Arc::clone(&guard));
+    jobs.attach(handle);
+
+    let approval = Approval {
+        envelope: Envelope::new(["GoToPlace".to_owned()], 5),
+        moves: true,
+        text: String::new(),
+    };
+    let m = Arc::clone(&missions);
+    let job = jobs
+        .spawn(JobKind::Program, "walk", approval, move |ctx| async move {
+            let pick = json!([{"skill": "PickObject",
+                               "args": {"object_id": "O18", "phrase": "blue cup", "arm": "left"}}]);
+            let Err(refused) = m.run_for_job(&ctx, "pick", pick).await else {
+                return Err("a pick outside the envelope ran".to_owned());
+            };
+            let walk = json!([{"skill": "GoToPlace", "args": {"place": "dock"}}]);
+            let end = m.run_for_job(&ctx, "walk to the dock", walk).await?;
+            Ok(format!(
+                "{refused} | {} {}",
+                end.outcome,
+                json!(end.outputs)
+            ))
+        })
+        .unwrap();
+    let mut done = None;
+    eventually(|| {
+        done = jobs
+            .list()
+            .into_iter()
+            .find(|j| j.id == job.id && j.state != JobState::Running);
+        done.is_some()
+    })
+    .await;
+    let done = done.unwrap();
+    assert_eq!(done.state, JobState::Done, "{}", done.summary);
+    assert!(
+        done.summary.contains("not among the skills"),
+        "{}",
+        done.summary
+    );
+    assert!(
+        done.summary.ends_with(r#"success {"s1_target_id":"O17"}"#),
+        "{}",
+        done.summary
+    );
+}
