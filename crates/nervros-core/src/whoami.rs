@@ -50,7 +50,7 @@ const PREAMBLE: &str = "You write a robot's self-description: the part of its as
 
 /// A URDF's body in short: its links, its joints by type and the names of those that move.
 #[must_use]
-pub fn body(urdf: &str) -> Value {
+pub(crate) fn body(urdf: &str) -> Value {
     let mut by_type: BTreeMap<String, usize> = BTreeMap::new();
     let mut moving = Vec::new();
     for tag in urdf.split("<joint").skip(1) {
@@ -133,18 +133,10 @@ pub async fn facts(profile: &Profile, robot: &dyn RobotPort) -> Value {
             .await
         && let Some(catalog) = out["catalog_json"]
             .as_str()
-            .and_then(|t| serde_json::from_str::<Value>(t).ok())
+            .and_then(|t| crate::mission::catalog::Catalog::parse(t).ok())
     {
-        facts["skills"] = json!(catalog["skills"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|s| json!({
-                "name": s["name"],
-                "description": s["description"],
-                "args": s["args"].as_array().into_iter().flatten().map(|a| &a["name"]).collect::<Vec<_>>(),
-            }))
-            .collect::<Vec<_>>());
+        // As the planner shows them to the model: the skills it may name, with what it gives.
+        facts["skills"] = json!(catalog.describe());
     }
     if let Some(rooms) = profile.world.as_ref().and_then(|w| w.rooms.as_ref())
         && let Ok(message) = robot.latest(&rooms.topic, &rooms.msg_type, CALL).await
@@ -164,7 +156,7 @@ pub async fn facts(profile: &Profile, robot: &dyn RobotPort) -> Value {
 
 /// Where the draft goes: beside the persona as `<persona>.draft.md`, or beside the profile.
 #[must_use]
-pub fn draft_path(profile: &Profile) -> PathBuf {
+pub(crate) fn draft_path(profile: &Profile) -> PathBuf {
     match &profile.robot.persona {
         Some(persona) => profile.resolve(persona).with_extension("draft.md"),
         None => profile.resolve(std::path::Path::new("persona.draft.md")),
@@ -216,26 +208,27 @@ pub fn save(profile: &Profile, text: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Gathers the facts, drafts the persona and saves it; returns where.
-///
-/// # Errors
-///
-/// No model could answer, or the draft could not be written.
-pub async fn write_draft(
-    llm: &Llm,
-    profile: &Profile,
-    robot: &dyn RobotPort,
-) -> Result<PathBuf, String> {
-    let facts = facts(profile, robot).await;
-    let text = draft(llm, profile, &facts)
-        .await
-        .map_err(|e| e.to_string())?;
-    save(profile, &text)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_skills_are_those_the_planner_lets_the_model_name() {
+        let profile = Profile::from_toml(
+            "[robot]\nname = \"t\"\n[models]\nfile = \"m.toml\"\n\
+             [mission]\nexecute = \"/x/execute\"\nvalidate = \"/x/validate\"\n\
+             catalog = \"/x/catalog\"\nstop = \"/x/stop\"\nstate = \"/x/state\"\n",
+            std::path::Path::new("nervros.toml"),
+        )
+        .unwrap();
+        let robot = nervros_ros::fake::FakeRobot::new().with_service("/x/catalog", |_| {
+            Ok(json!({"catalog_json": crate::mission::catalog::tests::CATALOG}))
+        });
+        let facts = facts(&profile, &robot).await;
+        let skills = facts["skills"].as_str().unwrap_or_default();
+        assert!(skills.contains("GoToPlace(place)"), "{skills}");
+        assert!(!skills.contains("GoToPose"), "{skills}");
+    }
 
     #[test]
     fn a_urdf_comes_down_to_its_links_and_moving_joints() {

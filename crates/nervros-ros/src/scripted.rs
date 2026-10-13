@@ -2,9 +2,11 @@
 //! suite against, so models can be compared in seconds, without a simulator.
 //!
 //! Services answer with a fixed response, actions run to a fixed end and topics hold one message.
-//! The graph, the nodes each component container hosts, parameters, topic rates and frames make
-//! it look to the ROS tools like a live graph. Callers parse the file (TOML in this repository)
-//! into [`ScriptedRobot`] and [`ScriptedRobot::build`] it.
+//! The graph, what each node publishes and subscribes to, the nodes each component container
+//! hosts, parameters, topic rates and frames make it look to the ROS tools like a live graph; a
+//! camera gives no image yet, and a service the graph lists without a response is not reachable.
+//! Callers parse the file (TOML in this repository) into [`ScriptedRobot`] and
+//! [`ScriptedRobot::build`] it.
 
 use std::collections::BTreeMap;
 
@@ -12,7 +14,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::fake::{FakeRobot, ScriptedRun};
-use crate::{GoalResult, GoalStatus, GraphDetail, NamesAndTypes, NodeEntities, Transform};
+use crate::{
+    Endpoint, GoalResult, GoalStatus, GraphDetail, NamesAndTypes, NodeEntities, QosInfo,
+    TopicEndpoints, Transform,
+};
 
 /// The service every rclcpp component container offers to list what it runs.
 const LIST_NODES: &str = "composition_interfaces/srv/ListNodes";
@@ -181,6 +186,37 @@ fn parameter_value(value: &Value) -> Value {
     }
 }
 
+/// Each topic's publishers and subscribers, from what the nodes say they do; their `QoS` is
+/// the ROS default, as a file does not say.
+fn endpoints(nodes: &BTreeMap<String, NodeFile>) -> BTreeMap<String, TopicEndpoints> {
+    let mut out: BTreeMap<String, TopicEndpoints> = BTreeMap::new();
+    for (node, n) in nodes {
+        let endpoint = |ty: &String| Endpoint {
+            node: node.clone(),
+            topic_type: ty.clone(),
+            qos: QosInfo {
+                reliability: "reliable".into(),
+                durability: "volatile".into(),
+                history: "keep_last".into(),
+                depth: 10,
+            },
+        };
+        for (topic, ty) in &n.publishers {
+            out.entry(topic.clone())
+                .or_default()
+                .publishers
+                .push(endpoint(ty));
+        }
+        for (topic, ty) in &n.subscribers {
+            out.entry(topic.clone())
+                .or_default()
+                .subscribers
+                .push(endpoint(ty));
+        }
+    }
+    out
+}
+
 fn names_and_types(map: &BTreeMap<String, String>) -> NamesAndTypes {
     map.iter()
         .map(|(n, t)| (n.clone(), vec![t.clone()]))
@@ -209,9 +245,9 @@ impl ScriptedRobot {
     ///
     /// # Errors
     ///
-    /// An action's status is not one of succeeded, aborted or canceled.
+    /// An action's status is not one of succeeded, aborted or canceled, or a rate is out of reach.
     pub fn build(self) -> Result<FakeRobot, String> {
-        let mut robot = FakeRobot::new();
+        let mut robot = FakeRobot::new().with_idle_cameras();
         let mut graph = GraphDetail {
             topics: names_and_types(&self.graph.topics),
             services: names_and_types(&self.graph.services),
@@ -254,6 +290,9 @@ impl ScriptedRobot {
         for (node, params) in self.params {
             robot = with_params(robot, &mut graph, &node, params);
         }
+        for (topic, ends) in endpoints(&self.nodes) {
+            robot = robot.with_endpoints(&topic, ends);
+        }
         for (name, n) in self.nodes {
             robot = robot.with_node(
                 &name,
@@ -266,6 +305,10 @@ impl ScriptedRobot {
             );
         }
         for (topic, rate) in self.rates {
+            // A rate makes the sampled period; zero, below or past these is not one.
+            if !(0.001..=10_000.0).contains(&rate.hz) {
+                return Err(format!("{topic}: hz must be from 0.001 to 10000"));
+            }
             robot = robot.with_rate(&topic, rate.hz, rate.bytes);
         }
         for f in self.transforms {
@@ -449,6 +492,25 @@ mod tests {
         let pose = robot.transform("map", "base_footprint").unwrap();
         assert!((pose.translation[0] - 1.0).abs() < 1e-9);
         assert!((pose.yaw() - 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn the_nodes_say_who_publishes_a_camera_waits_and_a_rate_must_be_one() {
+        let robot = robot(&json!({
+            "nodes": {"/laser": {"publishers": {"/scan": "sensor_msgs/msg/LaserScan"}},
+                      "/amcl": {"subscribers": {"/scan": "sensor_msgs/msg/LaserScan"}}},
+        }));
+        let ends = robot.endpoints("/scan").await.unwrap();
+        assert_eq!(ends.publishers[0].node, "/laser");
+        assert_eq!(ends.subscribers[0].node, "/amcl");
+        assert!(robot.frames("/camera/image").unwrap().borrow().is_none());
+        for hz in [0.0, -1.0, f64::NAN] {
+            let file = ScriptedRobot {
+                rates: BTreeMap::from([("/scan".to_owned(), Rate { hz, bytes: 0 })]),
+                ..ScriptedRobot::default()
+            };
+            assert!(file.build().is_err(), "{hz}");
+        }
     }
 
     #[test]

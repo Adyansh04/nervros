@@ -34,8 +34,8 @@ use nervros_core::llm::{AgentBuilder, AgentSource, LlmError};
 use nervros_core::providers::Role;
 use nervros_core::providers::router::Need;
 use nervros_core::session::Command;
+use nervros_ros::RobotPort;
 use nervros_ros::scripted::ScriptedRobot;
-use nervros_ros::{RobotPort, Transform};
 use rig::test_utils::{MockCompletionModel, MockTurn};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -113,11 +113,7 @@ async fn run(path: &Path) -> Result<Vec<String>, String> {
     let scenario: Scenario = toml::from_str(&read(path)?).map_err(|e| e.to_string())?;
     let shared: ScriptedRobot =
         toml::from_str(&read(&root().join("robot/robot.toml"))?).map_err(|e| e.to_string())?;
-    let robot: Arc<dyn RobotPort> = Arc::new(shared.with(scenario.robot).build()?.with_transform(
-        "map",
-        "base_footprint",
-        Transform::IDENTITY,
-    ));
+    let robot: Arc<dyn RobotPort> = Arc::new(shared.with(scenario.robot).build()?);
     let model = MockCompletionModel::from_turns(script(&scenario.model)?);
     let state = tempfile::tempdir().map_err(|e| e.to_string())?;
     let options = nervros_core::app::StartOptions {

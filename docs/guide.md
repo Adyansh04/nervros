@@ -14,6 +14,7 @@ answered by the local Qwen3.5-9B model. Missions play three or four times faster
 - [Driving by hand](#driving-by-hand)
 - [Keeping an eye on it](#keeping-an-eye-on-it)
 - [Remembering](#remembering)
+- [Keeping it out of places](#keeping-it-out-of-places)
 - [Mapping a new building](#mapping-a-new-building)
 - [Finishing the map](#finishing-the-map)
 - [Sessions and models](#sessions-and-models)
@@ -248,6 +249,7 @@ robot; `/look`, `/places` and `/explore` send their request to the agent. In the
 | `/look` | Ask the agent to look through the camera |
 | `/places` | Ask which places it can go to |
 | `/stop` | Stop the robot |
+| `/pause`, `/resume` | Pause the running mission, or let it go on |
 | `/arm`, `/disarm` | Let the agent act, or only observe |
 | `/explore` | Ask it to explore the building |
 | `/compact` | Condense the conversation |
@@ -337,7 +339,9 @@ place, or corners you give on the map. From then on the agent refuses a walk tha
 zone or pass through one, and Nav2 plans around the zones when the robot's profile publishes their
 mask ([`[geofence]`](profile.md#geofence)). The 3D view draws them in red, and the World tab lists
 them: **Add** starts the request in the composer, and **Remove** asks the agent to remove a zone,
-which you approve. Zones set in the profile stay until the profile changes.
+which you approve, whatever the autonomy. A plan made before a zone was added is checked again
+when it runs, from a schedule or by its hash. Zones set in the profile stay until the profile
+changes.
 
 ## Mapping a new building
 
@@ -490,7 +494,9 @@ $ nervros-cli --profile nervros.toml missions --limit 3
 `eval` runs a suite of requests against the live robot, each in a fresh session with every
 approval granted, and judges what happened: the tools and skills used, the missions' outcomes,
 the approvals asked for, the reply, and how far and which way the robot moved on the simulator's
-own pose. The apartment suite in grove-g1 has 44 cases:
+own pose. Each model and trial keeps its own keep-out zones in the run's folder, so a suite
+neither finds the operator's zones nor leaves its own behind. The apartment suite in grove-g1 has
+46 cases:
 
 ```text
 $ nervros-cli --profile nervros.toml eval eval/apartment.toml --out eval-r3

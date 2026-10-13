@@ -2,8 +2,9 @@
 //! trait.
 //!
 //! [`RobotPort`] is what the agent core talks to. [`R2rPort`] implements it over r2r (feature
-//! `rcl`, which needs a sourced ROS environment), and `fake::FakeRobot` (feature `test-support`)
-//! implements it from a script for tests that run without ROS.
+//! `rcl`, which needs a sourced ROS environment), and `fake::FakeRobot` and
+//! `scripted::ScriptedRobot` (feature `scripted`) implement it from a script or a file, for tests
+//! and `nervros-cli eval --robot`, which run without ROS.
 
 use std::sync::Arc;
 use std::time::Duration;

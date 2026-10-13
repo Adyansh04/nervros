@@ -54,13 +54,16 @@ impl Default for ScriptedRun {
 /// A scripted action: goal in, run out.
 pub type ActionFn = Arc<dyn Fn(&Value) -> ScriptedRun + Send + Sync>;
 
+/// Where a camera's frames come from.
+type FrameSender = watch::Sender<Option<Arc<Frame>>>;
+
 /// A robot made of scripts.
 #[derive(Default)]
 pub struct FakeRobot {
     services: HashMap<String, ServiceFn>,
     actions: HashMap<String, ActionFn>,
     topics: Mutex<HashMap<String, Value>>,
-    frames: HashMap<String, watch::Sender<Option<Arc<Frame>>>>,
+    frames: HashMap<String, FrameSender>,
     tf: Mutex<TfBuffer>,
     latency: Duration,
     calls: Arc<Mutex<Vec<(String, Value)>>>,
@@ -69,6 +72,8 @@ pub struct FakeRobot {
     nodes: HashMap<String, NodeEntities>,
     rates: HashMap<String, (f64, usize)>,
     published: Arc<Mutex<Vec<(String, Value)>>>,
+    /// Cameras it has no frames for, when it answers them with none yet.
+    idle_frames: Option<Mutex<HashMap<String, FrameSender>>>,
 }
 
 impl std::fmt::Debug for FakeRobot {
@@ -89,6 +94,14 @@ impl FakeRobot {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Answers a camera it has no frames for with none yet, as a live robot does before its first
+    /// image, rather than not at all.
+    #[must_use]
+    pub fn with_idle_cameras(mut self) -> Self {
+        self.idle_frames = Some(Mutex::default());
+        self
     }
 
     /// Adds a service.
@@ -274,10 +287,16 @@ impl RobotPort for FakeRobot {
     }
 
     fn frames(&self, topic: &str) -> Result<watch::Receiver<Option<Arc<Frame>>>, RosError> {
-        self.frames
-            .get(topic)
-            .map(watch::Sender::subscribe)
-            .ok_or_else(|| RosError::NoData(topic.to_owned()))
+        if let Some(tx) = self.frames.get(topic) {
+            return Ok(tx.subscribe());
+        }
+        match &self.idle_frames {
+            Some(idle) => Ok(lock(idle)
+                .entry(topic.to_owned())
+                .or_insert_with(|| watch::Sender::new(None))
+                .subscribe()),
+            None => Err(RosError::NoData(topic.to_owned())),
+        }
     }
 
     fn transform(&self, target: &str, source: &str) -> Result<Transform, RosError> {

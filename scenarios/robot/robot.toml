@@ -248,3 +248,8 @@ catalog_json = '''
  ]
 }
 '''
+
+# Where the robot stands: the map's origin, unless a scenario says otherwise.
+[[transforms]]
+parent = "map"
+child = "base_footprint"

@@ -73,7 +73,13 @@ pub(crate) async fn record(profile_path: &Path, out: &Path) -> Result<()> {
     );
     doc.insert("containers".into(), containers(&robot, &graph).await);
     doc.insert("nodes".into(), nodes(&robot, &graph).await);
-    doc.insert("params".into(), params(&robot, &graph).await);
+    let masked: Arc<[String]> = profile
+        .ros_tools
+        .clone()
+        .unwrap_or_default()
+        .param_read_deny
+        .into();
+    doc.insert("params".into(), params(&robot, &graph, &masked).await);
     let named = profile_topics(&profile);
     doc.insert("rates".into(), rates(&robot, &graph, &named).await);
     doc.insert("topics".into(), messages(&robot, &graph, &named).await);
@@ -100,23 +106,25 @@ pub(crate) async fn record(profile_path: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// TOML has no null: a field left out reads as its default.
+/// TOML has no null: a field left out reads as its default. An array with a null in it, as a
+/// scan's infinite ranges become, is left out whole: a shorter one would be another message.
 fn without_nulls(value: Value) -> Value {
     match value {
         Value::Object(fields) => Value::Object(
             fields
                 .into_iter()
-                .filter(|(_, v)| !v.is_null())
                 .map(|(k, v)| (k, without_nulls(v)))
+                .filter(|(_, v)| !v.is_null())
                 .collect(),
         ),
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .filter(|v| !v.is_null())
-                .map(without_nulls)
-                .collect(),
-        ),
+        Value::Array(items) => {
+            let items: Vec<Value> = items.into_iter().map(without_nulls).collect();
+            if items.iter().any(Value::is_null) {
+                Value::Null
+            } else {
+                Value::Array(items)
+            }
+        }
         other => other,
     }
 }
@@ -183,8 +191,13 @@ fn plain(v: &Value) -> Value {
     v[field].clone()
 }
 
-/// One node's parameters with their descriptions; none when it does not answer.
-async fn node_params(robot: Arc<dyn RobotPort>, node: String) -> Option<(String, Value)> {
+/// One node's parameters with their descriptions; none when it does not answer. A value the
+/// profile hides from the agent, such as a key, is not written down either.
+async fn node_params(
+    robot: Arc<dyn RobotPort>,
+    node: String,
+    masked: Arc<[String]>,
+) -> Option<(String, Value)> {
     let call = |service: &str, ty: &str, request: Value| {
         let robot = Arc::clone(&robot);
         let name = format!("{node}/{service}");
@@ -220,7 +233,15 @@ async fn node_params(robot: Arc<dyn RobotPort>, node: String) -> Option<(String,
         .unwrap_or_default();
     let mut out = Map::new();
     for (i, name) in names.iter().enumerate() {
-        let value = values.get(i).map(plain).unwrap_or_default();
+        let lower = name.to_lowercase();
+        let value = if masked
+            .iter()
+            .any(|p| nervros_core::guard::glob_match(&p.to_lowercase(), &lower))
+        {
+            json!("(hidden)")
+        } else {
+            values.get(i).map(plain).unwrap_or_default()
+        };
         if value.is_null() {
             continue;
         }
@@ -239,7 +260,7 @@ async fn node_params(robot: Arc<dyn RobotPort>, node: String) -> Option<(String,
     Some((node, Value::Object(out)))
 }
 
-async fn params(robot: &Arc<dyn RobotPort>, graph: &GraphDetail) -> Value {
+async fn params(robot: &Arc<dyn RobotPort>, graph: &GraphDetail, masked: &Arc<[String]>) -> Value {
     let askable: Vec<String> = graph
         .nodes
         .iter()
@@ -248,7 +269,7 @@ async fn params(robot: &Arc<dyn RobotPort>, graph: &GraphDetail) -> Value {
         .collect();
     eprintln!("asking {} nodes for their parameters", askable.len());
     let answered: Vec<Option<(String, Value)>> = futures::stream::iter(askable)
-        .map(|n| node_params(Arc::clone(robot), n))
+        .map(|n| node_params(Arc::clone(robot), n, Arc::clone(masked)))
         .buffer_unordered(AT_ONCE)
         .collect()
         .await;
@@ -404,4 +425,59 @@ async fn executor(robot: &Arc<dyn RobotPort>, profile: &Profile) -> (Value, Valu
         }),
     );
     (Value::Object(services), Value::Object(actions))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nervros_ros::fake::FakeRobot;
+    use nervros_ros::scripted::ScriptedRobot;
+
+    #[test]
+    fn an_array_with_a_null_is_left_out_whole() {
+        let kept = without_nulls(json!({"ranges": [1.0, null, 2.0], "frame": "laser", "x": null}));
+        assert_eq!(kept, json!({"frame": "laser"}));
+    }
+
+    #[tokio::test]
+    async fn a_recording_loads_back_as_the_robot_it_was_with_its_secrets_hidden() {
+        let graph = GraphDetail {
+            topics: vec![("/scan".into(), vec!["sensor_msgs/msg/LaserScan".into()])],
+            services: vec![
+                (
+                    "/nav2_container/_container/list_nodes".into(),
+                    vec!["composition_interfaces/srv/ListNodes".into()],
+                ),
+                (
+                    "/amcl/list_parameters".into(),
+                    vec!["rcl_interfaces/srv/ListParameters".into()],
+                ),
+            ],
+            nodes: vec!["/nav2_container".into(), "/amcl".into()],
+        };
+        let robot: Arc<dyn RobotPort> = Arc::new(
+            FakeRobot::new()
+                .with_graph(graph.clone())
+                .with_service("/nav2_container/_container/list_nodes", |_| {
+                    Ok(json!({"full_node_names": ["/amcl"], "unique_ids": [1]}))
+                })
+                .with_service("/amcl/list_parameters", |_| {
+                    Ok(json!({"result": {"names": ["max_particles", "map_api_key"], "prefixes": []}}))
+                })
+                .with_service("/amcl/get_parameters", |_| {
+                    Ok(json!({"values": [{"type": 2, "integer_value": 2000},
+                                         {"type": 4, "string_value": "s3cr3t"}]}))
+                }),
+        );
+        let masked: Arc<[String]> = vec!["*key*".to_owned()].into();
+        let mut doc = Map::new();
+        doc.insert("containers".into(), containers(&robot, &graph).await);
+        doc.insert("params".into(), params(&robot, &graph, &masked).await);
+        let text = toml::to_string_pretty(&without_nulls(Value::Object(doc))).unwrap();
+        assert!(!text.contains("s3cr3t"), "{text}");
+        let back: ScriptedRobot = toml::from_str(&text).unwrap();
+        assert_eq!(back.containers["/nav2_container"], ["/amcl"]);
+        assert_eq!(back.params["/amcl"].len(), 2);
+        assert!(back.build().is_ok());
+    }
 }
