@@ -28,7 +28,8 @@ const SCHEMA: &str = "
         ended REAL NOT NULL,
         outcome TEXT NOT NULL,
         failed_step TEXT NOT NULL,
-        reason TEXT NOT NULL
+        reason TEXT NOT NULL,
+        plan TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS missions_by_time ON missions (started);
     CREATE TABLE IF NOT EXISTS steps (
@@ -81,6 +82,9 @@ pub struct MissionRecord {
     pub reason: String,
     /// In order.
     pub steps: Vec<StepRecord>,
+    /// The plan's steps, as `run_mission` takes them, to run it again; null in a ledger from
+    /// before they were kept.
+    pub plan: Value,
 }
 
 /// One step of a mission as it ended.
@@ -197,6 +201,14 @@ impl Ledger {
 
     fn with(db: Connection) -> rusqlite::Result<Arc<Self>> {
         db.execute_batch(SCHEMA)?;
+        let kept_plans: bool = db.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('missions') WHERE name = 'plan'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !kept_plans {
+            db.execute_batch("ALTER TABLE missions ADD COLUMN plan TEXT NOT NULL DEFAULT ''")?;
+        }
         Ok(Arc::new(Self { db: Mutex::new(db) }))
     }
 
@@ -213,7 +225,7 @@ impl Ledger {
         let mut db = self.db();
         let tx = db.transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO missions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO missions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 m.id,
                 m.hash,
@@ -223,7 +235,8 @@ impl Ledger {
                 m.ended,
                 m.outcome,
                 m.failed_step,
-                m.reason
+                m.reason,
+                m.plan.to_string()
             ],
         )?;
         {
@@ -439,6 +452,7 @@ fn steps_of(db: &Connection, mission: &str) -> rusqlite::Result<Vec<StepRecord>>
 }
 
 fn mission_of(r: &Row<'_>) -> rusqlite::Result<MissionRecord> {
+    let plan: String = r.get(9)?;
     Ok(MissionRecord {
         id: r.get(0)?,
         hash: r.get(1)?,
@@ -450,6 +464,7 @@ fn mission_of(r: &Row<'_>) -> rusqlite::Result<MissionRecord> {
         failed_step: r.get(7)?,
         reason: r.get(8)?,
         steps: Vec::new(),
+        plan: serde_json::from_str(&plan).unwrap_or(Value::Null),
     })
 }
 
@@ -517,6 +532,10 @@ mod tests {
                     reason: reason.to_owned(),
                 },
             ],
+            plan: json!([
+                {"skill": "GoToPlace", "args": {"place": "dining_table_side"}},
+                {"id": "pick", "skill": "PickObject", "args": {"object_id": "mug_4"}, "retries": 1}
+            ]),
         }
     }
 
@@ -573,6 +592,10 @@ mod tests {
         );
         assert_eq!(recent[0].steps.len(), 2);
         assert_eq!(recent[0].steps[1].args, json!({"object_id": "mug_4"}));
+        assert_eq!(
+            recent[0].plan[1]["id"], "pick",
+            "the plan whole, its ids too"
+        );
         let started = ledger.mission("0190a").unwrap()[0].started;
         assert!((started - 100.0).abs() < 1e-9);
         assert!(ledger.mission("zzz").unwrap().is_empty());
@@ -585,6 +608,26 @@ mod tests {
             ledger.mission("%").unwrap().is_empty(),
             "text, not a pattern"
         );
+    }
+
+    #[test]
+    fn a_ledger_from_before_plans_were_kept_gains_them() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE missions (id TEXT PRIMARY KEY, hash TEXT NOT NULL, intent TEXT NOT NULL,
+                 request TEXT NOT NULL, started REAL NOT NULL, ended REAL NOT NULL,
+                 outcome TEXT NOT NULL, failed_step TEXT NOT NULL, reason TEXT NOT NULL);
+             INSERT INTO missions VALUES ('0190a', 'h', 'walk', 'walk', 1.0, 2.0, 'success', '', '');",
+        )
+        .unwrap();
+
+        let ledger = Ledger::with(db).unwrap();
+        ledger
+            .record(&mission("0190b", 100.0, ("success", 40.0, "")))
+            .unwrap();
+
+        assert_eq!(ledger.mission("0190a").unwrap()[0].plan, Value::Null);
+        assert!(ledger.mission("0190b").unwrap()[0].plan.is_array());
     }
 
     #[test]

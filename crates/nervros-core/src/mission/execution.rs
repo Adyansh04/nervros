@@ -208,6 +208,7 @@ impl Missions {
                 .iter()
                 .map(|s| times.record(s, &step, &reason))
                 .collect(),
+            plan: json!(compiled.plan.steps),
         });
         let seen = self.observe().await;
         // What happened to what the failed step was about: often it was moved, not missed. The
