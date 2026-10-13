@@ -2,8 +2,8 @@
 
 Which models answer is configuration, never code. The models file, which the profile names, lists
 providers (endpoints), models on them, shared quotas and, per role, the order to try models in.
-[`profiles/example/models.toml`](../profiles/example/models.toml) has a local model and two free
-OpenRouter ones.
+[`profiles/example/models.toml`](../profiles/example/models.toml) has a local model and a free
+OpenRouter one.
 
 ## Providers
 
@@ -25,14 +25,16 @@ headers = { "X-Title" = "NervROS" }
 
 - `kind` is `openai_compat` for anything that speaks OpenAI's chat completions: llama.cpp, Ollama,
   vLLM, OpenRouter, Groq. `gemini_interactions` is Google's Gemini, whose key travels only in the
-  `x-goog-api-key` header, never in a URL.
+  `x-goog-api-key` header, never in a URL. An `openai_compat` provider needs `base_url`;
+  `headers` go with each of its requests, and `timeout_s` (60 by default) bounds each call.
 - `key` is `{ file = "..." }` or `{ env = "NAME" }`, and absent for a local server. Keys are never
   logged. A key that cannot be read leaves its provider's models out, and says why when one is
   asked, rather than stopping the app.
-- Only free models run. On OpenRouter every id must end in `:free`, checked when the file loads
-  and before every request, and `nervros-cli models --check` also checks the prices OpenRouter
-  lists; `free_only = true` there says so, and `false` is refused. Elsewhere a free tier is a
-  property of the key, which nothing here can check, so `free_only` is refused there: use a
+- Only free models run. On OpenRouter every id must end in `:free` (and `openrouter/...` and
+  `stealth/...` ids are refused), checked when the file loads and before every request, and
+  `nervros-cli models --check` also checks the prices OpenRouter lists and reads its count of free
+  requests today; `free_only = true` there says so, and `false` is refused. Elsewhere a free tier is
+  a property of the key, which nothing here can check, so `free_only` is refused there: use a
   free-tier key.
 
 ## Models
@@ -72,17 +74,18 @@ routine = ["qwen3.5-9b-local"]        # conversation and tool calls
 plan = ["gemini-3.8-flash"]           # advice when the routine model's plans keep failing
 plan_check = ["gemini-3.8-flash"]     # a second opinion on each plan before it is shown
 vision_check = ["qwen3.5-9b-local"]   # what `look` sees: questions about the camera frame
-summarise = ["qwen3.5-9b-local"]      # captions and summaries
+summarise = ["qwen3.5-9b-local"]      # condensing the conversation
 segment = ["gemini-3.5-flash-lite"]   # outlines for `segment`, points for `point`
 ```
 
 A turn tries its role's models in order and skips a model that lacks what the turn needs, is over a
 limit, or would break the privacy mode. Local models not in the list are tried after the others,
-except for `segment` and `plan_check`: outlining is a skill few models have, and a second opinion
-from the same model is no second opinion, so only the models listed are asked. `plan` is asked once
+except for `segment`, `plan_check` and `plan`: outlining is a skill few models have, and a second
+opinion from the same model is no second opinion, so only the models listed are asked. `[roles]`
+must be there, even empty. `plan` is asked once
 a request's plans have failed their checks twice, with the request, the skills, the last plan and
 what was wrong with it; its few lines of advice go back to the routine model with the failure. It
-is asked only when it lists other models than `routine`, and a model out of quota gives no advice.
+is asked only when its list differs from `routine`'s, and a model out of quota gives no advice.
 Gemini's free tier outlines well:
 
 ```toml
@@ -117,4 +120,5 @@ first per-minute limit or 429 lifts within a minute, as after a burst of calls o
 turn says so and waits for it, once; daily limits still end the turn at once. A model that takes
 over from another gets the conversation without the other's reasoning, which Gemma refuses with a
 400, while a model carrying on gets its own back. The app's top bar shows the answering model with
-today's count, and the dock's Models tab shows every role's chain and why a model is skipped.
+today's count, and the Agent tab's Models list shows every role's chain and why a model is
+skipped.

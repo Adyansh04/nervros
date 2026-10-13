@@ -1,4 +1,5 @@
-# The agent bench's ten tasks (grove-g1 docs/notes/agent-bench) on the scripted robot: a model is
+# Ten tasks an operator gives a ROS robot's agent (reading the graph, topics, parameters and the
+# robot's pose, walking, and refusing to drive it by velocity), on the scripted robot: a model is
 # judged on what it says and plans, not on motion, since nothing here moves. Every case runs in a
 # fresh session, armed, with every approval granted.
 #   nervros-cli --profile scenarios/bench/nervros.toml eval scenarios/bench/suite.toml \

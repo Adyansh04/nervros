@@ -1,5 +1,5 @@
 # The model bench's profile: the scenarios' robot on a scripted graph, with the generic ROS tools
-# open as on a real robot, so a model is judged on the same tasks the agent bench gave every tool.
+# open as on a real robot, so models are compared on the same tasks.
 #   nervros-cli --profile scenarios/bench/nervros.toml eval scenarios/bench/suite.toml \
 #     --robot scenarios/robot/robot.toml --robot scenarios/bench/robot.toml --models a,b
 # The models are the example profile's; point `[models] file` at your own to compare yours.

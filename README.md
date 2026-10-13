@@ -37,15 +37,18 @@ waits for your approval. A step can take what an earlier one found, so "find a r
 up" is one mission. Each step is tracked live, and the report comes back checked against the world
 model and the camera.
 
-**Stop or pause it at once.** "Stop", the Stop button or Ctrl+Shift+S halts the robot without
-waiting on a model; "pause" holds the mission where it is, and "resume" lets it go on.
+**Stop it at once, or pause it.** "Stop", the Stop button or Ctrl+Shift+S halts the robot without
+waiting on a model. "Pause" holds the mission where it is, once a pick or a place in progress has
+finished, and "resume" lets it go on.
 
 **Keep it out of places.** "Keep the robot out of the kitchen" adds a keep-out zone, drawn in red
-in the 3D view: plans and navigation goals into it are refused, and Nav2 plans around it.
+in the 3D view: plans and navigation goals into it are refused, and where the profile publishes
+the zones for Nav2's keepout filter, Nav2 plans around them too.
 
 **Keep an eye on it.** "Tell me if the camera drops below 5 Hz", "plot the robot's speed", "every
 ten minutes, walk to the bedroom": watches, live plots and schedules run while you do other things.
-It reads the ROS graph, topics, TF, parameters and logs too, as `ros2` does.
+It reads the ROS graph, topics, TF, parameters and logs too, as `ros2` does: nodes composed into a
+container are listed under it, and parameters come with their values and descriptions.
 
 **Map a new building.** "Explore the building" walks until the camera has seen every room, mapping
 as it goes. Fix what it got wrong by saying so ("R1 is the living room") or by hand in the world
@@ -55,7 +58,8 @@ editor.
 commands from Ctrl+K, drive with W, A, S and D, and name places and notes it keeps for next time.
 
 **Or a terminal.** `nervros-cli` runs the same agent: chat, a setup check against the live graph,
-single ROS reads, and test suites against the robot.
+single ROS reads, test suites against the robot, a recording of the robot to compare models on
+without it, and a draft of what the robot is told about itself.
 
 The **[guide](docs/guide.md)** has a short video of most of these, with the exact words typed and
 what came back.
@@ -97,8 +101,9 @@ services, cameras, skills and limits, and the robot runs missions through a shor
 OpenAI-compatible server, each role with its own chain of fallbacks ([models](docs/models.md)).
 
 Also in the box: sessions you can resume, replay or keep as a test case; a context that condenses
-itself before it fills; a privacy mode that keeps camera frames on local models; and
-OpenTelemetry spans for each turn, model call, tool call and mission.
+itself before it fills; a privacy mode that keeps camera frames on local models; the robot's
+self-description, drafted from the robot itself; and OpenTelemetry spans for each turn, model
+call, tool call and mission.
 
 ## Safe by design
 
@@ -108,8 +113,8 @@ OpenTelemetry spans for each turn, model call, tool call and mission.
   tree, and NervROS checks the plan against what you asked.
 - **Stop always works.** "Stop", the Stop button or Ctrl+Shift+S halts the robot without a
   model, and a mission whose window closed or hung stops by itself.
-- **Keep-out zones hold.** A plan or a navigation goal into a zone is refused before the robot
-  sees it, and removing a zone needs your approval.
+- **Keep-out zones hold.** A plan whose walk ends in a zone, or a navigation goal into one, is
+  refused before the robot sees it, and every removal of a zone asks you first.
 - **The robot's data stays data.** What the cameras, topics and world model say reaches the
   model fenced as data, never as instructions, and hard deny lists keep every tool off motor and
   controller topics.
@@ -134,7 +139,7 @@ Then, from this repository:
 
 ```bash
 ./scripts/local-llm.sh start          # Qwen3.5-9B in llama.cpp on 127.0.0.1:8081
-./scripts/build-overlay.sh            # builds nervros_interfaces once
+./scripts/build-overlay.sh            # builds nervros_interfaces; again when they change
 source scripts/ros-env.sh             # bash; add NERVROS_UDP_ONLY=1 if the graph runs as root
 cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 ```
@@ -150,9 +155,12 @@ Without a window:
 cargo run -p nervros-cli -- --profile profiles/example/nervros.toml chat
 cargo run -p nervros-cli -- --profile profiles/example/nervros.toml doctor
 cargo run -p nervros-cli -- --profile profiles/example/nervros.toml eval suite.toml --repeat 3
-# A model against a scripted robot: no ROS graph, nothing moves.
+# A model against a scripted robot: no ROS graph, nothing moves (ROS is still sourced to build).
 cargo run -p nervros-cli -- --profile scenarios/bench/nervros.toml eval scenarios/bench/suite.toml \
   --robot scenarios/robot/robot.toml --robot scenarios/bench/robot.toml
+# The live robot written as a scripted one, and a draft of its self-description.
+cargo run -p nervros-cli -- --profile profiles/example/nervros.toml record robot.toml
+cargo run -p nervros-cli -- --profile profiles/example/nervros.toml whoami
 ```
 
 The core needs neither ROS nor the viewer: `cargo build` builds it, and
