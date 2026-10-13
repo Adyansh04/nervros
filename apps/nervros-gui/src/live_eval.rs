@@ -81,7 +81,7 @@ enum Step {
     Follow(bool),
     /// `:tab world`: a dock tab.
     Tab(Tab),
-    /// `:click Go there`: the first widget whose label holds the text.
+    /// `:click Go there`: the widget of that label, else the first whose label holds the text.
     Click(String),
     /// `:type text`: typed into the focused field.
     Type(String),
@@ -406,7 +406,13 @@ impl Run<'_> {
             }
             Step::Approve(on) => self.approve = *on,
             Step::Click(label) => {
-                let node = self.harness.query_all_by_label_contains(label).next();
+                // The widget called that, else the first whose label holds it: a card's title
+                // "Approve geofence?" comes before its Approve button.
+                let node = self
+                    .harness
+                    .query_all_by_label(label)
+                    .next()
+                    .or_else(|| self.harness.query_all_by_label_contains(label).next());
                 match node {
                     Some(node) => {
                         node.click();

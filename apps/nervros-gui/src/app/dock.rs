@@ -292,6 +292,7 @@ impl Gui {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 l.drafting = false;
                 l.draft = Some(drafted);
+                l.draft_fresh = true;
                 drop(l);
                 wake.request_repaint();
             });
@@ -300,10 +301,17 @@ impl Gui {
         match draft {
             Some(Ok((path, text))) => {
                 ui.add_space(8.0);
+                if std::mem::take(&mut self.live().draft_fresh) {
+                    ui.scroll_to_cursor(Some(egui::Align::TOP));
+                }
+                // The file's name, the whole path on hover: a long path would crush the button.
+                let name = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("Drafted {}", path.display())).color(theme::DIM),
-                    );
+                    ui.label(RichText::new(format!("Drafted {name}")).color(theme::DIM))
+                        .on_hover_text(path.display().to_string());
                     if ui.add(ReButton::new("Copy").small().secondary()).clicked() {
                         ui.ctx().copy_text(text.clone());
                     }

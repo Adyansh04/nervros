@@ -74,6 +74,8 @@ struct Live {
     pub drafting: bool,
     /// The last draft and where it was saved, or why none came.
     pub draft: Option<Result<(std::path::PathBuf, String), String>>,
+    /// The draft has just landed, below the checks: brought into view once.
+    pub draft_fresh: bool,
 }
 
 /// What the operator clicked in the viewer, when it is something the agent can act on.
