@@ -68,7 +68,11 @@ pub(super) fn approval_card(
                 }
                 (None, ..) => {
                     ui.label(&a.reason);
-                    code(ui, &pretty(&a.args));
+                    // A program reads as written, not as an escaped string.
+                    match a.args["source"].as_str() {
+                        Some(source) => code(ui, source),
+                        None => code(ui, &pretty(&a.args)),
+                    }
                 }
             }
             if let Some(problem) = a.problem.as_deref() {

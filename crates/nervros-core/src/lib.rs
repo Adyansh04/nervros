@@ -11,6 +11,8 @@ pub mod job;
 pub mod mission;
 pub mod model;
 mod persist;
+pub mod program;
+pub mod search;
 pub mod telemetry;
 pub mod tools;
 pub mod whoami;

@@ -7,6 +7,7 @@ mod editor;
 mod history;
 mod palette;
 mod plan_edit;
+mod programs;
 mod robot;
 mod sessions;
 #[cfg(test)]

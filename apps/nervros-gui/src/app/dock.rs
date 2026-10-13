@@ -92,6 +92,9 @@ impl Gui {
             ),
         }
         self.schedules_list(ui);
+        if let Some(store) = &self.agent.programs {
+            crate::programs::show(ui, store, &self.agent.jobs, &mut actions);
+        }
         let ledger = self.agent.missions.as_ref().and_then(|m| m.ledger());
         crate::history::show(ui, &mut self.records, ledger, &mut actions);
         self.act(ui.ctx(), actions);

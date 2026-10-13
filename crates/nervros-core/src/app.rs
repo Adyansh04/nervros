@@ -56,6 +56,8 @@ pub struct Agent {
     pub zones: Arc<crate::zones::Zones>,
     /// Programs and searches the operator approved once, for the window's list and its Stop.
     pub jobs: Arc<crate::job::Jobs>,
+    /// The programs kept by name, when the robot has an executor to run them.
+    pub programs: Option<Arc<crate::program::Store>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -553,6 +555,38 @@ fn mission_tools(
     Ok(Some(schedules))
 }
 
+/// The tools that start jobs the operator approves once, programs and searches, when the robot
+/// has an executor to run their missions; the kept programs.
+fn job_tools(
+    profile: &Profile,
+    missions: Option<&Arc<Missions>>,
+    jobs: &Arc<crate::job::Jobs>,
+    ledger: &Path,
+    registry: &mut Registry,
+) -> Result<Option<Arc<crate::program::Store>>, StartError> {
+    let Some(missions) = missions else {
+        return Ok(None);
+    };
+    let store = crate::program::Store::open(robot_file(profile, ledger, "programs"));
+    let frames = (
+        profile.ros.map_frame.clone(),
+        profile.ros.base_frame.clone(),
+    );
+    registry.add(Arc::new(crate::program::ProgramTool::new(
+        Arc::clone(missions),
+        Arc::clone(jobs),
+        Arc::clone(&store),
+        frames.clone(),
+    )))?;
+    registry.add(Arc::new(crate::search::SearchTool::new(
+        Arc::clone(missions),
+        Arc::clone(jobs),
+        crate::search::Priors::default(),
+        frames,
+    )))?;
+    Ok(Some(store))
+}
+
 /// Starts an agent as `options` say. Must run inside a tokio runtime.
 ///
 /// # Errors
@@ -609,6 +643,7 @@ pub fn start_with(
     );
     let schedules = mission_tools(missions.as_ref(), &guard, &mut registry)?;
     let jobs = crate::job::Jobs::new(Arc::clone(&guard));
+    let programs = job_tools(&profile, missions.as_ref(), &jobs, ledger, &mut registry)?;
     check_rules(&profile, &registry)?;
     let tools = registry.iter().map(|t| t.spec().name.clone()).collect();
     let config = SessionConfig {
@@ -658,6 +693,7 @@ pub fn start_with(
         unanswered,
         zones,
         jobs,
+        programs,
     })
 }
 

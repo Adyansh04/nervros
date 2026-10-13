@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::check::Observed;
 use super::plan::Compiled;
@@ -107,6 +107,12 @@ impl Missions {
     /// What happened to the objects `query` names, a line each, from the world model's history;
     /// none when the profile names no history service or it does not answer.
     pub(crate) async fn object_story(&self, query: &str) -> Vec<String> {
+        check::story(&self.object_events(query).await, crate::now_s())
+    }
+
+    /// What happened to the objects `query` names, oldest first, as the world model's
+    /// `ObjectEvent`s; none when it keeps no history or does not answer.
+    pub(crate) async fn object_events(&self, query: &str) -> Vec<Value> {
         let Some(service) = self.profile.world.as_ref().and_then(|w| w.history.as_ref()) else {
             return Vec::new();
         };
@@ -121,10 +127,7 @@ impl Missions {
             )
             .await
         {
-            Ok(reply) => check::story(
-                reply["events"].as_array().map_or(&[][..], Vec::as_slice),
-                crate::now_s(),
-            ),
+            Ok(reply) => reply["events"].as_array().cloned().unwrap_or_default(),
             Err(e) => {
                 tracing::info!(error = %e, "no object history");
                 Vec::new()

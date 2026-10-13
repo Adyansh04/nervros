@@ -86,7 +86,7 @@ impl Missions {
     }
 
     /// The catalog, fetched once and kept.
-    pub(super) async fn catalog(&self) -> Result<Arc<Catalog>, String> {
+    pub(crate) async fn catalog(&self) -> Result<Arc<Catalog>, String> {
         if let Some(c) = lock(&self.catalog).clone() {
             return Ok(c);
         }

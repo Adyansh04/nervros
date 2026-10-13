@@ -101,7 +101,8 @@ pub(crate) async fn record(profile_path: &Path, out: &Path) -> Result<()> {
         profile_path.display(),
         humantime::format_rfc3339_seconds(std::time::SystemTime::now())
     );
-    std::fs::write(out, header + &text).with_context(|| format!("writing {}", out.display()))?;
+    std::fs::write(out, header + text.as_str())
+        .with_context(|| format!("writing {}", out.display()))?;
     eprintln!("recorded into {}", out.display());
     Ok(())
 }

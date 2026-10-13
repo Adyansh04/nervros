@@ -1,0 +1,76 @@
+# Robot programs and searches on the scripted robot, each asked several ways: the agent must pick
+# the program or search tool, write a program that runs, and answer from its result. Every case
+# runs in a fresh session, armed, with every approval granted.
+#   nervros-cli --profile scenarios/jobs/nervros.toml eval scenarios/jobs/suite.toml \
+#     --robot scenarios/robot/robot.toml --robot scenarios/jobs/robot.toml
+
+# Counting from the world model, without walking: two mugs in the kitchen (one of them stale), one
+# in the office. A program is the usual way; any tool that answers right will do.
+[[case]]
+id = "count-mugs"
+say = ["Count the mugs in every room."]
+expect = { mission = "none", reply_has_all = ["kitchen", "office"] }
+
+[[case]]
+id = "count-mugs-question"
+say = ["How many mugs are there in each room?"]
+expect = { mission = "none", reply_has_all = ["kitchen", "office"] }
+
+[[case]]
+id = "count-mugs-casual"
+say = ["can u tell me how many mugs each room has"]
+expect = { mission = "none", reply_has_all = ["kitchen", "office"] }
+
+# Two chairs in the living room, one each in the kitchen and the office.
+[[case]]
+id = "most-chairs"
+say = ["Which room has the most chairs?"]
+expect = { mission = "none", reply_has = ["living room", "living_room", "R1", "room A"] }
+
+[[case]]
+id = "most-chairs-count"
+say = ["Count the chairs per room and tell me which room has the most."]
+expect = { mission = "none", reply_has = ["living room", "living_room", "R1", "room A"] }
+
+# A loop that walks and looks: one approval for all of it.
+[[case]]
+id = "walk-and-look"
+say = ["Walk to each room and look for a mug in each one, then tell me where you saw one."]
+expect = { tools = ["program"], approvals_max = 1, mission = "success" }
+
+[[case]]
+id = "patrol-and-look"
+say = ["Go round every room and check for mugs with the camera."]
+expect = { approvals_max = 1, mission = "success" }
+
+# Searching: the keys were never seen, so it ranks rooms; the white mug is in the office.
+[[case]]
+id = "find-keys"
+say = ["Find my keys."]
+expect = { tools = ["search"], approvals_max = 1, mission = "success", reply_has = ["found", "Found"] }
+
+[[case]]
+id = "find-keys-polite"
+say = ["Could you look for my keys please?"]
+expect = { tools = ["search"], approvals_max = 1, mission = "success" }
+
+[[case]]
+id = "find-white-mug"
+say = ["Go and find the white mug."]
+expect = { tools = ["search"], mission = "success", reply_has = ["O21", "office", "R3"] }
+
+[[case]]
+id = "where-keys-dont-move"
+say = ["Where might my keys be? Don't move, just tell me where you would look."]
+expect = { tools = ["search"], mission = "none", reply_has = ["hallway", "living", "kitchen", "bedroom", "R1", "R2", "R4"] }
+
+[[case]]
+id = "where-red-mug"
+# Where it was last seen is a recall, not a search.
+say = ["Where did you last see the red mug?"]
+expect = { mission = "none", reply_has = ["kitchen", "R2"] }
+
+[[case]]
+id = "look-for-tray"
+say = ["Search the flat for the tray."]
+expect = { tools = ["search"], mission = "success" }
