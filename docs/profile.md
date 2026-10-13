@@ -304,6 +304,7 @@ app, and the agent never asks first in the chat. `check_only` only checks a plan
 | `teleop` | none | The `Teleop` service: Drive in the Robot tab hands the base to the operator while no mission runs and the robot is armed; disarming hands it back. W S walk, A D turn, Q E step sideways. |
 | `teleop_cmd` | none | Where the hand-driving `geometry_msgs/msg/Twist` commands go; the executor caps their speed and stops the base when they pause. |
 | `teleop_speed` | `[0.5, 0.3, 0.8]` | Full hand-driving speed forward and sideways (m/s) and turning (rad/s); Slow in the Robot tab halves it. |
+| `define_skill`, `forget_skill` | none | The `DefineSkill` and `ForgetSkill` services: with both, the agent gets `teach_skill` and teaches the robot skills from the executor's learnable leaves; see [the executor contract](executor.md#taught-skills). |
 | `checks` | none | The skills the plan checks know; see below. |
 
 Before a plan reaches the operator it is checked against their words: a left turn planned as a
@@ -442,6 +443,9 @@ The rest are the checks you would run yourself before blaming the model:
 | `recall` | With `[mission]`: what the robot did lately, from the mission ledger, what happened to an object, from `[world] history` and the robot's own missions with it, and the operator's notes. |
 | `plans` | With `[mission]`: saves a plan that worked by name ("evening check"), lists them, and runs one again. |
 | `skill_gap` | With `[mission]`: logs a request no skill can do, and why; planning that gives up logs one itself. The Mission tab and `nervros-cli gaps` list them. |
+| `program` | With `[mission]`: runs a short [Rhai](https://rhai.rs) program for what takes loops, counting or measuring, sandboxed (no files, network or `eval`, bounded in operations and size), on the robot's functions: the world model, topic reads and rates, TF, waits, and skills, each run as a mission. One that moves is approved once, with the skills its text names and its time limit, and runs as a job with Stop; one that only reads runs at once. Programs are kept by name per robot in the state directory, and the Mission tab lists them. |
+| `search` | With `[mission]`: finds something, ranking where to look from the world model's sightings and history and where such things usually are, then walking to each place and looking until the detector sees it; approved once, with the places it will look in order. `plan` lists the places without moving. |
+| `teach_skill` | With `[mission]`'s `define_skill` and `forget_skill`: teaches the robot a skill from the executor's learnable leaves, as a draft kept once a mission with it succeeds; lists and forgets taught skills. |
 | `point` | With a `segment` model in the models file: points at what the operator names in the frame a camera's detector marks, found as `look` finds it, or the newest frame when there are no marks, including things no detector marks, and says which mark a point lands on. |
 | `skill` | With `skills`: reads one skill's procedure. |
 | `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each is an `annotate` call: approval when supervised, no arming. |

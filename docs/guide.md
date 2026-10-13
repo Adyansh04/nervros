@@ -241,6 +241,65 @@ argument takes. The plan card shows the id before its step: `look: FindInView(ph
   (see [Keeping an eye on it](#keeping-an-eye-on-it)). Stopping the robot cancels every schedule.
 - Requests no skill can do are logged as skill gaps, for whoever writes the next skill.
 
+### Counting, looping and measuring
+
+> **You:** Count the chairs in every room.
+
+What takes a loop, a count or a measurement the agent writes as a short program in
+[Rhai](https://rhai.rs), a small scripting language with no files, network or `eval`, and runs
+as a job. Counting what the world model knows needs no walking:
+
+```rhai
+let n = #{};
+for r in rooms() { n[r.name] = objects("chair", r.id).len(); }
+n
+```
+
+The program's functions are the robot's: `objects(words, room)`, `rooms()`, `places()`,
+`pose()`, `walk(place)`, `find(words)`, any skill by its name (`PickObject(#{object_id: id, arm:
+"right"})`) or `run("Skill", #{...})`, `read(topic)`, `rate(topic, seconds)`, `tf(parent, child)`,
+`wait(seconds)` and `say(text)`. One that only reads runs at once. One that moves is approved once,
+with what it may run and for how long: "may move the base (GoToPlace) and look (FindInView), for
+at most 10 min". It then runs on its own: the chat shows a card with its latest lines and a Stop
+button, and its result comes back as a report the agent answers. Every mission a program sends is
+checked like any plan, keep-out zones hold, and a skill the approval did not name is refused. A
+program stops at its time limit, after a few seconds of computing between two robot calls, and
+when the robot is stopped. "Keep that program as count chairs" keeps one by name; the Mission tab
+lists the kept programs to run again, each approved again.
+
+### Finding something
+
+> **You:** Find my keys.
+
+`search` ranks where to look: where the world model saw the thing and how long ago, where it went
+since, then the rooms such things are usually in, the less seen of them first, nearer before
+farther. The approval names the first places and why ("O7 (a mug was seen there 2 min ago), then
+R2 (such things are often in the office; the camera has seen 30% of it)"). The search then walks
+to each place and looks with the detector, up to four places in ten minutes, until it sees the
+thing, and reports where. "Where could my keys be? Don't move" lists the places without moving,
+and "where did you last see the red mug?" is a recall, answered at once.
+
+### Teaching it a skill
+
+> **You:** Point at the red mug with your right hand.
+
+No skill points, so the agent teaches the robot one: a small tree of the leaves the executor lets
+a taught skill use, such as `MoveHand` and `Wait`, with its own arguments:
+
+```json
+{"name": "PointAt", "args": [{"name": "object", "type": "world_id"}, {"name": "arm"}],
+ "body": {"sequence": [{"leaf": "MoveHand", "arm": "{arm}", "target": "{object}", "mode": "point"},
+                       {"leaf": "Wait", "seconds": 2}]}}
+```
+
+The executor checks it: only its learnable leaves and the plain control nodes, each value a
+literal or one of the skill's arguments, within a time and size limit, with the authority its
+leaves take. It is then a draft, and the plan that uses it comes to you as any plan does, its new
+step marked as a taught skill on its first try. Once that mission succeeds the skill is kept, on
+the robot, and the next "point at the tray" uses it. A taught skill that fails more often than
+not over four runs is forgotten again. The Mission tab lists the taught skills, each with what it
+was taught for and a Forget button.
+
 ## Clicking in the 3D view
 
 https://github.com/user-attachments/assets/a6f03d25-e631-441d-940b-dda37a833435

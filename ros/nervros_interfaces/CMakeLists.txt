@@ -13,6 +13,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/NodeEvent.msg"
   "msg/RobotState.msg"
   "msg/StepPreview.msg"
+  "srv/DefineSkill.srv"
+  "srv/ForgetSkill.srv"
   "srv/GetCatalog.srv"
   "srv/PauseMission.srv"
   "srv/PreviewMission.srv"

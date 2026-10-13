@@ -10,6 +10,7 @@ mod plan_edit;
 mod programs;
 mod robot;
 mod sessions;
+mod taught;
 #[cfg(test)]
 mod testkit;
 mod theme;

@@ -222,6 +222,7 @@ impl Missions {
                 .collect(),
             plan: json!(compiled.plan.steps),
         });
+        self.settle_taught(&compiled, outcome, &step).await;
         let seen = self.observe().await;
         // What happened to what the failed step was about: often it was moved, not missed. The
         // robot's own missions with it say so where the world model cannot tell which it is.

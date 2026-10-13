@@ -1,0 +1,7 @@
+# Forget a learned skill: its draft, and its copy on disk when it was kept.
+string name
+---
+bool ok
+string message
+# The catalog's version after the change.
+string catalog_version

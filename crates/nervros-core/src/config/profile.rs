@@ -400,6 +400,10 @@ pub struct MissionConfig {
     pub pause: Option<String>,
     /// `PreviewMission` service, for the picture of a plan beside its approval card.
     pub preview: Option<String>,
+    /// `DefineSkill` and `ForgetSkill` services, for the skills the agent teaches the robot.
+    pub define_skill: Option<String>,
+    /// See [`MissionConfig::define_skill`].
+    pub forget_skill: Option<String>,
     /// `RobotState` topic.
     pub state: String,
     /// Replans allowed after a failed mission.

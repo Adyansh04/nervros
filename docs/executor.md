@@ -44,6 +44,8 @@ it, and turns it away when:
 | `pause` | `PauseMission` service | Optional. Pauses the running mission, or resumes it; see below. |
 | `heartbeat` | `Heartbeat` topic | Optional. The agent's heartbeats while a mission runs; see the deadman below. |
 | `teleop` | `Teleop` service | Optional. Hands the base to the operator: while on, the executor refuses missions and forwards each `geometry_msgs/Twist` on its `~/teleop_cmd` within its speed limits, stops the base when they pause, and `StopAll` ends it. |
+| `define_skill` | `DefineSkill` service | Optional. Takes a skill an agent teaches; see below. |
+| `forget_skill` | `ForgetSkill` service | Optional. Forgets a taught skill. |
 
 ## Running a mission
 
@@ -176,7 +178,9 @@ and whether the balance controller is active, with some hysteresis, and says why
 - **Outputs.** `outputs` lists what a skill hands on, typed like an argument; plans give the
   step an `id` and a later argument the whole value `{id.output}`, which the planner compiles to
   the step's key. The reference executor's `GoToTarget` hands on `target_id`, and `FindInView`
-  the `object_id` the detector reports what it found under.
+  the `object_id` the detector reports what it found under. `ExecuteMission`'s result carries
+  what the steps handed on as `outputs_json`, `{"s2_object_id": "mug"}`, which programs and
+  searches read.
 - **Needs and effects.** The planner understands these predicates in `requires` and `effects`:
   - `near(x)`: within about 0.6 m of object or room `x`, judged only for ids the world model
     knows;
@@ -193,6 +197,38 @@ and whether the balance controller is active, with some hysteresis, and says why
   these two.
 - **`catalog_version`** changes with the catalog and with the node model, so an approval refers
   to a known catalog.
+
+## Taught skills
+
+An executor may let an agent teach it skills. `GetCatalog`'s JSON then carries `learnable`: the
+leaves a taught skill may be built from, each with the authority it takes (`base`, `arms` or
+none) and its inputs, and the most such a skill may take and hold:
+
+```json
+"learnable": {"leaves": {"MoveHand": {"holds": "arms", "ports": {"arm": "'left' or 'right'.", "target": "..."}},
+                         "Wait": {"holds": "", "ports": {"seconds": "How long, 0 to 60 s."}}},
+              "max_duration_s": 300.0, "max_nodes": 40}
+```
+
+The leaves are the executor's choice, and the boundary: each must check every goal it sends
+itself, as a planner's arrangement of them is only as safe as they are. The reference executor
+offers Nav2's walk, its own bounded walk and turn, the detector's look, named arm postures,
+`MoveHand` (one hand to a point, or pointing at one, planned by MoveIt against the scene) and
+`Wait`.
+
+`DefineSkill` takes a name, a description, the arguments as the catalog writes them, the body as
+one behaviour-tree element, the most it may take, and the request it was taught for. The
+executor accepts only the plain control nodes and the learnable leaves, with each attribute a
+literal or `{arg}`, one of the skill's own arguments, and within its size limits; it puts the
+body under a Timeout of the skill's time and gives the skill the authority its leaves take. The
+diagnostics come back as `ValidateMission`'s do. `keep: false` serves the skill as a draft until
+the executor restarts; `keep: true` keeps it on disk, where it loads with the executor and is
+checked again each time. Taught skills carry `learned` (`draft` or `kept`) and `taught_for` in
+the catalog, and the catalog's version changes with them. A mission is checked and built against
+the skills as they were when it started, whatever is taught meanwhile. `ForgetSkill` removes one.
+
+NervROS teaches a draft with `teach_skill`, and keeps it when the first mission that runs it
+succeeds; a kept skill that fails more often than not over its last four runs it forgets.
 
 ## Diagnostics
 

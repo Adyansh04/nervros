@@ -1,5 +1,6 @@
 //! The robot's skill catalog, as its executor's `GetCatalog` serves it.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use serde::Deserialize;
@@ -18,6 +19,31 @@ pub struct Catalog {
     pub catalog_version: String,
     /// The skills.
     pub skills: Vec<Skill>,
+    /// What a skill an agent teaches may be built from, when the executor takes taught skills.
+    #[serde(default)]
+    pub learnable: Option<Learnable>,
+}
+
+/// The leaves a taught skill may use, and its bounds.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Learnable {
+    /// Each leaf by its tag.
+    pub leaves: BTreeMap<String, LearnableLeaf>,
+    /// The longest a taught skill may take.
+    pub max_duration_s: f64,
+    /// Its size, in nodes.
+    pub max_nodes: u32,
+}
+
+/// One leaf a taught skill may use.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct LearnableLeaf {
+    /// What it takes: `base`, `arms`, or empty.
+    #[serde(default)]
+    pub holds: String,
+    /// Its inputs: name to what it is for.
+    #[serde(default)]
+    pub ports: BTreeMap<String, String>,
 }
 
 /// One skill: a behaviour-tree macro in the executor's library.
@@ -47,6 +73,12 @@ pub struct Skill {
     pub max_duration_s: f64,
     /// The `SubTree` ID in the executor's library.
     pub template: String,
+    /// For a skill an agent taught: `draft` until a mission with it succeeds, then `kept`.
+    #[serde(default)]
+    pub learned: String,
+    /// For a taught skill: the operator's request it was taught for.
+    #[serde(default)]
+    pub taught_for: String,
 }
 
 /// One input of a skill, or one of its outputs.
@@ -180,6 +212,11 @@ impl Catalog {
                 .skip(usize::from(self.can_travel())),
         ) {
             let mut text = format!("- {signature}: {}", s.description);
+            match s.learned.as_str() {
+                "draft" => text.push_str(" (Taught, not yet tried: say so when you plan it.)"),
+                "kept" => text.push_str(" (Taught.)"),
+                _ => {}
+            }
             if !s.requires.is_empty() {
                 let _ = write!(text, " Needs {}.", s.requires.join(" and "));
             }

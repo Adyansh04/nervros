@@ -55,6 +55,17 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
                     summary.on_hover_text(note);
                 }
                 track_label(ui, s);
+                match s.learned.as_str() {
+                    "draft" => {
+                        let text = "a skill the agent taught: its first try";
+                        ui.label(RichText::new(text).size(12.5).color(theme::WARN));
+                    }
+                    "kept" => {
+                        let text = "a skill the agent taught";
+                        ui.label(RichText::new(text).size(12.5).color(theme::DIM));
+                    }
+                    _ => {}
+                }
                 // Only a warning earns a line of its own; the rest is in the hover.
                 let warnings = preview_note
                     .filter(|n| n.starts_with("no path"))

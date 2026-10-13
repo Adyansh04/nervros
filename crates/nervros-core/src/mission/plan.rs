@@ -499,6 +499,9 @@ pub struct PlannedStep {
     /// For a walk: the place's name, or the room's or object's id, that its `place` resolved to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// For a skill an agent taught: `draft` on its first try, else `kept`; empty for the rest.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub learned: String,
     /// What its arguments may turn out to be when they are known only as it runs, for the
     /// profile's rules: each object a walk to a label may reach, and what a step it takes an
     /// output from went for.
@@ -669,6 +672,10 @@ pub fn compile(
                         added,
                         track: None,
                         target,
+                        learned: catalog
+                            .skill(&step.skill)
+                            .map(|s| s.learned.clone())
+                            .unwrap_or_default(),
                         may_take,
                     });
                 }

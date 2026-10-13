@@ -12,6 +12,7 @@ pub mod camera;
 pub mod catalog;
 pub mod check;
 pub mod history;
+pub mod learn;
 pub mod ledger;
 pub mod plan;
 pub mod preview;
@@ -206,6 +207,8 @@ pub struct Missions {
     questioned: AtomicBool,
     /// Whether the running mission is paused, as its feedback last said.
     paused: AtomicBool,
+    /// The skills taught in this session that wait for a mission to keep them.
+    drafts: learn::Drafts,
 }
 
 impl crate::session::Pulse for Missions {
@@ -263,6 +266,7 @@ impl Missions {
             guard: OnceLock::new(),
             questioned: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            drafts: learn::Drafts::default(),
         }))
     }
 
@@ -442,6 +446,21 @@ impl Missions {
     /// What the operator said last.
     pub(crate) fn request(&self) -> String {
         lock(&self.request).clone()
+    }
+
+    /// The catalog as last read, for what draws it without waiting on the robot.
+    #[must_use]
+    pub fn cached_catalog(&self) -> Option<Arc<Catalog>> {
+        lock(&self.catalog).clone()
+    }
+
+    /// Reads the catalog again now: a skill was taught or forgotten, and the next plan and the
+    /// window's list of taught skills both need it as it is. A plan that failed before may work
+    /// now, though it reads the same: it names the skill, not its new body.
+    pub(crate) async fn reload_catalog(&self) {
+        *lock(&self.catalog) = None;
+        *lock(&self.last) = None;
+        let _ = self.catalog().await;
     }
 
     /// Whether mission `id` holds the mission slot.

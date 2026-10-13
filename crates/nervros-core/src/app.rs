@@ -548,6 +548,7 @@ fn mission_tools(
         .tools()
         .into_iter()
         .chain(crate::mission::history::tools(missions))
+        .chain(crate::mission::learn::tools(missions))
         .chain(schedules.tools())
     {
         registry.add(tool)?;

@@ -305,6 +305,28 @@ impl Ledger {
         Ok(Some(track))
     }
 
+    /// How `skill` went in its latest runs, on whatever it acted on: runs and successes.
+    ///
+    /// # Errors
+    ///
+    /// The read failed.
+    pub fn skill_runs(&self, skill: &str) -> rusqlite::Result<(u32, u32)> {
+        let db = self.db();
+        let mut runs = db.prepare_cached(
+            "SELECT steps.outcome FROM steps JOIN missions ON missions.id = steps.mission
+             WHERE steps.skill = ?1 AND steps.outcome IN ('success', 'failure')
+             ORDER BY missions.started DESC LIMIT ?2",
+        )?;
+        let outcomes: Vec<String> = runs
+            .query_map(params![skill, TRACK_RUNS], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let succeeded = outcomes.iter().filter(|o| *o == "success").count();
+        Ok((
+            u32::try_from(outcomes.len()).unwrap_or(u32::MAX),
+            u32::try_from(succeeded).unwrap_or(u32::MAX),
+        ))
+    }
+
     /// The latest missions, newest first, with their steps.
     ///
     /// # Errors

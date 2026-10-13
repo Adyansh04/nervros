@@ -42,6 +42,8 @@ string failure_reason
 string diagnostics_json
 # Wall time from goal acceptance to the result.
 float32 elapsed_s
+# What the steps handed on, a JSON object by key, such as {"s2_object_id": "mug"}; {} when none.
+string outputs_json
 ---
 float32 elapsed_s
 # Paths of the nodes that are RUNNING now.

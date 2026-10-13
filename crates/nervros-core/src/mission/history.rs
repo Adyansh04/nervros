@@ -36,7 +36,7 @@ pub fn tools(missions: &Arc<Missions>) -> [Arc<dyn Tool>; 3] {
             missions: Arc::clone(missions),
         }),
         Arc::new(SkillGap {
-            spec: gap_spec(),
+            spec: gap_spec(missions.config.define_skill.is_some()),
             missions: Arc::clone(missions),
         }),
     ]
@@ -166,7 +166,8 @@ impl Tool for Recall {
                 let found = find_object(&seen, &[query.as_str()], Some(&query));
                 if found.is_none() && story.is_empty() && moves.is_empty() {
                     return ToolOutcome::failed(format!(
-                        "the world model knows nothing called \"{query}\"; find_objects searches it"
+                        "the world model has never seen anything called \"{query}\"; search, as \
+                         action plan, ranks where such a thing is likely to be without moving"
                     ));
                 }
                 let mut out = json!({});
@@ -339,12 +340,21 @@ impl Tool for Plans {
     }
 }
 
-fn gap_spec() -> ToolSpec {
+/// The spec, which sends the model to `teach_skill` first when the robot takes taught skills.
+fn gap_spec(teachable: bool) -> ToolSpec {
+    let first = if teachable {
+        " Teach a skill first with teach_skill when its leaves can do it, such as pointing, \
+         waving or looking around; log here only what they cannot."
+    } else {
+        ""
+    };
     ToolSpec::new(
         "skill_gap",
-        "When the robot's skills cannot do what the operator asked, log it here (what is \
-         missing, and the skills that came closest) before you tell the operator: the log \
-         is the list of skills to build next.",
+        &format!(
+            "When the robot's skills cannot do what the operator asked, log it here (what is \
+             missing, and the skills that came closest) before you tell the operator: the log \
+             is the list of skills to build next.{first}"
+        ),
         json!({"type": "object", "properties": {
             "missing": {"type": "string", "description": "What no skill can do, in one sentence."},
             "nearest": {"type": "string", "description": "The skills that came closest, if any."}
