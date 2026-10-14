@@ -993,10 +993,11 @@ mod tests {
 
     #[test]
     fn snapshot_world_tab() {
+        // Out of order, as canopy lists them: the tab shows them by number.
         let rooms = serde_json::json!({"rooms": [
+            {"id": "R3", "name": "bedroom", "type": "bedroom", "floor_coverage": 0.05, "face_coverage": 0.0, "object_count": 0},
             {"id": "R1", "name": "kitchen", "type": "kitchen", "floor_coverage": 0.96, "face_coverage": 0.88, "object_count": 9},
-            {"id": "R2", "name": "", "type": "living room", "floor_coverage": 0.61, "face_coverage": 0.34, "object_count": 4},
-            {"id": "R3", "name": "bedroom", "type": "bedroom", "floor_coverage": 0.05, "face_coverage": 0.0, "object_count": 0}
+            {"id": "R2", "name": "", "type": "living room", "floor_coverage": 0.61, "face_coverage": 0.34, "object_count": 4}
         ]});
         let zone = |name: &str, polygon: Vec<[f64; 2]>, fixed| nervros_core::zones::Zone {
             name: name.into(),

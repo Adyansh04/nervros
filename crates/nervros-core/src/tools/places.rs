@@ -110,12 +110,14 @@ impl Places {
 }
 
 /// What to call a room from the world model: its name, or what it is (its `type`) while the name
-/// is only canopy's placeholder, such as "room C".
-pub(crate) fn room_label(room: &serde_json::Value) -> Option<&str> {
+/// is only canopy's placeholder, such as "room C" or, past the alphabet, "room 354".
+#[must_use]
+pub fn room_label(room: &serde_json::Value) -> Option<&str> {
     let name = room["name"].as_str().filter(|n| !n.is_empty());
     let placeholder = name.is_none_or(|n| {
-        n.strip_prefix("room ")
-            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_uppercase()))
+        n.strip_prefix("room ").is_some_and(|rest| {
+            rest.chars().all(|c| c.is_ascii_uppercase()) || rest.chars().all(|c| c.is_ascii_digit())
+        })
     });
     let kind = room["type"].as_str().filter(|t| !t.is_empty());
     if placeholder { kind.or(name) } else { name }
@@ -274,6 +276,19 @@ mod tests {
              [[place]]\nname = \"dock\"\npose = { x = 0.0, y = 0.0 }\n",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_room_goes_by_its_type_while_its_name_is_a_placeholder() {
+        let room = |name: &str| serde_json::json!({"name": name, "type": "living_room"});
+        assert_eq!(room_label(&room("room C")), Some("living_room"));
+        assert_eq!(room_label(&room("room 354")), Some("living_room"));
+        assert_eq!(room_label(&room("Grandma's room")), Some("Grandma's room"));
+        assert_eq!(
+            room_label(&room("room 3B")),
+            Some("room 3B"),
+            "an operator's own name"
+        );
     }
 
     #[tokio::test]

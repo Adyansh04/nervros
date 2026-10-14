@@ -24,6 +24,7 @@ pub(crate) use config::secret;
 pub use config::{profile, schemas};
 pub(crate) use mission::schedule;
 pub use model::{llm, providers};
+pub use tools::places::room_label;
 pub use tools::{builtins, editor, look, mcp, ros_tools, segment, skills, vision, watch, zones};
 pub(crate) use tools::{memory, places, point};
 
