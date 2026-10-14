@@ -30,10 +30,18 @@ impl Gui {
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.label(RichText::new("NervROS").strong().size(17.0));
-            ui.label(RichText::new(&self.agent.profile.robot.name).color(theme::DIM));
+            // The robot's name gives way, cut short with the whole of it on hover: squeezed
+            // instead, a chip ran under the controls and "Armed" broke into a column of letters.
+            let room = (ui.available_width() - self.bar_reserved).max(0.0);
+            ui.allocate_ui(egui::vec2(room, ui.available_height()), |ui| {
+                let name = RichText::new(&self.agent.profile.robot.name).color(theme::DIM);
+                ui.add(egui::Label::new(name).truncate());
+            });
             ui.add_space(6.0);
+            let chips_from = ui.cursor().left();
             self.status_chips(ui);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let chips = ui.cursor().left() - chips_from;
+            let controls = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if window_chrome {
                     ui.native_window_buttons_ui();
                     ui.add_space(4.0);
@@ -90,7 +98,14 @@ impl Gui {
                         .session
                         .send(if armed { Command::Arm } else { Command::Disarm });
                 }
+                ui.min_rect().width()
             });
+            let reserved = 6.0 + chips + controls.inner + 2.0 * ui.spacing().item_spacing.x;
+            // A chip came or went: the name is laid out again for it at once.
+            if (reserved - self.bar_reserved).abs() > 0.5 {
+                self.bar_reserved = reserved;
+                ui.ctx().request_repaint();
+            }
         });
     }
 

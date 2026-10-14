@@ -40,6 +40,8 @@ use live::watch;
 
 const EVENT_LOG: usize = 300;
 const COMPOSER: &str = "nervros_composer";
+/// The top bar's height in points: its 30-point buttons and the frame's margins.
+const TOP_BAR_HEIGHT: f32 = 48.0;
 const STOP_HINT: &str = "Halts the mission and cancels every goal; the hands keep their grip. \
                          The e-stop on the robot's remote is the real emergency stop.";
 
@@ -285,6 +287,8 @@ pub struct Gui {
     viewer_commands: re_viewer::CommandSender,
     /// The earlier moment the 3D view is paused at, if it is not following the newest data.
     viewing: Option<SystemTime>,
+    /// How wide the top bar's chips and controls were last frame, which the robot's name leaves.
+    bar_reserved: f32,
     /// Driving by hand, when the profile names the executor's teleop.
     drive: Option<crate::robot::Drive>,
     /// The mission ledger's lists, for the Mission tab.
@@ -407,6 +411,7 @@ impl Gui {
             toasts: Toasts::default(),
             viewer_commands,
             viewing: None,
+            bar_reserved: 0.0,
             drive,
             records: crate::history::History::default(),
             attachments: crate::attach::Attachments::new(Arc::clone(&agent_snapshots)),
@@ -787,7 +792,10 @@ impl eframe::App for Gui {
         self.keys(ui.ctx());
         self.guard_close(ui.ctx());
         let edge = egui::Stroke::new(1.0, theme::BORDER);
+        // Exact: a panel grown by one crowded frame, as when a chip arrives before the robot's name
+        // has given way, never shrank back.
         egui::Panel::top("nervros_top")
+            .exact_size(TOP_BAR_HEIGHT)
             .frame(
                 Frame::new()
                     .fill(theme::BAR)
