@@ -378,9 +378,11 @@ pub struct StartOptions {
     /// What the session talks to in place of `models.toml`'s models, such as a scripted model
     /// for a scenario; the profile's other roles (plan checks, vision) keep theirs.
     pub source: Option<Arc<dyn crate::llm::AgentSource>>,
-    /// Where the operator's keep-out zones are kept in place of the robot's own file: an eval's,
-    /// so its cases neither find the operator's zones nor leave theirs behind.
-    pub zones: Option<PathBuf>,
+    /// Where the robot's own files go (its missions, memory, places, programs, zones and
+    /// incidents) in place of the state folder: an eval's, so its cases neither find the
+    /// operator's nor leave theirs behind. The quota ledger stays where it is, so free-tier
+    /// counts hold.
+    pub state: Option<PathBuf>,
 }
 
 /// A session for the window or the terminal: its conversation saved after every turn and its
@@ -633,6 +635,9 @@ pub fn start_with(
 ) -> Result<Agent, StartError> {
     let profile = Profile::load(profile_path)?;
     let models = model_layer(&profile, ledger, options.model)?;
+    // The robot's files live beside the quota ledger unless the caller keeps them elsewhere.
+    let own = options.state.map(|dir| dir.join("quota.json"));
+    let ledger = own.as_deref().unwrap_or(ledger);
     let (pending_file, unanswered) = waiting_requests(options.history.as_deref());
     let llm = Arc::clone(&models.llm);
     let guard = Arc::new(Guard::new(profile.policy.clone()));
@@ -641,9 +646,7 @@ pub fn start_with(
     let snapshots = Arc::new(SnapshotStore::default());
     let seeing = seeing_tools(&profile, &robot, &llm, &snapshots, &mut registry)?;
     let places = place_tools(&profile, &robot, ledger, &mut registry)?;
-    let zones_file = options
-        .zones
-        .or_else(|| robot_file(&profile, ledger, "zones"));
+    let zones_file = robot_file(&profile, ledger, "zones");
     let zones = zone_tools(&profile, &robot, zones_file, &places, &guard, &mut registry)?;
     registry.add(Arc::new(RobotState::new(
         &profile,

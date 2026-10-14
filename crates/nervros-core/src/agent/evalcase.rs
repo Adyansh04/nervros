@@ -43,6 +43,14 @@ pub struct Case {
     pub setup: Vec<String>,
     /// The operator's messages, in order, in one session.
     pub say: Vec<String>,
+    /// A shell command run once the session has watched the robot for a moment, before the
+    /// messages, such as one that stops a node for the agent to find; the case fails if it does
+    /// not succeed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub inject: String,
+    /// A shell command run after the case, however it went, to undo `inject`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub restore: String,
     /// How long the case may take.
     #[serde(default = "default_max_s")]
     pub max_s: u64,
@@ -455,6 +463,8 @@ pub fn from_log(log: &str, id: &str) -> Case {
         id: id.to_owned(),
         setup: Vec::new(),
         say,
+        inject: String::new(),
+        restore: String::new(),
         max_s: default_max_s(),
         expect: Expect {
             tools: tools.into_iter().collect(),

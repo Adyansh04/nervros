@@ -634,8 +634,9 @@ $ nervros-cli --profile nervros.toml missions --limit 3
 `eval` runs a suite of requests against the live robot, each in a fresh session with every
 approval granted, and judges what happened: the tools and skills used, the missions' outcomes,
 the approvals asked for, the reply, and how far and which way the robot moved on the simulator's
-own pose. Each model and trial keeps its own keep-out zones in the run's folder, so a suite
-neither finds the operator's zones nor leaves its own behind. The apartment suite in grove-g1 has
+own pose. Each model and trial keeps its own robot files in the run's folder (keep-out zones,
+missions, notes, places, programs, incidents), carried from one case to the next, so a suite
+neither finds the operator's nor leaves its own behind. The apartment suite in grove-g1 has
 46 cases:
 
 ```text

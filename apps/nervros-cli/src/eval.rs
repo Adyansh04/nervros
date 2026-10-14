@@ -303,15 +303,14 @@ fn pose(robot: &Arc<dyn RobotPort>, profile: &Profile) -> Option<(f64, f64, f64)
     Some(t.planar())
 }
 
-/// What every trial shares.
-/// Makes `out`, and empties the zones a run there kept before. Each model and trial keeps its
-/// own: a case that adds one is followed by the case that removes it, and neither touches the
-/// operator's.
+/// Makes `out`, and empties the state a run there kept before: zones, incidents, programs and
+/// memory. Each model and trial keeps its own for the run, as a case that adds a zone is
+/// followed by the case that removes it, and none touches the operator's.
 fn prepare(out: &Path) -> Result<()> {
     std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
-    let zones = out.join("zones");
-    if zones.exists() {
-        std::fs::remove_dir_all(&zones).with_context(|| format!("clearing {}", zones.display()))?;
+    let state = out.join("state");
+    if state.exists() {
+        std::fs::remove_dir_all(&state).with_context(|| format!("clearing {}", state.display()))?;
     }
     Ok(())
 }
@@ -348,7 +347,7 @@ async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize)
     let lane = format!("{}-{trial}", model.unwrap_or("chain"));
     let options = nervros_core::app::StartOptions {
         model: model.map(str::to_owned),
-        zones: Some(run.out.join("zones").join(format!("{lane}.json"))),
+        state: Some(run.out.join("state").join(&lane)),
         ..Default::default()
     };
     let agent =
@@ -360,6 +359,20 @@ async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize)
     let mut events = agent.session.subscribe();
     agent.session.send(Command::Arm);
     let mut seen = Seen::default();
+    if !case.inject.is_empty() {
+        // The recorder reads the graph every few seconds: it sees the robot whole first, then
+        // what the fault did to it, and opens its incident before anyone asks.
+        tokio::time::sleep(INJECT_SETTLE).await;
+        if let Err(e) = shell("inject", &case.inject).await {
+            // The case fails, the suite goes on: a fault that could not be made tests nothing.
+            seen.errors.push(format!("{e:#}"));
+            if let Err(e) = shell("restore", &case.restore).await {
+                seen.errors.push(format!("{e:#}"));
+            }
+            return Ok(seen);
+        }
+        tokio::time::sleep(INJECT_SETTLE * 2).await;
+    }
     let deadline = Instant::now() + Duration::from_secs(case.max_s);
     for text in &case.setup {
         let mut ignored = Seen::default();
@@ -399,7 +412,32 @@ async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize)
         let (moved, turned) = travel(a, b);
         (seen.truth_moved_m, seen.truth_turned_deg) = (Some(moved), Some(turned));
     }
+    if let Err(e) = shell("restore", &case.restore).await {
+        seen.errors.push(format!("{e:#}"));
+    }
     Ok(seen)
+}
+
+/// How long a case with a fault waits before injecting it, and twice that after.
+const INJECT_SETTLE: Duration = Duration::from_secs(6);
+
+/// Runs a case's `inject` or `restore` command with `sh -c`.
+async fn shell(what: &str, command: &str) -> Result<()> {
+    if command.is_empty() {
+        return Ok(());
+    }
+    let line = command.to_owned();
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&line)
+            .status()
+    })
+    .await
+    .context("running the command")?
+    .with_context(|| format!("starting the case's {what}"))?;
+    anyhow::ensure!(status.success(), "the case's {what} ended with {status}");
+    Ok(())
 }
 
 /// Where the robot's estimate of its travel disagrees with the simulator's.
