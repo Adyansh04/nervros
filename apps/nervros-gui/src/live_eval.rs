@@ -533,7 +533,7 @@ impl Run<'_> {
         self.frame();
     }
 
-    /// Steps until no turn runs, no mission runs, no approval waits (unless approving is left to
+    /// Steps until no turn, mission or job runs, no approval waits (unless approving is left to
     /// the script) and the chat has stayed the same for [`QUIET`].
     fn settle(&mut self) {
         let began = Instant::now();
@@ -552,7 +552,8 @@ impl Run<'_> {
             let gui = self.harness.state();
             // Left to the script, a turn waiting on an approval waits on the script's next step.
             let asking = gui.chat.pending().count() > 0;
-            let busy = (gui.chat.turn.is_some() && !asking) || gui.mission_running();
+            let busy =
+                (gui.chat.turn.is_some() && !asking) || gui.mission_running() || gui.job_running();
             let items = gui.chat.items.len();
             if busy || items != seen {
                 (quiet_since, seen) = (None, items);

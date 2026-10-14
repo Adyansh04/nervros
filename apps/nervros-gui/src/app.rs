@@ -403,6 +403,15 @@ impl Gui {
             .is_some_and(|id| !id.is_empty())
     }
 
+    /// Whether a program or a search runs.
+    fn job_running(&self) -> bool {
+        self.agent
+            .jobs
+            .list()
+            .iter()
+            .any(|j| j.state == JobState::Running)
+    }
+
     /// Whether the running mission is paused, or waits to pause once a pick or place ends.
     fn mission_paused(&self) -> bool {
         self.mission_running()
@@ -427,13 +436,7 @@ impl Gui {
     fn guard_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) {
             let cancel;
-            let working = self.mission_running()
-                || self
-                    .agent
-                    .jobs
-                    .list()
-                    .iter()
-                    .any(|j| j.state == JobState::Running);
+            let working = self.mission_running() || self.job_running();
             (cancel, self.closing) = on_close(self.closing, working);
             if cancel {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -547,7 +550,7 @@ impl Gui {
                 if job.summary.is_empty() {
                     ended
                 } else {
-                    format!("{ended}: {}", job.summary)
+                    format!("{ended}: {}", crate::chat::readable(&job.summary))
                 },
             );
             return;

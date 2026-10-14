@@ -7,6 +7,7 @@ use nervros_core::job::{JobInfo, JobState};
 use rerun::external::egui;
 use rerun::external::egui::RichText;
 use rerun::external::re_ui::ReButton;
+use serde_json::Value;
 
 use super::Action;
 use crate::theme;
@@ -87,7 +88,49 @@ pub(super) fn job_card(ui: &mut egui::Ui, card: &JobCard, actions: &mut Vec<Acti
         }
         if !job.summary.is_empty() {
             ui.add_space(4.0);
-            ui.add(egui::Label::new(RichText::new(&job.summary).size(13.0)).wrap());
+            // The result is what the card is for: it reads first.
+            let result = RichText::new(readable(&job.summary))
+                .size(13.5)
+                .color(theme::TEXT);
+            ui.add(egui::Label::new(result).wrap());
         }
     });
+}
+
+/// A job's result as the operator reads it: a program's counts by room read "bedroom 2 ·
+/// kitchen 4", a list its items; anything else as the job said it.
+pub(crate) fn readable(summary: &str) -> String {
+    let flat = |v: &Value| !v.is_object() && !v.is_array();
+    let text = |v: &Value| v.as_str().map_or_else(|| v.to_string(), str::to_owned);
+    match serde_json::from_str::<Value>(summary) {
+        Ok(Value::Object(map)) if !map.is_empty() && map.values().all(flat) => map
+            .iter()
+            .map(|(k, v)| format!("{k} {}", text(v)))
+            .collect::<Vec<_>>()
+            .join(" · "),
+        Ok(Value::Array(items)) if !items.is_empty() && items.iter().all(flat) => {
+            items.iter().map(text).collect::<Vec<_>>().join(", ")
+        }
+        _ => summary.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_programs_counts_read_as_words() {
+        assert_eq!(
+            readable(r#"{"bedroom":2,"living room":3}"#),
+            "bedroom 2 · living room 3"
+        );
+        assert_eq!(readable(r#"["O1","O7"]"#), "O1, O7");
+        assert_eq!(readable("found keys at R2"), "found keys at R2");
+        assert_eq!(
+            readable(r#"[{"id":"O1"}]"#),
+            r#"[{"id":"O1"}]"#,
+            "nested stays as it is"
+        );
+    }
 }

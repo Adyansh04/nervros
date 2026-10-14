@@ -25,6 +25,7 @@ mod report;
 pub(crate) mod tests;
 mod view;
 
+pub(crate) use job::readable;
 pub(crate) use plan::{plan_card, tree_panel};
 pub(crate) use view::{decode, spinner, thousands};
 

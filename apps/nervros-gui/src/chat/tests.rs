@@ -401,6 +401,75 @@ fn snapshot_draft_and_compaction() {
 }
 
 #[test]
+fn snapshot_jobs() {
+    use nervros_core::job::{Envelope, JobInfo, JobKind, JobState};
+    let job = |id: &str, kind, name: &str, state, summary: &str| JobInfo {
+        id: id.to_owned(),
+        kind,
+        name: name.to_owned(),
+        envelope: Envelope::new([], 10),
+        allows: "may move the base (GoToPlace) and look (FindInView), for at most 10 min"
+            .to_owned(),
+        started_s: 0.0,
+        state,
+        summary: summary.to_owned(),
+    };
+    let mut chat = Chat::default();
+    chat.push_user("Find my keys.".to_owned(), true);
+    chat.apply(&Event::JobStarted {
+        job: job("j1", JobKind::Search, "my keys", JobState::Running, ""),
+    });
+    for line in [
+        "1. O12: keys were seen there 3 min ago",
+        "running GoToPlace",
+        "could not get to O12: the goal was aborted",
+        "2. R4: such things are often in the hallway; the camera has seen 40% of it",
+    ] {
+        chat.apply(&Event::JobLog {
+            id: "j1".to_owned(),
+            line: line.to_owned(),
+        });
+    }
+    chat.push_user("Count the chairs in every room.".to_owned(), true);
+    let counted = job(
+        "j2",
+        JobKind::Program,
+        "count chairs per room",
+        JobState::Running,
+        "",
+    );
+    chat.apply(&Event::JobStarted {
+        job: counted.clone(),
+    });
+    chat.apply(&Event::JobFinished {
+        job: JobInfo {
+            state: JobState::Done,
+            summary: r#"{"bedroom":2,"kitchen":4,"living room":3,"office":1}"#.to_owned(),
+            ..counted
+        },
+    });
+    chat.apply(&Event::JobStarted {
+        job: job(
+            "j3",
+            JobKind::Program,
+            "walk and look",
+            JobState::Running,
+            "",
+        ),
+    });
+    chat.apply(&Event::JobFinished {
+        job: job(
+            "j3",
+            JobKind::Program,
+            "walk and look",
+            JobState::Failed,
+            "it failed: Function not found: lenght (line 3, position 12)",
+        ),
+    });
+    render(chat, "chat_jobs");
+}
+
+#[test]
 fn snapshot_empty_state() {
     render(Chat::default(), "chat_empty");
 }
