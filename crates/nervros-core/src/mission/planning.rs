@@ -307,7 +307,8 @@ impl Missions {
         by: By,
     ) -> (bool, Vec<Concern>) {
         let request = self.request();
-        let found = sanity::check(&request, &compiled.steps, &self.config.checks);
+        let mut found = sanity::check(&request, &compiled.steps, &self.config.checks);
+        found.extend(sanity::dead_ends(&compiled.steps, catalog));
         if !found.is_empty() {
             return (true, found);
         }

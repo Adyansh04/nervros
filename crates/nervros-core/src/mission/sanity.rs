@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::catalog::Catalog;
+use super::catalog::{Catalog, GO_TO_PLACE};
 use super::plan::{PlannedStep, StepArg};
 use crate::profile::{PlanChecks, TurnSkill, WalkSkill};
 
@@ -92,6 +92,42 @@ pub fn check(request: &str, steps: &[PlannedStep], skills: &PlanChecks) -> Vec<C
         hands(side, arm, steps, &mut out);
     }
     out
+}
+
+/// Steps that would end a tour early: one that moves nothing, such as a look, is not optional,
+/// hands on nothing a later step takes, and comes before a step that moves. If it finds nothing,
+/// the walks or turns after it never run.
+#[must_use]
+pub fn dead_ends(steps: &[PlannedStep], catalog: &Catalog) -> Vec<Concern> {
+    let moves_nothing = |s: &PlannedStep| {
+        s.skill != GO_TO_PLACE
+            && catalog
+                .skill(&s.skill)
+                .is_some_and(|k| k.resources.is_empty())
+    };
+    let moves_after = |i: usize| steps[i + 1..].iter().any(|s| !moves_nothing(s));
+    let used_after = |i: usize| {
+        let key = format!("{{{}_", steps[i].id);
+        steps[i + 1..]
+            .iter()
+            .any(|s| s.args.iter().any(|a| a.value.contains(&key)))
+    };
+    steps
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| !s.optional && moves_nothing(s) && moves_after(*i) && !used_after(*i))
+        .map(|(_, s)| {
+            Concern::new(
+                &s.id,
+                format!(
+                    "if {} {} finds nothing, the mission ends there and the moves after it never \
+                     run: make it optional (\"optional\": true), or write a program",
+                    s.id, s.skill
+                ),
+                None,
+            )
+        })
+        .collect()
 }
 
 fn arg<'a>(step: &'a PlannedStep, name: &str) -> Option<&'a str> {
@@ -253,12 +289,20 @@ fn read(request: &str) -> Asked {
             || pair("anti", "clockwise");
         let (left, right) = sides(&words);
         asked.turn = Side::of(left || counter, right || (has("clockwise") && !counter));
+        // "Every quarter turn" or "each 90 degrees" is a step of the turn, not the whole of it.
+        let each = has("every") || has("each");
         asked.degrees = single(&words, &["degree", "degrees", "deg"])
-            .or_else(|| pair("quarter", "turn").then_some(90.0))
-            .or_else(|| (pair("half", "turn") || pair("turn", "around")).then_some(180.0))
+            .filter(|_| !each)
+            .or_else(|| (pair("quarter", "turn") && !each).then_some(90.0))
             .or_else(|| {
-                (has("spin") || pair("full", "turn") || pair("full", "circle")).then_some(360.0)
-            });
+                (has("spin")
+                    || pair("full", "turn")
+                    || pair("full", "circle")
+                    || pair("around", "once")
+                    || words.windows(3).any(|w| w == ["all", "the", "way"]))
+                .then_some(360.0)
+            })
+            .or_else(|| (pair("half", "turn") || pair("turn", "around")).then_some(180.0));
     }
 
     asked.metres = single(&words, &METRES).or_else(|| single(&words, &CM).map(|cm| cm / 100.0));
@@ -551,6 +595,55 @@ mod tests {
     }
 
     #[test]
+    fn a_look_that_could_end_a_walk_through_several_places_is_named() {
+        let catalog = crate::mission::catalog::Catalog::parse(
+            r#"{"catalog_version": "v", "skills": [
+              {"name": "GoToPlace", "max_duration_s": 60, "template": "", "resources": ["base"]},
+              {"name": "FindInView", "max_duration_s": 20, "template": ""},
+              {"name": "PickObject", "max_duration_s": 60, "template": "", "resources": ["base", "left_arm"]}]}"#,
+        )
+        .unwrap();
+        let walk = |id: &str| step(id, "GoToPlace", &[("place", "R1")]);
+        let look = |id: &str| step(id, "FindInView", &[("phrase", "mug")]);
+        let rooms = [walk("s1"), look("s2"), walk("s3"), look("s4")];
+        let found = dead_ends(&rooms, &catalog);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].step, "s2", "the last look ends nothing");
+        assert!(
+            found[0].message.contains("optional"),
+            "{}",
+            found[0].message
+        );
+
+        let mut optional = rooms.clone();
+        optional[1].optional = true;
+        assert!(dead_ends(&optional, &catalog).is_empty());
+        let fetch = [
+            walk("s1"),
+            look("s2"),
+            step("s3", "PickObject", &[("object_id", "{s2_object_id}")]),
+            walk("s4"),
+        ];
+        assert!(
+            dead_ends(&fetch, &catalog).is_empty(),
+            "a pick needs what it found"
+        );
+        let turn = |id: &str| step(id, "TurnInPlace", &[("degrees", "90")]);
+        let around = [turn("s1"), look("s2"), turn("s3"), look("s4")];
+        let turning = crate::mission::catalog::Catalog::parse(
+            r#"{"catalog_version": "v", "skills": [
+              {"name": "TurnInPlace", "max_duration_s": 30, "template": "", "resources": ["base"]},
+              {"name": "FindInView", "max_duration_s": 20, "template": ""}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            dead_ends(&around, &turning).len(),
+            1,
+            "a look between turns"
+        );
+    }
+
+    #[test]
     fn the_checks_follow_the_robots_own_skills() {
         let clockwise = PlanChecks {
             turn: Some(TurnSkill {
@@ -636,6 +729,27 @@ mod tests {
         assert!(check("Turn left 90 degrees.", &[turn("90")]).is_empty());
         assert!(check("Turn left 90°", &[turn("90")]).is_empty());
         assert!(check("rotate clockwise a quarter turn", &[turn("-90")]).is_empty());
+        let quarters = [turn("90"), turn("90"), turn("90"), turn("90")];
+        assert!(
+            check(
+                "Turn around once, slowly, stopping to look every quarter turn.",
+                &quarters
+            )
+            .is_empty(),
+            "a quarter turn here is each stop"
+        );
+        assert!(
+            check(
+                "Turn all the way around, pausing each 90 degrees.",
+                &quarters
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            check("Turn around.", &quarters).len(),
+            1,
+            "turning around is half a turn"
+        );
         assert_eq!(
             check("turn anti-clockwise by 90deg", &[turn("-90")]).len(),
             1
