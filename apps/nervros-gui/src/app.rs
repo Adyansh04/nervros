@@ -716,6 +716,7 @@ impl Gui {
                 Action::Say(text) => self.say(&text),
                 Action::Prefill(text) => {
                     self.input = text;
+                    composer::cursor_to_end(ctx, &self.input);
                     ctx.memory_mut(|m| m.request_focus(egui::Id::new(COMPOSER)));
                 }
                 Action::ShowAt(at) => self.show_at(at),
@@ -1061,6 +1062,17 @@ mod tests {
         harness.run();
         harness.fit_contents();
         crate::testkit::compare(&mut harness, "layers", &SnapshotOptions::new());
+    }
+
+    #[test]
+    fn a_filled_in_composer_is_typed_onto_at_its_end() {
+        let ctx = egui::Context::default();
+        super::composer::cursor_to_end(&ctx, "In snapshot s1, ");
+        let state = egui::TextEdit::load_state(&ctx, egui::Id::new(COMPOSER));
+        let at = state
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| r.primary.index);
+        assert_eq!(at, Some(egui::text::CCursor::new(16).index));
     }
 
     #[test]
