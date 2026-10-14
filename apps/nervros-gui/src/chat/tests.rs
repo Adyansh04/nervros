@@ -494,6 +494,17 @@ fn snapshot_empty_state() {
 }
 
 #[test]
+fn arming_first_keeps_the_suggestions() {
+    let mut chat = Chat::default();
+    chat.apply(&Event::Armed { armed: true });
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(440.0, 800.0))
+        .build_ui(move |ui| chat.show(ui, Duration::from_mins(10), &mut Vec::new()));
+    harness.run();
+    assert!(harness.query_by_label("What do you see?").is_some());
+}
+
+#[test]
 fn snapshot_mission() {
     let mut chat = Chat::default();
     chat.apply(&Event::User {

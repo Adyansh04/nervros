@@ -176,7 +176,7 @@ A plain "stop" (or "halt", "freeze", "stop!") never waits on a model: it stops t
 robot at once, through the executor's `StopAll`. In the clip the walk had run for seven seconds:
 
 ```text
-[halted: stopped by the operator: reply and robot]
+[halted: the operator stopped the reply and the robot]
 [the robot stopped: holding posture; hands empty]
 report> Mission 01a0febc (Walk to the office, room R4) ended: canceled after 9 s.
         It was stopped during s1 GoToPlace(place=R4) (stopped: operator).

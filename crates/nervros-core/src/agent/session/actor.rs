@@ -243,9 +243,9 @@ fn halt(shared: &Arc<Shared>, robot: bool) {
         });
     }
     let reason = if stop.is_some() {
-        "stopped by the operator: reply and robot"
+        "the operator stopped the reply and the robot"
     } else {
-        "reply stopped by the operator"
+        "the operator stopped the reply"
     };
     shared.emit(Event::Halted {
         reason: reason.into(),

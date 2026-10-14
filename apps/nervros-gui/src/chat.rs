@@ -312,7 +312,7 @@ impl Chat {
             } else {
                 "Observe only: the agent cannot act".to_owned()
             })),
-            Event::Halted { reason } => self.items.push(Item::Notice(format!("Stopped: {reason}"))),
+            Event::Halted { reason } => self.items.push(Item::Notice(plan::capitalise(reason))),
             Event::Stopped { ok: true, detail } => {
                 self.items
                     .push(Item::Notice(format!("The robot stopped: {detail}")));
@@ -322,7 +322,8 @@ impl Chat {
                     "The robot did not confirm the stop: {detail}"
                 )));
             }
-            Event::Notice { text } => self.items.push(Item::Notice(text.clone())),
+            // As every notice reads: the robot's answers come as phrases, "no mission is running".
+            Event::Notice { text } => self.items.push(Item::Notice(plan::capitalise(text))),
             Event::Error { turn, text } => self.items.push(Item::Error {
                 text: text.clone(),
                 retry: self.asked.get(turn).cloned(),
@@ -774,6 +775,10 @@ impl Chat {
         }
         drop(heights);
         self.show_live(ui, turn_starts);
+        // Notices alone, such as arming first, are no conversation yet: the suggestions stay.
+        if self.turn.is_none() && self.items.iter().all(|i| matches!(i, Item::Notice(_))) {
+            empty_state(ui, actions);
+        }
     }
 
     /// The reply as it streams in, and how long the turn has run; `turn_starts` when the agent
