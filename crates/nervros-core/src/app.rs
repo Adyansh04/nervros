@@ -616,7 +616,6 @@ fn job_tools(
     registry.add(Arc::new(crate::search::SearchTool::new(
         Arc::clone(missions),
         Arc::clone(jobs),
-        crate::search::Priors::default(),
         frames,
     )))?;
     Ok(Some(store))

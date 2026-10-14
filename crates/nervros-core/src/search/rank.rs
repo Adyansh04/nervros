@@ -5,7 +5,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use super::priors::{Priors, room_type};
+use super::priors::{room_type, rooms_for};
 use crate::mission::check::{how_long, named};
 
 /// How fast what the world model saw goes stale: an hour old counts about 0.96 of new, a day 0.37.
@@ -50,11 +50,11 @@ pub struct Seen<'a> {
 
 /// The places to look, best first, one per target.
 #[must_use]
-pub fn rank(seen: &Seen<'_>, priors: &Priors) -> Vec<Lookout> {
+pub fn rank(seen: &Seen<'_>) -> Vec<Lookout> {
     let mut out: Vec<Lookout> = sightings(seen)
         .into_iter()
         .chain(moves(seen))
-        .chain(rooms(seen, priors))
+        .chain(rooms(seen))
         .collect();
     for l in &mut out {
         if let (Some((x, y)), Some((rx, ry))) = (l.xy, seen.robot) {
@@ -102,6 +102,13 @@ pub(super) fn bare(words: &str) -> String {
         rest.remove(0);
     }
     rest.join(" ")
+}
+
+/// The word the world model's labels hold a thing by: the last of `phrase`, without a plural
+/// `s`, so "red mugs" is looked up under every label holding "mug".
+pub(super) fn label_word(phrase: &str) -> &str {
+    let last = phrase.split_whitespace().last().unwrap_or(phrase);
+    last.strip_suffix('s').unwrap_or(last)
 }
 
 /// Whether an object is the thing: its label or name holds the words, or, less surely, the
@@ -194,8 +201,8 @@ fn moves(seen: &Seen<'_>) -> Vec<Lookout> {
 
 /// Every room: those such things are usually in first, each counting more the less of it the
 /// camera has seen, since a seen room would have shown the thing.
-fn rooms(seen: &Seen<'_>, priors: &Priors) -> Vec<Lookout> {
-    let usual = priors.rooms_for(seen.words);
+fn rooms(seen: &Seen<'_>) -> Vec<Lookout> {
+    let usual = rooms_for(seen.words);
     seen.rooms["rooms"]
         .as_array()
         .map_or(&[][..], Vec::as_slice)
@@ -256,10 +263,7 @@ mod tests {
     }
 
     fn order(seen: &Seen<'_>) -> Vec<String> {
-        rank(seen, &Priors::default())
-            .into_iter()
-            .map(|l| l.target)
-            .collect()
+        rank(seen).into_iter().map(|l| l.target).collect()
     }
 
     #[test]
@@ -278,7 +282,7 @@ mod tests {
             robot: Some((0.0, 0.0)),
             now_s: NOW,
         };
-        let ranked = rank(&seen, &Priors::default());
+        let ranked = rank(&seen);
         assert_eq!(
             ranked.iter().map(|l| l.target.as_str()).collect::<Vec<_>>(),
             ["O2", "O1", "R2", "R1", "R3"],
@@ -311,7 +315,7 @@ mod tests {
             words: "cup",
             ..seen
         };
-        let ranked = rank(&seen, &Priors::default());
+        let ranked = rank(&seen);
         assert_eq!(ranked[0].target, "R1", "cups are kitchen things");
         assert_eq!(ranked[1].target, "R2", "then the office, little of it seen");
         assert!(
@@ -336,13 +340,21 @@ mod tests {
             robot: None,
             now_s: NOW,
         };
-        let ranked = rank(&seen, &Priors::default());
+        let ranked = rank(&seen);
         assert_eq!(
             (ranked[0].target.as_str(), ranked[1].target.as_str()),
             ("O2", "O1")
         );
         assert_eq!(ranked[1].why, "a mug was seen there 0 s ago");
         assert_eq!(bare("The keys"), "keys");
+        assert_eq!(
+            [
+                label_word("red mugs"),
+                label_word("keys"),
+                label_word("glass")
+            ],
+            ["mug", "key", "glas"]
+        );
     }
 
     #[test]
@@ -359,7 +371,7 @@ mod tests {
             robot: None,
             now_s: NOW,
         };
-        let ranked = rank(&seen, &Priors::default());
+        let ranked = rank(&seen);
         assert_eq!(ranked[0].target, "R3");
         assert_eq!(ranked[0].why, "mug was moved there 60 s ago");
         assert_eq!(ranked.iter().filter(|l| l.target == "R3").count(), 1);

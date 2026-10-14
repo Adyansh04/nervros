@@ -6,6 +6,5 @@ mod priors;
 mod rank;
 mod tool;
 
-pub use priors::Priors;
 pub use rank::Lookout;
 pub use tool::SearchTool;

@@ -8,18 +8,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::priors::Priors;
-use super::rank::{Lookout, Seen, bare, rank};
+use super::rank::{Lookout, Seen, bare, label_word, rank};
+use crate::job::envelope::{DEFAULT_MINUTES, MAX_MINUTES};
 use crate::job::{Approval, Context, Envelope, JobKind, Jobs};
-use crate::mission::catalog::{Catalog, GO_TO_PLACE};
+use crate::mission::catalog::{Catalog, FIND_IN_VIEW, GO_TO_PLACE};
 use crate::mission::{Missions, Outcome};
 use crate::tools::{Assessment, Risk, Status, Tool, ToolOutcome, ToolSpec};
 
-/// The skill that looks.
-const FIND: &str = "FindInView";
 const DEFAULT_PLACES: u64 = 4;
 const MAX_PLACES: u64 = 8;
-const DEFAULT_MINUTES: u64 = 10;
 /// Lookouts the approval names before "and N more".
 const NAMED: usize = 3;
 
@@ -28,7 +25,6 @@ pub struct SearchTool {
     spec: ToolSpec,
     missions: Arc<Missions>,
     jobs: Arc<Jobs>,
-    priors: Priors,
     /// The map frame and the robot's base frame.
     frames: (String, String),
 }
@@ -36,7 +32,9 @@ pub struct SearchTool {
 /// A search, as checked: what to look for, the detector's word for it, and where.
 struct Plan {
     what: String,
-    phrase: String,
+    /// What the detector looks for, or why this robot cannot look for it: a plan that moves
+    /// nothing still says where it would be.
+    phrase: Result<String, String>,
     lookouts: Vec<Lookout>,
     minutes: u64,
 }
@@ -44,17 +42,11 @@ struct Plan {
 impl SearchTool {
     /// The tool for `missions`' robot, its searches run in `jobs`.
     #[must_use]
-    pub fn new(
-        missions: Arc<Missions>,
-        jobs: Arc<Jobs>,
-        priors: Priors,
-        frames: (String, String),
-    ) -> Self {
+    pub fn new(missions: Arc<Missions>, jobs: Arc<Jobs>, frames: (String, String)) -> Self {
         Self {
             spec: spec(),
             missions,
             jobs,
-            priors,
             frames,
         }
     }
@@ -68,9 +60,13 @@ impl SearchTool {
             );
         }
         let catalog = self.missions.catalog().await?;
-        let phrase = phrase_for(&catalog, &what)?;
-        let (seen, events) =
-            tokio::join!(self.missions.observe(), self.missions.object_events(&what));
+        let phrase = phrase_for(&catalog, &what);
+        // The world model's labels are the detector's words, not the operator's "my keys".
+        let named = phrase.clone().unwrap_or_else(|_| bare(&what));
+        let (seen, events) = tokio::join!(
+            self.missions.observe(),
+            self.missions.object_events(label_word(&named))
+        );
         if seen.rooms.is_null() && seen.objects.is_null() {
             return Err(
                 "the world model has not said what it knows; it may not be running".to_owned(),
@@ -81,17 +77,14 @@ impl SearchTool {
             let (x, y, _) = t.planar();
             (x, y)
         });
-        let ranked = rank(
-            &Seen {
-                words: &what,
-                objects: &seen.objects,
-                rooms: &seen.rooms,
-                events: &events,
-                robot,
-                now_s: crate::now_s(),
-            },
-            &self.priors,
-        );
+        let ranked = rank(&Seen {
+            words: &what,
+            objects: &seen.objects,
+            rooms: &seen.rooms,
+            events: &events,
+            robot,
+            now_s: crate::now_s(),
+        });
         if ranked.is_empty() {
             return Err(
                 "the world model knows no rooms to look in; map the building first".to_owned(),
@@ -118,11 +111,17 @@ impl SearchTool {
             Ok(p) => p,
             Err(e) => return ToolOutcome::failed(e),
         };
+        if let Err(e) = &plan.phrase {
+            return ToolOutcome::failed(e.clone());
+        }
         let catalog = match self.missions.catalog().await {
             Ok(c) => c,
             Err(e) => return ToolOutcome::failed(e),
         };
-        let envelope = Envelope::new([GO_TO_PLACE.to_owned(), FIND.to_owned()], plan.minutes);
+        let envelope = Envelope::new(
+            [GO_TO_PLACE.to_owned(), FIND_IN_VIEW.to_owned()],
+            plan.minutes,
+        );
         let approval = Approval::of(envelope, &catalog);
         let missions = Arc::clone(&self.missions);
         let name = plan.what.clone();
@@ -146,7 +145,7 @@ impl SearchTool {
 /// The detector's word for `what`: itself, or the one word of a narrowed list it holds.
 fn phrase_for(catalog: &Catalog, what: &str) -> Result<String, String> {
     let skill = catalog
-        .skill(FIND)
+        .skill(FIND_IN_VIEW)
         .ok_or("this robot has no FindInView skill to look with")?;
     if !catalog.can_travel() {
         return Err("this robot cannot walk anywhere to look".to_owned());
@@ -180,11 +179,16 @@ async fn search(missions: &Arc<Missions>, ctx: &Context, plan: Plan) -> Result<S
         ctx.log(format!("{}. {}: {}", n + 1, l.target, l.why));
         let steps = json!([
             {"skill": GO_TO_PLACE, "args": {"place": l.target}},
-            {"skill": FIND, "args": {"phrase": plan.phrase}}
+            {"skill": FIND_IN_VIEW, "args": {"phrase": plan.phrase.as_deref().unwrap_or_default()}}
         ]);
         let intent = format!("look for {} at {}", plan.what, l.target);
-        match missions.run_for_job(ctx, &intent, steps).await {
-            Ok(end) if end.outcome == Outcome::Success => {
+        let end = missions
+            .run_for_job(ctx, &intent, steps)
+            .await
+            // The robot cannot run missions now: looking further would fail the same way.
+            .map_err(|e| format!("the search could not go on: {e}"))?;
+        match (end.outcome, end.failed_step.as_str()) {
+            (Outcome::Success, _) => {
                 let id = end
                     .outputs
                     .iter()
@@ -194,19 +198,22 @@ async fn search(missions: &Arc<Missions>, ctx: &Context, plan: Plan) -> Result<S
                     .unwrap_or_default();
                 return Ok(format!("found {} at {}{id}", plan.what, l.target));
             }
-            Ok(end) if end.failed_step == "s1" => {
+            (Outcome::Failure | Outcome::Timeout, "s1") => {
                 ctx.log(format!("could not get to {}: {}", l.target, end.reason));
                 looked.push(format!("{} (not reached)", l.target));
             }
-            Ok(end) if end.outcome == Outcome::Canceled => {
-                return Err("the search was stopped".to_owned());
-            }
-            Ok(_) => {
+            (Outcome::Failure | Outcome::Timeout, "s2") => {
                 ctx.log(format!("not seen at {}", l.target));
                 looked.push(l.target.clone());
             }
-            // The robot cannot run missions now: looking further would fail the same way.
-            Err(e) => return Err(format!("the search could not go on: {e}")),
+            // A cancel names the step it stopped too: wherever it came, it ends the search.
+            (Outcome::Canceled, _) => return Err("the search was stopped".to_owned()),
+            (other, _) => {
+                return Err(format!(
+                    "the search could not go on: its mission ended {other}: {}",
+                    end.reason
+                ));
+            }
         }
     }
     let mut text = format!(
@@ -216,6 +223,18 @@ async fn search(missions: &Arc<Missions>, ctx: &Context, plan: Plan) -> Result<S
     );
     let _ = write!(text, " ({} places)", looked.len());
     Err(text)
+}
+
+/// Lookouts as the model reads them: why look there names what the world model calls things,
+/// which is world text.
+fn fenced(lookouts: Vec<Lookout>) -> Vec<Lookout> {
+    lookouts
+        .into_iter()
+        .map(|l| Lookout {
+            why: crate::tools::from_world(&l.why),
+            ..l
+        })
+        .collect()
 }
 
 /// The places a search would look, as the operator reads them.
@@ -250,7 +269,7 @@ fn spec() -> ToolSpec {
             "action": {"type": "string", "enum": ["plan", "go"]},
             "what": {"type": "string", "description": "The thing, in the operator's words."},
             "max_places": {"type": "integer", "minimum": 1, "maximum": MAX_PLACES},
-            "max_minutes": {"type": "integer", "minimum": 1, "maximum": crate::job::envelope::MAX_MINUTES}
+            "max_minutes": {"type": "integer", "minimum": 1, "maximum": MAX_MINUTES}
         }, "required": ["action", "what"], "additionalProperties": false}),
         Risk::Motion,
     )
@@ -272,6 +291,7 @@ impl Tool for SearchTool {
                 args: None,
             })),
             Some("go") => Some(match self.plan(args).await {
+                Ok(Plan { phrase: Err(e), .. }) | Err(e) => Err(ToolOutcome::failed(e)),
                 Ok(plan) => Ok(Assessment {
                     risk: Risk::Motion,
                     resources: Vec::new(),
@@ -279,14 +299,13 @@ impl Tool for SearchTool {
                         "searches for \"{}\" on its own, for at most {} min: it walks to {} and \
                          looks",
                         plan.what,
-                        plan.minutes.clamp(1, crate::job::envelope::MAX_MINUTES),
+                        plan.minutes.clamp(1, MAX_MINUTES),
                         describe(&plan)
                     ),
                     args: Some(json!({"action": "go", "what": plan.what,
                                       "max_places": plan.lookouts.len(),
                                       "max_minutes": plan.minutes})),
                 }),
-                Err(e) => Err(ToolOutcome::failed(e)),
             }),
             _ => Some(Err(ToolOutcome::failed("`action` is plan or go"))),
         }
@@ -297,10 +316,17 @@ impl Tool for SearchTool {
             Some("plan") => match self.plan(&args).await {
                 Ok(plan) => ToolOutcome {
                     status: Status::Succeeded,
-                    message: "where it would look, best first; nothing moved. To look, call \
-                              search with action go."
-                        .to_owned(),
-                    data: json!({"what": plan.what, "look_at": plan.lookouts}),
+                    message: match &plan.phrase {
+                        Ok(_) => "where it would look, best first; nothing moved. To look, call \
+                                  search with action go."
+                            .to_owned(),
+                        // Where it would be still helps the operator look themselves.
+                        Err(e) => format!(
+                            "where it would be, best first; nothing moved, and the robot cannot \
+                             look for it itself: {e}"
+                        ),
+                    },
+                    data: json!({"what": plan.what, "look_at": fenced(plan.lookouts)}),
                     images: Vec::new(),
                 },
                 Err(e) => ToolOutcome::failed(e),
@@ -366,7 +392,6 @@ mod tests {
         SearchTool::new(
             missions,
             jobs,
-            Priors::default(),
             ("map".to_owned(), "base_footprint".to_owned()),
         )
     }
@@ -407,6 +432,17 @@ mod tests {
             "{}",
             refused.message
         );
+        // Where keys might be still helps, though the detector here cannot look for them.
+        let keys = tool
+            .call(json!({"action": "plan", "what": "my keys"}))
+            .await;
+        assert_eq!(keys.status, Status::Succeeded, "{}", keys.message);
+        assert!(
+            keys.message.contains("cannot look for it itself"),
+            "{}",
+            keys.message
+        );
+        assert!(!keys.data["look_at"].as_array().unwrap().is_empty());
     }
 
     fn catalog(phrase_choices: &str) -> Catalog {
