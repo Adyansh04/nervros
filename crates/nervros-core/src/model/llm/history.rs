@@ -203,6 +203,8 @@ const SUMMARY_MARK: &str = "[The earlier conversation, summarised]";
 
 /// How a tool result cut to save room starts.
 pub(super) const CUT_MARK: &str = "[an earlier result, cut to save room]";
+/// Characters of an earlier result its cut keeps.
+const CUT_KEEP: usize = 160;
 
 /// The operator's own words: not a robot's report or a summary, which come as user text too.
 fn is_operator(m: &Message) -> bool {
@@ -287,11 +289,15 @@ pub(super) fn result_text(parts: &[ToolResultContent]) -> String {
 pub(super) fn cut_old(messages: &[Message], keep: usize) -> Vec<Message> {
     let edge = messages.len().saturating_sub(keep);
     let cut = |c: &UserContent| match c {
-        UserContent::ToolResult(r) if !result_text(&r.content).starts_with(CUT_MARK) => {
+        // One already as short as its cut stays as it is: the cut would only make it longer.
+        UserContent::ToolResult(r)
+            if !result_text(&r.content).starts_with(CUT_MARK)
+                && result_text(&r.content).chars().count() > CUT_KEEP + CUT_MARK.len() =>
+        {
             let mut r = r.clone();
             r.content = vec![ToolResultContent::text(format!(
                 "{CUT_MARK} {}",
-                crate::tools::clip(&result_text(&r.content), 160)
+                crate::tools::clip(&result_text(&r.content), CUT_KEEP)
             ))];
             UserContent::ToolResult(r)
         }

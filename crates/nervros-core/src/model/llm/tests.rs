@@ -55,11 +55,14 @@ fn old_results_are_cut_once_and_up_to_here_counts_the_operator_only() {
     let mut history = History(vec![
         said("where is the mug?"),
         found("c1", "y".repeat(2000)),
+        found("c3", "succeeded".to_owned()),
         said(&format!("{REPORT_MARK}\nthe mission succeeded")),
         said("and the basket?"),
         found("c2", "z".repeat(2000)),
     ]);
+    let before = history.size();
     history.mask();
+    assert!(history.size() < before, "a cut never grows the history");
     let results: Vec<String> = history
         .0
         .iter()
@@ -75,20 +78,21 @@ fn old_results_are_cut_once_and_up_to_here_counts_the_operator_only() {
         results[0].starts_with(CUT_MARK) && results[0].len() < 300,
         "{results:?}"
     );
-    assert_eq!(results[1].len(), 2000, "the newest request's result stays");
+    assert_eq!(results[1], "succeeded", "a short one stays as it is");
+    assert_eq!(results[2].len(), 2000, "the newest request's result stays");
     let once = history.clone();
     history.mask();
     assert_eq!(history.0, once.0, "a cut result is not cut again");
 
     let (n, text) = history.before_last(1).unwrap();
-    assert_eq!(n, 3, "the report is not the operator's");
+    assert_eq!(n, 4, "the report is not the operator's");
     assert!(
         text.contains("where is the mug?") && !text.contains("basket"),
         "{text}"
     );
     assert_eq!(
         history.before_last(0).unwrap().0,
-        5,
+        6,
         "keeping none condenses it all"
     );
     assert!(
