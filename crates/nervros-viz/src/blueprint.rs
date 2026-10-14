@@ -158,7 +158,8 @@ pub(super) struct Layout {
     framed: Mutex<Option<[f32; 4]>>,
     /// The 3D view keeps to the robot.
     follow: AtomicBool,
-    /// The strip's tab on show: a plot the agent starts is brought forward.
+    /// The strip's tab on show: the agent's log at first, as the mission lanes are empty until
+    /// one runs; a mission or a plot the agent starts is brought forward.
     strip: AtomicUsize,
 }
 
@@ -170,7 +171,7 @@ impl Layout {
             bounds: Mutex::new(None),
             framed: Mutex::new(None),
             follow: AtomicBool::new(false),
-            strip: AtomicUsize::new(MISSION_TAB),
+            strip: AtomicUsize::new(AGENT_TAB),
         }
     }
 
@@ -197,7 +198,16 @@ impl Layout {
 
     /// Shows the strip's Plots tab, where a plot the agent just started draws.
     pub(super) fn show_plots(&self) {
-        if self.strip.swap(PLOTS_TAB, Ordering::Relaxed) != PLOTS_TAB {
+        self.show_strip(PLOTS_TAB);
+    }
+
+    /// Shows the strip's Mission tab, where a mission's steps draw as it runs.
+    pub(super) fn show_mission(&self) {
+        self.show_strip(MISSION_TAB);
+    }
+
+    fn show_strip(&self, tab: usize) {
+        if self.strip.swap(tab, Ordering::Relaxed) != tab {
             self.send();
         }
     }
@@ -215,6 +225,7 @@ impl Layout {
 
 /// The strip's tabs, in the order `panes` lays them out.
 const MISSION_TAB: usize = 0;
+const AGENT_TAB: usize = 1;
 const PLOTS_TAB: usize = 3;
 
 /// The map has grown past the extent the view was framed on by more than a margin on some side,
@@ -483,6 +494,7 @@ mod tests {
             Pane::Split { .. } => String::new(),
         };
         assert_eq!(tab_name(MISSION_TAB), "Mission");
+        assert_eq!(tab_name(AGENT_TAB), "Agent");
         assert_eq!(tab_name(PLOTS_TAB), "Plots");
         let Pane::Split { panes, .. } = super::panes(&cameras, None, false, PLOTS_TAB) else {
             panic!("the root is a split");

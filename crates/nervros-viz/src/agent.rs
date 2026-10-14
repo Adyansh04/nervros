@@ -48,8 +48,9 @@ pub(super) async fn agent(
                 continue;
             }
             Event::MissionStarted { .. } => {
-                // A new mission's steps start from empty lanes.
+                // A new mission's steps start from empty lanes, on show.
                 put(&rec, "mission", &rerun::Clear::recursive());
+                layout.show_mission();
                 continue;
             }
             Event::MissionPreview { steps, .. } => {
