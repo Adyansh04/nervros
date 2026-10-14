@@ -1,5 +1,6 @@
 //! The bars above and below the chat: stop, arming, the model and its quota, the robot at a glance.
 
+use std::fmt::Write as _;
 use std::time::{Duration, SystemTime};
 
 use nervros_core::providers::router::{Need, Router};
@@ -223,17 +224,21 @@ impl Gui {
             }
             ui.label(item(format!("{} tools", self.agent.tools.len())));
             if let Some((used, window)) = self.chat.context {
-                let text = format!(
+                let mut text = format!(
                     "Context {} / {}",
                     crate::chat::thousands(used),
                     crate::chat::thousands(window)
                 );
+                if self.chat.condensed > 0 {
+                    let _ = write!(text, " · condensed {}×", self.chat.condensed);
+                }
                 // Past three quarters a compaction is near; past the window, a request fails.
                 let full = used.saturating_mul(4) >= window.saturating_mul(3);
                 let colour = if full { theme::WARN } else { theme::DIM };
                 ui.label(RichText::new(text).small().color(colour))
                     .on_hover_text(
-                        "Tokens the latest request took; /compact condenses the conversation",
+                        "Tokens the latest request took. As the model's window fills, older turns \
+                         are condensed on their own; /compact condenses the conversation now",
                     );
             }
             let spent = self.chat.spent;

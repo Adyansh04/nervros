@@ -344,6 +344,7 @@ fn print_event(e: &Event, logs: &Path) {
             before,
             after,
             summarised,
+            ..
         } => {
             let how = if *summarised { "summarised" } else { "cut" };
             println!("  [conversation {how}: {before} -> {after} tokens]");

@@ -213,6 +213,9 @@ pub struct Chat {
     pub model: Option<String>,
     /// Tokens the latest request took of the model's window, when the window is known.
     pub context: Option<(u64, u64)>,
+    /// Times the conversation was condensed on its own, as the window filled: the status bar
+    /// counts them, the chat shows only what the operator asked for.
+    pub condensed: u32,
     /// What the session's model calls cost.
     pub spent: Spent,
     /// The reply as it streams in, until it arrives whole or a tool call takes over.
@@ -521,11 +524,17 @@ impl Chat {
                     }
                 }
             }
-            Event::Compacted { before, after, .. } => self.items.push(Item::Notice(format!(
+            Event::Compacted {
+                before,
+                after,
+                asked: true,
+                ..
+            } => self.items.push(Item::Notice(format!(
                 "Condensed the conversation to stay inside the model's context: {} to {} tokens",
                 thousands(*before),
                 thousands(*after)
             ))),
+            Event::Compacted { .. } => self.condensed += 1,
             _ => {}
         }
     }

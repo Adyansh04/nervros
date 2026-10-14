@@ -511,7 +511,7 @@ async fn the_operator_compacts_and_resumes_a_conversation() {
     let events = collect_until_finished(&mut rx, |_| None, &session).await;
     assert!(
         events.iter().any(
-            |e| matches!(e, Event::Compacted { summarised: true, before, after } if after < before)
+            |e| matches!(e, Event::Compacted { summarised: true, before, after, asked: true } if after < before)
         ),
         "{events:?}"
     );

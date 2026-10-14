@@ -127,5 +127,6 @@ pub(super) async fn compact(
         before: u64::try_from(before).unwrap_or(u64::MAX),
         after: u64::try_from(history.size()).unwrap_or(u64::MAX),
         summarised,
+        asked: !matches!(how, Condense::ToFit),
     });
 }

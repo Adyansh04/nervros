@@ -97,6 +97,10 @@ fn a_report_shows_what_happened_with_short_ids() {
         report_text("Camera check: the camera agrees: <world>the mug is in the tray</world>."),
         "Camera check: the camera agrees: the mug is in the tray."
     );
+    assert_eq!(
+        report_text(r#"The program j2 (count) finished: <world>{"office":1,"study":2}</world>"#),
+        "The program j2 (count) finished: office 1 · study 2"
+    );
 }
 
 #[test]
@@ -386,6 +390,7 @@ fn snapshot_draft_and_compaction() {
         before: 9800,
         after: 2100,
         summarised: true,
+        asked: true,
     });
     chat.apply(&Event::User {
         turn: 3,

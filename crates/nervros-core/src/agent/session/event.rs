@@ -202,6 +202,8 @@ pub enum Event {
         after: u64,
         /// A model summarised the older part, rather than its old results only being cut.
         summarised: bool,
+        /// The operator asked for it; otherwise the model's window was filling.
+        asked: bool,
     },
     /// The operator must approve a call.
     ApprovalRequested {
