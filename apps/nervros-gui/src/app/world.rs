@@ -244,7 +244,12 @@ pub(super) fn layers_view(ui: &mut egui::Ui, layers: &nervros_viz::Layers) {
     ui.add_space(8.0);
     for (name, mut shown) in list {
         ui.horizontal(|ui| {
-            if ui.toggle_switch(14.0, &mut shown).changed() {
+            let toggle = ui.toggle_switch(14.0, &mut shown);
+            // Named for a screen reader, and for a script that clicks it.
+            toggle.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, shown, &name)
+            });
+            if toggle.changed() {
                 layers.set(&name, shown);
             }
             let text = RichText::new(&name);

@@ -80,7 +80,11 @@ impl Gui {
                         "Armed, the agent may move the robot once you approve; observing, it \
                          only looks",
                     );
-                if ui.toggle_switch(15.0, &mut armed).changed() {
+                let toggle = ui.toggle_switch(15.0, &mut armed);
+                toggle.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, armed, "Arm")
+                });
+                if toggle.changed() {
                     self.agent
                         .session
                         .send(if armed { Command::Arm } else { Command::Disarm });
