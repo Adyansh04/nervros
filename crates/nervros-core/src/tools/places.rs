@@ -11,7 +11,7 @@ use nervros_ros::RobotPort;
 use serde_json::{Value, json};
 
 use crate::profile::{PlaceConfig, PlacePose, Profile};
-use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
+use crate::tools::{Assessment, Risk, Tool, ToolOutcome, ToolSpec};
 
 /// Every named place.
 #[derive(Debug)]
@@ -251,6 +251,22 @@ impl Tool for ForgetPlace {
         Cow::Borrowed(&self.spec)
     }
 
+    /// A place nobody remembered is refused before the operator is asked to approve forgetting
+    /// it, which then only failed.
+    async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
+        let name = args["name"]
+            .as_str()
+            .and_then(place_name)
+            .unwrap_or_default();
+        if self.places.is_tagged(&name) {
+            None
+        } else {
+            Some(Err(ToolOutcome::failed(format!(
+                "no remembered place `{name}`"
+            ))))
+        }
+    }
+
     async fn call(&self, args: Value) -> ToolOutcome {
         let name = args["name"]
             .as_str()
@@ -328,6 +344,17 @@ mod tests {
             clash.message
         );
         let forget = ForgetPlace::new(Arc::clone(&again));
+        // Nothing to forget is said before anyone is asked to approve it.
+        assert!(matches!(
+            forget.assess(&json!({"name": "secret lab"})).await,
+            Some(Err(_))
+        ));
+        assert!(
+            forget
+                .assess(&json!({"name": "reading_corner"}))
+                .await
+                .is_none()
+        );
         assert_eq!(
             forget.call(json!({"name": "reading_corner"})).await.status,
             crate::tools::Status::Succeeded
