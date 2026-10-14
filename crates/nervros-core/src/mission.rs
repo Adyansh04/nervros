@@ -411,6 +411,15 @@ impl Missions {
         lock(&self.running).is_some()
     }
 
+    /// How many seconds the executor lets a mission run once this agent's heartbeat stops, or
+    /// `None` when nothing beats and a mission runs on alone.
+    #[must_use]
+    pub fn deadman_s(&self) -> Option<f64> {
+        lock(&self.heartbeat)
+            .is_some()
+            .then_some(self.config.heartbeat_timeout_s)
+    }
+
     /// The pause, or with false the resume, `text` orders when it applies now: the executor can
     /// pause, a mission runs, and it is not so already. Otherwise the words are the model's.
     #[must_use]

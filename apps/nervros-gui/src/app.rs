@@ -163,7 +163,8 @@ enum Closing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseChoice {
     StopAndClose,
-    LeaveRunning,
+    /// Closes without a stop: the mission runs on, or the executor's deadman stops it.
+    JustClose,
     Cancel,
 }
 
@@ -179,9 +180,38 @@ fn on_close(closing: Closing, mission_running: bool) -> (bool, Closing) {
 /// How long closing waits for the robot to say it stopped, past the stop's own timeout.
 const STOP_BEFORE_CLOSE: Duration = Duration::from_secs(8);
 
+/// What the close dialog says, and its button for closing without a stop. With a deadman
+/// (`deadman_s`) the executor stops the mission once the window is gone, so nothing runs on.
+fn close_words(failed: bool, deadman_s: Option<f64>) -> (String, &'static str) {
+    let stops =
+        deadman_s.map(|s| format!("the robot stops the mission {s} s after the window closes"));
+    let body = match (failed, stops) {
+        (true, None) => "The mission may still be running. Try the stop again, or close and leave \
+                         it running with nobody watching; the chat says what the robot answered."
+            .to_owned(),
+        (true, Some(stops)) => format!(
+            "The mission may still be running. Try the stop again, or close: {stops}. The chat \
+             says what the robot answered."
+        ),
+        (false, None) => "Closing ends its programs and searches, and leaves a mission running \
+                          with nobody watching. Stop the robot first, or leave it to finish."
+            .to_owned(),
+        (false, Some(stops)) => format!(
+            "Closing ends its programs and searches, and {stops}, since nothing watches it then."
+        ),
+    };
+    let close = if deadman_s.is_some() {
+        "Close anyway"
+    } else {
+        "Leave it running"
+    };
+    (body, close)
+}
+
 /// The question asked when the window is closed with a mission running, or after a stop the robot
 /// did not confirm.
-fn close_dialog(ctx: &egui::Context, failed: bool) -> Option<CloseChoice> {
+fn close_dialog(ctx: &egui::Context, failed: bool, deadman_s: Option<f64>) -> Option<CloseChoice> {
+    let (body, close) = close_words(failed, deadman_s);
     let mut choice = None;
     let modal = egui::Modal::new(egui::Id::new("nervros_close")).show(ctx, |ui| {
         theme::apply(ui);
@@ -193,19 +223,11 @@ fn close_dialog(ctx: &egui::Context, failed: bool) -> Option<CloseChoice> {
                     .size(16.0)
                     .color(theme::ERROR),
             );
-            ui.add_space(6.0);
-            ui.label(
-                "The mission may still be running. Try the stop again, or close and leave it \
-                 running with nobody watching; the chat says what the robot answered.",
-            );
         } else {
             ui.label(RichText::new("The robot is at work").strong().size(16.0));
-            ui.add_space(6.0);
-            ui.label(
-                "Closing ends its programs and searches, and leaves a mission running with nobody \
-                 watching. Stop the robot first, or leave it to finish.",
-            );
         }
+        ui.add_space(6.0);
+        ui.label(body.as_str());
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             let stop = egui::Button::new(RichText::new("Stop it and close").color(Color32::WHITE))
@@ -213,11 +235,8 @@ fn close_dialog(ctx: &egui::Context, failed: bool) -> Option<CloseChoice> {
             if ui.add(stop).clicked() {
                 choice = Some(CloseChoice::StopAndClose);
             }
-            if ui
-                .add(ReButton::new("Leave it running").secondary())
-                .clicked()
-            {
-                choice = Some(CloseChoice::LeaveRunning);
+            if ui.add(ReButton::new(close).secondary()).clicked() {
+                choice = Some(CloseChoice::JustClose);
             }
             if ui.add(ReButton::new("Cancel").ghost()).clicked() {
                 choice = Some(CloseChoice::Cancel);
@@ -431,8 +450,8 @@ impl Gui {
         }
     }
 
-    /// Closing the window with a mission or a job running asks first: the mission would go on
-    /// unwatched, and the job would end.
+    /// Closing the window with a mission or a job running asks first: the job would end, and the
+    /// mission go on unwatched or be stopped by the executor's deadman.
     fn guard_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) {
             let cancel;
@@ -444,12 +463,13 @@ impl Gui {
         }
         match self.closing {
             Closing::Asking | Closing::StopFailed => {
-                match close_dialog(ctx, self.closing == Closing::StopFailed) {
+                let deadman = self.agent.missions.as_ref().and_then(|m| m.deadman_s());
+                match close_dialog(ctx, self.closing == Closing::StopFailed, deadman) {
                     Some(CloseChoice::StopAndClose) => {
                         self.agent.session.send(Command::StopMission);
                         self.closing = Closing::Stopping(std::time::Instant::now());
                     }
-                    Some(CloseChoice::LeaveRunning) => {
+                    Some(CloseChoice::JustClose) => {
                         self.closing = Closing::Allowed;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -1050,6 +1070,20 @@ mod tests {
         let stopping = Closing::Stopping(std::time::Instant::now());
         assert_eq!(on_close(stopping, true), (true, stopping));
         assert_eq!(on_close(Closing::Allowed, true), (false, Closing::Allowed));
+    }
+
+    #[test]
+    fn closing_says_whether_the_mission_runs_on() {
+        // With a deadman the executor stops the mission, so the dialog must not promise it runs.
+        for failed in [false, true] {
+            let (body, close) = close_words(failed, Some(2.0));
+            assert!(body.contains("stops the mission 2 s after"), "{body}");
+            assert!(!body.contains("nobody watching"), "{body}");
+            assert_eq!(close, "Close anyway");
+            let (body, close) = close_words(failed, None);
+            assert!(body.contains("nobody watching"), "{body}");
+            assert_eq!(close, "Leave it running");
+        }
     }
 
     #[test]
