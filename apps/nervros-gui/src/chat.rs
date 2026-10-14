@@ -216,6 +216,9 @@ pub struct Chat {
     /// Times the conversation was condensed on its own, as the window filled: the status bar
     /// counts them, the chat shows only what the operator asked for.
     pub condensed: u32,
+    /// A job's newest mission, kept off the chat (the job's card tells it) for the Mission tab,
+    /// with how many items the chat had then, to tell it from a newer plan of the model's.
+    job_plan: Option<(usize, PlanCard)>,
     /// What the session's model calls cost.
     pub spent: Spent,
     /// The reply as it streams in, until it arrives whole or a tool call takes over.
@@ -541,30 +544,36 @@ impl Chat {
 
     fn apply_mission(&mut self, event: &Event) {
         match event {
-            // A job's missions show on its own card, as the lines it logs.
-            Event::MissionPlanned { by_job: true, .. } => {}
             Event::MissionPlanned {
                 hash,
                 intent,
                 steps,
                 worst_case_s,
                 concerns,
-                ..
-            } => self.items.push(Item::Plan(PlanCard {
-                hash: hash.clone(),
-                intent: intent.clone(),
-                steps: steps.clone(),
-                worst_case_s: *worst_case_s,
-                mission: None,
-                started: None,
-                progress: HashMap::new(),
-                finished: None,
-                preview: Vec::new(),
-                concerns: concerns.clone(),
-                replaced: false,
-                nodes: Vec::new(),
-                paused: false,
-            })),
+                by_job,
+            } => {
+                let card = PlanCard {
+                    hash: hash.clone(),
+                    intent: intent.clone(),
+                    steps: steps.clone(),
+                    worst_case_s: *worst_case_s,
+                    mission: None,
+                    started: None,
+                    progress: HashMap::new(),
+                    finished: None,
+                    preview: Vec::new(),
+                    concerns: concerns.clone(),
+                    replaced: false,
+                    nodes: Vec::new(),
+                    paused: false,
+                };
+                // A job's missions show on its own card in the chat, as the lines it logs.
+                if *by_job {
+                    self.job_plan = Some((self.items.len(), card));
+                } else {
+                    self.items.push(Item::Plan(card));
+                }
+            }
             Event::MissionPreview { hash, steps } => {
                 if let Some(p) = self.plan_mut(|p| p.hash == *hash) {
                     p.preview.clone_from(steps);
@@ -631,6 +640,9 @@ impl Chat {
 
     /// The newest plan matching `which`.
     fn plan_mut(&mut self, which: impl Fn(&PlanCard) -> bool) -> Option<&mut PlanCard> {
+        if self.job_plan.as_ref().is_some_and(|(_, p)| which(p)) {
+            return self.job_plan.as_mut().map(|(_, p)| p);
+        }
         self.items.iter_mut().rev().find_map(|i| match i {
             Item::Plan(p) if which(p) => Some(p),
             _ => None,
@@ -656,10 +668,20 @@ impl Chat {
 
     /// The newest plan, for the dock.
     pub fn latest_plan(&self) -> Option<&PlanCard> {
-        self.items.iter().rev().find_map(|i| match i {
-            Item::Plan(p) => Some(p),
-            _ => None,
-        })
+        let in_chat = self
+            .items
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(at, i)| match i {
+                Item::Plan(p) => Some((at, p)),
+                _ => None,
+            });
+        match (in_chat, &self.job_plan) {
+            (Some((at, p)), Some((job_at, job))) => Some(if *job_at > at { job } else { p }),
+            (None, Some((_, job))) => Some(job),
+            (in_chat, None) => in_chat.map(|(_, p)| p),
+        }
     }
 
     /// Draws the conversation; clicks are appended to `actions`.

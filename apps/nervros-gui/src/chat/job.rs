@@ -14,6 +14,8 @@ use crate::theme;
 
 /// Lines of its log a card keeps; the rest are in the session log.
 const LINES: usize = 8;
+/// What a card's Stop button takes of its first line.
+const STOP_ROOM: f32 = 56.0;
 
 /// A job, updated as it runs.
 #[derive(Debug, Clone)]
@@ -56,16 +58,26 @@ pub(super) fn job_card(ui: &mut egui::Ui, card: &JobCard, actions: &mut Vec<Acti
     };
     theme::status_card(ui, colour, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            let kind = match job.kind.as_str() {
-                "program" => "Program",
-                _ => "Search",
-            };
+        let kind = match job.kind.as_str() {
+            "program" => "Program",
+            _ => "Search",
+        };
+        let header = |ui: &mut egui::Ui| {
             ui.label(RichText::new(kind).strong().size(14.0));
             ui.label(RichText::new(&job.name).size(14.0));
             ui.label(RichText::new(format!("{} · {state}", job.id)).color(colour));
-            if job.state == JobState::Running {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        };
+        let running = job.state == JobState::Running;
+        ui.horizontal_top(|ui| {
+            // The name wraps in the room Stop leaves it, so a long one never squeezes the button.
+            let room = ui.available_width() - if running { STOP_ROOM } else { 0.0 };
+            ui.allocate_ui_with_layout(
+                egui::vec2(room.max(0.0), 0.0),
+                egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
+                header,
+            );
+            if running {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     if ui.add(ReButton::new("Stop").small()).clicked() {
                         actions.push(Action::StopJob(job.id.clone()));
                     }

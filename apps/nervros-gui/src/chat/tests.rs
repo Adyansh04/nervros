@@ -355,6 +355,11 @@ fn a_jobs_missions_show_on_its_card_not_as_plans() {
         by_job: true,
     });
     assert!(chat.items.is_empty());
+    assert_eq!(
+        chat.latest_plan().map(|p| p.intent.as_str()),
+        Some("look for keys at R2 (job j1)"),
+        "the Mission tab still shows it"
+    );
 }
 
 #[test]
@@ -452,6 +457,15 @@ fn snapshot_jobs() {
             summary: r#"{"bedroom":2,"kitchen":4,"living room":3,"office":1}"#.to_owned(),
             ..counted
         },
+    });
+    chat.apply(&Event::JobStarted {
+        job: job(
+            "j4",
+            JobKind::Program,
+            "Walk to the office and the bedroom to find the trays",
+            JobState::Running,
+            "",
+        ),
     });
     chat.apply(&Event::JobStarted {
         job: job(
