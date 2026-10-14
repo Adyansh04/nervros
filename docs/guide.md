@@ -262,9 +262,11 @@ The program's functions are the robot's: `objects(words, room)`, `rooms()`, `pla
 with what it may run and for how long: "may move the base (GoToPlace) and look (FindInView), for
 at most 10 min". It then runs on its own: the chat shows a card with its latest lines and a Stop
 button, and its result comes back as a report the agent answers. Every mission a program sends is
-checked like any plan, keep-out zones hold, and a skill the approval did not name is refused. A
-program stops at its time limit, after a few seconds of computing between two robot calls, and
-when the robot is stopped. "Keep that program as count chairs" keeps one by name; the Mission tab
+checked like any plan, keep-out zones and the profile's rules hold (a rule that would ask refuses,
+as a job cannot stop to ask), and a skill the approval did not name is refused. A program waits
+for a mission that runs already, and stops at its time limit, after a few seconds of computing
+between two robot calls, and when the robot is stopped; its Stop button and its time limit cancel
+the mission it runs, and nothing else the robot does. "Keep that program as count chairs" keeps one by name; the Mission tab
 lists the kept programs to run again, each approved again.
 
 ### Finding something
@@ -393,20 +395,26 @@ map?", "is the chest camera dropping frames?", "show me the controller's paramet
 in the logs?". Nodes composed into a container are listed under it, `params` gives each
 parameter's value with its description, and the read tools take `odom` for `/odom`. Acting through
 ROS (a service call, an action goal, a parameter, a publish) needs the profile to allow it, an
-absolute name, and your approval each time.
+absolute name, and your approval: each time for a call or a publish, which may move the robot,
+while a parameter change can be allowed for the rest of the session (Allow for session).
 
 ## When something goes wrong
 
-> **You:** Why did that fail?
+> **You:** Why can't the robot find anything with its head camera?
 >
-> **NervROS:** The robot is lost on the map: it stands 1.2 m and 91 degrees from where it thinks it
-> is, so the walk ended in the wrong place. Set its pose again (2D Pose Estimate) or restart the
-> stack before another walk; the same plan would fail the same way.
+> **NervROS:** The robot's head camera detector (`detector_head`) is not running. This prevents
+> the detector from finding objects with the head camera. To fix this, restart the world model
+> stack by running `world_model.launch.py`, or restart the entire stack before attempting any
+> missions.
+
+(The detector had been stopped for the test; the incident had opened by itself when it left the
+graph.)
 
 NervROS keeps a flight recorder of the robot's last five minutes: warnings and errors from
 `/rosout`, the nodes that started and stopped, the missions, and the topics the profile watches.
 When a mission fails, a watched topic goes quiet, a watched node stops or a node logs errors in a
-burst, it opens an incident: the recording is frozen, and every playbook that may explain it runs
+burst, it opens an incident (a failed step of a program's or a search's mission, such as a look
+that saw nothing, is the job's answer, and only its timeout or error opens one): the recording is frozen, and every playbook that may explain it runs
 on the robot as it is. A playbook is what someone who debugged the robot wrote down: a few
 read-only checks (a topic's rate or a field of its newest message, a line in the recording, a node
 missing or running twice, a transform missing or two poses that disagree, the failure's own
@@ -420,7 +428,7 @@ rests on, what was ruled out, and the minutes before it. Asked when nothing happ
 robot now, and "check the robot's health" runs the playbooks too. After a debugging session,
 "remember this" keeps what was found as a playbook (`remember_finding`, approved as an edit), so
 the next incident like it is named at once. The Doctor tab lists the incidents with their evidence,
-**Check now** and **Ask the agent**, and a new one shows a toast. The investigator only reads: it
+the newest open, **Check now** and **Ask the agent**, and a new one shows a toast. The investigator only reads: it
 never moves the robot.
 
 ## Remembering
@@ -555,9 +563,9 @@ chat share one history, so an edit made in one shows in the other.
 ## Sessions and models
 
 Every conversation is saved. The Agent tab lists earlier sessions to resume, what the agent
-remembers, and each model with its quota for the day. The context is condensed before it fills;
-`/compact` condenses it at once, and right-clicking one of your messages condenses everything
-before it. A model that hits its rate limit is set aside, and one whose server is not running is
+remembers, and each model with its quota for the day. The context is condensed before it fills,
+counted in the status bar beside the context ("condensed 3×"); `/compact` condenses it at once,
+and right-clicking one of your messages condenses everything before it, each said in the chat. A model that hits its rate limit is set aside, and one whose server is not running is
 tried last, so the next one in its role's chain answers; a busy one is asked once more first, and
 when every model is at its limit for the minute the turn waits for the first to free up. **Save this one
 as a test** turns the session into an eval case.
@@ -635,8 +643,9 @@ $ nervros-cli --profile nervros.toml missions --limit 3
 approval granted, and judges what happened: the tools and skills used, the missions' outcomes,
 the approvals asked for, the reply, and how far and which way the robot moved on the simulator's
 own pose. Each model and trial keeps its own robot files in the run's folder (keep-out zones,
-missions, notes, places, programs, incidents), carried from one case to the next, so a suite
-neither finds the operator's nor leaves its own behind. The apartment suite in grove-g1 has
+missions, notes, places, programs, incidents), carried from one case to the next and emptied when
+a run starts in the same folder, so a suite neither finds the operator's nor leaves its own
+behind. The apartment suite in grove-g1 has
 46 cases:
 
 ```text

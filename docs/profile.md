@@ -112,7 +112,9 @@ spaces around a value. For a plan that means its steps with each argument as `{n
 plan run by its hash or a saved name included, and each walk's `place` both as the model wrote it
 and as it resolved: the rule above holds whether the model wrote `R5`, `bedroom` or `Bedroom `.
 Write a rule on a room or an object with its id. A rule naming a tool the agent does not have, or
-an argument that tool does not take, stops start-up, since it would never apply.
+an argument that tool does not take, stops start-up, since it would never apply. A `run_mission`
+rule holds for the missions of a program or a search too, where one that would ask refuses: a job
+cannot stop to ask.
 
 The default `hard_deny` covers what commands motors, velocities or controllers directly, under any
 namespace: `rt/lowcmd`, `*/lowcmd`, `*/rt/*`, `*cmd_vel*`, `*/controller_manager/*`,
@@ -157,7 +159,7 @@ so neither can overlap the other: the second is refused as busy.
 | Key | Default | |
 |---|---|---|
 | `hidden` | action internals, `/rosout`, `/parameter_events`, parameter services | Left out of listings unless `all` is asked; not a boundary. |
-| `read_deny` | none | Topics never sampled, echoed, watched, plotted or used to start a schedule. |
+| `read_deny` | none | Topics never sampled, echoed, watched, plotted, read by a playbook or used to start a schedule. |
 | `param_read_deny` | `*key*`, `*token*`, `*secret*`, `*password*` | Parameter values shown as hidden, matched on the name whatever its case: in `params`, `param_set`'s answer, a `service_call` reply, and the files `nervros-cli record` writes. |
 | `service_observe` | `get_*`, `list_*`, `describe_*` | Services that only read: `service_call` runs them unarmed and unapproved. A pattern without `/` matches the last part of the name, so `get_*` covers `/map_server/get_map` but not `/arm/get_ready/execute`. |
 | `service_call` | none | Services `service_call` may call. |
@@ -424,8 +426,8 @@ pose_gap = ["map", "pelvis"]
 topic = "/g1_sensor_relay/base_state"
 type = "nav_msgs/msg/Odometry"
 field = "pose.pose"
-metres = 0.5
-degrees = 20
+metres = 1.0
+degrees = 30
 ```
 
 Each check has one test, and may have a `name` for the report and `not = true`:
