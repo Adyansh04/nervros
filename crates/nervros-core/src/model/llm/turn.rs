@@ -378,7 +378,7 @@ pub async fn chat(
     let agent = builder.build();
     let turn_error = |message: String, setback: Option<Setback>| LlmError::Turn {
         model: model_id.to_owned(),
-        message: without_provider_body(&message),
+        message: without_provider_body(cancel_reason(&message, model_id)),
         setback,
     };
     if let Some(delta) = delta {
@@ -432,6 +432,19 @@ pub(super) async fn streamed(
 
 /// A provider error with its JSON body replaced by the provider's own message: the body can
 /// carry account ids (OpenRouter's `user_id`) that belong in neither the chat nor the log.
+/// A turn our own hook cancelled, as rig words it (`PromptCancelled: <model>: <why>`), as the
+/// reason alone: the error names the model already.
+pub(super) fn cancel_reason<'a>(message: &'a str, model: &str) -> &'a str {
+    message
+        .strip_prefix("PromptCancelled: ")
+        .map_or(message, |reason| {
+            reason
+                .strip_prefix(model)
+                .and_then(|rest| rest.strip_prefix(": "))
+                .unwrap_or(reason)
+        })
+}
+
 pub(super) fn without_provider_body(text: &str) -> String {
     let Some(start) = text.find('{') else {
         return text.to_owned();

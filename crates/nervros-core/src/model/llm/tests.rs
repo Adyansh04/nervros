@@ -3,7 +3,7 @@ use rig::message::{AssistantContent, CallId, ToolName, UserContent};
 
 use super::client::Llm;
 use super::history::{CUT_MARK, History, is_user_text, result_text};
-use super::turn::{plain, streamed, without_provider_body};
+use super::turn::{cancel_reason, plain, streamed, without_provider_body};
 use super::*;
 use crate::providers::Role;
 use crate::providers::router::Router;
@@ -173,6 +173,19 @@ fn the_image_goes_first_unless_the_text_must() {
     };
     assert!(!first(false));
     assert!(first(true));
+}
+
+#[test]
+fn a_cancelled_turn_says_why_once() {
+    assert_eq!(
+        cancel_reason("PromptCancelled: m1: its per-minute limit is used up", "m1"),
+        "its per-minute limit is used up"
+    );
+    assert_eq!(
+        cancel_reason("PromptCancelled: the turn was stopped", "m1"),
+        "the turn was stopped"
+    );
+    assert_eq!(cancel_reason("status 429", "m1"), "status 429");
 }
 
 #[test]
