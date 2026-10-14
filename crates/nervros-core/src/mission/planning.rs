@@ -264,7 +264,7 @@ impl Missions {
             .as_f64()
             .filter(|w| *w > 0.0)
             .unwrap_or(compiled.worst_case_s);
-        self.checked(compiled, worst, concerns)
+        self.checked(compiled, worst, concerns, by)
     }
 
     /// Why a plan checked earlier may not run now, if it may not: a zone added since, or a
@@ -355,7 +355,13 @@ impl Missions {
 
     /// A plan that passed every check: shown to the window, kept by its hash, and described to
     /// the model with what went wrong before with its steps.
-    fn checked(&self, compiled: Compiled, worst: f64, concerns: Vec<Concern>) -> ToolOutcome {
+    fn checked(
+        &self,
+        compiled: Compiled,
+        worst: f64,
+        concerns: Vec<Concern>,
+        by: By,
+    ) -> ToolOutcome {
         let noted: Vec<String> = concerns.iter().map(concern_line).collect();
         self.emit(Event::MissionPlanned {
             hash: compiled.sha256.clone(),
@@ -363,6 +369,7 @@ impl Missions {
             steps: compiled.steps.clone(),
             worst_case_s: worst,
             concerns,
+            by_job: by == By::Job,
         });
         let mut out = json!({
             "hash": compiled.sha256,

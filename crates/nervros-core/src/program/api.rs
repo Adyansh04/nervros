@@ -7,7 +7,7 @@ use std::sync::Arc;
 use rhai::{Dynamic, Engine, EvalAltResult, Map};
 use serde_json::{Value, json};
 
-use super::skills::{FIND, GO};
+use crate::mission::catalog::{FIND_IN_VIEW, GO_TO_PLACE};
 
 /// Answers a program's calls. A call may block the program's own thread, never a runtime's.
 pub trait Host: Send + Sync {
@@ -49,7 +49,7 @@ pub trait Host: Send + Sync {
     ///
     /// The topic is not on the graph, the profile keeps it from being read, or nothing came.
     fn read(&self, topic: &str) -> Result<Value, String>;
-    /// How often a topic publishes, measured over `seconds`.
+    /// How often a topic publishes, measured over `seconds`, which may be any float.
     ///
     /// # Errors
     ///
@@ -61,7 +61,8 @@ pub trait Host: Send + Sync {
     ///
     /// No chain of transforms links them.
     fn tf(&self, parent: &str, child: &str) -> Result<Value, String>;
-    /// Waits, returning early when the program must stop.
+    /// Waits, returning early when the program must stop. `seconds` may be any float the
+    /// program computed, NaN included.
     fn wait(&self, seconds: f64);
     /// Tells the operator a line of what it does.
     fn say(&self, text: &str);
@@ -153,7 +154,7 @@ pub fn register(engine: &mut Engine, host: &Arc<dyn Host>, skills: &[SkillCall])
         "walk",
         move |place: &str| -> Result<bool, Box<EvalAltResult>> {
             let ended = h
-                .run(GO, json!({"place": place}))
+                .run(GO_TO_PLACE, json!({"place": place}))
                 .map_err(Box::<EvalAltResult>::from)?;
             Ok(ended["ok"].as_bool().unwrap_or(false))
         },
@@ -200,10 +201,13 @@ pub fn register(engine: &mut Engine, host: &Arc<dyn Host>, skills: &[SkillCall])
     engine.register_fn("tf", move |parent: &str, child: &str| {
         to_dynamic(h.tf(parent, child))
     });
-    let h = Arc::clone(host);
-    engine.register_fn("wait", move |seconds: f64| h.wait(seconds));
-    let h = Arc::clone(host);
-    engine.register_fn("wait", move |seconds: i64| h.wait(whole_seconds(seconds)));
+    // Rhai's own sleep would hold the program through a stop; registered here, it is wait.
+    for name in ["wait", "sleep"] {
+        let h = Arc::clone(host);
+        engine.register_fn(name, move |seconds: f64| h.wait(seconds));
+        let h = Arc::clone(host);
+        engine.register_fn(name, move |seconds: i64| h.wait(whole_seconds(seconds)));
+    }
     let h = Arc::clone(host);
     engine.register_fn("say", move |text: &str| h.say(text));
 }
@@ -211,7 +215,7 @@ pub fn register(engine: &mut Engine, host: &Arc<dyn Host>, skills: &[SkillCall])
 /// What the detector reports `words` under, or nothing when it sees none.
 fn find(host: &dyn Host, words: &str) -> Fallible {
     let ended = host
-        .run(FIND, json!({"phrase": words}))
+        .run(FIND_IN_VIEW, json!({"phrase": words}))
         .map_err(Box::<EvalAltResult>::from)?;
     Ok(match ended["outputs"]["object_id"].as_str() {
         Some(id) if ended["ok"] == true => Dynamic::from(id.to_owned()),

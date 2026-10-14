@@ -533,12 +533,18 @@ async fn pause_words_are_orders_only_for_a_mission_that_can_take_them() {
         Arc::clone(&robot),
     )
     .unwrap();
-    *lock(&cannot.running) = Some(Running { id: "m1".into() });
+    *lock(&cannot.running) = Some(Running {
+        id: "m1".into(),
+        cancel: None,
+    });
     assert_eq!(cannot.pause_order("wait"), None, "no pause service");
     let profile = profile_with(r#"pause = "/x/pause""#);
     let can = Missions::new(&profile, Places::new(&profile, None), robot).unwrap();
     assert_eq!(can.pause_order("pause"), None, "nothing runs");
-    *lock(&can.running) = Some(Running { id: "m1".into() });
+    *lock(&can.running) = Some(Running {
+        id: "m1".into(),
+        cancel: None,
+    });
     assert_eq!(can.pause_order("Wait."), Some(true));
     assert_eq!(can.pause_order("go on"), None, "not paused");
     can.paused.store(true, Ordering::SeqCst);

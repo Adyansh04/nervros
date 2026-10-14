@@ -68,7 +68,8 @@ pub fn engine(
     stopped: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Engine {
     let mut e = bare();
-    e.on_progress(move |_| stopped().then(|| Dynamic::from("stopped")));
+    // Looked at every few operations: the stop is a lock read, and a few operations are nothing.
+    e.on_progress(move |ops| (ops % 64 == 0 && stopped()).then(|| Dynamic::from("stopped")));
     let h = Arc::clone(host);
     e.on_print(move |text| h.say(text));
     let h = Arc::clone(host);
@@ -125,6 +126,7 @@ mod tests {
     struct Fake {
         ran: Mutex<Vec<(String, Value)>>,
         said: Mutex<Vec<String>>,
+        waited: Mutex<Vec<f64>>,
     }
 
     impl Host for Fake {
@@ -167,7 +169,9 @@ mod tests {
         fn tf(&self, _parent: &str, _child: &str) -> Result<Value, String> {
             Ok(json!({"x": 0.0}))
         }
-        fn wait(&self, _seconds: f64) {}
+        fn wait(&self, seconds: f64) {
+            self.waited.lock().unwrap().push(seconds);
+        }
         fn say(&self, text: &str) {
             self.said.lock().unwrap().push(text.to_owned());
         }
@@ -234,5 +238,14 @@ mod tests {
         let e = engine(&host, &[], move || flag.load(Ordering::SeqCst));
         let stopped = run(&e, &compile("let n = 0; loop { n += 1; }").unwrap()).unwrap_err();
         assert_eq!(stopped, "it was stopped");
+    }
+
+    #[test]
+    fn sleep_is_the_robots_wait() {
+        let fake = Arc::new(Fake::default());
+        run_on(&fake, "sleep(2); sleep(0.0 / 0.0); wait(1.5)").unwrap();
+        let waited = fake.waited.lock().unwrap().clone();
+        assert_eq!(waited.len(), 3, "Rhai's own sleep would not reach the host");
+        assert!(waited[1].is_nan(), "the host settles what a NaN wait means");
     }
 }

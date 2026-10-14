@@ -9,13 +9,11 @@ use serde_json::{Value, json};
 use super::api::SkillCall;
 use super::store::{Saved, Store};
 use super::{api, engine, host::RobotHost, skills};
+use crate::job::envelope::{DEFAULT_MINUTES, MAX_MINUTES};
 use crate::job::{Approval, Envelope, JobKind, Jobs};
 use crate::mission::Missions;
 use crate::mission::catalog::{Catalog, GO_TO_PLACE};
 use crate::tools::{Assessment, Risk, Status, Tool, ToolOutcome, ToolSpec};
-
-/// Minutes a program runs when the model names no limit.
-const DEFAULT_MINUTES: u64 = 10;
 
 /// Runs, keeps and stops programs.
 pub struct ProgramTool {
@@ -92,7 +90,7 @@ impl ProgramTool {
                 approval.text
             ),
             args: Some(json!({"action": "run", "title": title, "source": source,
-                              "max_minutes": envelope.max_minutes})),
+                              "max_minutes": envelope.max_minutes()})),
         })
     }
 
@@ -128,20 +126,22 @@ impl ProgramTool {
             .await
             .map_err(|e| format!("the program's thread failed: {e}"))?
         };
-        if self.store.get(&title).is_some() {
-            self.store.ran(&title);
-        }
         match self.jobs.spawn(JobKind::Program, &title, approval, work) {
-            Ok(job) => ToolOutcome {
-                status: Status::Accepted,
-                message: format!(
-                    "program {} runs on its own; its lines show as it goes and its result comes \
+            Ok(job) => {
+                if self.store.get(&title).is_some() {
+                    self.store.ran(&title);
+                }
+                ToolOutcome {
+                    status: Status::Accepted,
+                    message: format!(
+                        "program {} runs on its own; its lines show as it goes and its result comes \
                      as a report. Tell the operator it started.",
-                    job.id
-                ),
-                data: json!({"job": job}),
-                images: Vec::new(),
-            },
+                        job.id
+                    ),
+                    data: json!({"job": job}),
+                    images: Vec::new(),
+                }
+            }
             Err(e) => ToolOutcome::refused(e),
         }
     }
@@ -182,7 +182,10 @@ impl ProgramTool {
             .list()
             .into_iter()
             .filter(|j| j.kind == JobKind::Program)
-            .map(|j| json!({"id": j.id, "title": j.name, "state": j.state, "result": j.summary}))
+            .map(|j| {
+                let result = (!j.summary.is_empty()).then(|| crate::tools::from_world(&j.summary));
+                json!({"id": j.id, "title": j.name, "state": j.state, "result": result})
+            })
             .collect();
         ToolOutcome::ok(json!({"kept": kept, "jobs": jobs}))
     }
@@ -224,11 +227,11 @@ fn spec() -> ToolSpec {
              (write `.len()`), `()` is nothing, and the last line's value is the result. Counting \
              mugs per room: `let n = #{{}}; for r in rooms() {{ n[r.type] = objects(\"mug\", \
              r.id).len(); }} n`. Its functions: {}. run actions take `source` (or `name`, a kept \
-             program), a short `title`, and `max_minutes` (1 to 60, {DEFAULT_MINUTES} if left \
+             program), a short `title`, and `max_minutes` (1 to {MAX_MINUTES}, {DEFAULT_MINUTES} if left \
              out). The operator approves it once, with the skills its walk, find and run calls \
              name and its time limit; it then runs on its own, and its result comes as a report. \
              save keeps one as `name`; list shows the kept and running ones; forget drops one; \
-             stop ends one by job `id`.",
+             stop ends one by job `id`, a search's too, or every one without.",
             api::REFERENCE
         ),
         json!({"type": "object", "properties": {
@@ -236,7 +239,7 @@ fn spec() -> ToolSpec {
             "source": {"type": "string", "description": "For run or save: the program."},
             "title": {"type": "string", "description": "For run: what it is for, in a few words."},
             "name": {"type": "string", "description": "For save or forget, or run instead of source: the name it is kept as."},
-            "max_minutes": {"type": "integer", "minimum": 1, "maximum": crate::job::envelope::MAX_MINUTES},
+            "max_minutes": {"type": "integer", "minimum": 1, "maximum": MAX_MINUTES},
             "id": {"type": "string", "description": "For stop: the job, such as j2."}
         }, "required": ["action"], "additionalProperties": false}),
         Risk::Manipulation,
@@ -289,8 +292,10 @@ impl Tool for ProgramTool {
                 let id = args["id"].as_str().unwrap_or("all");
                 if self.jobs.stop(id) {
                     ToolOutcome::ok(json!({"stopped": id}))
+                } else if id == "all" {
+                    ToolOutcome::failed("no program or search runs")
                 } else {
-                    ToolOutcome::failed(format!("no program {id} runs; list them"))
+                    ToolOutcome::failed(format!("no job {id} runs; list them"))
                 }
             }
             _ => ToolOutcome::failed("`action` is run, save, list, forget or stop"),

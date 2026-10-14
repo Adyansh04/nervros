@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nervros_core::app::Agent;
 use nervros_core::doctor::Check;
+use nervros_core::job::JobState;
 use nervros_core::mission::{Outcome, held_by};
 use nervros_core::session::{Command, Event};
 use rerun::external::egui::{self, Color32, Frame, Key, Margin, Modifiers, RichText};
@@ -198,11 +199,11 @@ fn close_dialog(ctx: &egui::Context, failed: bool) -> Option<CloseChoice> {
                  running with nobody watching; the chat says what the robot answered.",
             );
         } else {
-            ui.label(RichText::new("A mission is running").strong().size(16.0));
+            ui.label(RichText::new("The robot is at work").strong().size(16.0));
             ui.add_space(6.0);
             ui.label(
-                "Closing leaves it running with nobody watching. Stop the robot first, or leave \
-                 it to finish.",
+                "Closing ends its programs and searches, and leaves a mission running with nobody \
+                 watching. Stop the robot first, or leave it to finish.",
             );
         }
         ui.add_space(10.0);
@@ -421,11 +422,19 @@ impl Gui {
         }
     }
 
-    /// Closing the window with a mission running asks first: the mission would go on unwatched.
+    /// Closing the window with a mission or a job running asks first: the mission would go on
+    /// unwatched, and the job would end.
     fn guard_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) {
             let cancel;
-            (cancel, self.closing) = on_close(self.closing, self.mission_running());
+            let working = self.mission_running()
+                || self
+                    .agent
+                    .jobs
+                    .list()
+                    .iter()
+                    .any(|j| j.state == JobState::Running);
+            (cancel, self.closing) = on_close(self.closing, working);
             if cancel {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
@@ -495,8 +504,8 @@ impl Gui {
         }
     }
 
-    /// A finished mission gets a toast, and so does an incident with news in it: the operator
-    /// may be looking at the viewer or away.
+    /// A finished mission or job gets a toast, and so does an incident with news in it: the
+    /// operator may be looking at the viewer or away.
     fn toast(&mut self, e: &Event) {
         if let Event::Incident { incident } = e {
             let text = match incident.causes.first() {
@@ -504,8 +513,14 @@ impl Gui {
                     "{}: likely {}. The Doctor tab has why",
                     incident.id, c.title
                 )),
-                // A failed mission has its own toast; anything else is news.
-                None if incident.kind != nervros_core::incident::Kind::MissionFailed => {
+                // A failed mission has its own toast, and the reply answers who asked; anything
+                // else is news.
+                None if !matches!(
+                    incident.kind,
+                    nervros_core::incident::Kind::MissionFailed
+                        | nervros_core::incident::Kind::Asked
+                ) =>
+                {
                     Some(format!("{}: {}", incident.id, incident.trigger))
                 }
                 None => None,
@@ -515,18 +530,45 @@ impl Gui {
             }
             return;
         }
+        if let Event::JobFinished { job } = e {
+            let kind = match job.state {
+                JobState::Done => Kind::Success,
+                JobState::Failed => Kind::Failure,
+                JobState::Stopped | JobState::TimedOut | JobState::Running => Kind::Info,
+            };
+            let ended = format!(
+                "The {} {} {}",
+                job.kind.as_str(),
+                job.name,
+                job.state.as_str()
+            );
+            self.toasts.add(
+                kind,
+                if job.summary.is_empty() {
+                    ended
+                } else {
+                    format!("{ended}: {}", job.summary)
+                },
+            );
+            return;
+        }
         let Event::MissionFinished {
             id,
             outcome,
             failed_step,
             reason,
             elapsed_s,
+            by_job,
             ..
         } = e
         else {
             return;
         };
         self.records.stale();
+        // The job's own toast says how it went.
+        if *by_job {
+            return;
+        }
         let what = self.chat.intent_of_mission(id).unwrap_or("the mission");
         let (kind, text) = match outcome {
             Outcome::Success => (Kind::Success, format!("Done: {what} in {elapsed_s:.0} s")),

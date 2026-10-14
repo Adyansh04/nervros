@@ -2,6 +2,7 @@
 //! job's envelope was the approval, and followed to their end.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 use tokio::sync::broadcast::error::RecvError;
@@ -9,6 +10,7 @@ use tokio::sync::broadcast::error::RecvError;
 use super::execution::Reported;
 use super::plan::Author as By;
 use super::{Missions, Outcome};
+use crate::guard::Autonomy;
 use crate::job::Context;
 use crate::session::Event;
 use crate::tools::Status;
@@ -28,14 +30,21 @@ pub struct MissionEnd {
     pub outputs: Map<String, Value>,
 }
 
+/// What a job hears when it was stopped, or ran out of time, before its mission ended.
+const STOPPED: &str = "the job was stopped";
+/// How often a job waiting for the mission slot looks again.
+const SLOT_POLL: Duration = Duration::from_millis(250);
+
 impl Missions {
     /// Runs `steps` as one mission for the job `ctx` and waits for its end. Every step, the
-    /// walks the planner adds included, must be a skill the job's envelope names.
+    /// walks the planner adds included, must be a skill the job's envelope names, and no rule of
+    /// the profile may stand against it: a job cannot stop to ask. It waits for a mission that
+    /// runs already, and stopping the job cancels its mission.
     ///
     /// # Errors
     ///
-    /// The plan failed its checks, a step is outside the envelope, the robot is not armed or
-    /// runs a mission already, or the executor did not start it.
+    /// The plan failed its checks, a step is outside the envelope, a rule refuses it, the robot
+    /// is not armed, the executor did not start it, or the job was stopped.
     pub async fn run_for_job(
         self: &Arc<Self>,
         ctx: &Context,
@@ -48,7 +57,8 @@ impl Missions {
         if checked.status != Status::Succeeded {
             return Err(checked.message);
         }
-        let compiled = self.find(checked.data["hash"].as_str().unwrap_or_default())?;
+        let hash = checked.data["hash"].as_str().unwrap_or_default();
+        let mut compiled = self.find(hash)?;
         if let Some(step) = compiled
             .steps
             .iter()
@@ -64,21 +74,49 @@ impl Missions {
                 step.skill
             ));
         }
-        if !self.guard.get().is_some_and(|g| g.armed()) {
+        let guard = self.guard.get().ok_or("the robot is not armed")?;
+        if guard.policy().autonomy == Autonomy::Observe {
+            return Err("this profile only observes the robot".to_owned());
+        }
+        if let Some(rule) = self
+            .rule_view(hash)
+            .and_then(|view| guard.rule("run_mission", &view))
+        {
+            return Err(format!("the profile's rules refuse it: {}", rule.reason));
+        }
+        if !guard.armed() {
             return Err("the robot is not armed".to_owned());
         }
         let session = ctx
             .session()
             .ok_or("no session to run the mission in")?
             .clone();
+        // A mission the model, a schedule or another job runs ends before this one starts.
+        while self.busy() {
+            tokio::select! {
+                () = ctx.until_stopped() => return Err(STOPPED.to_owned()),
+                () = tokio::time::sleep(SLOT_POLL) => {}
+            }
+        }
+        if ctx.stopped() {
+            return Err(STOPPED.to_owned());
+        }
         // Subscribed before the launch, so even a mission refused at once is heard ending.
         let mut events = session.subscribe();
-        let mut compiled = compiled;
         compiled.plan.intent = format!("{intent} (job {})", ctx.id());
         let id = self.launch(compiled, Reported::ToJob).await?;
-        ctx.running(Some(id.clone()));
-        let end = loop {
-            match events.recv().await {
+        // Dropped with a stopped job, or let go here, it cancels the mission if it still runs.
+        let _cancel = CancelOnDrop {
+            missions: Arc::clone(self),
+            id: id.clone(),
+        };
+        loop {
+            let event = tokio::select! {
+                biased;
+                () = ctx.until_stopped() => return Err(STOPPED.to_owned()),
+                event = events.recv() => event,
+            };
+            match event {
                 Ok(Event::MissionFinished {
                     id: ended,
                     outcome,
@@ -87,17 +125,16 @@ impl Missions {
                     outputs,
                     ..
                 }) if ended == id => {
-                    break MissionEnd {
+                    return Ok(MissionEnd {
                         id,
                         outcome,
                         failed_step,
                         reason,
                         outputs,
-                    };
+                    });
                 }
                 // Behind on events, its end may have gone by unheard.
                 Err(RecvError::Lagged(_)) if !self.runs(&id) => {
-                    ctx.running(None);
                     return Err(format!(
                         "lost track of mission {id}; its report says how it ended"
                     ));
@@ -105,8 +142,30 @@ impl Missions {
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => return Err("the session ended".to_owned()),
             }
+        }
+    }
+}
+
+/// Cancels a job's mission that still runs when the job lets go of it: only its own mission, so
+/// the operator's turn and every other job go on.
+struct CancelOnDrop {
+    missions: Arc<Missions>,
+    id: String,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let (Some(cancel), Ok(runtime)) = (
+            self.missions.canceller(&self.id),
+            tokio::runtime::Handle::try_current(),
+        ) else {
+            return;
         };
-        ctx.running(None);
-        Ok(end)
+        let id = std::mem::take(&mut self.id);
+        runtime.spawn(async move {
+            if let Err(e) = cancel().await {
+                tracing::warn!(error = %e, mission = %id, "the job's mission was not cancelled");
+            }
+        });
     }
 }

@@ -1,7 +1,7 @@
 //! Jobs: work the operator approves once that then runs on its own for minutes, such as a robot
 //! program or a search for something. A job moves the robot only through missions its envelope
 //! covers (`Missions::run_for_job`), says what it does as it goes, ends at its time limit, and a
-//! stop of the robot ends every job.
+//! stop of the robot ends every job. A job that ends cancels the mission it runs, and only that.
 
 mod context;
 pub mod envelope;
@@ -160,24 +160,15 @@ impl Jobs {
 
     /// Where jobs report; also ends every job as soon as the robot is stopped.
     pub fn attach(self: &Arc<Self>, session: SessionHandle) {
-        let mut events = session.subscribe();
         if self.session.set(session).is_err() {
             return;
         }
         let me = Arc::downgrade(self);
-        let mut seen = self.guard.stops();
+        let mut stops = self.guard.stopped();
         tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
+            while stops.changed().await.is_ok() {
                 let Some(me) = me.upgrade() else { return };
-                let stops = me.guard.stops();
-                if stops != seen {
-                    seen = stops;
-                    me.stop("all");
-                }
+                me.stop("all");
             }
         });
     }
@@ -287,13 +278,6 @@ impl Jobs {
                     None if watcher.left().is_zero() => JobState::TimedOut,
                     None => JobState::Stopped,
                 };
-                // Ended with a mission still running, the job takes the robot's stop with it.
-                if result.is_none()
-                    && watcher.mission().is_some()
-                    && let Some(s) = &session
-                {
-                    s.send(Command::StopMission);
-                }
                 let summary = match result {
                     Some(Ok(text) | Err(text)) => text,
                     None => String::new(),
@@ -310,6 +294,13 @@ impl Jobs {
     }
 }
 
+impl Drop for Jobs {
+    /// Work started on the robot's behalf ends with what started it.
+    fn drop(&mut self) {
+        self.stop("all");
+    }
+}
+
 /// Marks job `id` ended; the job as it ended.
 fn finish(list: &Mutex<Vec<Entry>>, id: &str, state: JobState, summary: &str) -> Option<JobInfo> {
     let mut list = lock(list);
@@ -319,18 +310,26 @@ fn finish(list: &Mutex<Vec<Entry>>, id: &str, state: JobState, summary: &str) ->
     Some(entry.info.clone())
 }
 
-/// What the model is told when a job ends.
+/// What the model is told when a job ends. Its result can hold what the world model calls
+/// things, such as a program's list of objects: world text.
 fn report(job: &JobInfo, name: &str) -> String {
     let kind = job.kind.as_str();
+    let said = crate::tools::from_world(&job.summary);
     match job.state {
-        JobState::Done => format!("The {kind} {} ({name}) finished: {}", job.id, job.summary),
-        JobState::Failed => format!("The {kind} {} ({name}) failed: {}", job.id, job.summary),
+        JobState::Done => format!("The {kind} {} ({name}) finished: {said}", job.id),
+        JobState::Failed => format!("The {kind} {} ({name}) failed: {said}", job.id),
         JobState::TimedOut => format!(
             "The {kind} {} ({name}) ran out of its {} min and was ended.",
-            job.id, job.envelope.max_minutes
+            job.id,
+            job.envelope.max_minutes()
         ),
+        // Only the operator, the model or a stop of the robot ends one so: there is no fault to
+        // look for.
         JobState::Stopped | JobState::Running => {
-            format!("The {kind} {} ({name}) was stopped.", job.id)
+            format!(
+                "The {kind} {} ({name}) was stopped, as asked: not a fault.",
+                job.id
+            )
         }
     }
 }

@@ -286,6 +286,9 @@ pub enum Event {
         /// Ways it may not do what the operator asked.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         concerns: Vec<Concern>,
+        /// Planned by a job, whose own card and report follow it.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        by_job: bool,
     },
     /// Where a checked plan would take the robot, for the viewer; follows its `MissionPlanned`.
     MissionPreview {
@@ -339,6 +342,9 @@ pub enum Event {
         /// What its steps handed on, by key (`s2_object_id`), when the executor says.
         #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
         outputs: serde_json::Map<String, Value>,
+        /// Run by a job: a failed step is the job's to weigh, such as a look that saw nothing.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        by_job: bool,
     },
     /// A job the operator approved started, such as a robot program or a search.
     JobStarted {

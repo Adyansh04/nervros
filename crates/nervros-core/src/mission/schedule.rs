@@ -85,29 +85,20 @@ impl Schedules {
     }
 
     /// Where runs report; also cancels every schedule as soon as the robot is stopped. Each run
-    /// checks for a stop itself too, so a schedule never outlives one whose events were missed.
+    /// checks for a stop itself too.
     pub fn attach(self: &Arc<Self>, session: SessionHandle) {
-        let mut events = session.subscribe();
         if self.session.set(session).is_err() {
             return;
         }
         let me = Arc::downgrade(self);
-        let mut seen = self.guard.stops();
+        let mut stops = self.guard.stopped();
         tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
+            while stops.changed().await.is_ok() {
                 let Some(me) = me.upgrade() else { return };
-                let stops = me.guard.stops();
-                if stops != seen {
-                    seen = stops;
-                    if me.cancel("all") {
-                        me.say(Event::Notice {
-                            text: "the stop cancelled every schedule".to_owned(),
-                        });
-                    }
+                if me.cancel("all") {
+                    me.say(Event::Notice {
+                        text: "the stop cancelled every schedule".to_owned(),
+                    });
                 }
             }
         });

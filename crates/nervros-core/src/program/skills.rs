@@ -7,11 +7,7 @@
 use std::collections::BTreeSet;
 
 use super::api::SkillCall;
-
-/// The skill `find` runs.
-pub const FIND: &str = "FindInView";
-/// The skill `walk` runs.
-pub const GO: &str = "GoToPlace";
+use crate::mission::catalog::{FIND_IN_VIEW, GO_TO_PLACE};
 
 /// The skills `source` runs, by the names plans use.
 ///
@@ -34,10 +30,10 @@ pub fn named_in(source: &str, callable: &[SkillCall]) -> Result<BTreeSet<String>
         }
         match *name {
             "find" => {
-                skills.insert(FIND.to_owned());
+                skills.insert(FIND_IN_VIEW.to_owned());
             }
             "walk" => {
-                skills.insert(GO.to_owned());
+                skills.insert(GO_TO_PLACE.to_owned());
             }
             "run" => match tokens.get(i + 2) {
                 Some(Token::Str(skill)) if is_skill_name(skill) => {

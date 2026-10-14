@@ -5,21 +5,23 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::mission::catalog::{Catalog, GO_TO_PLACE, Skill};
 use crate::tools::Risk;
 
 /// The longest any job may run.
 pub const MAX_MINUTES: u64 = 60;
+/// Minutes a job runs when its call names no limit.
+pub const DEFAULT_MINUTES: u64 = 10;
 
 /// The skills a job's missions may use, and its time limit.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Envelope {
     /// Skill names as plans write them, such as `GoToPlace` or `FindInView`.
-    pub skills: BTreeSet<String>,
-    /// Minutes it may run, at most [`MAX_MINUTES`].
-    pub max_minutes: u64,
+    skills: BTreeSet<String>,
+    /// Minutes it may run, 1 to [`MAX_MINUTES`].
+    max_minutes: u64,
 }
 
 impl Envelope {
@@ -30,6 +32,12 @@ impl Envelope {
             skills: skills.into_iter().collect(),
             max_minutes: max_minutes.clamp(1, MAX_MINUTES),
         }
+    }
+
+    /// Minutes it may run, 1 to [`MAX_MINUTES`].
+    #[must_use]
+    pub fn max_minutes(&self) -> u64 {
+        self.max_minutes
     }
 
     /// Whether its missions may use `skill`.
@@ -168,6 +176,6 @@ mod tests {
             Envelope::new([], 0).describe(&c),
             "moves nothing, for at most 1 min"
         );
-        assert_eq!(Envelope::new([], 500).max_minutes, MAX_MINUTES);
+        assert_eq!(Envelope::new([], 500).max_minutes(), MAX_MINUTES);
     }
 }

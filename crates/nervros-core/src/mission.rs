@@ -145,6 +145,8 @@ pub fn held_by(state: &Value, arm: &str) -> String {
 /// The mission in flight.
 struct Running {
     id: String,
+    /// Its goal's cancel, once the executor took it.
+    cancel: Option<nervros_ros::CancelFn>,
 }
 
 /// The mission slot, from the moment a launch claims it until the executor takes the goal. Dropped
@@ -466,6 +468,14 @@ impl Missions {
     /// Whether mission `id` holds the mission slot.
     fn runs(&self, id: &str) -> bool {
         lock(&self.running).as_ref().is_some_and(|r| r.id == id)
+    }
+
+    /// The cancel of mission `id`'s goal, while it runs.
+    fn canceller(&self, id: &str) -> Option<nervros_ros::CancelFn> {
+        lock(&self.running)
+            .as_ref()
+            .filter(|r| r.id == id)
+            .and_then(|r| r.cancel.clone())
     }
 
     /// Frees the mission slot, if mission `id` still holds it.

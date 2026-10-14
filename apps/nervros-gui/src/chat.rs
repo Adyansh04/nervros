@@ -531,12 +531,15 @@ impl Chat {
 
     fn apply_mission(&mut self, event: &Event) {
         match event {
+            // A job's missions show on its own card, as the lines it logs.
+            Event::MissionPlanned { by_job: true, .. } => {}
             Event::MissionPlanned {
                 hash,
                 intent,
                 steps,
                 worst_case_s,
                 concerns,
+                ..
             } => self.items.push(Item::Plan(PlanCard {
                 hash: hash.clone(),
                 intent: intent.clone(),

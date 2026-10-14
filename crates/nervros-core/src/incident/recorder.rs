@@ -165,7 +165,8 @@ impl Recorder {
     }
 
     fn log(&self, line: LogLine) {
-        let now = line.t;
+        // A line's stamp is its host's clock, up to an hour off: pruning by it could empty all.
+        let now = crate::now_s();
         let mut b = lock(&self.buffers);
         b.logs.push_back(line);
         while b.logs.len() > MAX_LOGS {
@@ -371,6 +372,7 @@ async fn follow_events(me: Weak<Recorder>, mut events: broadcast::Receiver<Event
                 outcome,
                 failed_step,
                 reason,
+                by_job,
                 ..
             } => {
                 let at = if failed_step.is_empty() {
@@ -385,10 +387,13 @@ async fn follow_events(me: Weak<Recorder>, mut events: broadcast::Receiver<Event
                 };
                 let text = format!("mission {id} ended, {}{at}{said}", outcome.as_str());
                 me.mark(text.clone());
-                if matches!(
-                    outcome,
-                    Outcome::Failure | Outcome::Timeout | Outcome::Error
-                ) {
+                // A job's failed step is the job's answer, such as a look that saw nothing.
+                let failed = match outcome {
+                    Outcome::Failure => !by_job,
+                    Outcome::Timeout | Outcome::Error => true,
+                    Outcome::Success | Outcome::Canceled | Outcome::Rejected => false,
+                };
+                if failed {
                     me.open(Trigger {
                         kind: Kind::MissionFailed,
                         text,
@@ -435,22 +440,28 @@ mod tests {
                 hash: String::new(),
             })
             .unwrap();
+        let finished = |id: &str, reason: &str, by_job| Event::MissionFinished {
+            id: id.into(),
+            outcome: Outcome::Failure,
+            failed_step: "s2".into(),
+            reason: reason.into(),
+            elapsed_s: 30.0,
+            outputs: serde_json::Map::new(),
+            by_job,
+        };
+        events.send(finished("m9", "nothing seen", true)).unwrap();
         events
-            .send(Event::MissionFinished {
-                id: "m3".into(),
-                outcome: Outcome::Failure,
-                failed_step: "s2".into(),
-                reason: "Nav2 aborted the goal".into(),
-                elapsed_s: 30.0,
-                outputs: serde_json::Map::new(),
-            })
+            .send(finished("m3", "Nav2 aborted the goal", false))
             .unwrap();
         let trigger = tokio::time::timeout(Duration::from_secs(2), opened.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(trigger.kind, Kind::MissionFailed);
-        assert_eq!(trigger.mission, "m3");
+        assert_eq!(
+            trigger.mission, "m3",
+            "a job's look that saw nothing opens none"
+        );
         assert_eq!(trigger.failure, "Nav2 aborted the goal");
         let marks: Vec<String> = recorder
             .snapshot()
@@ -462,6 +473,7 @@ mod tests {
             marks,
             [
                 "mission m3 started",
+                "mission m9 ended, failure at s2: nothing seen",
                 "mission m3 ended, failure at s2: Nav2 aborted the goal"
             ]
         );
@@ -502,6 +514,15 @@ mod tests {
             recorder.snapshot().logs.len(),
             1,
             "one in the window, kept once"
+        );
+        recorder.log(LogLine {
+            t: now + 600.0,
+            ..line_of(&warn, now).unwrap()
+        });
+        assert_eq!(
+            recorder.snapshot().logs.len(),
+            2,
+            "a line from a clock ten minutes ahead empties nothing"
         );
     }
 

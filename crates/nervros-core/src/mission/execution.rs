@@ -73,7 +73,10 @@ impl Missions {
                     r.id
                 ));
             }
-            *running = Some(Running { id: id.clone() });
+            *running = Some(Running {
+                id: id.clone(),
+                cancel: None,
+            });
         }
         let mut claim = Claim {
             missions: self,
@@ -109,6 +112,9 @@ impl Missions {
             .await
             .map_err(|e| format!("the executor did not start the mission: {e}"))?;
         claim.kept = true;
+        if let Some(r) = lock(&self.running).as_mut().filter(|r| r.id == id) {
+            r.cancel = Some(goal.canceller());
+        }
         self.emit(Event::MissionStarted {
             id: id.clone(),
             hash: compiled.sha256.clone(),
@@ -204,8 +210,9 @@ impl Missions {
             reason: reason.clone(),
             elapsed_s: elapsed,
             outputs,
+            by_job: reported == Reported::ToJob,
         });
-        self.keep(MissionRecord {
+        let kept = self.keep(MissionRecord {
             id: id.clone(),
             hash: compiled.sha256.clone(),
             intent: compiled.plan.intent.clone(),
@@ -222,7 +229,16 @@ impl Missions {
                 .collect(),
             plan: json!(compiled.plan.steps),
         });
+        // A taught skill is judged on its runs, this one included.
+        if let Some(kept) = kept {
+            let _ = kept.await;
+        }
         self.settle_taught(&compiled, outcome, &step).await;
+        // A job hears its mission end from the event; the report, and the failures it counts
+        // against the model's request, are the model's.
+        if reported == Reported::ToJob {
+            return;
+        }
         let seen = self.observe().await;
         // What happened to what the failed step was about: often it was moved, not missed. The
         // robot's own missions with it say so where the world model cannot tell which it is.
@@ -263,7 +279,7 @@ impl Missions {
             elapsed,
             (&seen, &story, &moves, &camera.lines),
         );
-        if let Some(s) = self.session.get().filter(|_| reported == Reported::ToModel) {
+        if let Some(s) = self.session.get() {
             s.send(Command::Report(report));
         }
     }
@@ -325,15 +341,14 @@ impl Missions {
         result
     }
 
-    /// Writes a finished mission to the ledger, off the async threads.
-    fn keep(&self, record: MissionRecord) {
-        if let Some(ledger) = self.ledger.get().cloned() {
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = ledger.record(&record) {
-                    tracing::warn!(error = %e, mission = %record.id, "the mission was not recorded");
-                }
-            });
-        }
+    /// Writes a finished mission to the ledger, off the async threads; the write, to wait for.
+    fn keep(&self, record: MissionRecord) -> Option<tokio::task::JoinHandle<()>> {
+        let ledger = self.ledger.get().cloned()?;
+        Some(tokio::task::spawn_blocking(move || {
+            if let Err(e) = ledger.record(&record) {
+                tracing::warn!(error = %e, mission = %record.id, "the mission was not recorded");
+            }
+        }))
     }
 
     /// Maps one feedback message's node events onto steps.
@@ -385,7 +400,6 @@ impl Missions {
     }
 }
 
-/// `(outcome, failed step, reason)` from the executor's result.
 /// Who hears how a mission ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Reported {
@@ -411,6 +425,7 @@ fn outputs_of(result: &Result<GoalResult, RosError>) -> serde_json::Map<String, 
         .unwrap_or_default()
 }
 
+/// `(outcome, failed step, reason)` from the executor's result.
 fn summarise(result: Result<GoalResult, RosError>) -> (Outcome, String, String) {
     match result {
         Ok(r) => {

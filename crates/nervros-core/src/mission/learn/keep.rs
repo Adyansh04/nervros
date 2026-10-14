@@ -22,7 +22,8 @@ impl Missions {
         outcome: Outcome,
         failed_step: &str,
     ) {
-        if self.config.define_skill.is_none() {
+        // A stop is the operator's, not the skill's failure.
+        if self.config.define_skill.is_none() || outcome == Outcome::Canceled {
             return;
         }
         let Ok(catalog) = self.catalog().await else {

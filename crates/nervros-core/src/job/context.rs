@@ -1,13 +1,11 @@
 //! What a running job has: its id, its envelope, a way to report, and whether it must stop.
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::Envelope;
-use crate::lock;
 use crate::session::{Event, SessionHandle};
 
 /// Handed to a job's work. Cheap to clone, so blocking work (a program's engine) can take one.
@@ -18,8 +16,6 @@ pub struct Context {
     deadline: Instant,
     stop: watch::Receiver<bool>,
     session: Option<SessionHandle>,
-    /// The mission the job runs now, so stopping the job stops the robot too.
-    mission: Arc<Mutex<Option<String>>>,
 }
 
 impl std::fmt::Debug for Context {
@@ -44,7 +40,6 @@ impl Context {
             envelope,
             stop,
             session,
-            mission: Arc::default(),
         }
     }
 
@@ -95,18 +90,8 @@ impl Context {
         }
     }
 
-    /// The session, to run missions in and to stop the robot through.
+    /// The session, to run missions in.
     pub(crate) fn session(&self) -> Option<&SessionHandle> {
         self.session.as_ref()
-    }
-
-    /// Notes the mission it runs now, or none.
-    pub(crate) fn running(&self, mission: Option<String>) {
-        *lock(&self.mission) = mission;
-    }
-
-    /// The mission it runs now.
-    pub(crate) fn mission(&self) -> Option<String> {
-        lock(&self.mission).clone()
     }
 }

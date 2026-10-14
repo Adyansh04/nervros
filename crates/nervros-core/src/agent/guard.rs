@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::watch;
 
 use crate::lock;
 use crate::tools::{Lane, Resource, ToolSpec};
@@ -272,8 +273,6 @@ pub enum Decision {
 #[derive(Debug, Default)]
 struct State {
     armed: bool,
-    /// Stops of the robot so far: what started before one ends with it.
-    stops: u64,
     tool_calls: u32,
     last_calls: VecDeque<(String, String)>,
     locked: BTreeSet<Resource>,
@@ -284,6 +283,8 @@ struct State {
 pub struct Guard {
     policy: Policy,
     state: Arc<Mutex<State>>,
+    /// Stops of the robot so far: what started before one ends with it.
+    stops: watch::Sender<u64>,
     /// The keep-out zones, once the session has them.
     zones: std::sync::OnceLock<Arc<crate::zones::Zones>>,
 }
@@ -321,6 +322,7 @@ impl Guard {
         Self {
             policy,
             state: Arc::new(Mutex::new(state)),
+            stops: watch::channel(0).0,
             zones: std::sync::OnceLock::new(),
         }
     }
@@ -389,14 +391,20 @@ impl Guard {
 
     /// Counts a stop of the robot, from the window or the model.
     pub fn note_stop(&self) {
-        lock(&self.state).stops += 1;
+        self.stops.send_modify(|n| *n += 1);
     }
 
     /// Stops of the robot so far. Work started on the robot's behalf, such as a schedule, ends
     /// once this differs from what it was when the work began.
     #[must_use]
     pub fn stops(&self) -> u64 {
-        lock(&self.state).stops
+        *self.stops.borrow()
+    }
+
+    /// Changes with every stop of the robot from now on: what ends work on its behalf at once.
+    #[must_use]
+    pub fn stopped(&self) -> watch::Receiver<u64> {
+        self.stops.subscribe()
     }
 
     /// Resets the per-turn counters at the start of a user turn.

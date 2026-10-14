@@ -315,6 +315,7 @@ impl Ledger {
         let mut runs = db.prepare_cached(
             "SELECT steps.outcome FROM steps JOIN missions ON missions.id = steps.mission
              WHERE steps.skill = ?1 AND steps.outcome IN ('success', 'failure')
+               AND missions.outcome <> 'canceled'
              ORDER BY missions.started DESC LIMIT ?2",
         )?;
         let outcomes: Vec<String> = runs
@@ -595,6 +596,22 @@ mod tests {
                 .runs,
             3
         );
+    }
+
+    #[test]
+    fn a_skills_runs_leave_out_the_ones_the_operator_stopped() {
+        let ledger = Ledger::in_memory().unwrap();
+        ledger
+            .record(&mission("m1", 100.0, ("success", 40.0, "")))
+            .unwrap();
+        // A cancel marks the step it stopped as failed.
+        let mut stopped = mission("m2", 200.0, ("failure", 5.0, "cancelled"));
+        stopped.outcome = "canceled".to_owned();
+        ledger.record(&stopped).unwrap();
+        ledger
+            .record(&mission("m3", 300.0, ("failure", 25.0, "slipped")))
+            .unwrap();
+        assert_eq!(ledger.skill_runs("PickObject").unwrap(), (2, 1));
     }
 
     #[test]

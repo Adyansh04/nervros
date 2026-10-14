@@ -219,6 +219,7 @@ fn doubtful_plan() -> Chat {
             ),
             concern("", "the walk may end close to the table", None),
         ],
+        by_job: false,
     });
     chat.apply(&Event::ApprovalRequested {
         id: 9,
@@ -320,6 +321,7 @@ fn a_passed_edit_moves_the_approval_below_its_new_plan() {
         steps: Vec::new(),
         worst_case_s: 60.0,
         concerns: Vec::new(),
+        by_job: false,
     });
     chat.apply(&Event::ApprovalEdited {
         id: 9,
@@ -335,6 +337,20 @@ fn a_passed_edit_moves_the_approval_below_its_new_plan() {
         Some("e7f3aa01c2d4")
     );
     assert!(matches!(&chat.items[1], Item::Plan(p) if p.replaced));
+}
+
+#[test]
+fn a_jobs_missions_show_on_its_card_not_as_plans() {
+    let mut chat = Chat::default();
+    chat.apply(&Event::MissionPlanned {
+        hash: "a1".to_owned(),
+        intent: "look for keys at R2 (job j1)".to_owned(),
+        steps: Vec::new(),
+        worst_case_s: 60.0,
+        concerns: Vec::new(),
+        by_job: true,
+    });
+    assert!(chat.items.is_empty());
 }
 
 #[test]
@@ -416,6 +432,7 @@ fn snapshot_mission() {
         ],
         worst_case_s: 1140.0,
         concerns: Vec::new(),
+        by_job: false,
     });
     chat.apply(&Event::ApprovalRequested {
         id: 3,
@@ -455,6 +472,7 @@ fn snapshot_mission() {
         reason: "the grasp slipped".to_owned(),
         elapsed_s: 94.0,
         outputs: serde_json::Map::new(),
+        by_job: false,
     });
     chat.apply(&Event::Report {
         turn: 2,
@@ -509,6 +527,7 @@ fn snapshot_plan_with_records_and_a_preview_warning() {
         ],
         worst_case_s: 1500.0,
         concerns: Vec::new(),
+        by_job: false,
     });
     let preview = |id: &str, note: &str| PreviewStep {
         id: id.to_owned(),

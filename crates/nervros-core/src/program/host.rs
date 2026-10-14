@@ -14,8 +14,10 @@ use crate::mission::{Missions, Outcome};
 const READ_WAIT: Duration = Duration::from_secs(2);
 /// Messages a rate counts at most.
 const RATE_MAX: usize = 100_000;
-/// The longest a rate measures.
-const RATE_MAX_S: f64 = 30.0;
+/// The shortest and the longest a rate measures.
+const RATE_S: (f64, f64) = (0.5, 30.0);
+/// The longest a wait lasts.
+const WAIT_MAX_S: f64 = 3600.0;
 /// How often a wait looks whether the program must stop.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
 
@@ -124,7 +126,7 @@ impl Host for RobotHost {
 
     fn rate(&self, topic: &str, seconds: f64) -> Result<f64, String> {
         let (topic, msg_type) = self.topic(topic, false)?;
-        let seconds = seconds.clamp(0.5, RATE_MAX_S);
+        let seconds = within(seconds, RATE_S);
         let window = Duration::from_secs_f64(seconds);
         let arrivals = self
             .runtime
@@ -149,7 +151,8 @@ impl Host for RobotHost {
     }
 
     fn wait(&self, seconds: f64) {
-        let until = std::time::Instant::now() + Duration::from_secs_f64(seconds.clamp(0.0, 3600.0));
+        let until =
+            std::time::Instant::now() + Duration::from_secs_f64(within(seconds, (0.0, WAIT_MAX_S)));
         while !self.ctx.stopped() && std::time::Instant::now() < until {
             std::thread::sleep(WAIT_SLICE);
         }
@@ -158,6 +161,12 @@ impl Host for RobotHost {
     fn say(&self, text: &str) {
         self.ctx.log(text);
     }
+}
+
+/// `seconds` within `(least, most)`; NaN, which a program's arithmetic can make and a `Duration`
+/// cannot hold, is the least.
+fn within(seconds: f64, (least, most): (f64, f64)) -> f64 {
+    seconds.max(least).min(most)
 }
 
 /// A one-step mission's outputs by their own names: `s1_object_id` is the step's `object_id`.
@@ -284,6 +293,20 @@ mod tests {
         );
         assert_eq!(rooms_of(&rooms)[1]["seen"], 0.4);
         assert_eq!(rooms_of(&rooms)[0]["name"], "kitchen", "room A is its type");
+    }
+
+    #[test]
+    fn any_float_a_program_waits_for_is_a_duration() {
+        for (seconds, expected) in [
+            (f64::NAN, 0.0),
+            (f64::INFINITY, WAIT_MAX_S),
+            (f64::NEG_INFINITY, 0.0),
+            (-3.0, 0.0),
+            (2.5, 2.5),
+        ] {
+            assert!((within(seconds, (0.0, WAIT_MAX_S)) - expected).abs() < 1e-9);
+        }
+        assert!((within(f64::NAN, RATE_S) - 0.5).abs() < 1e-9);
     }
 
     #[test]
