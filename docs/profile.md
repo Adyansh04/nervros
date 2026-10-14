@@ -390,6 +390,61 @@ rooms share is refused until one is named by id; an object or a place gets a mar
 unless the operator says otherwise, and a place is a square reaching half a metre out from it,
 plus the margin.
 
+### `[incidents]`
+
+The incident investigator: what its flight recorder watches, and this robot's playbooks. It runs
+without the section too, recording `/rosout`, the nodes and the missions, with the playbooks
+NervROS carries (the robot not placed on the map, a node running twice).
+
+```toml
+[incidents]
+playbooks = ["playbooks"]   # folders of *.toml, relative to this file
+window_s = 300              # how far back the recorder keeps
+watch = [                   # going quiet, after keeping its rate, opens an incident
+    { name = "head camera", topic = "/camera/color/camera_info", type = "sensor_msgs/msg/CameraInfo", min_hz = 1.0 },
+]
+nodes = ["detector_head", "nervros_executor"]   # stopping opens one; full name or last part
+```
+
+A playbook names the incidents it may explain (`mission_failed`, `topic_silent`, `node_gone`,
+`error_burst`, `asked`; none for all), whether `all` its checks must hold or `any`, the verdict and
+the fix, and the agent skill with the long form, if any:
+
+```toml
+id = "robot-lost"
+title = "The robot is lost on the map"
+explains = ["mission_failed", "asked"]
+verdict = "Localization settled far from where the simulator has the robot."
+fix = "Set the robot's pose again before any walk."
+procedure = "lost-on-the-map"
+
+[[check]]
+name = "map to pelvis, against the simulator"
+pose_gap = ["map", "pelvis"]
+topic = "/g1_sensor_relay/base_state"
+type = "nav_msgs/msg/Odometry"
+field = "pose.pose"
+metres = 0.5
+degrees = 20
+```
+
+Each check has one test, and may have a `name` for the report and `not = true`:
+
+| Test | Holds when |
+|---|---|
+| `topic`, `type`, `condition` | The topic, read now, meets a `watch` condition: `rate_below` with `hz`, `value` with `field`, `op` and `value`, or `text` with `contains`. |
+| `log` | The recording has a line holding these words, case aside; `node` narrows it to nodes whose name holds that, `level` (`warn` unless given) and `at_least` (1) set the least. |
+| `node_missing`, `node_duplicated` | The node is not running, or runs twice under one name; `*` for any node. |
+| `tf_missing` | `[target, source]`: no transform links them. |
+| `pose_gap` | `[target, source]` differs from the pose at `field` of `topic`'s newest message by more than `metres` or `degrees`. |
+| `failure_has` | The failed mission's reason holds these words. |
+
+A check that cannot run leaves its playbook unchecked rather than ruled out. `{map_frame}` and
+`{base_frame}` in a playbook are filled from `[ros]`. A playbook of the same id as an earlier one
+replaces it: the profile's folders come after NervROS's, and the ones the agent was asked to
+remember, kept per robot in the state directory, after those. Incidents are kept there too, the
+newest fifty.
+
 ### `[models]`
 
 `file`: the [models file](models.md).
@@ -434,7 +489,9 @@ The rest are the checks you would run yourself before blaming the model:
 
 | Tool | What it does |
 |---|---|
-| `health_check` | The connection check, plus each camera's frame rate, whether the robot knows where it is on the map, and the executor's state. Returns what is wrong and what is fine. |
+| `health_check` | The connection check, plus each camera's frame rate, whether the robot knows where it is on the map, the executor's state, and the known problems the playbooks check for. Returns what is wrong and what is fine. |
+| `why` | Explains the newest incident (within ten minutes), one by its id or its mission's, or checks the robot now; `list` lists the incidents. See [`[incidents]`](#incidents). |
+| `remember_finding` | Keeps a playbook the agent writes from a debugging session, checked as the profile's are; an `annotate` call. |
 | `watch` | Watches a topic in the background and posts to the chat when a condition holds: its rate drops below a floor, a field crosses a value, or a text field matches. Once, or each time it comes back; at most 8 at a time, all ended with the session. |
 | `watches` | Lists the running watches, or cancels one or all. |
 | `plot` | Draws a number from a topic's messages over time in the app's Plots tab, as `rqt_plot` does, for two minutes unless told longer. |

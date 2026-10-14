@@ -395,6 +395,34 @@ parameter's value with its description, and the read tools take `odom` for `/odo
 ROS (a service call, an action goal, a parameter, a publish) needs the profile to allow it, an
 absolute name, and your approval each time.
 
+## When something goes wrong
+
+> **You:** Why did that fail?
+>
+> **NervROS:** The robot is lost on the map: it stands 1.2 m and 91 degrees from where it thinks it
+> is, so the walk ended in the wrong place. Set its pose again (2D Pose Estimate) or restart the
+> stack before another walk; the same plan would fail the same way.
+
+NervROS keeps a flight recorder of the robot's last five minutes: warnings and errors from
+`/rosout`, the nodes that started and stopped, the missions, and the topics the profile watches.
+When a mission fails, a watched topic goes quiet, a watched node stops or a node logs errors in a
+burst, it opens an incident: the recording is frozen, and every playbook that may explain it runs
+on the robot as it is. A playbook is what someone who debugged the robot wrote down: a few
+read-only checks (a topic's rate or a field of its newest message, a line in the recording, a node
+missing or running twice, a transform missing or two poses that disagree, the failure's own
+words), and when they hold, the verdict and the fix. NervROS carries some that fit any robot, and
+the profile adds its robot's own ([`[incidents]`](profile.md#incidents)).
+
+An incident the robot opened by itself, with a likely cause, reaches the agent with your next
+message, so "why can't it find anything?" starts from it. `why` tells the newest incident, or one
+by its id or its mission's: the likely causes and what each
+rests on, what was ruled out, and the minutes before it. Asked when nothing happened, it checks the
+robot now, and "check the robot's health" runs the playbooks too. After a debugging session,
+"remember this" keeps what was found as a playbook (`remember_finding`, approved as an edit), so
+the next incident like it is named at once. The Doctor tab lists the incidents with their evidence,
+**Check now** and **Ask the agent**, and a new one shows a toast. The investigator only reads: it
+never moves the robot.
+
 ## Remembering
 
 https://github.com/user-attachments/assets/60e89e67-063b-417f-920d-92c33ad09105
@@ -552,6 +580,7 @@ nervros-cli --profile my.toml ask "What can you see?" --image frame.jpg
 | `look`, `segment` | The camera's marks, or the regions a prompt names, saved as an image |
 | `ros` | One read-only ROS tool, no model: graph, topic sample, interface, TF, parameters, logs |
 | `doctor` | The profile's tools, topics and mission services against the live graph |
+| `why`, `incidents` | What is wrong with the robot now, checked against the playbooks and kept as an incident; the incidents kept, or one in full |
 | `missions`, `gaps` | The mission ledger, and the requests no skill could do |
 | `replay` | A session as it happened |
 | `eval`, `case` | Test suites against the live robot or a scripted one, and a session kept as a new case |

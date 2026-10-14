@@ -58,6 +58,8 @@ pub struct Agent {
     pub jobs: Arc<crate::job::Jobs>,
     /// The programs kept by name, when the robot has an executor to run them.
     pub programs: Option<Arc<crate::program::Store>>,
+    /// What went wrong, investigated, for the Doctor tab.
+    pub incidents: Arc<crate::incident::Investigator>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -303,6 +305,17 @@ pub fn mission_ledger_file(profile: &Profile, state: &Path) -> PathBuf {
         .with_extension("sqlite3")
 }
 
+/// Where a robot's incidents are kept under the state folder `state`, and the playbooks it was
+/// asked to remember.
+#[must_use]
+pub fn incident_files(profile: &Profile, state: &Path) -> (PathBuf, PathBuf) {
+    let file = |kind: &str| {
+        robot_file(profile, &state.join("quota.json"), kind)
+            .unwrap_or_else(|| state.join(kind).join("robot.json"))
+    };
+    (file("incidents"), file("playbooks").with_extension(""))
+}
+
 /// The robot's mission ledger, beside its memory. Missions still run without one, unrecorded.
 fn mission_ledger(profile: &Profile, ledger: &Path) -> Option<Arc<crate::mission::ledger::Ledger>> {
     let path = mission_ledger_file(profile, ledger.parent()?);
@@ -311,12 +324,20 @@ fn mission_ledger(profile: &Profile, ledger: &Path) -> Option<Arc<crate::mission
         .ok()
 }
 
-/// The watches and the health check: what a person runs before blaming the model.
+/// The watches, the incident investigator and the health check: what a person runs before
+/// blaming the model. Incidents and remembered playbooks are kept per robot beside its memory.
 fn debug_tools(
     profile: &Profile,
     robot: &Arc<dyn RobotPort>,
+    ledger: &Path,
     registry: &mut Registry,
-) -> Result<Arc<crate::watch::Watches>, StartError> {
+) -> Result<
+    (
+        Arc<crate::watch::Watches>,
+        Arc<crate::incident::Investigator>,
+    ),
+    StartError,
+> {
     let read_deny = profile
         .ros_tools
         .as_ref()
@@ -326,11 +347,22 @@ fn debug_tools(
     for tool in watches.tools() {
         registry.add(tool)?;
     }
+    let files = ledger.parent().map(|state| incident_files(profile, state));
+    let investigator = crate::incident::Investigator::start(
+        profile,
+        Arc::clone(robot),
+        files.as_ref().map(|f| f.0.clone()),
+        files.map(|f| f.1),
+    );
+    for tool in crate::incident::tools(&investigator) {
+        registry.add(tool)?;
+    }
     registry.add(Arc::new(crate::doctor::HealthCheck::new(
         profile,
         Arc::clone(robot),
+        Some(Arc::clone(&investigator)),
     )))?;
-    Ok(watches)
+    Ok((watches, investigator))
 }
 
 /// How a session starts: where it keeps its conversation, the conversation it carries on, and
@@ -623,7 +655,7 @@ pub fn start_with(
             registry.add(tool)?;
         }
     }
-    let watches = debug_tools(&profile, &robot, &mut registry)?;
+    let (watches, incidents) = debug_tools(&profile, &robot, ledger, &mut registry)?;
     let mcp = mcp_tools(&profile, models.privacy, &mut registry)?;
     let skills = skill_tools(&profile, &mut registry)?;
     let memory = crate::memory::Memory::new(robot_file(&profile, ledger, "memory"));
@@ -671,6 +703,7 @@ pub fn start_with(
     }
     watches.attach(session.handle());
     jobs.attach(session.handle());
+    incidents.attach(&session.handle());
     say_orphan(&profile, &robot, session.handle());
     let notices = llm
         .missing_keys()
@@ -695,6 +728,7 @@ pub fn start_with(
         zones,
         jobs,
         programs,
+        incidents,
     })
 }
 

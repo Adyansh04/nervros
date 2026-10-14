@@ -5,6 +5,7 @@ mod attach;
 mod chat;
 mod editor;
 mod history;
+mod incidents;
 mod palette;
 mod plan_edit;
 mod programs;

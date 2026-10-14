@@ -1,0 +1,9 @@
+# Two copies of a stack on one graph answer for each other and fail at random.
+id = "duplicate-nodes"
+title = "Two copies of the stack on one graph"
+verdict = "A node runs twice under one name: two stacks share the graph, and each takes the other's messages and goals."
+fix = "The operator stops every stack on this graph, then starts one; no tool of the agent's restarts a stack."
+
+[[check]]
+name = "the graph's nodes"
+node_duplicated = "*"

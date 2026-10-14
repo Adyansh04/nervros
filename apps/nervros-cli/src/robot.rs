@@ -233,6 +233,32 @@ fn print_mission(e: &Event) {
     }
 }
 
+/// What runs beside the conversation: jobs, and incidents as they open.
+fn print_background(e: &Event) {
+    match e {
+        Event::JobStarted { job } => println!(
+            "  [{} {} started: {}; it {}]",
+            job.kind.as_str(),
+            job.id,
+            job.name,
+            job.allows
+        ),
+        Event::JobLog { id, line } => println!("  [{id}] {line}"),
+        Event::JobFinished { job } => {
+            println!(
+                "  [{} {} {}]",
+                job.kind.as_str(),
+                job.id,
+                job.state.as_str()
+            );
+        }
+        Event::Incident { incident } => {
+            println!("  [incident {}: {}]", incident.id, incident.headline());
+        }
+        _ => {}
+    }
+}
+
 fn print_event(e: &Event, logs: &Path) {
     match e {
         Event::Reply { text, model, .. } => println!("robot> {text}\n        [{model}]"),
@@ -296,22 +322,10 @@ fn print_event(e: &Event, logs: &Path) {
         | Event::MissionProgress { .. }
         | Event::MissionPaused { .. }
         | Event::MissionFinished { .. } => print_mission(e),
-        Event::JobStarted { job } => println!(
-            "  [{} {} started: {}; it {}]",
-            job.kind.as_str(),
-            job.id,
-            job.name,
-            job.allows
-        ),
-        Event::JobLog { id, line } => println!("  [{id}] {line}"),
-        Event::JobFinished { job } => {
-            println!(
-                "  [{} {} {}]",
-                job.kind.as_str(),
-                job.id,
-                job.state.as_str()
-            );
-        }
+        Event::JobStarted { .. }
+        | Event::JobLog { .. }
+        | Event::JobFinished { .. }
+        | Event::Incident { .. } => print_background(e),
         // Plots are drawn by the app's viewer; the tool's reply already says what it plots.
         Event::User { .. }
         | Event::TurnStarted { .. }
@@ -528,6 +542,27 @@ pub(crate) async fn doctor(profile_path: &Path) -> Result<()> {
     if bad > 0 {
         bail!("{bad} checks failed");
     }
+    Ok(())
+}
+
+/// Investigates the robot now and prints the incident, kept with the robot's others.
+pub(crate) async fn why(profile_path: &Path) -> Result<()> {
+    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let robot = nervros_core::app::connect(&profile)?;
+    tokio::time::sleep(profile.ros.discovery_timeout.min(Duration::from_secs(5))).await;
+    let (file, remembered) =
+        nervros_core::app::incident_files(&profile, &nervros_core::app::state_dir());
+    let investigator =
+        nervros_core::incident::Investigator::start(&profile, robot, Some(file), Some(remembered));
+    for problem in investigator.problems() {
+        eprintln!("left out: {problem}");
+    }
+    let asked = nervros_core::incident::Trigger::new(
+        nervros_core::incident::Kind::Asked,
+        "asked from the command line",
+    );
+    let incident = investigator.investigate(asked).await;
+    print!("{}", incident.text(nervros_core::now_s()));
     Ok(())
 }
 

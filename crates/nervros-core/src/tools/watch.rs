@@ -172,6 +172,23 @@ pub(crate) async fn holds(
     ty: &str,
     condition: &Condition,
 ) -> Result<Option<String>, String> {
+    Ok(observe(robot, topic, ty, condition)
+        .await?
+        .and_then(|(held, seen)| held.then_some(seen)))
+}
+
+/// One look, whichever way it went: whether the condition holds and what was seen, or `None`
+/// when a value's topic has said nothing yet.
+///
+/// # Errors
+///
+/// As [`holds`].
+pub(crate) async fn observe(
+    robot: &dyn RobotPort,
+    topic: &str,
+    ty: &str,
+    condition: &Condition,
+) -> Result<Option<(bool, String)>, String> {
     match condition {
         Condition::RateBelow(hz) => {
             let window = rate_window(*hz);
@@ -181,7 +198,7 @@ pub(crate) async fn holds(
                 .map_err(|e| e.to_string())?;
             #[expect(clippy::cast_precision_loss, reason = "a count of messages")]
             let rate = arrivals.len() as f64 / window.as_secs_f64();
-            Ok((rate < *hz).then(|| format!("{rate:.1} Hz")))
+            Ok(Some((rate < *hz, format!("{rate:.1} Hz"))))
         }
         Condition::Value {
             field: path,
@@ -193,9 +210,10 @@ pub(crate) async fn holds(
                 Err(RosError::NoData(_)) => return Ok(None),
                 Err(e) => return Err(e.to_string()),
             };
-            Ok(field(&msg, path)
-                .filter(|found| compare(found, op, value))
-                .map(|found| format!("{path} is {found}")))
+            Ok(Some(field(&msg, path).map_or_else(
+                || (false, format!("{path} is not in its messages")),
+                |found| (compare(found, op, value), format!("{path} is {found}")),
+            )))
         }
         Condition::Text(text) => {
             // Every message in the window, not the newest: a log line is gone by the next look.
@@ -203,7 +221,10 @@ pub(crate) async fn holds(
                 .sample_messages(topic, ty, 1000, RATE_WINDOW)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(msgs.iter().find_map(|m| said(m, text)))
+            Ok(Some(msgs.iter().find_map(|m| said(m, text)).map_or_else(
+                || (false, format!("nothing said \"{text}\"")),
+                |line| (true, line),
+            )))
         }
     }
 }
@@ -301,12 +322,7 @@ pub(crate) async fn topic_of(
 ) -> Result<(String, String), String> {
     let topic = crate::guard::canonical_ros_name(args["topic"].as_str().unwrap_or_default())
         .map_err(|e| format!("`topic`: {e}, such as /scan"))?;
-    if read_deny
-        .iter()
-        .any(|p| crate::guard::glob_match(p, &topic))
-    {
-        return Err(format!("the profile keeps {topic} from being read"));
-    }
+    readable(&topic, read_deny)?;
     let graph = robot.graph().await.map_err(|e| e.to_string())?;
     let ty = graph
         .topics
@@ -321,12 +337,28 @@ pub(crate) async fn topic_of(
                 crate::ros_tools::missing("topic", &topic, names)
             )
         })?;
-    if whole && crate::ros_tools::BULK_TYPES.contains(&ty.as_str()) {
+    if whole {
+        small(&topic, &ty)?;
+    }
+    Ok((topic, ty))
+}
+
+/// Refuses a topic the profile keeps from being read.
+pub(crate) fn readable(topic: &str, read_deny: &[String]) -> Result<(), String> {
+    if read_deny.iter().any(|p| crate::guard::glob_match(p, topic)) {
+        return Err(format!("the profile keeps {topic} from being read"));
+    }
+    Ok(())
+}
+
+/// Refuses reading `topic`, of type `ty`, message by message when its messages are too large.
+pub(crate) fn small(topic: &str, ty: &str) -> Result<(), String> {
+    if crate::ros_tools::BULK_TYPES.contains(&ty) {
         return Err(format!(
             "{topic} carries {ty}, too large to read message by message; watch its rate, or look"
         ));
     }
-    Ok((topic, ty))
+    Ok(())
 }
 
 struct Entry {

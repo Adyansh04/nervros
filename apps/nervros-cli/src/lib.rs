@@ -142,6 +142,18 @@ enum Command {
     /// Check the profile's tools, topics and mission services against the live graph.
     #[cfg(feature = "ros")]
     Doctor,
+    /// Investigate what is wrong with the robot now, with the profile's playbooks and those
+    /// NervROS carries, and keep it as an incident.
+    #[cfg(feature = "ros")]
+    Why,
+    /// The incidents kept for the robot, newest first, or one in full by its id.
+    Incidents {
+        /// An incident's id, such as i3.
+        id: Option<String>,
+        /// How many to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Write the live robot as a scripted robot file for `eval --robot`: its graph, nodes,
     /// parameters, the profile's topics and the executor's catalog.
     #[cfg(feature = "ros")]
@@ -289,6 +301,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Skills => skills(&cli.profile),
         #[cfg(feature = "ros")]
         Command::Doctor => robot::doctor(&cli.profile).await,
+        #[cfg(feature = "ros")]
+        Command::Why => robot::why(&cli.profile).await,
+        Command::Incidents { id, limit } => records::incidents(&cli.profile, id.as_deref(), limit),
         #[cfg(feature = "ros")]
         Command::Record { out } => record::record(&cli.profile, &out).await,
         #[cfg(feature = "ros")]

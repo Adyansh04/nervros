@@ -47,6 +47,8 @@ struct Shared {
     repeated: Mutex<(String, u32)>,
     /// What the operator said during the running turn, for its next tool result.
     steer: Mutex<Vec<String>>,
+    /// What the robot noticed since the operator last spoke, for their next message.
+    notes: Mutex<Vec<String>>,
     calls: AtomicU64,
     next_approval: AtomicU64,
     /// Milliseconds this turn spent waiting for the operator.
@@ -172,6 +174,7 @@ impl Session {
             denials: AtomicU32::new(0),
             repeated: Mutex::default(),
             steer: Mutex::default(),
+            notes: Mutex::default(),
             waited_ms: AtomicU64::new(0),
             allowed: Mutex::default(),
             waiting: Mutex::default(),

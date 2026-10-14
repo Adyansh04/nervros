@@ -37,6 +37,20 @@ waits for your approval. A step can take what an earlier one found, so "find a r
 up" is one mission. Each step is tracked live, and the report comes back checked against the world
 model and the camera.
 
+**Count, loop and measure.** "Count the chairs in every room" or "walk to the kitchen and the
+living room and look for a mug in each": the agent writes a short program in
+[Rhai](https://rhai.rs), sandboxed, on the robot's own functions. One that moves you approve once,
+with the skills it may run and for how long; it then runs as a job with a live log and Stop, every
+mission it sends checked like any plan.
+
+**Find things.** "Find my keys" ranks where to look (where the world model last saw them, where
+such things usually are, what the camera has seen least of, how far each place is), then walks to
+each and looks until the detector sees them.
+
+**Teach it a skill.** "Point at the red mug", when no skill points: the agent teaches the robot one
+from the leaves its executor allows, the executor checks it, and it is kept once the first mission
+with it, approved as usual, succeeds.
+
 **Stop it at once, or pause it.** "Stop", the Stop button or Ctrl+Shift+S halts the robot without
 waiting on a model. "Pause" holds the mission where it is, once a pick or a place in progress has
 finished, and "resume" lets it go on.
@@ -50,6 +64,11 @@ ten minutes, walk to the bedroom": watches, live plots and schedules run while y
 It reads the ROS graph, topics, TF, parameters and logs too, as `ros2` does: nodes composed into a
 container are listed under it, and parameters come with their values and descriptions.
 
+**Ask it why.** A failed mission, a camera going quiet or a node stopping opens an incident: the
+robot's last minutes, checked against playbooks of what is known to go wrong on it. "Why did that
+fail?" gets the likely cause, what it rests on, what was ruled out and the fix, and "remember
+this" keeps a new finding as a playbook.
+
 **Map a new building.** "Explore the building" walks until the camera has seen every room, mapping
 as it goes. Fix what it got wrong by saying so ("R1 is the living room") or by hand in the world
 editor.
@@ -58,7 +77,7 @@ editor.
 commands from Ctrl+K, drive with W, A, S and D, and name places and notes it keeps for next time.
 
 **Or a terminal.** `nervros-cli` runs the same agent: chat, a setup check against the live graph,
-single ROS reads, test suites against the robot, a recording of the robot to compare models on
+an investigation of what is wrong now, single ROS reads, test suites against the robot, a recording of the robot to compare models on
 without it, and a draft of what the robot is told about itself.
 
 The **[guide](docs/guide.md)** has a short video of most of these, with the exact words typed and

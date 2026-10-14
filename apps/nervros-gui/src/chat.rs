@@ -350,8 +350,9 @@ impl Chat {
                     card.ended(job);
                 }
             }
-            // The viewer draws it; the tool's card already says what.
-            Event::Plot { .. } => {}
+            // The viewer draws a plot, and the tool's card already says what; the Doctor tab
+            // lists an incident, and a toast says it opened.
+            Event::Plot { .. } | Event::Incident { .. } => {}
             Event::ModelCall {
                 input_tokens,
                 cached_tokens,

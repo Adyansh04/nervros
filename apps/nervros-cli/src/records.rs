@@ -191,6 +191,33 @@ pub fn gaps(profile: &Path, limit: usize) -> Result<()> {
     Ok(())
 }
 
+/// The robot's incidents, newest first, or one in full by its id.
+pub fn incidents(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
+    let profile = Profile::load(profile).context("loading the profile")?;
+    let (file, _) = nervros_core::app::incident_files(&profile, &nervros_core::app::state_dir());
+    let all = nervros_core::incident::read(&file);
+    let now = nervros_core::now_s();
+    if let Some(id) = id {
+        let Some(incident) = all.iter().find(|i| i.id.eq_ignore_ascii_case(id)) else {
+            bail!("no incident {id} in {}", file.display());
+        };
+        print!("{}", incident.text(now));
+        return Ok(());
+    }
+    if all.is_empty() {
+        println!("no incidents kept yet ({})", file.display());
+    }
+    for i in all.iter().rev().take(limit) {
+        println!(
+            "{} {:.0} min ago: {}",
+            i.id,
+            (now - i.opened_s) / 60.0,
+            i.headline()
+        );
+    }
+    Ok(())
+}
+
 /// A session as an eval case: printed, or appended to a suite file.
 pub fn case(which: &str, id: &str, append: Option<&Path>) -> Result<()> {
     let path = session_log(which)?;

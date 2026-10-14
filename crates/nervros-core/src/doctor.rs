@@ -1,6 +1,7 @@
 //! The connection check: whether the robot offers everything the profile names. The CLI prints
 //! it and the GUI shows it on its Doctor tab; `health_check` gives the agent the same, with the
-//! cameras' rates, the robot's place on the map and the executor's state.
+//! cameras' rates, the robot's place on the map, the executor's state, and the known problems
+//! the incident playbooks check for.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -127,18 +128,23 @@ pub struct HealthCheck {
     spec: ToolSpec,
     profile: Arc<Profile>,
     robot: Arc<dyn RobotPort>,
+    incidents: Option<Arc<crate::incident::Investigator>>,
 }
 
 impl HealthCheck {
-    /// The check over a profile's robot.
+    /// The check over a profile's robot, with the investigator's playbooks when given.
     #[must_use]
-    pub fn new(profile: &Profile, robot: Arc<dyn RobotPort>) -> Self {
+    pub fn new(
+        profile: &Profile,
+        robot: Arc<dyn RobotPort>,
+        incidents: Option<Arc<crate::incident::Investigator>>,
+    ) -> Self {
         let spec = ToolSpec::new(
             "health_check",
             "Checks the robot end to end, as a person would before blaming the model: every \
              service and topic the profile uses, each camera's frame rate, whether the robot \
-             knows where it is on the map, and what the mission executor is doing. Returns the \
-             problems first.",
+             knows where it is on the map, what the mission executor is doing, and the known \
+             problems written down for this robot (playbooks). Returns the problems first.",
             json!({"type": "object", "properties": {}, "additionalProperties": false}),
             Risk::Observe,
         );
@@ -146,6 +152,7 @@ impl HealthCheck {
             spec,
             profile: Arc::new(profile.clone()),
             robot,
+            incidents,
         }
     }
 
@@ -214,8 +221,36 @@ impl HealthCheck {
                 },
             });
         }
+        if let Some(incidents) = &self.incidents {
+            out.extend(known_problems(&incidents.preflight().await));
+        }
         out
     }
+}
+
+/// A line for each known problem the playbooks found, or one saying none was.
+fn known_problems(found: &crate::incident::Incident) -> Vec<Check> {
+    if found.causes.is_empty() {
+        let unchecked = match found.unchecked.len() {
+            0 => String::new(),
+            n => format!(" ({n} could not be checked)"),
+        };
+        return vec![Check {
+            ok: true,
+            what: format!(
+                "none of the {} known problems shows{unchecked}",
+                found.ruled_out.len() + found.unchecked.len()
+            ),
+        }];
+    }
+    found
+        .causes
+        .iter()
+        .map(|c| Check {
+            ok: false,
+            what: format!("{}: {} Fix: {}", c.title, c.evidence.join("; "), c.fix),
+        })
+        .collect()
 }
 
 #[async_trait]

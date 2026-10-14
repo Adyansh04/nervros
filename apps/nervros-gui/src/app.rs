@@ -76,6 +76,8 @@ struct Live {
     pub draft: Option<Result<(std::path::PathBuf, String), String>>,
     /// The draft has just landed, below the checks: brought into view once.
     pub draft_fresh: bool,
+    /// A check of the robot started from the Doctor tab runs.
+    pub investigating: bool,
 }
 
 /// What the operator clicked in the viewer, when it is something the agent can act on.
@@ -493,8 +495,26 @@ impl Gui {
         }
     }
 
-    /// A finished mission gets a toast: the operator may be looking at the viewer or away.
+    /// A finished mission gets a toast, and so does an incident with news in it: the operator
+    /// may be looking at the viewer or away.
     fn toast(&mut self, e: &Event) {
+        if let Event::Incident { incident } = e {
+            let text = match incident.causes.first() {
+                Some(c) => Some(format!(
+                    "{}: likely {}. The Doctor tab has why",
+                    incident.id, c.title
+                )),
+                // A failed mission has its own toast; anything else is news.
+                None if incident.kind != nervros_core::incident::Kind::MissionFailed => {
+                    Some(format!("{}: {}", incident.id, incident.trigger))
+                }
+                None => None,
+            };
+            if let Some(text) = text {
+                self.toasts.add(Kind::Failure, text);
+            }
+            return;
+        }
         let Event::MissionFinished {
             id,
             outcome,

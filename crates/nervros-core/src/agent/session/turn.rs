@@ -169,7 +169,15 @@ fn announce(shared: &Shared, turn: u64, origin: Origin) -> String {
                 turn,
                 text: text.clone(),
             });
-            text
+            let notes = std::mem::take(&mut *lock(&shared.notes));
+            if notes.is_empty() {
+                text
+            } else {
+                format!(
+                    "{text}\n\n(Noticed by the robot since: {}.)",
+                    notes.join("; ")
+                )
+            }
         }
         Origin::Report(text) => {
             shared.emit(Event::Report {

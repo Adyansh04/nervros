@@ -50,6 +50,9 @@ pub enum Command {
     /// Something the robot reports, such as a finished mission; the model answers it in a turn
     /// of its own, after any running turn.
     Report(String),
+    /// Something the robot noticed on its own, such as an incident it opened: no turn of its
+    /// own, the model reads it with the operator's next message.
+    Note(String),
     /// Condense the conversation now, as it is condensed when it grows past half the model's
     /// window.
     Compact,
@@ -353,6 +356,12 @@ pub enum Event {
     JobFinished {
         /// The job as it ended.
         job: crate::job::JobInfo,
+    },
+    /// Something went wrong and was investigated: the likely causes, what was ruled out, and
+    /// the minutes before it.
+    Incident {
+        /// The incident as it was kept.
+        incident: crate::incident::Incident,
     },
 }
 

@@ -91,6 +91,7 @@ pub(super) async fn actor(
                         running = Some(start(turns, Origin::User(text), &history));
                         answering_report = false;
                     }
+                    Command::Note(text) => lock(&shared.notes).push(text),
                     Command::Report(text) => {
                         reports.push(text);
                         if running.is_none() {
