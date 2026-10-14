@@ -546,8 +546,9 @@ fn graph_detail(node: &r2r::Node) -> Result<GraphDetail, RosError> {
         .into_iter()
         .map(|(name, ns)| full_name(&ns, &name))
         .collect();
+    // Kept twice when two nodes share a name, as `ros2 node list` shows them: two stacks on one
+    // graph look like that.
     nodes.sort();
-    nodes.dedup();
     Ok(GraphDetail {
         topics: sorted(topics),
         services: sorted(services),
