@@ -1362,6 +1362,38 @@ async fn after_three_denials_in_a_row_the_model_is_told_to_stop_asking() {
 }
 
 #[tokio::test]
+async fn a_request_turned_down_is_not_asked_again_unchanged() {
+    let model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("c1", "find_objects", json!({"n": 1})),
+        MockTurn::tool_call("c2", "find_objects", json!({"n": 1})),
+        MockTurn::text("I will ask what you want."),
+    ]);
+    let guard = Arc::new(Guard::new(Policy::default()));
+    guard.set_armed(true);
+    let session = Session::start(
+        Arc::new(Scripted::new(model.clone())),
+        registry(Risk::Motion),
+        guard,
+        None,
+        SessionConfig::default(),
+    );
+    let mut rx = session.subscribe();
+    session.send(Command::User("go".into()));
+    let deny = |e: &Event| match e {
+        Event::ApprovalRequested { id, .. } => Some(Command::Deny(*id)),
+        _ => None,
+    };
+    let events = collect_until_finished(&mut rx, deny, &session).await;
+    let asked = events
+        .iter()
+        .filter(|e| matches!(e, Event::ApprovalRequested { .. }))
+        .count();
+    assert_eq!(asked, 1, "the same request is not asked twice");
+    let seen = format!("{:?}", model.requests().last().unwrap().chat_history);
+    assert!(seen.contains("turned down this same request"), "{seen}");
+}
+
+#[tokio::test]
 async fn the_same_failure_three_times_in_a_row_is_called_stuck() {
     let calls: Vec<MockTurn> = (1..=3)
         .map(|n| MockTurn::tool_call(format!("c{n}"), "look", json!({"n": n})))

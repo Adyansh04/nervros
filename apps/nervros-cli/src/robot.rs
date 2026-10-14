@@ -304,9 +304,12 @@ fn print_event(e: &Event, logs: &Path) {
         }
         Event::ApprovalEdited { id, reason, .. } => println!("  approval #{id} edited: {reason}"),
         Event::EditRejected { id, message } => println!("  edit of #{id} refused: {message}"),
-        Event::ApprovalResolved { id, approved } => {
-            println!("  approval #{id}: {}", if *approved { "yes" } else { "no" });
-        }
+        Event::ApprovalResolved {
+            id, not_approved, ..
+        } => match not_approved {
+            None => println!("  approval #{id}: yes"),
+            Some(why) => println!("  approval #{id}: no ({why:?})"),
+        },
         Event::Armed { armed } => println!("  [{}]", if *armed { "armed" } else { "disarmed" }),
         Event::Halted { reason } => println!("  [halted: {reason}]"),
         Event::Stopped { ok: true, detail } => println!("  [the robot stopped: {detail}]"),

@@ -215,6 +215,11 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut
                 (None, None) if p.replaced => {
                     RichText::new("Replaced by an edited plan").color(theme::FAINT)
                 }
+                (None, None) if p.not_run.is_some() => RichText::new(format!(
+                    "Did not run: {}",
+                    p.not_run.as_deref().unwrap_or_default()
+                ))
+                .color(theme::FAINT),
                 (None, None) => RichText::new(format!(
                     "Checked · at most {} · waiting to run",
                     minutes(p.worst_case_s)

@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use super::calls::Approved;
-use super::event::Event;
+use super::event::{Event, NotApproved};
 use super::{Shared, millis};
 use crate::lock;
 use crate::tools::{Lane, Risk, Tool};
@@ -46,8 +46,20 @@ pub(super) enum Answer {
     /// Approve, and stop asking about this tool for the session.
     AllowForSession,
     Deny,
+    /// Turned down by disarming.
+    Disarm,
     /// Check these arguments instead, and wait again.
     Edit(Value),
+}
+
+/// How an approval ended, for its trace span.
+fn outcome_word(outcome: Result<(), NotApproved>) -> &'static str {
+    match outcome {
+        Ok(()) => "approved",
+        Err(NotApproved::Denied) => "denied",
+        Err(NotApproved::Disarmed) => "disarmed",
+        Err(NotApproved::Unanswered) => "unanswered",
+    }
 }
 
 /// Denials in a row after which the model is told to stop asking and ask the operator instead.
@@ -65,7 +77,8 @@ pub(super) struct Asked {
 struct Asking<'a> {
     shared: &'a Shared,
     id: u64,
-    approved: bool,
+    /// Why it may not run; `None` once approved.
+    not_approved: Option<NotApproved>,
 }
 
 impl Drop for Asking<'_> {
@@ -73,7 +86,8 @@ impl Drop for Asking<'_> {
         lock(&self.shared.approvals).remove(&self.id);
         self.shared.emit(Event::ApprovalResolved {
             id: self.id,
-            approved: self.approved,
+            approved: self.not_approved.is_none(),
+            not_approved: self.not_approved,
         });
     }
 }
@@ -93,7 +107,7 @@ impl Shared {
         reason: String,
         risk: Risk,
         mut approved: Approved,
-    ) -> Option<Approved> {
+    ) -> Result<Approved, NotApproved> {
         let can_allow =
             !matches!(risk, Risk::Motion | Risk::Manipulation) && !tool.always_asks(&approved.args);
         let acts = risk.lane() == Lane::Act;
@@ -101,7 +115,7 @@ impl Shared {
         let mut asking = Asking {
             shared: self,
             id,
-            approved: false,
+            not_approved: Some(NotApproved::Denied),
         };
         let mut rx = self.listen(id, acts);
         self.keep_waiting(id, tool, name, &reason, &approved.args);
@@ -114,13 +128,13 @@ impl Shared {
         });
         let asked = Instant::now();
         let mut early = None;
-        let yes = loop {
+        let outcome = loop {
             let answer = match early.take() {
                 Some(answer) => Ok(Ok(answer)),
                 None => tokio::time::timeout(self.config.approval_ttl, &mut rx).await,
             };
             match answer {
-                Ok(Ok(Answer::Approve)) => break true,
+                Ok(Ok(Answer::Approve)) => break Ok(()),
                 Ok(Ok(Answer::AllowForSession)) => {
                     let text = if can_allow {
                         lock(&self.allowed).insert(name.to_owned());
@@ -136,7 +150,7 @@ impl Shared {
                         )
                     };
                     self.emit(Event::Notice { text });
-                    break true;
+                    break Ok(());
                 }
                 Ok(Ok(Answer::Edit(edited))) => {
                     // Waiting again before the check, so a stop during it still lands.
@@ -178,16 +192,18 @@ impl Shared {
                         Err(_) => {}
                     }
                 }
-                Ok(Ok(Answer::Deny) | Err(_)) | Err(_) => break false,
+                Ok(Ok(Answer::Disarm)) => break Err(NotApproved::Disarmed),
+                Err(_) => break Err(NotApproved::Unanswered),
+                Ok(Ok(Answer::Deny) | Err(_)) => break Err(NotApproved::Denied),
             }
         };
         self.waited_ms
             .fetch_add(millis(asked.elapsed()), Ordering::Relaxed);
         self.done_waiting(id);
-        tracing::Span::current().record("nervros.outcome", if yes { "approved" } else { "denied" });
-        asking.approved = yes;
+        tracing::Span::current().record("nervros.outcome", outcome_word(outcome));
+        asking.not_approved = outcome.err();
         drop(asking);
-        yes.then_some(approved)
+        outcome.map(|()| approved)
     }
 
     /// Keeps approval `id` where the next session finds it if this one ends first.
@@ -253,7 +269,7 @@ impl Shared {
             .map(|(id, _)| *id)
             .collect();
         for id in acting {
-            self.answer(id, Answer::Deny);
+            self.answer(id, Answer::Disarm);
         }
     }
 }

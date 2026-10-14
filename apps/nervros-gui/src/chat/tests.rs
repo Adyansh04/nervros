@@ -9,7 +9,7 @@ use nervros_core::mission::Outcome;
 use nervros_core::mission::plan::{PlannedStep, StepArg};
 use nervros_core::mission::preview::PreviewStep;
 use nervros_core::mission::sanity::Concern;
-use nervros_core::session::{Command, Event, Unanswered};
+use nervros_core::session::{Command, Event, NotApproved, Unanswered};
 use nervros_core::tools::Status;
 use rerun::external::egui;
 use rerun::external::egui::{Frame, Margin};
@@ -81,6 +81,7 @@ fn a_resolved_approval_is_no_longer_pending() {
     chat.apply(&Event::ApprovalResolved {
         id: 7,
         approved: false,
+        not_approved: Some(NotApproved::Denied),
     });
     assert_eq!(chat.pending().count(), 0);
 }
@@ -315,6 +316,34 @@ fn snapshot_tree_panel() {
 }
 
 #[test]
+fn an_edit_that_changes_nothing_keeps_one_card() {
+    let mut chat = doubtful_plan();
+    let cards = |chat: &Chat| {
+        chat.items
+            .iter()
+            .filter(|i| matches!(i, Item::Plan(_)))
+            .count()
+    };
+    let before = cards(&chat);
+    chat.edit_sent(9);
+    chat.apply(&Event::MissionPlanned {
+        hash: "5be0c1d9f2a4".to_owned(),
+        intent: "turn left and walk half a metre".to_owned(),
+        steps: Vec::new(),
+        worst_case_s: 60.0,
+        concerns: Vec::new(),
+        by_job: false,
+    });
+    chat.apply(&Event::ApprovalEdited {
+        id: 9,
+        args: serde_json::json!({"hash": "5be0c1d9f2a4"}),
+        reason: "runs it".to_owned(),
+    });
+    assert_eq!(cards(&chat), before);
+    assert!(chat.latest_plan().is_some_and(|p| !p.replaced));
+}
+
+#[test]
 fn a_passed_edit_moves_the_approval_below_its_new_plan() {
     let mut chat = doubtful_plan();
     chat.edit_sent(9);
@@ -374,7 +403,7 @@ fn snapshot_unanswered_and_allow() {
         Unanswered {
             tool: "run_mission".to_owned(),
             args: serde_json::json!({"intent": "bring the red mug to the sofa", "steps": []}),
-            reason: "runs \"bring the red mug to the sofa\": 4 step(s), at most 6 min".to_owned(),
+            reason: "runs \"bring the red mug to the sofa\": 4 steps, at most 6 min".to_owned(),
         },
         Cell::new(false),
     ));
@@ -494,6 +523,51 @@ fn snapshot_empty_state() {
 }
 
 #[test]
+fn a_plan_its_call_refused_says_it_did_not_run() {
+    let mut chat = Chat::default();
+    chat.apply(&Event::ToolStarted {
+        turn: 1,
+        call: 1,
+        tool: "schedule".to_owned(),
+        args: serde_json::json!({}),
+    });
+    chat.apply(&Event::MissionPlanned {
+        hash: "a1b2c3d4e5f6".to_owned(),
+        intent: "turn left three times".to_owned(),
+        steps: Vec::new(),
+        worst_case_s: 30.0,
+        concerns: Vec::new(),
+        by_job: false,
+    });
+    chat.apply(&Event::ToolFinished {
+        turn: 1,
+        call: 1,
+        tool: "schedule".to_owned(),
+        status: Status::Failed,
+        message: "the operator asked for 3 times in all".to_owned(),
+        ms: 5,
+    });
+    assert_eq!(
+        chat.latest_plan().and_then(|p| p.not_run.as_deref()),
+        Some("the operator asked for 3 times in all")
+    );
+}
+
+#[test]
+fn a_denied_plan_says_it_did_not_run() {
+    let mut chat = doubtful_plan();
+    chat.apply(&Event::ApprovalResolved {
+        id: 9,
+        approved: false,
+        not_approved: Some(NotApproved::Denied),
+    });
+    assert_eq!(
+        chat.latest_plan().and_then(|p| p.not_run.as_deref()),
+        Some("not approved")
+    );
+}
+
+#[test]
 fn arming_first_keeps_the_suggestions() {
     let mut chat = Chat::default();
     chat.apply(&Event::Armed { armed: true });
@@ -543,6 +617,7 @@ fn snapshot_mission() {
     chat.apply(&Event::ApprovalResolved {
         id: 3,
         approved: true,
+        not_approved: None,
     });
     chat.apply(&Event::MissionStarted {
         id: "m1".to_owned(),

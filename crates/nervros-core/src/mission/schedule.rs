@@ -530,9 +530,11 @@ impl ScheduleTool {
             .add_trigger(compiled, intent, trigger, times, for_min);
         let mut out = ToolOutcome::ok(json!({"schedule": info}));
         out.message = format!(
-            "trigger {} runs each time {}, up to {times} time(s) in the next {for_min} min; it \
-             does not run for what holds already",
-            info.id, info.when
+            "trigger {} runs each time {}, up to {} in the next {for_min} min; it does not run \
+             for what holds already",
+            info.id,
+            info.when,
+            crate::counted(times, "time")
         );
         out
     }
@@ -599,8 +601,10 @@ impl Tool for ScheduleTool {
                 risk: Risk::Manipulation,
                 resources: Vec::new(),
                 reason: format!(
-                    "runs \"{intent}\" ({steps} step(s)) each time {}, up to {times} time(s) in the next {for_min} min",
-                    trigger.describe()
+                    "runs \"{intent}\" ({}) each time {}, up to {} in the next {for_min} min",
+                    crate::counted(steps, "step"),
+                    trigger.describe(),
+                    crate::counted(times, "time")
                 ),
                 args: Some(json!({"action": "add", "hash": hash, "intent": intent,
                                   "when": args["when"], "times": times, "for_min": for_min})),
@@ -610,7 +614,9 @@ impl Tool for ScheduleTool {
             risk: Risk::Manipulation,
             resources: Vec::new(),
             reason: format!(
-                "runs \"{intent}\" ({steps} step(s)) now and every {every} min, {times} time(s) in all"
+                "runs \"{intent}\" ({}) now and every {every} min, {} in all",
+                crate::counted(steps, "step"),
+                crate::counted(times, "time")
             ),
             args: Some(json!({"action": "add", "hash": hash, "intent": intent,
                               "every_min": every, "times": times})),
@@ -663,8 +669,9 @@ impl Tool for ScheduleTool {
                 let info = self.schedules.add(compiled, intent, every, times);
                 let mut out = ToolOutcome::ok(json!({"schedule": info}));
                 out.message = format!(
-                    "schedule {} runs now and every {every} min, {times} time(s); a report follows each run",
-                    info.id
+                    "schedule {} runs now and every {every} min, {}; a report follows each run",
+                    info.id,
+                    crate::counted(times, "time")
                 );
                 out
             }

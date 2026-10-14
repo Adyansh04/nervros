@@ -168,14 +168,14 @@ impl RunMission {
                 r.every_min
             ));
         }
-        let minutes = (compiled.worst_case_s / 60.0).ceil();
+        let at_most = crate::duration_words(compiled.worst_case_s);
         Some(Ok(Assessment {
             risk: Risk::Manipulation,
             resources: Vec::new(),
             reason: format!(
-                "runs \"{}\": {} step(s), at most {minutes} min",
+                "runs \"{}\": {}, at most {at_most}",
                 compiled.plan.intent,
-                compiled.steps.len()
+                crate::counted(compiled.steps.len(), "step")
             ),
             args: Some(json!({"hash": compiled.sha256})),
         }))
@@ -195,12 +195,13 @@ impl RunMission {
             return Err(refusal);
         }
         let steps = out.data["steps"].as_array().map_or(0, Vec::len);
-        let minutes = (out.data["worst_case_s"].as_f64().unwrap_or(0.0) / 60.0).ceil();
+        let at_most = crate::duration_words(out.data["worst_case_s"].as_f64().unwrap_or(0.0));
         let intent = self
             .0
             .find(&hash)
             .map_or_else(|_| "the plan".to_owned(), |c| c.plan.intent);
-        let mut reason = format!("runs \"{intent}\": {steps} step(s), at most {minutes} min");
+        let steps = crate::counted(steps, "step");
+        let mut reason = format!("runs \"{intent}\": {steps}, at most {at_most}");
         if let Some(concerns) = out.data["concerns"].as_array() {
             for c in concerns.iter().filter_map(Value::as_str) {
                 let _ = write!(reason, "; check: {c}");

@@ -66,6 +66,18 @@ pub enum Command {
     Restore(History),
 }
 
+/// Why a request asked of the operator did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotApproved {
+    /// The operator said no.
+    Denied,
+    /// Disarming turned it down while it waited.
+    Disarmed,
+    /// Nobody answered before it ran out.
+    Unanswered,
+}
+
 /// What the session reports.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -240,6 +252,9 @@ pub enum Event {
         id: u64,
         /// Whether it may run.
         approved: bool,
+        /// Why not, when it may not.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        not_approved: Option<NotApproved>,
     },
     /// Arming changed.
     Armed {

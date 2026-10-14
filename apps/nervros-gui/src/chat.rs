@@ -10,7 +10,7 @@ use nervros_core::mission::Outcome;
 use nervros_core::mission::plan::PlannedStep;
 use nervros_core::mission::preview::PreviewStep;
 use nervros_core::mission::sanity::Concern;
-use nervros_core::session::{Command, Event, Unanswered};
+use nervros_core::session::{Command, Event, NotApproved, Unanswered};
 use nervros_core::tools::Status;
 use rerun::external::egui::{self, Color32, RichText};
 use serde_json::Value;
@@ -89,6 +89,8 @@ pub struct Approval {
     can_allow: bool,
     asked: Instant,
     answer: Option<bool>,
+    /// Why it did not run, once answered no.
+    not_approved: Option<NotApproved>,
     /// An edit is being checked.
     checking: bool,
     /// Why the last edit failed its checks.
@@ -184,6 +186,8 @@ pub struct PlanCard {
     concerns: Vec<Concern>,
     /// An edit replaced it before it ran.
     replaced: bool,
+    /// Why it never ran: its approval was denied or ran out, or its call was refused.
+    not_run: Option<String>,
     /// Each tree node seen so far, by path, with its latest status, in the order they started.
     nodes: Vec<(String, String)>,
     /// Paused, or waiting to pause once a pick or place ends.
@@ -406,14 +410,27 @@ impl Chat {
                 ms,
                 ..
             } => {
-                let found = self.items.iter_mut().rev().find_map(|i| match i {
-                    Item::Tool(t) if t.turn == *turn && t.call == *call => Some(t),
-                    _ => None,
-                });
-                if let Some(t) = found {
+                let found = self.items.iter().rposition(
+                    |i| matches!(i, Item::Tool(t) if t.turn == *turn && t.call == *call),
+                );
+                let Some(at) = found else { return };
+                if let Item::Tool(t) = &mut self.items[at] {
                     t.status = Some(*status);
                     t.message.clone_from(message);
                     t.ms = *ms;
+                }
+                // A plan its call then refused, as run_mission when disarmed or schedule on a bad
+                // count, never runs: the plans this call made come before the next call's row.
+                if !status.ok() {
+                    for item in &mut self.items[at + 1..] {
+                        match item {
+                            Item::Tool(_) => break,
+                            Item::Plan(p) if p.mission.is_none() && !p.replaced => {
+                                p.not_run.get_or_insert_with(|| message.clone());
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             Event::ApprovalRequested {
@@ -430,6 +447,7 @@ impl Chat {
                 can_allow: *can_allow,
                 asked: Instant::now(),
                 answer: None,
+                not_approved: None,
                 checking: false,
                 problem: None,
             })),
@@ -441,13 +459,32 @@ impl Chat {
                     a.asked = Instant::now();
                 }
             }
-            Event::ApprovalResolved { id, approved } => {
+            Event::ApprovalResolved {
+                id,
+                approved,
+                not_approved,
+            } => {
+                let mut asked_for = None;
                 for item in &mut self.items {
                     if let Item::Approval(a) = item
                         && a.id == *id
                     {
                         a.answer = Some(*approved);
+                        a.not_approved = *not_approved;
+                        asked_for = a.args["hash"].as_str().map(str::to_owned);
                     }
+                }
+                // Else its card would say "waiting to run" for good.
+                if !*approved
+                    && let Some(hash) = asked_for.filter(|h| !h.is_empty())
+                    && let Some(p) = self.plan_mut(|p| p.hash.starts_with(&hash))
+                {
+                    let why = match not_approved {
+                        Some(NotApproved::Unanswered) => "nobody answered in time",
+                        Some(NotApproved::Disarmed) => "the robot was disarmed",
+                        _ => "not approved",
+                    };
+                    p.not_run.get_or_insert_with(|| why.to_owned());
                 }
             }
             _ => {}
@@ -475,7 +512,11 @@ impl Chat {
             return;
         };
         let before = a.args["hash"].as_str().unwrap_or_default().to_owned();
-        if let Some(p) = self.plan_mut(|p| !before.is_empty() && p.hash.starts_with(&before)) {
+        let after = args["hash"].as_str().unwrap_or_default();
+        // An edit that changed nothing replaces nothing.
+        if !after.starts_with(&before)
+            && let Some(p) = self.plan_mut(|p| !before.is_empty() && p.hash.starts_with(&before))
+        {
             p.replaced = true;
         }
         a.args = args.clone();
@@ -565,13 +606,18 @@ impl Chat {
                     preview: Vec::new(),
                     concerns: concerns.clone(),
                     replaced: false,
+                    not_run: None,
                     nodes: Vec::new(),
                     paused: false,
                 };
                 // A job's missions show on its own card in the chat, as the lines it logs.
                 if *by_job {
                     self.job_plan = Some((self.items.len(), card));
-                } else {
+                } else if !self.items.iter().any(|i| {
+                    // Planned again unchanged, as by an edit checked as it was: one card.
+                    matches!(i, Item::Plan(p) if p.hash == *hash && p.mission.is_none()
+                        && p.finished.is_none() && !p.replaced && p.not_run.is_none())
+                }) {
                     self.items.push(Item::Plan(card));
                 }
             }

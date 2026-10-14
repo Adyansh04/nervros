@@ -61,7 +61,7 @@ pub(super) async fn agent(
             | Event::ApprovalResolved {
                 approved: false, ..
             } => {
-                put(&rec, PLAN_PATH, &rerun::Clear::recursive());
+                clear_plan(&rec);
                 continue;
             }
             Event::MissionFinished {
@@ -69,18 +69,8 @@ pub(super) async fn agent(
                 failed_step,
                 ..
             } => {
-                put(&rec, PLAN_PATH, &rerun::Clear::recursive());
-                // The executor sends no last state for a step it stopped: the lane would stay
-                // "running" for good.
-                if !failed_step.is_empty() {
-                    let state = if *outcome == Outcome::Canceled {
-                        "stopped"
-                    } else {
-                        "failure"
-                    };
-                    let path = format!("mission/{failed_step}");
-                    put(&rec, &path, &rerun::StateChange::single(state));
-                }
+                clear_plan(&rec);
+                end_lane(&rec, *outcome, failed_step);
                 continue;
             }
             Event::MissionProgress {
@@ -124,4 +114,29 @@ pub(super) async fn agent(
             &rerun::TextLog::new(text).with_level(level),
         );
     }
+}
+
+/// Takes the preview and the navigation stack's last path off the map. The path is drawn as
+/// static data, which a clear on the timeline leaves standing: a denied plan's path stayed drawn.
+fn clear_plan(rec: &RecordingStream) {
+    put_static(rec, PLAN_PATH, &rerun::Clear::recursive());
+    put(rec, PLAN_PATH, &rerun::Clear::recursive());
+}
+
+/// The executor sends no last state for a step it stopped: its lane would stay "running" for
+/// good.
+fn end_lane(rec: &RecordingStream, outcome: Outcome, failed_step: &str) {
+    if failed_step.is_empty() {
+        return;
+    }
+    let state = if outcome == Outcome::Canceled {
+        "stopped"
+    } else {
+        "failure"
+    };
+    put(
+        rec,
+        &format!("mission/{failed_step}"),
+        &rerun::StateChange::single(state),
+    );
 }

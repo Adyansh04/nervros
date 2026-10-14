@@ -43,7 +43,38 @@ pub fn now_s() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
+/// `n` and its noun, which takes an "s" unless `n` is 1: "1 step", "3 steps".
+pub(crate) fn counted<N: std::fmt::Display + PartialEq + From<u8> + Copy>(
+    n: N,
+    noun: &str,
+) -> String {
+    let s = if n == N::from(1) { "" } else { "s" };
+    format!("{n} {noun}{s}")
+}
+
+/// A duration as the window words it: seconds under a minute and a half, else minutes, so an
+/// approval's "at most" reads as its plan card's.
+pub(crate) fn duration_words(seconds: f64) -> String {
+    if seconds < 90.0 {
+        format!("{seconds:.0} s")
+    } else {
+        format!("{:.0} min", seconds / 60.0)
+    }
+}
+
 /// A mutex's guard, poisoned or not: a panic while it was held leaves data still worth reading.
 pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn counts_read_as_words() {
+        assert_eq!(super::counted(1usize, "step"), "1 step");
+        assert_eq!(super::counted(4u64, "step"), "4 steps");
+        assert_eq!(super::counted(0u32, "time"), "0 times");
+        assert_eq!(super::duration_words(30.0), "30 s");
+        assert_eq!(super::duration_words(240.0), "4 min");
+    }
 }

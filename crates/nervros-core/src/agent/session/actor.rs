@@ -72,6 +72,7 @@ pub(super) async fn actor(
                     Command::User(text) => {
                         // The operator speaking is a new say on what they want.
                         shared.denials.store(0, Ordering::SeqCst);
+                        lock(&shared.denied).clear();
                         if let Some((turn, _)) = &running {
                             if answering_report {
                                 if queued.is_none() {
