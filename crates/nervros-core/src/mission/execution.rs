@@ -202,7 +202,11 @@ impl Missions {
             Outcome::Canceled => "was stopped".to_owned(),
             _ => format!("failed at {step}: {reason}"),
         };
-        *lock(&self.last) = Some((compiled.sha256.clone(), how));
+        // The guard against rerunning a plan unchanged is the model's: a job's look that saw
+        // nothing does not stand against the model's own plan.
+        if reported == Reported::ToModel {
+            *lock(&self.last) = Some((compiled.sha256.clone(), how));
+        }
         self.emit(Event::MissionFinished {
             id: id.clone(),
             outcome,
@@ -212,6 +216,12 @@ impl Missions {
             outputs,
             by_job: reported == Reported::ToJob,
         });
+        let steps: Vec<StepRecord> = compiled
+            .steps
+            .iter()
+            .map(|s| times.record(s, &step, &reason))
+            .collect();
+        let passed_over = passed_over(&compiled, &steps, &step);
         let kept = self.keep(MissionRecord {
             id: id.clone(),
             hash: compiled.sha256.clone(),
@@ -222,11 +232,7 @@ impl Missions {
             outcome: outcome.as_str().to_owned(),
             failed_step: step.clone(),
             reason: reason.clone(),
-            steps: compiled
-                .steps
-                .iter()
-                .map(|s| times.record(s, &step, &reason))
-                .collect(),
+            steps,
             plan: json!(compiled.plan.steps),
         });
         // A taught skill is judged on its runs, this one included.
@@ -277,7 +283,7 @@ impl Missions {
             &compiled,
             (outcome, &step, &reason),
             elapsed,
-            (&seen, &story, &moves, &camera.lines),
+            (&seen, &story, &moves, &camera.lines, &passed_over),
         );
         if let Some(s) = self.session.get() {
             s.send(Command::Report(report));
@@ -423,6 +429,18 @@ fn outputs_of(result: &Result<GoalResult, RosError>) -> serde_json::Map<String, 
             _ => None,
         })
         .unwrap_or_default()
+}
+
+/// Steps that failed while the mission went on, such as a look that saw nothing: its success
+/// alone would hide what they did not do.
+fn passed_over(compiled: &Compiled, steps: &[StepRecord], failed: &str) -> Vec<String> {
+    compiled
+        .steps
+        .iter()
+        .zip(steps)
+        .filter(|(s, r)| r.outcome == "failure" && s.id != failed)
+        .map(|(s, _)| format!("{} {}", s.id, s.summary))
+        .collect()
 }
 
 /// `(outcome, failed step, reason)` from the executor's result.

@@ -392,7 +392,9 @@ async fn a_plan_runs_and_reports_with_goal_checks() {
             {"name": "s1_GoToPlace", "path": "Mission/s1_GoToPlace", "status": 1},
             {"name": "NavigateToPose", "path": "s1_GoToPlace/NavigateToPose", "status": 1},
             {"name": "s1_GoToPlace", "path": "s1_GoToPlace", "status": 2},
-            {"name": "s1_GoToPlace", "path": "s1_GoToPlace", "status": 0}]})],
+            {"name": "s1_GoToPlace", "path": "s1_GoToPlace", "status": 0},
+            {"name": "s2_PickObject", "path": "Mission/s2_PickObject", "status": 1},
+            {"name": "s2_PickObject", "path": "Mission/s2_PickObject", "status": 3}]})],
         result: Ok(GoalResult {
             status: GoalStatus::Succeeded,
             result: json!({"outcome": 0, "failed_step_id": "", "failure_reason": ""}),
@@ -419,6 +421,10 @@ async fn a_plan_runs_and_reports_with_goal_checks() {
         panic!("not a report")
     };
     assert!(text.contains("ended: success"), "{text}");
+    assert!(
+        text.contains("went on past steps that failed: s2 PickObject"),
+        "an optional step's failure is said: {text}"
+    );
     // The checks come from the steps, not the model's goal list: the pick moves the base, so
     // no at(dock), and the fake's hands never change.
     assert!(
@@ -441,7 +447,9 @@ async fn a_plan_runs_and_reports_with_goal_checks() {
     }
     assert!(seen.iter().any(|e| matches!(e, Event::MissionProgress { step, node, .. } if step == "s1" && node == "NavigateToPose")));
     let last = seen.iter().rev().find_map(|e| match e {
-        Event::MissionProgress { node, status, .. } if node.is_empty() => Some(status.as_str()),
+        Event::MissionProgress {
+            step, node, status, ..
+        } if node.is_empty() && step == "s1" => Some(status.as_str()),
         _ => None,
     });
     assert_eq!(last, Some("success"), "the reset to idle is not reported");

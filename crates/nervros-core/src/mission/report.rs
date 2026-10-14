@@ -19,7 +19,13 @@ impl Missions {
         compiled: &Compiled,
         (outcome, step, reason): (Outcome, &str, &str),
         elapsed: f64,
-        (seen, story, moves, camera): (&Observed, &[String], &[String], &[String]),
+        (seen, story, moves, camera, passed_over): (
+            &Observed,
+            &[String],
+            &[String],
+            &[String],
+            &[String],
+        ),
     ) -> String {
         let mut report = format!(
             "Mission {id} ({}) ended: {outcome} after {elapsed:.0} s.",
@@ -60,6 +66,13 @@ impl Missions {
             }
             if !camera.is_empty() {
                 let _ = write!(report, " Camera check: {}.", camera.join("; "));
+            }
+            if !passed_over.is_empty() {
+                let _ = write!(
+                    report,
+                    " It went on past steps that failed: {}; say what they did not do.",
+                    passed_over.join("; ")
+                );
             }
         } else {
             let n = self.run_failures.fetch_add(1, Ordering::SeqCst) + 1;
