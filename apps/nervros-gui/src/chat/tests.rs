@@ -568,6 +568,38 @@ fn a_denied_plan_says_it_did_not_run() {
 }
 
 #[test]
+fn a_message_said_while_working_shows_once_when_it_starts_a_turn() {
+    let mut chat = Chat::default();
+    chat.apply(&Event::User {
+        turn: 1,
+        text: "Pause.".to_owned(),
+    });
+    chat.apply(&Event::Steer {
+        turn: 1,
+        text: "Resume.".to_owned(),
+    });
+    chat.apply(&Event::Reply {
+        turn: 1,
+        text: "Understood.".to_owned(),
+        model: "m".to_owned(),
+    });
+    // Unread by turn 1, it starts turn 2.
+    chat.apply(&Event::User {
+        turn: 2,
+        text: "Resume.".to_owned(),
+    });
+    let said: Vec<_> = chat
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said, ["Pause.", "Resume."]);
+}
+
+#[test]
 fn arming_first_keeps_the_suggestions() {
     let mut chat = Chat::default();
     chat.apply(&Event::Armed { armed: true });

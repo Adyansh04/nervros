@@ -261,13 +261,22 @@ impl Chat {
     /// Adds the operator's message. A message said mid-turn that the session sends again as a
     /// turn of its own is the same bubble, now a turn's.
     fn push_user(&mut self, text: String, turn: bool) {
-        if turn
-            && let Some(Item::User { text: said, turn }) = self.items.last_mut()
-            && !*turn
-            && *said == text
-        {
-            *turn = true;
-            return;
+        // Said while the agent worked and unread, it starts the next turn: the bubble is the one
+        // already shown, even with the reply that was running drawn after it.
+        if turn {
+            let said = self
+                .items
+                .iter_mut()
+                .rev()
+                .take_while(|i| !matches!(i, Item::User { turn: true, .. }))
+                .find_map(|i| match i {
+                    Item::User { text: said, turn } if !*turn && *said == text => Some(turn),
+                    _ => None,
+                });
+            if let Some(turn) = said {
+                *turn = true;
+                return;
+            }
         }
         self.items.push(Item::User { text, turn });
     }
