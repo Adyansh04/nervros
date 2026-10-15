@@ -150,6 +150,8 @@ pub(crate) struct ChatOptions {
     pub(crate) approve: bool,
     /// A saved conversation to carry on: a path, or `last`.
     pub(crate) resume: Option<String>,
+    /// The only model to talk on.
+    pub(crate) model: Option<String>,
 }
 
 /// A checked plan, each step with how it has gone before, then what may not match the request.
@@ -412,7 +414,7 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
         log_path,
         blobs,
         ..
-    } = nervros_core::app::start_logged(profile_path, state, resume)
+    } = nervros_core::app::start_logged(profile_path, state, resume, options.model.clone())
         .context("starting the agent")?;
     eprintln!(
         "NervROS: {} with tools {}; log {}",

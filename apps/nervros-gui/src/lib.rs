@@ -52,7 +52,7 @@ pub fn run(args: &Args) -> Result<()> {
         events,
         log_path,
         ..
-    } = nervros_core::app::start_logged(&args.profile, &nervros_core::app::state_dir(), None)
+    } = nervros_core::app::start_logged(&args.profile, &nervros_core::app::state_dir(), None, None)
         .context("starting the agent")?;
     let (rec, viewer_input) = nervros_viz::in_process().context("creating the recording")?;
     let bridge = nervros_viz::spawn(

@@ -70,6 +70,9 @@ enum Command {
         /// Carry on a saved conversation: a `.history.json` path, or `last`.
         #[arg(long)]
         resume: Option<String>,
+        /// Talk on this `models.toml` model alone, with no fallback, as an eval's `--models` does.
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Run a suite of requests against the live robot, or with `--robot` a scripted one, each in
     /// a fresh session approving every request, and report which cases did what they expect.
@@ -254,6 +257,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             arm,
             approve,
             resume,
+            model,
         } => {
             robot::chat(
                 &cli.profile,
@@ -263,6 +267,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     arm,
                     approve,
                     resume,
+                    model,
                 },
             )
             .await

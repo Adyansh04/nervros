@@ -728,7 +728,7 @@ nervros-cli --profile my.toml ask "What can you see?" --image frame.jpg
 
 | Command | Does |
 |---|---|
-| `chat` | Chats with the robot; `--say` sends a script of messages and exits |
+| `chat` | Chats with the robot; `--say` sends a script of messages and exits, `--model <id>` talks on one model alone |
 | `ask` | Sends one prompt, optionally with an image, to one role's models |
 | `look`, `segment` | Saves the camera's marks, or the regions a prompt names, as an image |
 | `ros` | Runs one read-only ROS tool with no model: graph, topic sample, interface, TF, parameters, logs |

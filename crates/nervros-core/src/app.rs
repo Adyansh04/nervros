@@ -426,7 +426,8 @@ pub struct LoggedSession {
 }
 
 /// Starts a session on the profile's robot, with the quota ledger, conversation and log under
-/// `state`, carrying on `resume` when given. Must run inside a tokio runtime.
+/// `state`, carrying on `resume` when given, and talking on `model` alone when named. Must run
+/// inside a tokio runtime.
 ///
 /// # Errors
 ///
@@ -436,6 +437,7 @@ pub fn start_logged(
     profile_path: &Path,
     state: &Path,
     resume: Option<crate::llm::History>,
+    model: Option<String>,
 ) -> Result<LoggedSession, StartError> {
     let robot = connect(&Profile::load(profile_path)?)?;
     let logs = state.join("logs");
@@ -443,6 +445,7 @@ pub fn start_logged(
     let files = StartOptions {
         history: Some(logs.join(format!("{name}.history.json"))),
         resume,
+        model,
         ..StartOptions::default()
     };
     let agent = start_with(profile_path, robot, &state.join("quota.json"), files)?;
