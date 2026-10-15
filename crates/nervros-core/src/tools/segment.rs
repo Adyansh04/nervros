@@ -475,8 +475,8 @@ impl SegmentTool {
             format!("nothing matched `{prompt}`; the user sees the frame")
         } else {
             format!(
-                "{} region(s); the user sees the segmented image",
-                listed.len()
+                "{}; the user sees the segmented image",
+                crate::counted(listed.len(), "region")
             )
         };
         out.images.push(snapshot.image.clone());
@@ -492,7 +492,7 @@ impl SegmentTool {
             .outliner
             .as_ref()
             .ok_or("no vision model is set up to segment")?;
-        let frame = camera.newest()?;
+        let frame = camera.newest_soon().await?;
         let img = frame.to_rgb().map_err(|e| e.to_string())?;
         let image = ImageInput::jpeg(&img)?;
         let (answer, model) = outliner.outline(&outline_prompt(prompt), image).await?;

@@ -101,7 +101,7 @@ impl LookTool {
         camera: Option<&str>,
     ) -> Result<Looked, String> {
         let camera = self.cameras.get(camera)?;
-        let newest = camera.newest()?;
+        let newest = camera.newest_soon().await?;
         let (mut dets, frame, age, left_out) = camera.marked(self.robot.as_ref(), newest).await;
         dets.instances.sort_by(|a, b| b.score.total_cmp(&a.score));
         dets.instances.truncate(self.config.max_marks);

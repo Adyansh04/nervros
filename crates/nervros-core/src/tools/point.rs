@@ -161,7 +161,7 @@ impl PointTool {
             return Err("say what to point at in `what`".to_owned());
         }
         let camera = self.cameras.get(args["camera"].as_str())?;
-        let newest = camera.newest()?;
+        let newest = camera.newest_soon().await?;
         // Points are found on the frame the marks were cut from, as look draws them, so they land
         // on the marks they are reported with.
         let (dets, frame, _, _) = camera.marked(self.robot.as_ref(), newest).await;
@@ -194,10 +194,19 @@ impl PointTool {
             .store(jpeg, drawn.dimensions(), frame.stamp_s, marks);
         let mut out = ToolOutcome::ok(json!({"snapshot": snapshot.id, "camera": camera.name,
             "points": listed, "marks": marks_listed, "by": model}));
+        // Said plainly: a model read "did not find the chair" as having pointed at it.
         out.message = if listed.is_empty() {
-            format!("the model did not find {what} in the frame; the user sees the frame")
+            format!(
+                "`{what}` is not in the {} camera's frame: nothing is marked, and nothing \
+                 moved; the user sees the frame",
+                camera.name
+            )
         } else {
-            format!("{} point(s); the user sees them as rings", listed.len())
+            format!(
+                "{} marked in the {} camera's frame, which the user sees as rings; nothing moved",
+                crate::counted(listed.len(), "point"),
+                camera.name
+            )
         };
         out.images.push(snapshot.image.clone());
         Ok(out)
