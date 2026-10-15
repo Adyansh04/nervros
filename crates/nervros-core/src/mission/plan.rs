@@ -841,10 +841,11 @@ fn compile_step<'c>(
         }
         None => skill.max_duration_s,
     };
-    // What later steps take goes under this step's own key, which their arguments name.
-    for out in taken.into_iter().flatten() {
-        if skill.outputs.iter().any(|o| o.name == *out) {
-            ports.push((out.clone(), format!("{{{id}_{out}}}")));
+    // What later steps take goes under this step's own key, which their arguments name. A job
+    // reads what its mission found from the mission's end, so a job's steps hand on everything.
+    for output in &skill.outputs {
+        if author == Author::Job || taken.is_some_and(|t| t.contains(&output.name)) {
+            ports.push((output.name.clone(), format!("{{{id}_{}}}", output.name)));
         }
     }
     if !problems.is_empty() {
@@ -1359,6 +1360,20 @@ mod tests {
             "nothing found at run time is checked afterwards: {:?}",
             c.goal
         );
+    }
+
+    #[test]
+    fn a_jobs_step_hands_on_what_it_finds_with_no_later_step() {
+        // A program's find() is a one-step look, and reads its answer from the mission's end.
+        let p = plan(&json!([{"skill": "FindInView", "args": {"phrase": "red mug"}}]));
+        let job = compile(&p, &catalog_with_outputs(), &world(), Author::Job).unwrap();
+        assert!(
+            job.xml.contains(r#"object_id="{s1_object_id}""#),
+            "{}",
+            job.xml
+        );
+        let asked = compile(&p, &catalog_with_outputs(), &world(), Author::Model).unwrap();
+        assert!(!asked.xml.contains("object_id="), "{}", asked.xml);
     }
 
     #[test]
