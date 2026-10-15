@@ -13,20 +13,35 @@ use serde_json::{Map, Value};
 
 use crate::mission::catalog::Learnable;
 
-/// The body as XML, or what is wrong with it.
+/// The body as XML, or what is wrong with it. `world_args` are the skill's arguments that take a
+/// world-model id.
 ///
 /// # Errors
 ///
 /// Each problem in the tree, by where it is.
-pub fn to_xml(body: &Value, learnable: &Learnable) -> Result<String, Vec<String>> {
+pub fn to_xml(
+    body: &Value,
+    learnable: &Learnable,
+    world_args: &[&str],
+) -> Result<String, Vec<String>> {
     let mut problems = Vec::new();
     let mut xml = String::new();
-    node(body, learnable, "body", &mut xml, &mut problems);
+    let rules = Rules {
+        learnable,
+        world_args,
+    };
+    node(body, &rules, "body", &mut xml, &mut problems);
     if problems.is_empty() {
         Ok(xml)
     } else {
         Err(problems)
     }
+}
+
+/// What a body is checked against: the leaves, and which of the skill's arguments are world ids.
+struct Rules<'a> {
+    learnable: &'a Learnable,
+    world_args: &'a [&'a str],
 }
 
 /// Room for a leaf that moves an arm or the base: a plan and a slow move.
@@ -66,7 +81,8 @@ pub fn least_s(body: &Value, learnable: &Learnable) -> f64 {
     child("force_success")
 }
 
-fn node(v: &Value, learnable: &Learnable, at: &str, xml: &mut String, problems: &mut Vec<String>) {
+fn node(v: &Value, rules: &Rules, at: &str, xml: &mut String, problems: &mut Vec<String>) {
+    let learnable = rules.learnable;
     let Some(fields) = v.as_object() else {
         problems.push(format!(
             "{at}: each node is an object, such as {{\"leaf\": \"Wait\", \"seconds\": 1}}"
@@ -74,7 +90,7 @@ fn node(v: &Value, learnable: &Learnable, at: &str, xml: &mut String, problems: 
         return;
     };
     if let Some(name) = fields.get("leaf") {
-        leaf(name, fields, learnable, at, xml, problems);
+        leaf(name, fields, rules, at, xml, problems);
     } else if let Some(children) = fields.get("sequence").or_else(|| fields.get("fallback")) {
         let tag = if fields.contains_key("sequence") {
             "Sequence"
@@ -87,7 +103,7 @@ fn node(v: &Value, learnable: &Learnable, at: &str, xml: &mut String, problems: 
         };
         let _ = write!(xml, "<{tag}>");
         for (i, child) in children.iter().enumerate() {
-            node(child, learnable, &format!("{at}.{}", i + 1), xml, problems);
+            node(child, rules, &format!("{at}.{}", i + 1), xml, problems);
         }
         let _ = write!(xml, "</{tag}>");
     } else if let Some(attempts) = fields.get("retry") {
@@ -99,7 +115,7 @@ fn node(v: &Value, learnable: &Learnable, at: &str, xml: &mut String, problems: 
                 1
             });
         let _ = write!(xml, "<RetryUntilSuccessful num_attempts=\"{attempts}\">");
-        only_child(fields, learnable, at, xml, problems);
+        only_child(fields, rules, at, xml, problems);
         xml.push_str("</RetryUntilSuccessful>");
     } else if let Some(seconds) = fields.get("timeout_s") {
         let msec = seconds
@@ -115,17 +131,11 @@ fn node(v: &Value, learnable: &Learnable, at: &str, xml: &mut String, problems: 
                 |s| format!("{:.0}", (s * 1000.0).max(1.0)),
             );
         let _ = write!(xml, "<Timeout msec=\"{msec}\">");
-        only_child(fields, learnable, at, xml, problems);
+        only_child(fields, rules, at, xml, problems);
         xml.push_str("</Timeout>");
     } else if let Some(child) = fields.get("force_success") {
         xml.push_str("<ForceSuccess>");
-        node(
-            child,
-            learnable,
-            &format!("{at}.force_success"),
-            xml,
-            problems,
-        );
+        node(child, rules, &format!("{at}.force_success"), xml, problems);
         xml.push_str("</ForceSuccess>");
     } else {
         problems.push(format!(
@@ -136,13 +146,13 @@ fn node(v: &Value, learnable: &Learnable, at: &str, xml: &mut String, problems: 
 
 fn only_child(
     fields: &Map<String, Value>,
-    learnable: &Learnable,
+    rules: &Rules,
     at: &str,
     xml: &mut String,
     problems: &mut Vec<String>,
 ) {
     match fields.get("do") {
-        Some(child) => node(child, learnable, &format!("{at}.do"), xml, problems),
+        Some(child) => node(child, rules, &format!("{at}.do"), xml, problems),
         None => problems.push(format!("{at}: it wraps one node, given as \"do\"")),
     }
 }
@@ -150,14 +160,14 @@ fn only_child(
 fn leaf(
     name: &Value,
     fields: &Map<String, Value>,
-    learnable: &Learnable,
+    rules: &Rules,
     at: &str,
     xml: &mut String,
     problems: &mut Vec<String>,
 ) {
     let name = name.as_str().unwrap_or_default();
-    let Some(known) = learnable.leaves.get(name) else {
-        let names: Vec<&str> = learnable.leaves.keys().map(String::as_str).collect();
+    let Some(known) = rules.learnable.leaves.get(name) else {
+        let names: Vec<&str> = rules.learnable.leaves.keys().map(String::as_str).collect();
         problems.push(format!(
             "{at}: no leaf {name}; a taught skill may use {}",
             names.join(", ")
@@ -191,9 +201,50 @@ fn leaf(
                 continue;
             }
         };
+        if let (Some(takers), Some(arg)) = (&known.world_ids, bound(&text))
+            && rules.world_args.contains(&arg)
+            && !takers.contains(port)
+        {
+            let to = if takers.is_empty() {
+                String::new()
+            } else {
+                format!("; give it to {}", takers.join(" or "))
+            };
+            problems.push(format!(
+                "{at}: {{{arg}}} is a world-model id, and {name}'s {port} takes none{to}"
+            ));
+        }
         let _ = write!(xml, " {port}=\"{}\"", escape(&text));
     }
     xml.push_str("/>");
+    for group in &known.one_of {
+        let set = group
+            .iter()
+            .filter(|p| {
+                fields
+                    .get(p.as_str())
+                    .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+            })
+            .count();
+        let choices = group
+            .iter()
+            .map(|p| match known.ports.get(p).filter(|w| !w.is_empty()) {
+                Some(what) => format!("{p} ({what})"),
+                None => p.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(" or ");
+        match set {
+            0 => problems.push(format!("{at}: {name} needs one of {choices}")),
+            1 => {}
+            _ => problems.push(format!("{at}: {name} takes only one of {choices}")),
+        }
+    }
+}
+
+/// The argument a value names, `{arg}`.
+fn bound(text: &str) -> Option<&str> {
+    text.strip_prefix('{')?.strip_suffix('}')
 }
 
 /// Text as an XML attribute value holds it.
@@ -220,6 +271,7 @@ mod tests {
                 .iter()
                 .map(|p| ((*p).to_owned(), String::new()))
                 .collect(),
+            ..LearnableLeaf::default()
         };
         Learnable {
             leaves: BTreeMap::from([
@@ -242,7 +294,7 @@ mod tests {
             {"timeout_s": 4, "do": {"force_success": {"leaf": "Wait", "seconds": 2}}}
         ]});
         assert_eq!(
-            to_xml(&body, &learnable()).unwrap(),
+            to_xml(&body, &learnable(), &[]).unwrap(),
             "<Sequence><MoveHand arm=\"{arm}\" mode=\"point\" target=\"{object}\"/>\
              <RetryUntilSuccessful num_attempts=\"2\"><Wait seconds=\"1.5\"/></RetryUntilSuccessful>\
              <Timeout msec=\"4000\"><ForceSuccess><Wait seconds=\"2\"/></ForceSuccess></Timeout>\
@@ -251,10 +303,37 @@ mod tests {
     }
 
     #[test]
+    fn a_target_or_a_frame_and_a_world_id_only_as_the_target() {
+        let mut rules = learnable();
+        let hand = rules.leaves.get_mut("MoveHand").unwrap();
+        hand.ports.insert("frame".to_owned(), String::new());
+        hand.one_of = vec![vec!["target".to_owned(), "frame".to_owned()]];
+        hand.world_ids = Some(vec!["target".to_owned()]);
+        let check = |body: Value| to_xml(&body, &rules, &["object"]).map_err(|p| p.join("; "));
+        assert!(check(json!({"leaf": "MoveHand", "arm": "{arm}", "target": "{object}"})).is_ok());
+        assert!(check(json!({"leaf": "MoveHand", "frame": "torso_link"})).is_ok());
+        // As a model taught them on 15 Oct: each failed only once its step ran.
+        let both = check(json!({"leaf": "MoveHand", "target": "{object}", "frame": "map"}));
+        assert!(
+            both.unwrap_err()
+                .contains("takes only one of target or frame")
+        );
+        let none = check(json!({"leaf": "MoveHand", "arm": "{arm}"}));
+        assert!(none.unwrap_err().contains("needs one of target or frame"));
+        let as_frame = check(json!({"leaf": "MoveHand", "frame": "{object}"})).unwrap_err();
+        assert!(
+            as_frame.contains(
+                "{object} is a world-model id, and MoveHand's frame takes none; give it to target"
+            ),
+            "{as_frame}"
+        );
+    }
+
+    #[test]
     fn a_misspelt_leaf_or_input_is_named_with_what_there_is() {
         let body = json!({"sequence": [{"leaf": "PickUp"}, {"leaf": "Wait", "secs": 1},
                                        {"retry": 9, "do": {"leaf": "Wait", "seconds": 1}}]});
-        let problems = to_xml(&body, &learnable()).unwrap_err().join("; ");
+        let problems = to_xml(&body, &learnable(), &[]).unwrap_err().join("; ");
         assert!(
             problems.contains("no leaf PickUp; a taught skill may use MoveHand, Wait"),
             "{problems}"

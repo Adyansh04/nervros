@@ -46,6 +46,13 @@ pub struct LearnableLeaf {
     /// Its inputs: name to what it is for.
     #[serde(default)]
     pub ports: BTreeMap<String, String>,
+    /// Groups of inputs of which a body sets exactly one, such as a target or a frame.
+    #[serde(default)]
+    pub one_of: Vec<Vec<String>>,
+    /// The inputs that take a world-model id, when the executor types them: a `world_id`
+    /// argument may feed only these.
+    #[serde(default)]
+    pub world_ids: Option<Vec<String>>,
 }
 
 /// One skill: a behaviour-tree macro in the executor's library.

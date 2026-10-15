@@ -225,10 +225,21 @@ leaves a taught skill may be built from, each with the authority it takes (`base
 none) and its inputs, and the most such a skill may take and hold:
 
 ```json
-"learnable": {"leaves": {"MoveHand": {"holds": "arms", "ports": {"arm": "'left' or 'right'.", "target": "..."}},
-                         "Wait": {"holds": "", "ports": {"seconds": "How long, 0 to 60 s."}}},
+"learnable": {"leaves": {"MoveHand": {"holds": "arms", "ports": {"arm": "'left' or 'right'.", "target": "...", "frame": "..."},
+                                      "one_of": [["target", "frame"]], "world_ids": ["target"]},
+                         "Wait": {"holds": "", "ports": {"seconds": "How long, 0 to 60 s."}, "world_ids": []}},
               "max_duration_s": 300.0, "max_nodes": 40}
 ```
+
+Two optional rules on a leaf's inputs:
+
+- `one_of`: groups of inputs of which a body sets exactly one, such as a target in the world model
+  or a frame of the robot.
+- `world_ids`: the inputs that take a world-model id. When present, a skill's `world_id` argument
+  may feed only these, so an object's id never goes in as a frame.
+
+NervROS checks both before the operator is asked to approve the teaching; the executor checks them
+again.
 
 The leaves are the executor's choice, and the boundary: each must check every goal it sends
 itself, since a planner's arrangement of them is only as safe as they are. The reference executor

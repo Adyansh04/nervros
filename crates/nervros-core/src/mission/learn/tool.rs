@@ -78,7 +78,14 @@ impl TeachSkill {
                 "`name` is the skill's, such as PointAt",
             ));
         }
-        let xml = body::to_xml(&args["body"], learnable)
+        let world_args: Vec<&str> = args["args"]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .filter(|a| a["type"] == "world_id")
+            .filter_map(|a| a["name"].as_str())
+            .collect();
+        let xml = body::to_xml(&args["body"], learnable, &world_args)
             .map_err(|problems| ToolOutcome::failed(problems.join("; ")))?;
         let args_list: Vec<Value> = args["args"]
             .as_array()
@@ -155,15 +162,30 @@ fn leaf_lines(learnable: &Learnable, explained: bool) -> Vec<String> {
         .leaves
         .iter()
         .map(|(name, leaf)| {
+            let label = |p: &str| {
+                let world = leaf
+                    .world_ids
+                    .as_ref()
+                    .is_some_and(|w| w.iter().any(|x| x == p));
+                let what = leaf.ports.get(p).filter(|w| explained && !w.is_empty());
+                match (world, what) {
+                    (true, Some(what)) => format!("{p} (a world id; {what})"),
+                    (true, None) => format!("{p} (a world id)"),
+                    (false, Some(what)) => format!("{p} ({what})"),
+                    (false, None) => p.to_owned(),
+                }
+            };
+            // A group shows once, where its first input would: "target or frame, exactly one".
             let ports: Vec<String> = leaf
                 .ports
-                .iter()
-                .map(|(p, what)| {
-                    if explained && !what.is_empty() {
-                        format!("{p} ({what})")
-                    } else {
-                        p.clone()
-                    }
+                .keys()
+                .filter_map(|p| match leaf.one_of.iter().find(|g| g.contains(p)) {
+                    Some(g) if g.first() != Some(p) => None,
+                    Some(g) => Some(format!(
+                        "{}, exactly one",
+                        g.iter().map(|x| label(x)).collect::<Vec<_>>().join(" or ")
+                    )),
+                    None => Some(label(p)),
                 })
                 .collect();
             let holds = match leaf.holds.as_str() {
