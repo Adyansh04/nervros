@@ -403,22 +403,38 @@ impl From<&crate::tools::ImageArtifact> for Event {
 /// Whether the operator's message is a plain order to pause the running mission (`Some(true)`)
 /// or to carry on with it (`Some(false)`), which never waits on a model: "pause", "wait", "hold
 /// on"; "resume", "continue", "carry on", "go on". Only while a mission runs: otherwise these are
-/// words for the model.
+/// words for the model, but for those [`only_pause_word`] knows.
 #[must_use]
 pub fn pause_word(text: &str) -> Option<bool> {
-    let text = text
-        .trim()
-        .trim_end_matches(['!', '.'])
-        .trim()
-        .to_lowercase();
-    let text = text.strip_prefix("please ").unwrap_or(&text);
-    match text {
+    match ordered(text).as_str() {
         "pause" | "/pause" | "wait" | "hold on" | "pause the mission" => Some(true),
         "resume" | "/resume" | "continue" | "carry on" | "go on" | "resume the mission" => {
             Some(false)
         }
         _ => None,
     }
+}
+
+/// Whether the words are a pause or a resume and could be nothing else, as "pause" or "resume
+/// the mission" are: the executor answers them even with no mission running, where a model said
+/// "the robot is paused". "Wait" and "go on" stay the model's then.
+#[must_use]
+pub fn only_pause_word(text: &str) -> bool {
+    matches!(
+        ordered(text).as_str(),
+        "pause" | "/pause" | "pause the mission" | "resume" | "/resume" | "resume the mission"
+    )
+}
+
+/// The words of an order, as the matchers compare them: lowercase, "please" and a closing "!"
+/// or "." dropped.
+fn ordered(text: &str) -> String {
+    let text = text
+        .trim()
+        .trim_end_matches(['!', '.'])
+        .trim()
+        .to_lowercase();
+    text.strip_prefix("please ").unwrap_or(&text).to_owned()
 }
 
 /// Whether the operator's message is a plain order to stop, which takes the stop path and never

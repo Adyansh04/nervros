@@ -205,7 +205,8 @@ and the plan card's do the same, as in the clip: the card reads "Paused · start
 the top bar shows **Mission paused**. Time spent paused is not counted in a step's time, and the
 executor ends a mission paused for too long (ten minutes on grove-g1's). The words count only
 while a mission runs and the profile names the executor's pause service (`pause` under
-[`[mission]`](profile.md#mission)); otherwise they go to the model as any others.
+[`[mission]`](profile.md#mission)); otherwise they go to the model as any others, except a plain
+"pause" or "resume", which the executor answers, saying when nothing runs.
 
 ### One step's answer in the next
 

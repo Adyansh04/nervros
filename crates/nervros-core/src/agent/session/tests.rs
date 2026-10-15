@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use super::approval::{Unanswered, take_unanswered};
 use super::config::SessionConfig;
-use super::event::{Command, Event, is_stop_word, pause_word};
+use super::event::{Command, Event, is_stop_word, only_pause_word, pause_word};
 use super::*;
 use crate::guard::{Guard, Policy};
 use crate::llm::{AgentBuilder, AgentSource, History, LlmError};
@@ -927,6 +927,13 @@ fn plain_words_pause_and_resume_and_sentences_go_to_the_model() {
         "go",
     ] {
         assert_eq!(pause_word(text), None, "{text}");
+    }
+    // Only these mean a mission whatever runs; "wait" and "go on" may be talk.
+    for word in ["Pause.", "please resume", "pause the mission"] {
+        assert!(only_pause_word(word), "{word}");
+    }
+    for word in ["wait", "go on", "continue", "hold on"] {
+        assert!(!only_pause_word(word), "{word}");
     }
 }
 

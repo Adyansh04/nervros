@@ -31,7 +31,7 @@ use actor::actor;
 use approval::Asked;
 pub use approval::{Unanswered, take_unanswered};
 pub use config::{EVENT_BACKLOG, PULSE_PERIOD, Pulse, SessionConfig};
-pub use event::{Command, Event, NotApproved, is_stop_word, pause_word};
+pub use event::{Command, Event, NotApproved, is_stop_word, only_pause_word, pause_word};
 
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)

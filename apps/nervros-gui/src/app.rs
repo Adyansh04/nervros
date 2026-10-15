@@ -620,11 +620,11 @@ impl Gui {
             self.agent.session.send(Command::StopMission);
             return;
         }
-        // Only on a mission that can take it: otherwise "wait" or "go on" is for the model.
+        // Only on a mission that can take it: otherwise "wait" or "go on" is for the model, and a
+        // plain "pause" for the executor, which says what there is to pause.
         if let Some(on) = nervros_core::session::pause_word(text)
-            && self.chat.can_pause
-            && self.mission_running()
-            && on != self.mission_paused()
+            && ((self.chat.can_pause && self.mission_running() && on != self.mission_paused())
+                || nervros_core::session::only_pause_word(text))
         {
             self.pause(on, "chat");
             return;
