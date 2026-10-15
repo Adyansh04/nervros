@@ -278,6 +278,10 @@ impl Tool for Plans {
 
     async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
         let observe = args["action"].as_str() == Some("list");
+        // Before the operator is asked: "saves the plan \"\"" was approved, then failed.
+        if !observe && args["name"].as_str().is_none_or(|n| n.trim().is_empty()) {
+            return Some(Err(ToolOutcome::failed("`name` is what to call the plan")));
+        }
         Some(Ok(Assessment {
             risk: if observe {
                 Risk::Observe
