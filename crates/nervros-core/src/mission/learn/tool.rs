@@ -215,11 +215,17 @@ impl Tool for TeachSkill {
                 args["name"].as_str().unwrap_or_default()
             ))),
             Some("define") => self.request(args, false).await.map(|request| {
+                let description = request["description"].as_str().unwrap_or_default().trim();
+                // Models write the description without a full stop, and a sentence follows it.
+                let stop = if description.ends_with(['.', '!', '?']) {
+                    ""
+                } else {
+                    "."
+                };
                 annotate(format!(
-                    "teaches the robot {}: {} It is tried, with your approval, in the next \
-                     mission that uses it",
+                    "teaches the robot {}: {description}{stop} It is tried, with your approval, \
+                     in the next mission that uses it",
                     request["name"].as_str().unwrap_or_default(),
-                    request["description"].as_str().unwrap_or_default()
                 ))
             }),
             _ => Err(ToolOutcome::failed("`action` is define, list or forget")),
