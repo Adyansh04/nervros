@@ -185,7 +185,11 @@ fn timeline(recording: &Recording) -> Vec<String> {
             } else {
                 String::new()
             };
-            format!("-{:.0} s {text}{again}", (recording.at_s - t).max(0.0))
+            // In words: a model read "-2 s detector_head stopped" as "-2 seconds ago".
+            format!(
+                "{:.0} s before: {text}{again}",
+                (recording.at_s - t).max(0.0)
+            )
         })
         .collect()
 }
@@ -311,9 +315,9 @@ mod tests {
         assert_eq!(
             incident.timeline,
             [
-                "-60 s mission m1 started",
-                "-45 s ERROR nav: No path (x2)",
-                "-10 s ERROR nav: Aborted"
+                "60 s before: mission m1 started",
+                "45 s before: ERROR nav: No path (x2)",
+                "10 s before: ERROR nav: Aborted"
             ]
         );
     }

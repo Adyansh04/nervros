@@ -167,7 +167,7 @@ mod tests {
                 causes: Vec::new(),
                 ruled_out: vec![verdict("Stale shared memory", "head camera: 0.0 Hz")],
                 unchecked: Vec::new(),
-                timeline: vec!["-4 s head camera went quiet: 0.0 Hz, from 15.0 Hz".into()],
+                timeline: vec!["4 s before: head camera went quiet: 0.0 Hz, from 15.0 Hz".into()],
             },
             Incident {
                 id: "i2".into(),
@@ -182,9 +182,9 @@ mod tests {
                 ruled_out: vec![verdict("The robot fell", "tilt_deg is 2.1")],
                 unchecked: Vec::new(),
                 timeline: vec![
-                    "-48 s mission m7 started".into(),
-                    "-20 s WARN controller_server: Failed to make progress (x3)".into(),
-                    "-2 s mission m7 ended, failure at s1: the goal was aborted".into(),
+                    "48 s before: mission m7 started".into(),
+                    "20 s before: WARN controller_server: Failed to make progress (x3)".into(),
+                    "2 s before: mission m7 ended, failure at s1: the goal was aborted".into(),
                 ],
             },
         ];

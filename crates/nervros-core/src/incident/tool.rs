@@ -249,7 +249,7 @@ mod tests {
             }],
             ruled_out: Vec::new(),
             unchecked: Vec::new(),
-            timeline: (0..20).map(|i| format!("-{i} s line")).collect(),
+            timeline: (0..20).map(|i| format!("{i} s before: line")).collect(),
         }
     }
 
@@ -260,7 +260,7 @@ mod tests {
         assert_eq!(out.data["opened"], "2 min ago");
         assert_eq!(out.data["likely_causes"][0]["procedure"], "lost-on-the-map");
         assert_eq!(out.data["timeline"].as_array().unwrap().len(), TIMELINE);
-        assert_eq!(out.data["timeline"][0], "-5 s line");
+        assert_eq!(out.data["timeline"][0], "5 s before: line");
     }
 
     #[test]
