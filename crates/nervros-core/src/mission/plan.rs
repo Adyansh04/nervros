@@ -1056,7 +1056,9 @@ fn go_to_place<'c>(
     let Some(place) = arg(&step.args, "place") else {
         return Err(Problem::new(id, "place", "GoToPlace needs `place`"));
     };
-    let same = |a: &str| a.eq_ignore_ascii_case(place);
+    // "living room" is canopy's living_room, and "dining table side" the dining_table_side place.
+    let words = |a: &str| a.replace('_', " ");
+    let same = |a: &str| words(a).eq_ignore_ascii_case(&words(place));
     let named = world
         .places
         .iter()
@@ -1069,10 +1071,27 @@ fn go_to_place<'c>(
         };
         return Ok((skill, vec![(port(skill, "station"), station)], spot));
     }
-    let mut target = world
+    let rooms: Vec<&Thing> = world
         .rooms
         .iter()
-        .find(|r| r.id == place || same(&r.name))
+        .filter(|r| r.id == place || same(&r.name))
+        .collect();
+    // Two rooms can be the same thing, two bedrooms: which one is not for the planner to guess.
+    if let [_, _, ..] = rooms.as_slice() {
+        let ids: Vec<&str> = rooms.iter().map(|r| r.id.as_str()).collect();
+        return Err(Problem::new(
+            id,
+            "place",
+            format!(
+                "`{place}` could be {} rooms ({}); use one id, as list_places gives it",
+                rooms.len(),
+                ids.join(", ")
+            ),
+        ));
+    }
+    let mut target = rooms
+        .first()
+        .copied()
         .or_else(|| world.objects.iter().find(|o| o.id == place));
     // "the sofa": an object by what it is, when only one object is that.
     if target.is_none() {
@@ -1359,6 +1378,21 @@ mod tests {
             c.goal.iter().all(|g| !g.contains('{')),
             "nothing found at run time is checked afterwards: {:?}",
             c.goal
+        );
+    }
+
+    #[test]
+    fn a_room_two_rooms_share_the_name_of_is_not_guessed() {
+        let walk = plan(&json!([{"skill": "GoToPlace", "args": {"place": "Kitchen"}}]));
+        let mut w = world();
+        let one = compile(&walk, &catalog(), &w, Author::Model).unwrap();
+        assert!(one.xml.contains(r#"target="R2""#), "{}", one.xml);
+        w.rooms.push(thing("R7", "kitchen", -3.0, 2.0));
+        let two = compile(&walk, &catalog(), &w, Author::Model).unwrap_err();
+        assert!(
+            two.iter()
+                .any(|p| p.message.contains("could be 2 rooms (R2, R7)")),
+            "{two:?}"
         );
     }
 

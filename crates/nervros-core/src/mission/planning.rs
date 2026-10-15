@@ -141,7 +141,7 @@ impl Missions {
     /// What the plan compiler knows: places, rooms and objects with their positions, where the
     /// robot is and what it holds.
     fn world_of(&self, seen: &Observed) -> World {
-        let things = |msg: &Value, list: &str, name: &str, at: &str| -> Vec<Thing> {
+        let things = |msg: &Value, list: &str, name: fn(&Value) -> &str, at: &str| {
             msg[list]
                 .as_array()
                 .map(|items| {
@@ -149,16 +149,15 @@ impl Missions {
                         .iter()
                         .filter(|o| o["state"].as_u64() != Some(2))
                         .map(|o| {
-                            let text = |k: &str| o[k].as_str().unwrap_or_default().to_owned();
                             let p = o.pointer(at);
                             let xy = p.and_then(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)));
                             Thing {
-                                id: text("id"),
-                                name: text(name),
+                                id: o["id"].as_str().unwrap_or_default().to_owned(),
+                                name: name(o).to_owned(),
                                 xy,
                             }
                         })
-                        .collect()
+                        .collect::<Vec<Thing>>()
                 })
                 .unwrap_or_default()
         };
@@ -168,8 +167,8 @@ impl Missions {
             .collect();
         World {
             places: self.places.all(),
-            rooms: things(&seen.rooms, "rooms", "name", "/centroid"),
-            objects: things(&seen.objects, "objects", "label", "/pose/position"),
+            rooms: things(&seen.rooms, "rooms", room_name, "/centroid"),
+            objects: things(&seen.objects, "objects", object_name, "/pose/position"),
             robot: seen.pose,
             holding,
         }
@@ -639,4 +638,13 @@ impl Missions {
             state,
         }
     }
+}
+
+/// A room canopy only numbered ("room D") goes by what it is, so "the office" finds it.
+fn room_name(room: &Value) -> &str {
+    crate::places::room_label(room).unwrap_or_default()
+}
+
+fn object_name(object: &Value) -> &str {
+    object["label"].as_str().unwrap_or_default()
 }
