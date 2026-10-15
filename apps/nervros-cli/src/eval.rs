@@ -186,7 +186,7 @@ pub(crate) async fn run(
 async fn robot_for(profile: &Profile, files: &[PathBuf]) -> Result<Arc<dyn RobotPort>> {
     if files.is_empty() {
         let robot = nervros_core::app::connect(profile)?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
         return Ok(robot);
     }
     scripted_robot(files)

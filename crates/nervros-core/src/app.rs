@@ -114,6 +114,30 @@ pub fn state_dir() -> PathBuf {
     )
 }
 
+/// Waits until discovery stops adding to the graph, at most `most`. A node that has just started
+/// sees only part of it for seconds: over UDP a one-shot command saw 40 of 150 topics after 2 s.
+pub async fn settled(robot: &dyn RobotPort, most: std::time::Duration) {
+    use std::time::Duration;
+    const POLL: Duration = Duration::from_millis(250);
+    // Unchanged this long: discovery adds a participant's names in bursts, a few hundred ms apart.
+    const STEADY: u32 = 6;
+    let deadline = tokio::time::Instant::now() + most;
+    let (mut last, mut steady) = (None, 0);
+    while tokio::time::Instant::now() < deadline {
+        // A robot that cannot list its graph has nothing to wait for.
+        let Ok(g) = robot.graph_detail().await else {
+            return;
+        };
+        let size = Some((g.topics.len(), g.services.len(), g.nodes.len()));
+        steady = if size == last { steady + 1 } else { 0 };
+        if steady >= STEADY {
+            return;
+        }
+        last = size;
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// Starts the ROS node after checking the environment matches the profile; the environment
 /// decides, because ROS reads it when the node starts.
 ///

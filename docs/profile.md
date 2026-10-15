@@ -91,7 +91,7 @@ that never came up.
 | `domain_id` | `0` | Must equal `ROS_DOMAIN_ID`, which ROS reads when the node starts; the agent refuses to start otherwise. |
 | `transport` | `default` | `udp` turns Fast DDS shared memory off, for a graph run by another user, such as a root container: shared memory between users fails without an error. The agent then needs `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`, which `scripts/ros-env.sh` exports with `NERVROS_UDP_ONLY=1`. |
 | `node_name` | `nervros` | The agent's node. |
-| `discovery_timeout` | `"20s"` | How long `nervros-cli doctor` waits for the graph, at most 5 s. |
+| `discovery_timeout` | `"20s"` | The longest a `nervros-cli` command waits for discovery to settle before it reads the graph. |
 | `interfaces` | none | Where interface packages are: an install prefix such as `/opt/ros/jazzy`, or a package's source directory. Tool schemas come from these. |
 | `remap` | none | Path prefixes to rewrite, for an install tree whose links point at another machine's paths. |
 | `map_frame` | `map` | The frame of places and poses. |

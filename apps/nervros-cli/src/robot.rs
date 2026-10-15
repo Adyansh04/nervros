@@ -2,7 +2,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use nervros_core::look::LookTool;
@@ -67,8 +66,6 @@ pub(crate) async fn segment(
 
 /// Calls an image tool once, prints its data and saves its image.
 async fn run_once(tool: &dyn Tool, args: serde_json::Value, out: &Path) -> Result<()> {
-    // Frames and discovery need a moment after the node starts.
-    tokio::time::sleep(Duration::from_secs(2)).await;
     let name = tool.spec().name.clone();
     let outcome = tool.call(args).await;
     if outcome.status != Status::Succeeded {
@@ -119,8 +116,7 @@ pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<(
             rule.reason
         );
     }
-    // Discovery needs a moment after the node starts.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
     let risk = match tool.assess(&args).await {
         Some(Ok(a)) => a.risk,
         Some(Err(out)) => bail!("{name}: {}", out.message),
@@ -437,8 +433,7 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
     if options.arm {
         agent.session.send(SessionCommand::Arm);
     }
-    // Discovery and the camera need a moment after the node starts.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    nervros_core::app::settled(agent.robot.as_ref(), agent.profile.ros.discovery_timeout).await;
     if !options.say.is_empty() {
         return say_all(&agent, &mut events, options.say, options.approve, &blobs).await;
     }
@@ -537,7 +532,7 @@ async fn interactive(
 pub(crate) async fn doctor(profile_path: &Path) -> Result<()> {
     let profile = Profile::load(profile_path).context("loading the profile")?;
     let robot = nervros_core::app::connect(&profile)?;
-    tokio::time::sleep(profile.ros.discovery_timeout.min(Duration::from_secs(5))).await;
+    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
     let checks = nervros_core::doctor::run(&profile, robot.as_ref()).await;
     for c in &checks {
         println!("{} {}", if c.ok { "ok     " } else { "MISSING" }, c.what);
@@ -553,7 +548,7 @@ pub(crate) async fn doctor(profile_path: &Path) -> Result<()> {
 pub(crate) async fn why(profile_path: &Path) -> Result<()> {
     let profile = Profile::load(profile_path).context("loading the profile")?;
     let robot = nervros_core::app::connect(&profile)?;
-    tokio::time::sleep(profile.ros.discovery_timeout.min(Duration::from_secs(5))).await;
+    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
     let (file, remembered) =
         nervros_core::app::incident_files(&profile, &nervros_core::app::state_dir());
     let investigator =
@@ -574,8 +569,7 @@ pub(crate) async fn why(profile_path: &Path) -> Result<()> {
 pub(crate) async fn whoami(profile_path: &Path, only_facts: bool) -> Result<()> {
     let profile = Profile::load(profile_path).context("loading the profile")?;
     let robot = nervros_core::app::connect(&profile)?;
-    // Discovery needs a moment after the node starts.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
     let facts = nervros_core::whoami::facts(&profile, robot.as_ref()).await;
     if only_facts {
         println!("{}", serde_json::to_string_pretty(&facts)?);
