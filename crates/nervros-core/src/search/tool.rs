@@ -296,8 +296,8 @@ impl Tool for SearchTool {
                     risk: Risk::Motion,
                     resources: Vec::new(),
                     reason: format!(
-                        "searches for \"{}\" on its own, for at most {} min: it walks to {} and \
-                         looks",
+                        "searches for \"{}\" on its own, for at most {} min, looking at each \
+                         place it walks to: {}",
                         plan.what,
                         plan.minutes.clamp(1, MAX_MINUTES),
                         describe(&plan)
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(assessed.risk, Risk::Motion);
         assert!(
             assessed.reason.starts_with(
-                "searches for \"the red mug\" on its own, for at most 10 min: it walks to O7 (a mug was seen there 2 min ago), then R2"
+                "searches for \"the red mug\" on its own, for at most 10 min, looking at each place it walks to: O7 (a mug was seen there 2 min ago), then R2"
             ),
             "{}",
             assessed.reason
