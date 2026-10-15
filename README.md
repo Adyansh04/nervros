@@ -19,7 +19,7 @@ turns what you ask into missions. You check and approve each one before anything
 > **Start with the [guide](docs/guide.md).** It shows every feature in a short clip from a real run,
 > with the exact words typed and what came back.
 
-https://github.com/user-attachments/assets/dc4712e6-81cc-4f7a-b986-baae0cda8bf9
+https://github.com/user-attachments/assets/0c9381e1-ae1e-4391-a63d-53ef5df6179c
 
 *A simulated Unitree G1 fetches a mug: the plan, the approval, then the walk, the pick and the
 place, sped up four times while the robot works.*

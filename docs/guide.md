@@ -61,7 +61,7 @@ cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 
 ## Asking what it sees
 
-https://github.com/user-attachments/assets/84720295-ae66-47d6-a6be-060d07b3e0eb
+https://github.com/user-attachments/assets/ea9c76e9-0ab1-49e5-8326-06d29deee212
 
 > **You:** What can you see right now?
 >
@@ -87,7 +87,7 @@ and how many objects it holds. Then it lists the named places.
 
 ### Pointing and outlining
 
-https://github.com/user-attachments/assets/f32f4b9b-bd5e-4961-a186-ebc9150aff91
+https://github.com/user-attachments/assets/520b0f75-001f-45a2-a9c7-51a8ac6cbfc0
 
 > **You:** Point at the tray.
 >
@@ -110,7 +110,7 @@ plan reach you, as a card to approve.
 
 ### Walking somewhere
 
-https://github.com/user-attachments/assets/34cf6674-b1e5-4dec-81d7-1bfdb72a0d9f
+https://github.com/user-attachments/assets/7cf1cd95-a8dc-4519-a4cf-155976221887
 
 > **You:** Walk to the bedroom, room R3.
 
@@ -126,7 +126,7 @@ report> Mission 01a0feba (Walk to the bedroom, room R3) ended: success after 24 
 
 ### A short one, and the plan check
 
-https://github.com/user-attachments/assets/a0839b5c-ef27-43ef-b483-2c50629f3e90
+https://github.com/user-attachments/assets/88c9effd-38af-4ce4-96c6-d5887d5ca9fb
 
 > **You:** Turn left 90 degrees.
 
@@ -145,7 +145,7 @@ If the model sends the same plan again, the concern stays on the card with a one
 
 ### Fetching something
 
-https://github.com/user-attachments/assets/dc4712e6-81cc-4f7a-b986-baae0cda8bf9
+https://github.com/user-attachments/assets/0c9381e1-ae1e-4391-a63d-53ef5df6179c
 
 > **You:** Bring the small white mug from the dining table to the tray on the office desk.
 
@@ -179,7 +179,7 @@ talking while a mission runs.
 
 ### Stopping
 
-https://github.com/user-attachments/assets/8a2d0caa-46ec-472e-8664-ebf82297b63b
+https://github.com/user-attachments/assets/d3111b11-fab2-429c-a8fb-b387522f74d1
 
 > **You:** Walk to the office, room R4.
 >
@@ -202,7 +202,7 @@ report> Mission 01a0febc (Walk to the office, room R4) ended: canceled after 9 s
 
 ### Pausing
 
-https://github.com/user-attachments/assets/d6e4dc59-a2c3-4b54-87cb-25c1abc4c190
+https://github.com/user-attachments/assets/7bf2d1ef-5c5e-4873-b48f-7222fd3dc6f3
 
 > **You:** Walk to the living room, room R1.
 >
@@ -232,7 +232,7 @@ The window's **Pause** button and the plan card's do the same, as in the clip: t
 
 ### One step's answer in the next
 
-https://github.com/user-attachments/assets/9b4cfc4f-5355-43bb-a4c8-de9aff755d4a
+https://github.com/user-attachments/assets/99be5972-bc7b-457b-ae5c-feb447bf00e3
 
 > **You:** Walk to the red mug, look for a mug there, and pick up the one you find with your left
 > hand.
@@ -276,7 +276,7 @@ kind the argument takes.
 
 ### Counting, looping and measuring
 
-<!-- video: Counting and walking with a program.mp4 -->
+https://github.com/user-attachments/assets/c46fbd2f-89fd-4069-83ee-c0dcf27b8c6f
 
 > **You:** Count the chairs in every room.
 >
@@ -342,7 +342,7 @@ again, and each run is approved again.
 
 ### Finding something
 
-<!-- video: Finding something.mp4 -->
+https://github.com/user-attachments/assets/51157255-5ddb-487b-b77f-5181f9481dd7
 
 > **You:** Where could my keys be? Don't move.
 >
@@ -376,7 +376,7 @@ clip it saw the red mug at the first place.
 
 ### Teaching it a skill
 
-<!-- video: Teaching a skill.mp4 -->
+https://github.com/user-attachments/assets/4e1bf457-9f63-498c-b293-d18661542491
 
 > **You:** Point at the red mug with your right hand.
 >
@@ -413,7 +413,7 @@ uses it. The Mission tab lists the taught skills, each with what it was taught f
 
 ## Clicking in the 3D view
 
-https://github.com/user-attachments/assets/a6f03d25-e631-441d-940b-dda37a833435
+https://github.com/user-attachments/assets/bfe51e79-41ec-4697-a017-dfaefe0bfd26
 
 Click a room, an object or a point on the floor in the 3D view. It lights up, and a bar above the
 message box offers what the agent can do with it. **Go there** plans the walk at once, for you to
@@ -429,7 +429,7 @@ frames the whole map.
 
 ## Commands without the model
 
-https://github.com/user-attachments/assets/4fdabfda-5e5e-4c1d-a830-6af4db0a406b
+https://github.com/user-attachments/assets/e8cce4e9-8e55-47d8-9585-80c6ae21a2d4
 
 Ctrl+K opens the command palette: type a few letters and press Enter. Every command also works as
 a `/word` typed in the chat. Most need no model: they open a tab, change the view or stop the
@@ -456,7 +456,7 @@ robot. `/look`, `/places` and `/explore` send their request to the agent. In the
 
 ## Driving by hand
 
-https://github.com/user-attachments/assets/5b176fdf-aa97-401b-9e44-2cf031865379
+https://github.com/user-attachments/assets/e6edf6ef-67c4-441b-a0b9-3381bf94d3ed
 
 The Robot tab shows whether the robot is upright, where it is and in which room, what each hand
 holds, and its motors and battery when the robot reports them.
@@ -468,7 +468,7 @@ Driving needs the robot armed.
 
 ## Keeping an eye on it
 
-https://github.com/user-attachments/assets/891d3213-9841-4bc5-9f79-a09c3a4be631
+https://github.com/user-attachments/assets/d5717403-34a7-4bb5-bd64-cc8ebdc6eeef
 
 > **You:** Tell me if the chest camera's images drop below 5 Hz.
 >
@@ -515,7 +515,7 @@ so it asks every time; a parameter change can be allowed for the rest of the ses
 
 ## When something goes wrong
 
-<!-- video: When something goes wrong.mp4 -->
+https://github.com/user-attachments/assets/eb499b8c-4e19-487d-939e-51b98aa5eefa
 
 > **You:** Why can't the robot find anything with its head camera?
 >
@@ -555,7 +555,7 @@ The investigator only reads: it never moves the robot.
 
 ## Remembering
 
-https://github.com/user-attachments/assets/60e89e67-063b-417f-920d-92c33ad09105
+https://github.com/user-attachments/assets/4e948469-2f78-470e-b5e3-1755cc7346aa
 
 > **You:** Remember this spot as the charging spot.
 >
@@ -573,7 +573,7 @@ history.
 
 ## Keeping it out of places
 
-https://github.com/user-attachments/assets/696fc57c-44bb-4984-a8cc-5d2f2e68e7ce
+https://github.com/user-attachments/assets/3df05f4a-344a-4d54-a824-6ecfa8bebf57
 
 > **You:** Keep the robot out of the bedroom.
 >
@@ -609,7 +609,7 @@ approve every time.
 
 ## The robot's self-description
 
-https://github.com/user-attachments/assets/cdadbd00-b26b-4e14-a006-65d56f2dea02
+https://github.com/user-attachments/assets/32d93917-9227-47be-83e7-5b408e125657
 
 The persona tells the model what the robot is. **Draft from the robot** in the Doctor tab, or
 `nervros-cli whoami`, writes a new one from the robot as it is now: the executor's skills as the
@@ -622,7 +622,7 @@ The routine model drafts it in the current persona's style, into `<persona>.draf
 
 ## Mapping a new building
 
-https://github.com/user-attachments/assets/90340180-66da-4bc3-a7d9-b2e6a1f24c7b
+https://github.com/user-attachments/assets/7c772eab-a4a0-4b78-a464-bbe55f937ab0
 
 > **You:** Explore the building to fill in the map.
 
@@ -653,7 +653,7 @@ until you save, and a save reaches the running world model at once.
 
 ### In the editor
 
-https://github.com/user-attachments/assets/c1385c2b-85c4-4dec-961d-4a33d173f93c
+https://github.com/user-attachments/assets/0c4ec282-3535-4302-8221-021d0d24642a
 
 **Edit world** in the top bar (or `/edit`) puts the editor in place of the 3D view: the floor plan
 with every room and object, and in the dock the selection and a list to review, most doubtful
@@ -678,7 +678,7 @@ On the plan:
 
 ### In the chat
 
-https://github.com/user-attachments/assets/4606a6ec-f39d-44b3-a4ec-c19bbd7f3b64
+https://github.com/user-attachments/assets/fce54439-64e5-45ef-8697-3ad88ba75b84
 
 > **You:** Review the new map. What needs a second look?
 >
