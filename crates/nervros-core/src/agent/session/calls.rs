@@ -169,7 +169,10 @@ impl Shared {
             NotApproved::Denied => {
                 // Only a no: a request nobody answered may be asked again.
                 lock(&self.denied).insert(request);
-                "the operator did not approve this, so nothing ran and nothing waits".to_owned()
+                // "did not approve" read as "not yet": qwen answered "once approved, it will turn".
+                "the operator said no: it did not run, and it is not waiting for approval. Tell \
+                 them it was not done"
+                    .to_owned()
             }
             NotApproved::Disarmed => "the robot was disarmed while this waited for approval, so \
                                       nothing ran and nothing waits"
