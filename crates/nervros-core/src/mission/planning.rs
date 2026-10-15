@@ -450,15 +450,20 @@ impl Missions {
             );
         }
         // The problems first: what a reader of the first line most needs.
+        let fix = if count == 1 {
+            "Fix it".to_owned()
+        } else {
+            format!("Fix all {count} problems")
+        };
         let mut message = if lines.is_empty() {
             format!(
-                "the plan has {count} problem(s); fix them all and call run_mission again \
-                 (attempt {n} of {MAX_PLAN_ATTEMPTS})"
+                "the plan has {}. {fix} and call run_mission again (attempt {n} of \
+                 {MAX_PLAN_ATTEMPTS})",
+                crate::counted(count, "problem")
             )
         } else {
             format!(
-                "{}. Fix all {count} problem(s) and call run_mission again (attempt {n} of \
-                 {MAX_PLAN_ATTEMPTS})",
+                "{}. {fix} and call run_mission again (attempt {n} of {MAX_PLAN_ATTEMPTS})",
                 lines.iter().take(2).cloned().collect::<Vec<_>>().join("; ")
             )
         };
