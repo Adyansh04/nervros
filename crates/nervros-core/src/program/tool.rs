@@ -82,11 +82,12 @@ impl ProgramTool {
         }
         let approval = Approval::of(envelope.clone(), &catalog);
         let lines = source.lines().filter(|l| !l.trim().is_empty()).count();
+        let s = if lines == 1 { "" } else { "s" };
         Ok(Assessment {
             risk: envelope.risk(&catalog),
             resources: Vec::new(),
             reason: format!(
-                "runs the program \"{title}\" ({lines} lines) on its own: it {}",
+                "runs the program \"{title}\" ({lines} line{s}) on its own: it {}",
                 approval.text
             ),
             args: Some(json!({"action": "run", "title": title, "source": source,
