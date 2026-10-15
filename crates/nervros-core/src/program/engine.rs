@@ -78,14 +78,14 @@ pub fn engine(
     e
 }
 
-/// Runs a program to its end; its last value, as text.
+/// Runs a program to its end; its last value, as text, or `None` when that was `()`.
 ///
 /// # Errors
 ///
 /// It failed, ran out of operations, or was stopped, said as the model can act on.
-pub fn run(engine: &Engine, ast: &AST) -> Result<String, String> {
+pub fn run(engine: &Engine, ast: &AST) -> Result<Option<String>, String> {
     match engine.eval_ast::<Dynamic>(ast) {
-        Ok(value) => Ok(result_text(&value)),
+        Ok(value) => Ok((!value.is_unit()).then(|| result_text(&value))),
         Err(e) => Err(match *e {
             EvalAltResult::ErrorTerminated(..) => "it was stopped".to_owned(),
             EvalAltResult::ErrorTooManyOperations(_) => {
@@ -99,11 +99,22 @@ pub fn run(engine: &Engine, ast: &AST) -> Result<String, String> {
     }
 }
 
+/// The result of a program that ended on `()`. That is also "found nothing", as a search loop
+/// that never set its answer ("done" read as success), and what it said last may be the answer.
+#[must_use]
+pub fn nothing(last_said: Option<&str>) -> String {
+    match last_said {
+        Some(said) => format!(
+            "nothing: its last value was (); the last thing it said was \"{}\"",
+            crate::tools::clip(said, MAX_RESULT)
+        ),
+        None => "nothing: its last value was ()".to_owned(),
+    }
+}
+
 /// A program's result as the operator and the model read it.
 fn result_text(value: &Dynamic) -> String {
-    let text = if value.is_unit() {
-        "done".to_owned()
-    } else if let Some(s) = value.read_lock::<rhai::ImmutableString>() {
+    let text = if let Some(s) = value.read_lock::<rhai::ImmutableString>() {
         s.to_string()
     } else {
         rhai::serde::from_dynamic::<serde_json::Value>(value)
@@ -186,7 +197,9 @@ mod tests {
 
     fn run_on(fake: &Arc<Fake>, source: &str) -> Result<String, String> {
         let host: Arc<dyn Host> = Arc::clone(fake) as Arc<dyn Host>;
-        run(&engine(&host, &callable(), || false), &compile(source)?)
+        let value = run(&engine(&host, &callable(), || false), &compile(source)?)?;
+        let said = fake.said.lock().unwrap().last().cloned();
+        Ok(value.unwrap_or_else(|| nothing(said.as_deref())))
     }
 
     #[test]
@@ -218,6 +231,21 @@ mod tests {
             "a skill called by its name"
         );
         assert_eq!(fake.said.lock().unwrap().as_slice(), ["kitchen has 1"]);
+    }
+
+    #[test]
+    fn a_program_that_ends_on_nothing_says_so() {
+        // A search loop that never set its answer must not read as having found something.
+        let fake = Arc::new(Fake::default());
+        assert_eq!(
+            run_on(&fake, "let found = (); found").unwrap(),
+            "nothing: its last value was ()"
+        );
+        // Its answer can be what it said, as a loop that says where it found the mug.
+        assert_eq!(
+            run_on(&fake, r#"say("Found a mug at the dining table!");"#).unwrap(),
+            r#"nothing: its last value was (); the last thing it said was "Found a mug at the dining table!""#
+        );
     }
 
     #[test]

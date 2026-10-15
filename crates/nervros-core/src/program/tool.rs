@@ -117,11 +117,12 @@ impl ProgramTool {
         let (missions, frames) = (Arc::clone(&self.missions), self.frames.clone());
         let work = move |ctx: crate::job::Context| async move {
             let runtime = tokio::runtime::Handle::current();
-            let host: Arc<dyn api::Host> =
-                Arc::new(RobotHost::new(missions, ctx.clone(), runtime, frames));
+            let robot = Arc::new(RobotHost::new(missions, ctx.clone(), runtime, frames));
+            let host: Arc<dyn api::Host> = Arc::clone(&robot) as Arc<dyn api::Host>;
             tokio::task::spawn_blocking(move || {
                 let engine = engine::engine(&host, &skills, move || ctx.stopped());
-                engine::run(&engine, &ast)
+                let value = engine::run(&engine, &ast)?;
+                Ok(value.unwrap_or_else(|| engine::nothing(robot.last_said().as_deref())))
             })
             .await
             .map_err(|e| format!("the program's thread failed: {e}"))?

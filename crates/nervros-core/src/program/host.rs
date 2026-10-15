@@ -1,13 +1,14 @@
 //! The robot a program runs on: the world model and the robot port read through the missions,
 //! and every skill run as one mission of the program's job.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
 use super::api::Host;
 use crate::job::Context;
+use crate::lock;
 use crate::mission::{Missions, Outcome};
 
 /// How long a read waits for a first message.
@@ -28,6 +29,7 @@ pub struct RobotHost {
     runtime: tokio::runtime::Handle,
     /// The map frame and the robot's base frame, for `pose`.
     frames: (String, String),
+    last_said: Mutex<Option<String>>,
 }
 
 impl RobotHost {
@@ -44,7 +46,14 @@ impl RobotHost {
             ctx,
             runtime,
             frames,
+            last_said: Mutex::default(),
         }
+    }
+
+    /// The last line the program said.
+    #[must_use]
+    pub fn last_said(&self) -> Option<String> {
+        lock(&self.last_said).clone()
     }
 
     /// A topic the profile lets programs read, and its type; `whole` when it is read message by
@@ -159,6 +168,7 @@ impl Host for RobotHost {
     }
 
     fn say(&self, text: &str) {
+        *lock(&self.last_said) = Some(text.to_owned());
         self.ctx.log(text);
     }
 }
