@@ -347,9 +347,12 @@ pub(super) async fn run_turn(
                     source.set_back(&model, setback);
                 }
                 if !flags.acted.load(Ordering::SeqCst) {
-                    shared.emit(Event::Notice {
-                        text: format!("{e}; trying the next model"),
-                    });
+                    // With no model after it, the turn's own error says this once.
+                    if !candidates.as_slice().is_empty() {
+                        shared.emit(Event::Notice {
+                            text: format!("{e}; trying the next model"),
+                        });
+                    }
                     failures.push(e.to_string());
                     continue;
                 }
