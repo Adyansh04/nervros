@@ -134,15 +134,22 @@ impl Gui {
                 ui.label(RichText::new(&s.id).monospace().color(theme::FAINT));
                 ui.vertical(|ui| {
                     ui.add(egui::Label::new(&s.intent).wrap());
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(when).small().color(theme::DIM));
-                        if ui
-                            .add(ReButton::new("Cancel").small().secondary())
-                            .clicked()
-                        {
-                            cancel = Some(s.id.clone());
-                        }
-                    });
+                    // A long "when ..." beside the button squeezed it to a letter a line too.
+                    theme::row(
+                        ui,
+                        |ui| {
+                            if ui
+                                .add(ReButton::new("Cancel").small().secondary())
+                                .clicked()
+                            {
+                                cancel = Some(s.id.clone());
+                            }
+                        },
+                        |ui| {
+                            ui.label(RichText::new(&when).small().color(theme::DIM))
+                                .on_hover_text(&when);
+                        },
+                    );
                 });
             });
         }
