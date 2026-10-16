@@ -453,6 +453,15 @@ async fn say_all(
 ) -> Result<()> {
     for text in say {
         println!("you> {text}");
+        // A `/` command or a stop word is the session's, as typed in a chat, not the model's.
+        match parse_line(&text) {
+            Some(SessionCommand::User(_)) => {}
+            Some(cmd) => {
+                agent.session.send(cmd);
+                continue;
+            }
+            None => continue,
+        }
         agent.session.send(SessionCommand::User(text.clone()));
         let mut exchange = nervros_core::evalcase::Exchange::default();
         loop {
