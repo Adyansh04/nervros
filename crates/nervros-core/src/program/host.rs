@@ -30,6 +30,7 @@ pub struct RobotHost {
     /// The map frame and the robot's base frame, for `pose`.
     frames: (String, String),
     last_said: Mutex<Option<String>>,
+    skills_run: std::sync::atomic::AtomicUsize,
 }
 
 impl RobotHost {
@@ -47,7 +48,14 @@ impl RobotHost {
             runtime,
             frames,
             last_said: Mutex::default(),
+            skills_run: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many skills the program has run.
+    #[must_use]
+    pub fn skills_run(&self) -> usize {
+        self.skills_run.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The last line the program said.
@@ -110,6 +118,8 @@ impl Host for RobotHost {
     fn run(&self, skill: &str, args: Value) -> Result<Value, String> {
         let steps = json!([{"skill": skill, "args": args}]);
         let intent = format!("{skill} for program {}", self.ctx.id());
+        self.skills_run
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.ctx.log(format!("running {skill}"));
         let end = self
             .runtime

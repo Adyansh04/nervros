@@ -117,6 +117,7 @@ impl ProgramTool {
         };
         let minutes = args["max_minutes"].as_u64().unwrap_or(DEFAULT_MINUTES);
         let approval = Approval::of(Envelope::new(named, minutes), &catalog);
+        let moves = approval.moves;
         let (missions, frames) = (Arc::clone(&self.missions), self.frames.clone());
         let work = move |ctx: crate::job::Context| async move {
             let runtime = tokio::runtime::Handle::current();
@@ -125,7 +126,14 @@ impl ProgramTool {
             tokio::task::spawn_blocking(move || {
                 let engine = engine::engine(&host, &skills, move || ctx.stopped());
                 let value = engine::run(&engine, &ast)?;
-                Ok(value.unwrap_or_else(|| engine::nothing(robot.last_said().as_deref())))
+                let text = value.unwrap_or_else(|| engine::nothing(robot.last_said().as_deref()));
+                // A loop over rooms() in an unmapped building walks nowhere, and a model then
+                // told the operator it had walked through every room.
+                Ok(if moves && robot.skills_run() == 0 {
+                    format!("{text}; it ran no skill, so the robot did not move")
+                } else {
+                    text
+                })
             })
             .await
             .map_err(|e| format!("the program's thread failed: {e}"))?
@@ -223,7 +231,9 @@ fn spec() -> ToolSpec {
              \"count the mugs in every room\", \"which room has the most chairs?\", \"walk to each \
              room and look for a cup\", \"time five walks of 2 m\". Counting or listing what the \
              world model knows needs no walking: use objects() and rooms(); walk and find only \
-             when the operator wants the camera to check. A mission ends at its first failed \
+             when the operator wants the camera to check. Not for exploring or mapping: rooms() \
+             lists only the rooms already mapped, so plan a mission with the robot's own skill \
+             for that. A mission ends at its first failed \
              step, so a look that finds nothing would end a walk through several rooms: to look \
              in each place whatever each look finds, write a program. Write Rhai, which is not JavaScript: end \
              every statement with `;`, an empty map is `#{{}}` (never `{{}}`), a map is \
