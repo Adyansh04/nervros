@@ -236,7 +236,8 @@ Two optional rules on a leaf's inputs:
 - `one_of`: groups of inputs of which a body sets exactly one, such as a target in the world model
   or a frame of the robot.
 - `world_ids`: the inputs that take a world-model id. When present, a skill's `world_id` argument
-  may feed only these, so an object's id never goes in as a frame.
+  may feed only these, so an object's id never goes in as a frame, and a literal there must name
+  something the world model knows, so a frame of the robot never goes in as an object.
 
 NervROS checks both before the operator is asked to approve the teaching; the executor checks them
 again.

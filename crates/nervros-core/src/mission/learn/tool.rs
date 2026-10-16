@@ -87,6 +87,31 @@ impl TeachSkill {
             .collect();
         let xml = body::to_xml(&args["body"], learnable, &world_args)
             .map_err(|problems| ToolOutcome::failed(problems.join("; ")))?;
+        // "torso_link" as MoveHand's target failed only once it ran: a literal where a world-model
+        // id goes must name something the world model knows.
+        let literals = body::world_literals(&args["body"], learnable);
+        if !literals.is_empty() {
+            let seen = self.0.observe().await;
+            let unknown: Vec<String> = literals
+                .iter()
+                .filter(|l| !knows(&seen.objects, &l.value))
+                .map(|l| {
+                    let instead = if l.instead.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", or give it as {}", l.instead.join(" or "))
+                    };
+                    format!(
+                        "`{}` for {}'s {} names nothing in the world model: give an object it \
+                         knows, or one of the skill's arguments{instead}",
+                        l.value, l.leaf, l.input
+                    )
+                })
+                .collect();
+            if !unknown.is_empty() {
+                return Err(ToolOutcome::failed(unknown.join("; ")));
+            }
+        }
         let args_list: Vec<Value> = args["args"]
             .as_array()
             .map_or(&[][..], Vec::as_slice)
@@ -144,6 +169,28 @@ impl TeachSkill {
             Err(why) => ToolOutcome::failed(why),
         }
     }
+}
+
+/// Whether the world model's `objects` (a `WorldObjectArray`) holds something `value` names: an
+/// id, or a label one of its words is ("the red mug"). With no objects at all, nothing is known
+/// either way, and it passes.
+fn knows(objects: &Value, value: &str) -> bool {
+    let Some(list) = objects["objects"].as_array().filter(|l| !l.is_empty()) else {
+        return true;
+    };
+    let words = |text: &str| -> Vec<String> {
+        text.split(|c: char| !c.is_ascii_alphabetic())
+            .filter(|w| w.len() > 2)
+            .map(str::to_ascii_lowercase)
+            .collect()
+    };
+    let asked = words(value);
+    list.iter().any(|o| {
+        o["id"].as_str() == Some(value)
+            || o["label"]
+                .as_str()
+                .is_some_and(|l| words(l).iter().any(|w| asked.contains(w)))
+    })
 }
 
 /// The skill's time: what the model asked, raised to what its leaves need at least, within the

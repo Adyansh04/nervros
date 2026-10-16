@@ -247,6 +247,61 @@ fn bound(text: &str) -> Option<&str> {
     text.strip_prefix('{')?.strip_suffix('}')
 }
 
+/// A literal given where a leaf takes a world-model id: the leaf, the input, the value, and the
+/// inputs it could have gone in instead (its `one_of` group).
+pub(crate) struct WorldLiteral {
+    pub leaf: String,
+    pub input: String,
+    pub value: String,
+    pub instead: Vec<String>,
+}
+
+/// Every literal in the body that goes where a leaf takes a world-model id, to check against the
+/// world model before the operator is asked.
+pub(crate) fn world_literals(body: &Value, learnable: &Learnable) -> Vec<WorldLiteral> {
+    let mut out = Vec::new();
+    collect(body, learnable, &mut out);
+    out
+}
+
+fn collect(v: &Value, learnable: &Learnable, out: &mut Vec<WorldLiteral>) {
+    let Some(fields) = v.as_object() else { return };
+    if let Some(name) = fields.get("leaf").and_then(Value::as_str) {
+        let Some(leaf) = learnable.leaves.get(name) else {
+            return;
+        };
+        for input in leaf.world_ids.iter().flatten() {
+            if let Some(value) = fields.get(input).and_then(Value::as_str)
+                && bound(value).is_none()
+                && !value.trim().is_empty()
+            {
+                let instead = leaf
+                    .one_of
+                    .iter()
+                    .filter(|g| g.contains(input))
+                    .flatten()
+                    .filter(|p| *p != input)
+                    .cloned()
+                    .collect();
+                out.push(WorldLiteral {
+                    leaf: name.to_owned(),
+                    input: input.clone(),
+                    value: value.to_owned(),
+                    instead,
+                });
+            }
+        }
+        return;
+    }
+    for child in fields.values() {
+        match child {
+            Value::Array(items) => items.iter().for_each(|i| collect(i, learnable, out)),
+            Value::Object(_) => collect(child, learnable, out),
+            _ => {}
+        }
+    }
+}
+
 /// Text as an XML attribute value holds it.
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
