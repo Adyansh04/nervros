@@ -80,11 +80,15 @@ impl Condition {
                     value: args["value"].clone(),
                 })
             }
-            "text" => args["contains"]
-                .as_str()
-                .filter(|t| !t.is_empty())
-                .map(|t| Self::Text(t.to_lowercase()))
-                .ok_or_else(|| "text needs `contains`".to_owned()),
+            "text" => match args["contains"].as_str().filter(|t| !t.is_empty()) {
+                None => Err("text needs `contains`".to_owned()),
+                // qwen wrote "bt_navigator.*begin.*navigate", which plain text never matches.
+                Some(t) if [".*", ".+", "\\"].iter().any(|p| t.contains(p)) => Err(format!(
+                    "`contains` is plain text, not a pattern, so `{t}` would never match: give \
+                     a few words of the message itself, such as \"begin navigating\""
+                )),
+                Some(t) => Ok(Self::Text(t.to_lowercase())),
+            },
             other => Err(format!(
                 "`condition` is rate_below, value or text, not `{other}`"
             )),
@@ -595,7 +599,7 @@ fn watch_spec() -> ToolSpec {
             "field": {"type": "string", "description": "For value: a dotted path into the message."},
             "op": {"type": "string", "enum": ["<", "<=", ">", ">=", "==", "!="]},
             "value": {"description": "For value: what to compare with."},
-            "contains": {"type": "string", "description": "For text."},
+            "contains": {"type": "string", "description": "For text: words of the message as the log words them, in any case; plain text, not a pattern. log_tail shows how a node words its lines."},
             "say": {"type": "string", "description": "What the report should add, such as what to do then."},
             "repeat": {"type": "boolean", "description": "true for \"each time\", \"every time\" or \"whenever\": report each time it comes back. Otherwise it reports once and ends."},
             "for_s": {"type": "integer", "minimum": 1, "maximum": MAX_FOR_S, "description": "How long to watch (1800)."}
@@ -723,6 +727,7 @@ mod tests {
             err(json!({"condition": "value", "field": "x", "op": "~", "value": 1})).contains("op")
         );
         assert!(err(json!({"condition": "soon"})).contains("rate_below"));
+        assert!(err(json!({"condition": "text", "contains": "a.*b"})).contains("plain text"));
         assert_eq!(
             Condition::parse(&json!({"condition": "text", "contains": "ERROR"})).unwrap(),
             Condition::Text("error".into())
