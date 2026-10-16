@@ -21,7 +21,7 @@ use crate::tools::{Status, ToolOutcome};
 impl Missions {
     /// Runs an approved plan, unless a mission runs or this one just failed the same way.
     pub(super) async fn run(self: &Arc<Self>, args: &Value) -> ToolOutcome {
-        let compiled = match self.find(args["hash"].as_str().unwrap_or_default()) {
+        let mut compiled = match self.find(args["hash"].as_str().unwrap_or_default()) {
             Ok(c) => c,
             Err(e) => return ToolOutcome::refused(e),
         };
@@ -42,12 +42,30 @@ impl Missions {
         {
             return refusal;
         }
+        let message = if by == By::Operator {
+            // An edit in the window keeps the plan's name, and the model told what it had planned:
+            // the steps that run name the mission, here and in its report.
+            let steps: Vec<String> = compiled
+                .steps
+                .iter()
+                .map(|s| format!("{} {}", s.id, s.summary))
+                .collect();
+            compiled.plan.intent = format!("the operator's steps: {}", steps.join("; "));
+            format!(
+                "the operator set these steps themselves, in place of any you planned: {}. The \
+                 mission is running; a report follows when it ends. Tell the operator it started, \
+                 saying what these steps do, not what was first asked for.",
+                steps.join("; ")
+            )
+        } else {
+            "the mission is running; a report follows when it ends. Tell the operator it started."
+                .to_owned()
+        };
         match self.launch(compiled, Reported::ToModel).await {
             Ok(id) => ToolOutcome {
                 status: Status::Accepted,
                 data: json!({"mission_id": id}),
-                message: "the mission is running; a report follows when it ends. Tell the operator it started."
-                    .to_owned(),
+                message,
                 images: Vec::new(),
             },
             Err(e) => ToolOutcome::failed(e),
