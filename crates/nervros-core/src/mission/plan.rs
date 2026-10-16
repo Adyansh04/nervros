@@ -1057,8 +1057,7 @@ fn go_to_place<'c>(
         return Err(Problem::new(id, "place", "GoToPlace needs `place`"));
     };
     // "living room" is canopy's living_room, and "dining table side" the dining_table_side place.
-    let words = |a: &str| a.replace('_', " ");
-    let same = |a: &str| words(a).eq_ignore_ascii_case(&words(place));
+    let same = |a: &str| crate::places::same_words(a, place);
     let named = world
         .places
         .iter()
