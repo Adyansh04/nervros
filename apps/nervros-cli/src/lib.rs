@@ -337,7 +337,13 @@ async fn models(profile: &Path, check: bool) -> Result<()> {
     let now = SystemTime::now();
     let config = router.config();
     for role in Role::ALL {
-        println!("{}: {}", role.name(), config.roles.chain(role).join(" > "));
+        let chain = config.roles.chain(role);
+        let models = if chain.is_empty() {
+            "none".to_owned()
+        } else {
+            chain.join(" > ")
+        };
+        println!("{}: {models}", role.name());
     }
     for model in &config.models {
         println!(

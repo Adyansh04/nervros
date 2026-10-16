@@ -22,6 +22,7 @@ pub(crate) use agent::{argcheck, context};
 pub use agent::{evalcase, guard, log, session};
 pub(crate) use config::secret;
 pub use config::{profile, schemas};
+pub use mission::check::how_long;
 pub(crate) use mission::schedule;
 pub use model::{llm, providers};
 pub use tools::places::room_label;

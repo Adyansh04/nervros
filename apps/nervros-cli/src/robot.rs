@@ -129,7 +129,10 @@ pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<(
     if !outcome.message.is_empty() {
         eprintln!("{}", outcome.message);
     }
-    println!("{}", serde_json::to_string_pretty(&outcome.data)?);
+    // A failure carries no data: its message says it all.
+    if !outcome.data.is_null() {
+        println!("{}", serde_json::to_string_pretty(&outcome.data)?);
+    }
     if outcome.status != Status::Succeeded {
         bail!("{name} did not succeed");
     }

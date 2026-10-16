@@ -117,30 +117,36 @@ fn describe(e: &Value) -> Option<String> {
     })
 }
 
-fn open_ledger(profile: &Path) -> Result<std::sync::Arc<Ledger>> {
+/// The robot's mission ledger, or `None`, said, when it has run none yet: an empty record is not
+/// an error.
+fn open_ledger(profile: &Path) -> Result<Option<std::sync::Arc<Ledger>>> {
     let profile = Profile::load(profile).context("loading the profile")?;
     let path = nervros_core::app::mission_ledger_file(&profile, &nervros_core::app::state_dir());
     if !path.exists() {
-        bail!("no missions recorded yet ({})", path.display());
+        println!("no missions recorded yet ({})", path.display());
+        return Ok(None);
     }
-    Ledger::open(&path).with_context(|| format!("opening {}", path.display()))
+    Ledger::open(&path)
+        .map(Some)
+        .with_context(|| format!("opening {}", path.display()))
 }
 
 /// The latest missions, or one in full by its id.
 pub fn missions(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
-    let ledger = open_ledger(profile)?;
+    let Some(ledger) = open_ledger(profile)? else {
+        return Ok(());
+    };
     let now = nervros_core::now_s();
     let list = match id {
         Some(id) => ledger.mission(id)?,
         None => ledger.recent(limit)?,
     };
     for m in &list {
-        let ago = (now - m.started) / 60.0;
         println!(
-            "{} {:.0} min ago: {} ({}, {:.0} s)",
+            "{} {} ago: {} ({}, {:.0} s)",
             // A version 7 id begins with its millisecond: this much tells missions apart.
             &m.id[..m.id.len().min(13)],
-            ago,
+            nervros_core::how_long(now - m.started),
             m.intent,
             m.outcome,
             m.ended - m.started
@@ -173,17 +179,23 @@ pub fn missions(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
 
 /// The requests no skill could do, newest first.
 pub fn gaps(profile: &Path, limit: usize) -> Result<()> {
-    let ledger = open_ledger(profile)?;
+    let Some(ledger) = open_ledger(profile)? else {
+        return Ok(());
+    };
     let now = nervros_core::now_s();
-    for g in ledger.gaps(limit)? {
+    let gaps = ledger.gaps(limit)?;
+    if gaps.is_empty() {
+        println!("no skill gaps: every request so far had a skill for it");
+    }
+    for g in gaps {
         let nearest = if g.nearest.is_empty() {
             String::new()
         } else {
             format!(" (nearest: {})", g.nearest)
         };
         println!(
-            "{:.0} min ago: \"{}\": {}{nearest}",
-            (now - g.at) / 60.0,
+            "{} ago: \"{}\": {}{nearest}",
+            nervros_core::how_long(now - g.at),
             g.request,
             g.reason
         );
@@ -209,9 +221,9 @@ pub fn incidents(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
     }
     for i in all.iter().rev().take(limit) {
         println!(
-            "{} {:.0} min ago: {}",
+            "{} {} ago: {}",
             i.id,
-            (now - i.opened_s) / 60.0,
+            nervros_core::how_long(now - i.opened_s),
             i.headline()
         );
     }

@@ -335,7 +335,8 @@ pub(crate) fn words_of(name: &str) -> String {
 }
 
 /// A duration for people: "40 s", "12 min", "3 h", "5 days".
-pub(crate) fn how_long(seconds: f64) -> String {
+#[must_use]
+pub fn how_long(seconds: f64) -> String {
     match seconds {
         s if s < 90.0 => format!("{s:.0} s"),
         s if s < 90.0 * 60.0 => format!("{:.0} min", s / 60.0),
