@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::llm::{ImageFormat, ImageInput};
 use crate::look::Eyes;
 use crate::profile::EditorConfig;
-use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
+use crate::tools::{Assessment, Risk, Tool, ToolOutcome, ToolSpec};
 use crate::vision::SnapshotStore;
 
 /// The ops `edit_world` passes on, as the editor names them.
@@ -33,6 +33,72 @@ pub const OPS: [&str; 13] = [
     "room_name",
     "room_check",
 ];
+
+/// What each op must name, as the editor requires it; the values it checks itself. Checked before
+/// anyone is asked to approve.
+fn needs(op: &str) -> &'static [&'static str] {
+    match op {
+        "label" | "name" | "check" | "box" | "split" | "delete" => &["id"],
+        "remove" | "restore" => &["ids"],
+        "merge" => &["into", "ids"],
+        "room_type" | "room_name" | "room_check" => &["room"],
+        _ => &[],
+    }
+}
+
+/// What is wrong with one edit before the editor sees it: a missing field, or a room's id where
+/// an object's goes, which the editor answered with a bare Python error, three times running.
+fn edit_problem(edit: &Value) -> Option<String> {
+    let op = edit["op"].as_str().unwrap_or_default();
+    if let Some(missing) = needs(op).iter().find(|f| edit[**f].is_null()) {
+        return Some(format!(
+            "{op} needs {}: `{missing}` is missing",
+            needs(op).join(", ")
+        ));
+    }
+    let room_id = |v: &Value| {
+        v.as_str()
+            .and_then(|s| s.strip_prefix('R'))
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    };
+    let names_room = room_id(&edit["id"])
+        || edit["ids"]
+            .as_array()
+            .is_some_and(|i| i.iter().any(room_id));
+    if !op.starts_with("room_") && names_room {
+        let room_op = match op {
+            "name" => " with room_name (room, name)",
+            "label" => " with room_type (room, type)",
+            "check" => " with room_check (room, checked)",
+            _ => "",
+        };
+        return Some(format!(
+            "{op} takes an object such as O12, and a room is changed{room_op}"
+        ));
+    }
+    None
+}
+
+/// An edit in words, for the approval.
+fn edit_words(edit: &Value) -> String {
+    let s = |k: &str| {
+        edit[k]
+            .as_str()
+            .map_or_else(|| edit[k].to_string(), str::to_owned)
+    };
+    match edit["op"].as_str().unwrap_or_default() {
+        "label" => format!("labels {} \"{}\"", s("id"), s("label")),
+        "name" => format!("names {} \"{}\"", s("id"), s("name")),
+        "room_type" => format!("makes {} a {}", s("room"), s("type")),
+        "room_name" => format!("names {} \"{}\"", s("room"), s("name")),
+        "remove" => format!("removes {}", s("ids")),
+        "restore" => format!("restores {}", s("ids")),
+        "merge" => format!("merges {} into {}", s("ids"), s("into")),
+        "delete" => format!("deletes {}", s("id")),
+        "add" => format!("adds a {}", s("label")),
+        op => format!("{op} {}", s("id")),
+    }
+}
 
 /// How long a call may take; the editor answers from memory, a save writes a few files.
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -553,8 +619,8 @@ impl EditWorld {
             "applied": edits.len(), "created": created, "unsaved_edits": world["unsaved"],
         }));
         out.message = format!(
-            "{} edit(s) applied, not saved: world_edits saves them",
-            edits.len()
+            "{} applied, not saved: world_edits saves them",
+            crate::counted(edits.len(), "edit")
         );
         Ok(out)
     }
@@ -564,6 +630,23 @@ impl EditWorld {
 impl Tool for EditWorld {
     fn spec(&self) -> Cow<'_, ToolSpec> {
         Cow::Borrowed(&self.spec)
+    }
+
+    /// The edits checked and said in words, before the operator is asked.
+    async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
+        let edits = args["edits"].as_array()?;
+        if let Some(why) = edits.iter().find_map(edit_problem) {
+            return Some(Err(ToolOutcome::failed(why)));
+        }
+        Some(Ok(Assessment {
+            risk: Risk::Annotate,
+            resources: Vec::new(),
+            reason: format!(
+                "edits the world model: {}",
+                edits.iter().map(edit_words).collect::<Vec<_>>().join("; ")
+            ),
+            args: None,
+        }))
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
