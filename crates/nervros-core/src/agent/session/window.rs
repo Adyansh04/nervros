@@ -123,10 +123,15 @@ pub(super) async fn compact(
     if history.size() > room / 2 {
         history.squeeze(room / 2);
     }
+    let asked = !matches!(how, Condense::ToFit);
+    // A fit that freed nothing is not news; the operator's own request always hears back.
+    if !summarised && history.size() >= before && !asked {
+        return;
+    }
     shared.emit(Event::Compacted {
         before: u64::try_from(before).unwrap_or(u64::MAX),
         after: u64::try_from(history.size()).unwrap_or(u64::MAX),
         summarised,
-        asked: !matches!(how, Condense::ToFit),
+        asked,
     });
 }
