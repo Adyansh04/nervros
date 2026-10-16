@@ -123,6 +123,11 @@ pub fn room_label(room: &serde_json::Value) -> Option<&str> {
     if placeholder { kind.or(name) } else { name }
 }
 
+/// Two names for one thing: "living room" and canopy's `living_room`, in any case.
+pub(crate) fn same_words(a: &str, b: &str) -> bool {
+    a.replace('_', " ").eq_ignore_ascii_case(&b.replace('_', " "))
+}
+
 /// Lowercase letters, digits and underscores.
 pub(crate) fn slug(text: &str) -> String {
     let name: String = text

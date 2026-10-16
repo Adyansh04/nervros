@@ -53,6 +53,9 @@ fn hint(error: &str, source: &str) -> &'static str {
         "; end every statement with ;"
     } else if error.contains("Unknown operator: '?'") {
         "; Rhai has no ?: , write if c { a } else { b }"
+    } else if error.contains("Function not found: range (i64)") {
+        // Python's range(3), which a model wrote twice in a row.
+        "; Rhai counts with 0..3 or range(0, 3), never range(3)"
     } else if error.contains("Function not found") || error.contains("Property not found") {
         "; the robot's functions are objects, rooms, places, pose, walk, find, run, read, rate, \
          tf, wait and say, a list counts with .len(), and a value cannot be called"
