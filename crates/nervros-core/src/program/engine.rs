@@ -216,6 +216,7 @@ mod tests {
                 let id = find("mug");
                 run("PickObject", #{object_id: id, arm: "right"});
                 PickObject(id);
+                PickObject();
             }
             counts
         "#;
@@ -225,7 +226,13 @@ mod tests {
         let skills: Vec<&str> = ran.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(
             skills,
-            ["GoToPlace", "FindInView", "PickObject", "PickObject"]
+            [
+                "GoToPlace",
+                "FindInView",
+                "PickObject",
+                "PickObject",
+                "PickObject"
+            ]
         );
         assert_eq!(ran[2].1, json!({"object_id": "mug_4", "arm": "right"}));
         assert_eq!(
@@ -233,6 +240,7 @@ mod tests {
             json!({"object_id": "mug_4"}),
             "a skill called by its name"
         );
+        assert_eq!(ran[4].1, json!({}), "a skill called with nothing");
         assert_eq!(fake.said.lock().unwrap().as_slice(), ["kitchen has 1"]);
     }
 

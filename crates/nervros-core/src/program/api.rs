@@ -73,8 +73,9 @@ pub const REFERENCE: &str = "objects(words) and objects(words, room) -> [#{id, l
      room, x, y, z, state, last_seen_s}]; rooms() -> [#{id, name, type, x, y, area, seen}]; \
      places() -> [#{name, x, y}]; pose() -> #{x, y, yaw}; walk(place) -> true once there (a place, \
      room or object id, or words); find(words) -> the id the detector reports, or () when it sees \
-     none; any skill by its name, such as PickObject(#{object_id: id, arm: \"right\"}) or \
-     PickObject(id), or run(\"Skill\", #{args}), -> #{ok, outcome, reason, outputs}; read(topic) -> \
+     none; any skill by its name, such as PickObject(#{object_id: id, arm: \"right\"}), \
+     PickObject(id) or TuckForTravel(), or run(\"Skill\", #{args}), -> #{ok, outcome, reason, \
+     outputs}; read(topic) -> \
      the newest message; rate(topic, seconds) -> Hz; tf(parent, child) -> #{x, y, z, yaw}; \
      wait(seconds); say(text) tells the operator. The last value is the program's result.";
 
@@ -178,6 +179,11 @@ pub fn register(engine: &mut Engine, host: &Arc<dyn Host>, skills: &[SkillCall])
         );
         engine.register_fn(&skill.name, move |value: &str| -> Fallible {
             to_dynamic(h.run(&name, json!({ arg.as_str(): value })))
+        });
+        // ExploreBuilding() takes nothing: approved as a skill it ran, it then failed as no function.
+        let (h, name) = (Arc::clone(host), skill.name.clone());
+        engine.register_fn(&skill.name, move || -> Fallible {
+            to_dynamic(h.run(&name, json!({})))
         });
     }
     let h = Arc::clone(host);
