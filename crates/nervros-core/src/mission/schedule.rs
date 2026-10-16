@@ -555,6 +555,22 @@ impl ScheduleTool {
     }
 }
 
+impl ScheduleTool {
+    /// A plan that does its one step as many times as the schedule runs it: "turn left 10
+    /// degrees, three times in all" once became three turns a run, three runs.
+    fn counted_twice(&self, hash: &str, times: u64) -> Option<ToolOutcome> {
+        let c = self.schedules.missions.find(hash).ok()?;
+        let same = c.steps.windows(2).all(|w| w[0].summary == w[1].summary);
+        (times > 1 && c.steps.len() == usize::try_from(times).ok()? && same).then(|| {
+            ToolOutcome::refused(format!(
+                "the schedule runs it {times} times, and each run does `{}` {times} times over: \
+                 give the plan that step once",
+                c.steps[0].summary
+            ))
+        })
+    }
+}
+
 #[async_trait]
 impl Tool for ScheduleTool {
     fn spec(&self) -> Cow<'_, ToolSpec> {
@@ -626,6 +642,9 @@ impl Tool for ScheduleTool {
                 Err(problems) => return Some(Err(problems)),
             },
         };
+        if let Some(twice) = self.counted_twice(&hash, times) {
+            return Some(Err(twice));
+        }
         if let Some(trigger) = trigger {
             let for_min = args["for_min"]
                 .as_u64()
