@@ -189,10 +189,10 @@ fn announce(shared: &Shared, turn: u64, origin: Origin) -> String {
     }
 }
 
-/// One model's go at the turn, asked once more when busy: its result, the history it leaves and
-/// the tokens it used.
+/// One model's go at the turn, asked again a little later when busy, and again for longer when no
+/// model is left after it: its result, the history it leaves and the tokens it used.
 async fn ask(
-    model: &str,
+    (model, last): (&str, bool),
     (shared, source, flags): (&Arc<Shared>, &Arc<dyn AgentSource>, &Arc<TurnFlags>),
     (turn, text, tools): (u64, &str, &[LoopTool]),
     history: &History,
@@ -200,7 +200,7 @@ async fn ask(
     let system = preamble(shared);
     // The reasoning in the history is the last turn's model's, and only it takes it back.
     let theirs = lock(&shared.answered_by).as_deref() != Some(model);
-    let mut retried = false;
+    let mut tries = 0;
     loop {
         let mut updated = history.clone();
         if theirs {
@@ -218,16 +218,24 @@ async fn ask(
             delta: Some(deltas(shared, turn, &answered)),
         };
         let result = llm::chat(model, Arc::clone(source), setup, &mut updated, text).await;
-        // A busy provider often answers a moment later: once more, while nothing came back or was
-        // done that a second try would repeat.
+        // A busy provider often answers a moment later: again, waiting longer each time, while
+        // nothing came back or was done that a try would repeat. A 503 spike outlasted one 2 s wait.
         let busy = matches!(&result, Err(e) if e.setback() == Some(llm::Setback::Busy));
+        let allowed = if last { llm::BUSY_BACKOFF.len() } else { 1 };
         if busy
-            && !retried
+            && tries < allowed
+            && let Some(wait) = llm::BUSY_BACKOFF.get(tries)
             && !answered.load(Ordering::Relaxed)
             && !flags.acted.load(Ordering::SeqCst)
         {
-            retried = true;
-            tokio::time::sleep(llm::BUSY_RETRY).await;
+            // The first quick try goes unsaid; a longer wait is the operator's to know of.
+            if tries > 0 {
+                shared.emit(Event::Notice {
+                    text: format!("{model} is busy; asking again in {} s", wait.as_secs()),
+                });
+            }
+            tries += 1;
+            tokio::time::sleep(*wait).await;
             continue;
         }
         return (result, updated, used.load(Ordering::Relaxed));
@@ -312,8 +320,9 @@ pub(super) async fn run_turn(
             continue;
         };
         let window = source.context(&model);
+        let last = candidates.as_slice().is_empty();
         let (result, mut updated, used) = ask(
-            &model,
+            (&model, last),
             (&shared, &source, &flags),
             (turn, &text, &tools),
             &history,
