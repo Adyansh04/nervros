@@ -86,7 +86,7 @@ impl Missions {
     }
 
     /// The catalog, fetched once and kept.
-    pub(super) async fn catalog(&self) -> Result<Arc<Catalog>, String> {
+    pub(crate) async fn catalog(&self) -> Result<Arc<Catalog>, String> {
         if let Some(c) = lock(&self.catalog).clone() {
             return Ok(c);
         }
@@ -141,7 +141,7 @@ impl Missions {
     /// What the plan compiler knows: places, rooms and objects with their positions, where the
     /// robot is and what it holds.
     fn world_of(&self, seen: &Observed) -> World {
-        let things = |msg: &Value, list: &str, name: &str, at: &str| -> Vec<Thing> {
+        let things = |msg: &Value, list: &str, name: fn(&Value) -> &str, at: &str| {
             msg[list]
                 .as_array()
                 .map(|items| {
@@ -149,16 +149,15 @@ impl Missions {
                         .iter()
                         .filter(|o| o["state"].as_u64() != Some(2))
                         .map(|o| {
-                            let text = |k: &str| o[k].as_str().unwrap_or_default().to_owned();
                             let p = o.pointer(at);
                             let xy = p.and_then(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)));
                             Thing {
-                                id: text("id"),
-                                name: text(name),
+                                id: o["id"].as_str().unwrap_or_default().to_owned(),
+                                name: name(o).to_owned(),
                                 xy,
                             }
                         })
-                        .collect()
+                        .collect::<Vec<Thing>>()
                 })
                 .unwrap_or_default()
         };
@@ -168,8 +167,8 @@ impl Missions {
             .collect();
         World {
             places: self.places.all(),
-            rooms: things(&seen.rooms, "rooms", "name", "/centroid"),
-            objects: things(&seen.objects, "objects", "label", "/pose/position"),
+            rooms: things(&seen.rooms, "rooms", room_name, "/centroid"),
+            objects: things(&seen.objects, "objects", object_name, "/pose/position"),
             robot: seen.pose,
             holding,
         }
@@ -264,7 +263,7 @@ impl Missions {
             .as_f64()
             .filter(|w| *w > 0.0)
             .unwrap_or(compiled.worst_case_s);
-        self.checked(compiled, worst, concerns)
+        self.checked(compiled, worst, concerns, by)
     }
 
     /// Why a plan checked earlier may not run now, if it may not: a zone added since, or a
@@ -307,7 +306,8 @@ impl Missions {
         by: By,
     ) -> (bool, Vec<Concern>) {
         let request = self.request();
-        let found = sanity::check(&request, &compiled.steps, &self.config.checks);
+        let mut found = sanity::check(&request, &compiled.steps, &self.config.checks);
+        found.extend(sanity::dead_ends(&compiled.steps, catalog));
         if !found.is_empty() {
             return (true, found);
         }
@@ -354,7 +354,13 @@ impl Missions {
 
     /// A plan that passed every check: shown to the window, kept by its hash, and described to
     /// the model with what went wrong before with its steps.
-    fn checked(&self, compiled: Compiled, worst: f64, concerns: Vec<Concern>) -> ToolOutcome {
+    fn checked(
+        &self,
+        compiled: Compiled,
+        worst: f64,
+        concerns: Vec<Concern>,
+        by: By,
+    ) -> ToolOutcome {
         let noted: Vec<String> = concerns.iter().map(concern_line).collect();
         self.emit(Event::MissionPlanned {
             hash: compiled.sha256.clone(),
@@ -362,6 +368,7 @@ impl Missions {
             steps: compiled.steps.clone(),
             worst_case_s: worst,
             concerns,
+            by_job: by == By::Job,
         });
         let mut out = json!({
             "hash": compiled.sha256,
@@ -419,7 +426,7 @@ impl Missions {
                 })
             })
             .collect();
-        if by == By::Operator {
+        if by != By::Model {
             return ToolOutcome::failed(if lines.is_empty() {
                 "the edited plan failed its checks".to_owned()
             } else {
@@ -443,15 +450,20 @@ impl Missions {
             );
         }
         // The problems first: what a reader of the first line most needs.
+        let fix = if count == 1 {
+            "Fix it".to_owned()
+        } else {
+            format!("Fix all {count} problems")
+        };
         let mut message = if lines.is_empty() {
             format!(
-                "the plan has {count} problem(s); fix them all and call run_mission again \
-                 (attempt {n} of {MAX_PLAN_ATTEMPTS})"
+                "the plan has {}. {fix} and call run_mission again (attempt {n} of \
+                 {MAX_PLAN_ATTEMPTS})",
+                crate::counted(count, "problem")
             )
         } else {
             format!(
-                "{}. Fix all {count} problem(s) and call run_mission again (attempt {n} of \
-                 {MAX_PLAN_ATTEMPTS})",
+                "{}. {fix} and call run_mission again (attempt {n} of {MAX_PLAN_ATTEMPTS})",
                 lines.iter().take(2).cloned().collect::<Vec<_>>().join("; ")
             )
         };
@@ -631,4 +643,13 @@ impl Missions {
             state,
         }
     }
+}
+
+/// A room canopy only numbered ("room D") goes by what it is, so "the office" finds it.
+fn room_name(room: &Value) -> &str {
+    crate::places::room_label(room).unwrap_or_default()
+}
+
+fn object_name(object: &Value) -> &str {
+    object["label"].as_str().unwrap_or_default()
 }

@@ -85,29 +85,20 @@ impl Schedules {
     }
 
     /// Where runs report; also cancels every schedule as soon as the robot is stopped. Each run
-    /// checks for a stop itself too, so a schedule never outlives one whose events were missed.
+    /// checks for a stop itself too.
     pub fn attach(self: &Arc<Self>, session: SessionHandle) {
-        let mut events = session.subscribe();
         if self.session.set(session).is_err() {
             return;
         }
         let me = Arc::downgrade(self);
-        let mut seen = self.guard.stops();
+        let mut stops = self.guard.stopped();
         tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
+            while stops.changed().await.is_ok() {
                 let Some(me) = me.upgrade() else { return };
-                let stops = me.guard.stops();
-                if stops != seen {
-                    seen = stops;
-                    if me.cancel("all") {
-                        me.say(Event::Notice {
-                            text: "the stop cancelled every schedule".to_owned(),
-                        });
-                    }
+                if me.cancel("all") {
+                    me.say(Event::Notice {
+                        text: "the stop cancelled every schedule".to_owned(),
+                    });
                 }
             }
         });
@@ -216,10 +207,11 @@ impl Schedules {
         info
     }
 
-    /// Runs `compiled` each time `trigger` newly holds, up to `times` runs within `for_min`.
+    /// Runs `compiled` each time `trigger` newly holds, up to `times` runs within `for_min`; with
+    /// no plan, tells the operator instead.
     fn add_trigger(
         self: &Arc<Self>,
-        compiled: Compiled,
+        compiled: Option<Compiled>,
         intent: String,
         trigger: Trigger,
         times: u32,
@@ -263,6 +255,11 @@ impl Schedules {
                 };
                 run += 1;
                 counter.fetch_sub(1, Ordering::Relaxed);
+                let Some(compiled) = &compiled else {
+                    me.report(format!("Trigger {id} ({what}) fired, {run} of {times}: {seen}."));
+                    let _ = looker.settle(&me.missions).await;
+                    continue;
+                };
                 let skipped = |why: &str| {
                     format!(
                         "Trigger {id} ({what}) fired: {seen}; it skipped run {run} of {times} ({intent}): {why}."
@@ -475,8 +472,9 @@ fn spec() -> ToolSpec {
          once and then every every_min minutes, times runs in all. With when instead of \
          every_min it runs each time something happens, up to times runs within for_min \
          minutes: when {object, room} for \"when a cup appears in the kitchen\", or a topic \
-         condition as watch takes it. The operator approves it once for all its runs. list shows \
-         the schedules, cancel ends one by id or all.",
+         condition as watch takes it. With when and no steps it only tells the operator, each \
+         time: \"tell me when a mug appears in the bedroom\". The operator approves it once for \
+         all its runs. list shows the schedules, cancel ends one by id or all.",
         json!({"type": "object", "properties": {
             "action": {"type": "string", "enum": ["add", "list", "cancel"]},
             "intent": {"type": "string", "description": "For add: what it does, in a few words."},
@@ -489,6 +487,12 @@ fn spec() -> ToolSpec {
         }, "required": ["action"], "additionalProperties": false}),
         Risk::Manipulation,
     )
+}
+
+/// A trigger with neither a plan's hash nor steps: it only tells the operator.
+fn tells_only(args: &Value) -> bool {
+    args["hash"].as_str().is_none_or(str::is_empty)
+        && args["steps"].as_array().is_none_or(Vec::is_empty)
 }
 
 /// What a clock schedule's numbers say that the operator's words do not.
@@ -521,7 +525,7 @@ struct ScheduleTool {
 impl ScheduleTool {
     async fn trigger(
         &self,
-        compiled: Compiled,
+        compiled: Option<Compiled>,
         intent: String,
         args: &Value,
         times: u32,
@@ -534,16 +538,36 @@ impl ScheduleTool {
             .as_u64()
             .unwrap_or(DEFAULT_FOR_MIN)
             .clamp(1, MAX_EVERY_MIN);
+        let tells = compiled.is_none();
         let info = self
             .schedules
             .add_trigger(compiled, intent, trigger, times, for_min);
         let mut out = ToolOutcome::ok(json!({"schedule": info}));
+        let does = if tells { "tells the operator" } else { "runs" };
         out.message = format!(
-            "trigger {} runs each time {}, up to {times} time(s) in the next {for_min} min; it \
-             does not run for what holds already",
-            info.id, info.when
+            "trigger {} {does} each time {}, up to {} in the next {for_min} min; it does not \
+             count what holds already",
+            info.id,
+            info.when,
+            crate::counted(times, "time")
         );
         out
+    }
+}
+
+impl ScheduleTool {
+    /// A plan that does its one step as many times as the schedule runs it: "turn left 10
+    /// degrees, three times in all" once became three turns a run, three runs.
+    fn counted_twice(&self, hash: &str, times: u64) -> Option<ToolOutcome> {
+        let c = self.schedules.missions.find(hash).ok()?;
+        let same = c.steps.windows(2).all(|w| w[0].summary == w[1].summary);
+        (times > 1 && c.steps.len() == usize::try_from(times).ok()? && same).then(|| {
+            ToolOutcome::refused(format!(
+                "the schedule runs it {times} times, and each run does `{}` {times} times over: \
+                 give the plan that step once",
+                c.steps[0].summary
+            ))
+        })
     }
 }
 
@@ -588,6 +612,25 @@ impl Tool for ScheduleTool {
             },
             None => None,
         };
+        if let Some(trigger) = trigger.as_ref().filter(|_| tells_only(args)) {
+            let for_min = args["for_min"]
+                .as_u64()
+                .unwrap_or(DEFAULT_FOR_MIN)
+                .clamp(1, MAX_EVERY_MIN);
+            return Some(Ok(Assessment {
+                risk: Risk::Observe,
+                resources: Vec::new(),
+                reason: format!(
+                    "tells you each time {}, up to {} in the next {for_min} min",
+                    trigger.describe(),
+                    crate::counted(times, "time")
+                ),
+                args: Some(
+                    json!({"action": "add", "intent": intent, "when": args["when"],
+                                  "times": times, "for_min": for_min}),
+                ),
+            }));
+        }
         // A plan checked before goes by its hash, past none of the checks above.
         let (hash, steps) = match args["hash"].as_str() {
             Some(hash) => match self.schedules.missions.find(hash) {
@@ -599,6 +642,9 @@ impl Tool for ScheduleTool {
                 Err(problems) => return Some(Err(problems)),
             },
         };
+        if let Some(twice) = self.counted_twice(&hash, times) {
+            return Some(Err(twice));
+        }
         if let Some(trigger) = trigger {
             let for_min = args["for_min"]
                 .as_u64()
@@ -608,8 +654,10 @@ impl Tool for ScheduleTool {
                 risk: Risk::Manipulation,
                 resources: Vec::new(),
                 reason: format!(
-                    "runs \"{intent}\" ({steps} step(s)) each time {}, up to {times} time(s) in the next {for_min} min",
-                    trigger.describe()
+                    "runs \"{intent}\" ({}) each time {}, up to {} in the next {for_min} min",
+                    crate::counted(steps, "step"),
+                    trigger.describe(),
+                    crate::counted(times, "time")
                 ),
                 args: Some(json!({"action": "add", "hash": hash, "intent": intent,
                                   "when": args["when"], "times": times, "for_min": for_min})),
@@ -619,7 +667,9 @@ impl Tool for ScheduleTool {
             risk: Risk::Manipulation,
             resources: Vec::new(),
             reason: format!(
-                "runs \"{intent}\" ({steps} step(s)) now and every {every} min, {times} time(s) in all"
+                "runs \"{intent}\" ({}) now and every {every} min, {} in all",
+                crate::counted(steps, "step"),
+                crate::counted(times, "time")
             ),
             args: Some(json!({"action": "add", "hash": hash, "intent": intent,
                               "every_min": every, "times": times})),
@@ -651,12 +701,14 @@ impl Tool for ScheduleTool {
                         "{MAX_SCHEDULES} schedules run already; cancel one first"
                     ));
                 }
+                let tells = args["when"].is_object() && tells_only(&args);
                 let compiled = match self
                     .schedules
                     .missions
                     .find(args["hash"].as_str().unwrap_or_default())
                 {
-                    Ok(c) => c,
+                    Ok(c) => Some(c),
+                    Err(_) if tells => None,
                     Err(e) => return ToolOutcome::refused(e),
                 };
                 let every = args["every_min"]
@@ -669,11 +721,17 @@ impl Tool for ScheduleTool {
                 if args["when"].is_object() {
                     return self.trigger(compiled, intent, &args, times).await;
                 }
+                let Some(compiled) = compiled else {
+                    return ToolOutcome::refused(
+                        "a schedule without `when` runs a plan: give it one",
+                    );
+                };
                 let info = self.schedules.add(compiled, intent, every, times);
                 let mut out = ToolOutcome::ok(json!({"schedule": info}));
                 out.message = format!(
-                    "schedule {} runs now and every {every} min, {times} time(s); a report follows each run",
-                    info.id
+                    "schedule {} runs now and every {every} min, {}; a report follows each run",
+                    info.id,
+                    crate::counted(times, "time")
                 );
                 out
             }

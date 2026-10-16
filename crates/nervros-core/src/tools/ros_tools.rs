@@ -20,7 +20,7 @@ mod action;
 mod config;
 mod graph;
 mod interface;
-mod logs;
+pub(crate) mod logs;
 mod params;
 mod publish;
 mod sample;

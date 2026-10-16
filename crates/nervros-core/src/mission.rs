@@ -12,6 +12,7 @@ pub mod camera;
 pub mod catalog;
 pub mod check;
 pub mod history;
+pub mod learn;
 pub mod ledger;
 pub mod plan;
 pub mod preview;
@@ -36,6 +37,7 @@ use crate::profile::{MissionConfig, Profile};
 use crate::session::{Event, SessionHandle};
 use crate::tools::Tool;
 
+mod awaited;
 mod execution;
 mod fence;
 mod planning;
@@ -44,6 +46,7 @@ mod report;
 mod tests;
 mod tool;
 
+pub use awaited::MissionEnd;
 use tool::RunMission;
 
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -142,6 +145,8 @@ pub fn held_by(state: &Value, arm: &str) -> String {
 /// The mission in flight.
 struct Running {
     id: String,
+    /// Its goal's cancel, once the executor took it.
+    cancel: Option<nervros_ros::CancelFn>,
 }
 
 /// The mission slot, from the moment a launch claims it until the executor takes the goal. Dropped
@@ -204,6 +209,8 @@ pub struct Missions {
     questioned: AtomicBool,
     /// Whether the running mission is paused, as its feedback last said.
     paused: AtomicBool,
+    /// The skills taught in this session that wait for a mission to keep them.
+    drafts: learn::Drafts,
 }
 
 impl crate::session::Pulse for Missions {
@@ -261,6 +268,7 @@ impl Missions {
             guard: OnceLock::new(),
             questioned: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            drafts: learn::Drafts::default(),
         }))
     }
 
@@ -403,6 +411,15 @@ impl Missions {
         lock(&self.running).is_some()
     }
 
+    /// How many seconds the executor lets a mission run once this agent's heartbeat stops, or
+    /// `None` when nothing beats and a mission runs on alone.
+    #[must_use]
+    pub fn deadman_s(&self) -> Option<f64> {
+        lock(&self.heartbeat)
+            .is_some()
+            .then_some(self.config.heartbeat_timeout_s)
+    }
+
     /// The pause, or with false the resume, `text` orders when it applies now: the executor can
     /// pause, a mission runs, and it is not so already. Otherwise the words are the model's.
     #[must_use]
@@ -440,6 +457,34 @@ impl Missions {
     /// What the operator said last.
     pub(crate) fn request(&self) -> String {
         lock(&self.request).clone()
+    }
+
+    /// The catalog as last read, for what draws it without waiting on the robot.
+    #[must_use]
+    pub fn cached_catalog(&self) -> Option<Arc<Catalog>> {
+        lock(&self.catalog).clone()
+    }
+
+    /// Reads the catalog again now: a skill was taught or forgotten, and the next plan and the
+    /// window's list of taught skills both need it as it is. A plan that failed before may work
+    /// now, though it reads the same: it names the skill, not its new body.
+    pub(crate) async fn reload_catalog(&self) {
+        *lock(&self.catalog) = None;
+        *lock(&self.last) = None;
+        let _ = self.catalog().await;
+    }
+
+    /// Whether mission `id` holds the mission slot.
+    fn runs(&self, id: &str) -> bool {
+        lock(&self.running).as_ref().is_some_and(|r| r.id == id)
+    }
+
+    /// The cancel of mission `id`'s goal, while it runs.
+    fn canceller(&self, id: &str) -> Option<nervros_ros::CancelFn> {
+        lock(&self.running)
+            .as_ref()
+            .filter(|r| r.id == id)
+            .and_then(|r| r.cancel.clone())
     }
 
     /// Frees the mission slot, if mission `id` still holds it.

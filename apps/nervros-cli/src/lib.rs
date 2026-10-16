@@ -70,6 +70,9 @@ enum Command {
         /// Carry on a saved conversation: a `.history.json` path, or `last`.
         #[arg(long)]
         resume: Option<String>,
+        /// Talk on this `models.toml` model alone, with no fallback, as an eval's `--models` does.
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Run a suite of requests against the live robot, or with `--robot` a scripted one, each in
     /// a fresh session approving every request, and report which cases did what they expect.
@@ -142,6 +145,18 @@ enum Command {
     /// Check the profile's tools, topics and mission services against the live graph.
     #[cfg(feature = "ros")]
     Doctor,
+    /// Investigate what is wrong with the robot now, with the profile's playbooks and those
+    /// NervROS carries, and keep it as an incident.
+    #[cfg(feature = "ros")]
+    Why,
+    /// The incidents kept for the robot, newest first, or one in full by its id.
+    Incidents {
+        /// An incident's id, such as i3.
+        id: Option<String>,
+        /// How many to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Write the live robot as a scripted robot file for `eval --robot`: its graph, nodes,
     /// parameters, the profile's topics and the executor's catalog.
     #[cfg(feature = "ros")]
@@ -242,6 +257,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             arm,
             approve,
             resume,
+            model,
         } => {
             robot::chat(
                 &cli.profile,
@@ -251,6 +267,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     arm,
                     approve,
                     resume,
+                    model,
                 },
             )
             .await
@@ -290,6 +307,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         #[cfg(feature = "ros")]
         Command::Doctor => robot::doctor(&cli.profile).await,
         #[cfg(feature = "ros")]
+        Command::Why => robot::why(&cli.profile).await,
+        Command::Incidents { id, limit } => records::incidents(&cli.profile, id.as_deref(), limit),
+        #[cfg(feature = "ros")]
         Command::Record { out } => record::record(&cli.profile, &out).await,
         #[cfg(feature = "ros")]
         Command::Whoami { facts } => robot::whoami(&cli.profile, facts).await,
@@ -317,7 +337,13 @@ async fn models(profile: &Path, check: bool) -> Result<()> {
     let now = SystemTime::now();
     let config = router.config();
     for role in Role::ALL {
-        println!("{}: {}", role.name(), config.roles.chain(role).join(" > "));
+        let chain = config.roles.chain(role);
+        let models = if chain.is_empty() {
+            "none".to_owned()
+        } else {
+            chain.join(" > ")
+        };
+        println!("{}: {models}", role.name());
     }
     for model in &config.models {
         println!(

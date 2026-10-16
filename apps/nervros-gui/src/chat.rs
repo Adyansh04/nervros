@@ -10,7 +10,7 @@ use nervros_core::mission::Outcome;
 use nervros_core::mission::plan::PlannedStep;
 use nervros_core::mission::preview::PreviewStep;
 use nervros_core::mission::sanity::Concern;
-use nervros_core::session::{Command, Event, Unanswered};
+use nervros_core::session::{Command, Event, NotApproved, Unanswered};
 use nervros_core::tools::Status;
 use rerun::external::egui::{self, Color32, RichText};
 use serde_json::Value;
@@ -18,12 +18,14 @@ use serde_json::Value;
 use crate::theme;
 
 mod approval;
+mod job;
 mod plan;
 mod report;
 #[cfg(test)]
 pub(crate) mod tests;
 mod view;
 
+pub(crate) use job::readable;
 pub(crate) use plan::{plan_card, tree_panel};
 pub(crate) use view::{decode, spinner, thousands};
 
@@ -60,6 +62,8 @@ pub enum Action {
     ShowAt(SystemTime),
     /// Pause the running mission, or with false let it go on.
     Pause(bool),
+    /// Stop a job, by its id.
+    StopJob(String),
 }
 
 /// One tool call, from its start to its end.
@@ -85,6 +89,8 @@ pub struct Approval {
     can_allow: bool,
     asked: Instant,
     answer: Option<bool>,
+    /// Why it did not run, once answered no.
+    not_approved: Option<NotApproved>,
     /// An edit is being checked.
     checking: bool,
     /// Why the last edit failed its checks.
@@ -155,6 +161,8 @@ pub enum Item {
     Report(String),
     /// A plan, and the mission that runs it.
     Plan(PlanCard),
+    /// A program or a search the operator approved once.
+    Job(job::JobCard),
     /// A request the last session ended waiting on, and whether it was taken up or put aside.
     Unanswered(Unanswered, Cell<bool>),
 }
@@ -178,6 +186,8 @@ pub struct PlanCard {
     concerns: Vec<Concern>,
     /// An edit replaced it before it ran.
     replaced: bool,
+    /// Why it never ran: its approval was denied or ran out, or its call was refused.
+    not_run: Option<String>,
     /// Each tree node seen so far, by path, with its latest status, in the order they started.
     nodes: Vec<(String, String)>,
     /// Paused, or waiting to pause once a pick or place ends.
@@ -207,6 +217,12 @@ pub struct Chat {
     pub model: Option<String>,
     /// Tokens the latest request took of the model's window, when the window is known.
     pub context: Option<(u64, u64)>,
+    /// Times the conversation was condensed on its own, as the window filled: the status bar
+    /// counts them, the chat shows only what the operator asked for.
+    pub condensed: u32,
+    /// A job's newest mission, kept off the chat (the job's card tells it) for the Mission tab,
+    /// with how many items the chat had then, to tell it from a newer plan of the model's.
+    job_plan: Option<(usize, PlanCard)>,
     /// What the session's model calls cost.
     pub spent: Spent,
     /// The reply as it streams in, until it arrives whole or a tool call takes over.
@@ -236,6 +252,7 @@ impl Item {
                 | Self::Image { .. }
                 | Self::Approval(_)
                 | Self::Plan(_)
+                | Self::Job(_)
         )
     }
 }
@@ -244,13 +261,22 @@ impl Chat {
     /// Adds the operator's message. A message said mid-turn that the session sends again as a
     /// turn of its own is the same bubble, now a turn's.
     fn push_user(&mut self, text: String, turn: bool) {
-        if turn
-            && let Some(Item::User { text: said, turn }) = self.items.last_mut()
-            && !*turn
-            && *said == text
-        {
-            *turn = true;
-            return;
+        // Said while the agent worked and unread, it starts the next turn: the bubble is the one
+        // already shown, even with the reply that was running drawn after it.
+        if turn {
+            let said = self
+                .items
+                .iter_mut()
+                .rev()
+                .take_while(|i| !matches!(i, Item::User { turn: true, .. }))
+                .find_map(|i| match i {
+                    Item::User { text: said, turn } if !*turn && *said == text => Some(turn),
+                    _ => None,
+                });
+            if let Some(turn) = said {
+                *turn = true;
+                return;
+            }
         }
         self.items.push(Item::User { text, turn });
     }
@@ -299,7 +325,7 @@ impl Chat {
             } else {
                 "Observe only: the agent cannot act".to_owned()
             })),
-            Event::Halted { reason } => self.items.push(Item::Notice(format!("Stopped: {reason}"))),
+            Event::Halted { reason } => self.items.push(Item::Notice(plan::capitalise(reason))),
             Event::Stopped { ok: true, detail } => {
                 self.items
                     .push(Item::Notice(format!("The robot stopped: {detail}")));
@@ -309,7 +335,8 @@ impl Chat {
                     "The robot did not confirm the stop: {detail}"
                 )));
             }
-            Event::Notice { text } => self.items.push(Item::Notice(text.clone())),
+            // As every notice reads: the robot's answers come as phrases, "no mission is running".
+            Event::Notice { text } => self.items.push(Item::Notice(plan::capitalise(text))),
             Event::Error { turn, text } => self.items.push(Item::Error {
                 text: text.clone(),
                 retry: self.asked.get(turn).cloned(),
@@ -333,8 +360,20 @@ impl Chat {
             | Event::MissionProgress { .. }
             | Event::MissionPaused { .. }
             | Event::MissionFinished { .. } => self.apply_mission(event),
-            // The viewer draws it; the tool's card already says what.
-            Event::Plot { .. } => {}
+            Event::JobStarted { job } => self.items.push(Item::Job(job::JobCard::new(job.clone()))),
+            Event::JobLog { id, line } => {
+                if let Some(card) = self.job_mut(id) {
+                    card.log(line);
+                }
+            }
+            Event::JobFinished { job } => {
+                if let Some(card) = self.job_mut(&job.id) {
+                    card.ended(job);
+                }
+            }
+            // The viewer draws a plot, and the tool's card already says what; the Doctor tab
+            // lists an incident, and a toast says it opened.
+            Event::Plot { .. } | Event::Incident { .. } => {}
             Event::ModelCall {
                 input_tokens,
                 cached_tokens,
@@ -380,14 +419,27 @@ impl Chat {
                 ms,
                 ..
             } => {
-                let found = self.items.iter_mut().rev().find_map(|i| match i {
-                    Item::Tool(t) if t.turn == *turn && t.call == *call => Some(t),
-                    _ => None,
-                });
-                if let Some(t) = found {
+                let found = self.items.iter().rposition(
+                    |i| matches!(i, Item::Tool(t) if t.turn == *turn && t.call == *call),
+                );
+                let Some(at) = found else { return };
+                if let Item::Tool(t) = &mut self.items[at] {
                     t.status = Some(*status);
                     t.message.clone_from(message);
                     t.ms = *ms;
+                }
+                // A plan its call then refused, as run_mission when disarmed or schedule on a bad
+                // count, never runs: the plans this call made come before the next call's row.
+                if !status.ok() {
+                    for item in &mut self.items[at + 1..] {
+                        match item {
+                            Item::Tool(_) => break,
+                            Item::Plan(p) if p.mission.is_none() && !p.replaced => {
+                                p.not_run.get_or_insert_with(|| message.clone());
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             Event::ApprovalRequested {
@@ -404,6 +456,7 @@ impl Chat {
                 can_allow: *can_allow,
                 asked: Instant::now(),
                 answer: None,
+                not_approved: None,
                 checking: false,
                 problem: None,
             })),
@@ -415,13 +468,32 @@ impl Chat {
                     a.asked = Instant::now();
                 }
             }
-            Event::ApprovalResolved { id, approved } => {
+            Event::ApprovalResolved {
+                id,
+                approved,
+                not_approved,
+            } => {
+                let mut asked_for = None;
                 for item in &mut self.items {
                     if let Item::Approval(a) = item
                         && a.id == *id
                     {
                         a.answer = Some(*approved);
+                        a.not_approved = *not_approved;
+                        asked_for = a.args["hash"].as_str().map(str::to_owned);
                     }
+                }
+                // Else its card would say "waiting to run" for good.
+                if !*approved
+                    && let Some(hash) = asked_for.filter(|h| !h.is_empty())
+                    && let Some(p) = self.plan_mut(|p| p.hash.starts_with(&hash))
+                {
+                    let why = match not_approved {
+                        Some(NotApproved::Unanswered) => "nobody answered in time",
+                        Some(NotApproved::Disarmed) => "the robot was disarmed",
+                        _ => "not approved",
+                    };
+                    p.not_run.get_or_insert_with(|| why.to_owned());
                 }
             }
             _ => {}
@@ -449,7 +521,11 @@ impl Chat {
             return;
         };
         let before = a.args["hash"].as_str().unwrap_or_default().to_owned();
-        if let Some(p) = self.plan_mut(|p| !before.is_empty() && p.hash.starts_with(&before)) {
+        let after = args["hash"].as_str().unwrap_or_default();
+        // An edit that changed nothing replaces nothing.
+        if !after.starts_with(&before)
+            && let Some(p) = self.plan_mut(|p| !before.is_empty() && p.hash.starts_with(&before))
+        {
             p.replaced = true;
         }
         a.args = args.clone();
@@ -502,11 +578,17 @@ impl Chat {
                     }
                 }
             }
-            Event::Compacted { before, after, .. } => self.items.push(Item::Notice(format!(
+            Event::Compacted {
+                before,
+                after,
+                asked: true,
+                ..
+            } => self.items.push(Item::Notice(format!(
                 "Condensed the conversation to stay inside the model's context: {} to {} tokens",
                 thousands(*before),
                 thousands(*after)
             ))),
+            Event::Compacted { .. } => self.condensed += 1,
             _ => {}
         }
     }
@@ -519,21 +601,35 @@ impl Chat {
                 steps,
                 worst_case_s,
                 concerns,
-            } => self.items.push(Item::Plan(PlanCard {
-                hash: hash.clone(),
-                intent: intent.clone(),
-                steps: steps.clone(),
-                worst_case_s: *worst_case_s,
-                mission: None,
-                started: None,
-                progress: HashMap::new(),
-                finished: None,
-                preview: Vec::new(),
-                concerns: concerns.clone(),
-                replaced: false,
-                nodes: Vec::new(),
-                paused: false,
-            })),
+                by_job,
+            } => {
+                let card = PlanCard {
+                    hash: hash.clone(),
+                    intent: intent.clone(),
+                    steps: steps.clone(),
+                    worst_case_s: *worst_case_s,
+                    mission: None,
+                    started: None,
+                    progress: HashMap::new(),
+                    finished: None,
+                    preview: Vec::new(),
+                    concerns: concerns.clone(),
+                    replaced: false,
+                    not_run: None,
+                    nodes: Vec::new(),
+                    paused: false,
+                };
+                // A job's missions show on its own card in the chat, as the lines it logs.
+                if *by_job {
+                    self.job_plan = Some((self.items.len(), card));
+                } else if !self.items.iter().any(|i| {
+                    // Planned again unchanged, as by an edit checked as it was: one card.
+                    matches!(i, Item::Plan(p) if p.hash == *hash && p.mission.is_none()
+                        && p.finished.is_none() && !p.replaced && p.not_run.is_none())
+                }) {
+                    self.items.push(Item::Plan(card));
+                }
+            }
             Event::MissionPreview { hash, steps } => {
                 if let Some(p) = self.plan_mut(|p| p.hash == *hash) {
                     p.preview.clone_from(steps);
@@ -579,6 +675,7 @@ impl Chat {
                 failed_step,
                 reason,
                 elapsed_s,
+                ..
             } => {
                 if let Some(p) = self.plan_mut(|p| p.mission.as_ref() == Some(id)) {
                     p.finished = Some((*outcome, failed_step.clone(), reason.clone(), *elapsed_s));
@@ -589,8 +686,19 @@ impl Chat {
         }
     }
 
+    /// The card of job `id`.
+    fn job_mut(&mut self, id: &str) -> Option<&mut job::JobCard> {
+        self.items.iter_mut().rev().find_map(|i| match i {
+            Item::Job(card) if card.job.id == id => Some(card),
+            _ => None,
+        })
+    }
+
     /// The newest plan matching `which`.
     fn plan_mut(&mut self, which: impl Fn(&PlanCard) -> bool) -> Option<&mut PlanCard> {
+        if self.job_plan.as_ref().is_some_and(|(_, p)| which(p)) {
+            return self.job_plan.as_mut().map(|(_, p)| p);
+        }
         self.items.iter_mut().rev().find_map(|i| match i {
             Item::Plan(p) if which(p) => Some(p),
             _ => None,
@@ -616,10 +724,20 @@ impl Chat {
 
     /// The newest plan, for the dock.
     pub fn latest_plan(&self) -> Option<&PlanCard> {
-        self.items.iter().rev().find_map(|i| match i {
-            Item::Plan(p) => Some(p),
-            _ => None,
-        })
+        let in_chat = self
+            .items
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(at, i)| match i {
+                Item::Plan(p) => Some((at, p)),
+                _ => None,
+            });
+        match (in_chat, &self.job_plan) {
+            (Some((at, p)), Some((job_at, job))) => Some(if *job_at > at { job } else { p }),
+            (None, Some((_, job))) => Some(job),
+            (in_chat, None) => in_chat.map(|(_, p)| p),
+        }
     }
 
     /// Draws the conversation; clicks are appended to `actions`.
@@ -702,6 +820,7 @@ impl Chat {
                         }
                         Item::Report(text) => report(ui, text),
                         Item::Plan(p) => plan_card(ui, p, self.can_pause, actions),
+                        Item::Job(card) => job::job_card(ui, card, actions),
                         Item::Unanswered(u, done) => unanswered_card(ui, u, done, actions),
                     }
                 })
@@ -711,6 +830,10 @@ impl Chat {
         }
         drop(heights);
         self.show_live(ui, turn_starts);
+        // Notices alone, such as arming first, are no conversation yet: the suggestions stay.
+        if self.turn.is_none() && self.items.iter().all(|i| matches!(i, Item::Notice(_))) {
+            empty_state(ui, actions);
+        }
     }
 
     /// The reply as it streams in, and how long the turn has run; `turn_starts` when the agent

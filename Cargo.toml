@@ -69,6 +69,8 @@ opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = 
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
+# Robot programs: a small scripting language in pure Rust, sandboxed (no files, network or eval).
+rhai = { version = "=1.26.1", features = ["sync", "serde"] }
 # The MCP client, used directly: rig 0.43's route is rmcp 2. Tools only, no client capabilities.
 rmcp = { version = "=3.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 rig = "=0.43.0"

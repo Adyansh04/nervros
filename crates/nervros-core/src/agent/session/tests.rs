@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use super::approval::{Unanswered, take_unanswered};
 use super::config::SessionConfig;
-use super::event::{Command, Event, is_stop_word, pause_word};
+use super::event::{Command, Event, is_stop_word, only_pause_word, pause_word};
 use super::*;
 use crate::guard::{Guard, Policy};
 use crate::llm::{AgentBuilder, AgentSource, History, LlmError};
@@ -511,7 +511,7 @@ async fn the_operator_compacts_and_resumes_a_conversation() {
     let events = collect_until_finished(&mut rx, |_| None, &session).await;
     assert!(
         events.iter().any(
-            |e| matches!(e, Event::Compacted { summarised: true, before, after } if after < before)
+            |e| matches!(e, Event::Compacted { summarised: true, before, after, asked: true } if after < before)
         ),
         "{events:?}"
     );
@@ -927,6 +927,13 @@ fn plain_words_pause_and_resume_and_sentences_go_to_the_model() {
         "go",
     ] {
         assert_eq!(pause_word(text), None, "{text}");
+    }
+    // Only these mean a mission whatever runs; "wait" and "go on" may be talk.
+    for word in ["Pause.", "please resume", "pause the mission"] {
+        assert!(only_pause_word(word), "{word}");
+    }
+    for word in ["wait", "go on", "continue", "hold on"] {
+        assert!(!only_pause_word(word), "{word}");
     }
 }
 
@@ -1359,6 +1366,38 @@ async fn after_three_denials_in_a_row_the_model_is_told_to_stop_asking() {
     let seen = format!("{:?}", model.requests().last().unwrap().chat_history);
     assert!(seen.contains("3 times in a row"), "{seen}");
     assert!(seen.contains("turned down the last 3 requests"), "{seen}");
+}
+
+#[tokio::test]
+async fn a_request_turned_down_is_not_asked_again_unchanged() {
+    let model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("c1", "find_objects", json!({"n": 1})),
+        MockTurn::tool_call("c2", "find_objects", json!({"n": 1})),
+        MockTurn::text("I will ask what you want."),
+    ]);
+    let guard = Arc::new(Guard::new(Policy::default()));
+    guard.set_armed(true);
+    let session = Session::start(
+        Arc::new(Scripted::new(model.clone())),
+        registry(Risk::Motion),
+        guard,
+        None,
+        SessionConfig::default(),
+    );
+    let mut rx = session.subscribe();
+    session.send(Command::User("go".into()));
+    let deny = |e: &Event| match e {
+        Event::ApprovalRequested { id, .. } => Some(Command::Deny(*id)),
+        _ => None,
+    };
+    let events = collect_until_finished(&mut rx, deny, &session).await;
+    let asked = events
+        .iter()
+        .filter(|e| matches!(e, Event::ApprovalRequested { .. }))
+        .count();
+    assert_eq!(asked, 1, "the same request is not asked twice");
+    let seen = format!("{:?}", model.requests().last().unwrap().chat_history);
+    assert!(seen.contains("turned down this same request"), "{seen}");
 }
 
 #[tokio::test]

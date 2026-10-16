@@ -21,7 +21,7 @@ use crate::tools::{Status, ToolOutcome};
 impl Missions {
     /// Runs an approved plan, unless a mission runs or this one just failed the same way.
     pub(super) async fn run(self: &Arc<Self>, args: &Value) -> ToolOutcome {
-        let compiled = match self.find(args["hash"].as_str().unwrap_or_default()) {
+        let mut compiled = match self.find(args["hash"].as_str().unwrap_or_default()) {
             Ok(c) => c,
             Err(e) => return ToolOutcome::refused(e),
         };
@@ -42,12 +42,30 @@ impl Missions {
         {
             return refusal;
         }
-        match self.launch(compiled).await {
+        let message = if by == By::Operator {
+            // An edit in the window keeps the plan's name, and the model told what it had planned:
+            // the steps that run name the mission, here and in its report.
+            let steps: Vec<String> = compiled
+                .steps
+                .iter()
+                .map(|s| format!("{} {}", s.id, s.summary))
+                .collect();
+            compiled.plan.intent = format!("the operator's steps: {}", steps.join("; "));
+            format!(
+                "the operator set these steps themselves, in place of any you planned: {}. The \
+                 mission is running; a report follows when it ends. Tell the operator it started, \
+                 saying what these steps do, not what was first asked for.",
+                steps.join("; ")
+            )
+        } else {
+            "the mission is running; a report follows when it ends. Tell the operator it started."
+                .to_owned()
+        };
+        match self.launch(compiled, Reported::ToModel).await {
             Ok(id) => ToolOutcome {
                 status: Status::Accepted,
                 data: json!({"mission_id": id}),
-                message: "the mission is running; a report follows when it ends. Tell the operator it started."
-                    .to_owned(),
+                message,
                 images: Vec::new(),
             },
             Err(e) => ToolOutcome::failed(e),
@@ -56,7 +74,11 @@ impl Missions {
 
     /// Sends a checked plan to the executor and watches it; its id. The slot is claimed before the
     /// goal goes out, so two launches at once cannot both pass.
-    async fn launch(self: &Arc<Self>, compiled: Compiled) -> Result<String, String> {
+    pub(super) async fn launch(
+        self: &Arc<Self>,
+        compiled: Compiled,
+        reported: Reported,
+    ) -> Result<String, String> {
         // Run by its hash or on a schedule, a plan was checked when it was made: a zone may have
         // been added since, and a straight walk starts from where the robot stands now.
         self.still_clear(&compiled).await?;
@@ -69,7 +91,10 @@ impl Missions {
                     r.id
                 ));
             }
-            *running = Some(Running { id: id.clone() });
+            *running = Some(Running {
+                id: id.clone(),
+                cancel: None,
+            });
         }
         let mut claim = Claim {
             missions: self,
@@ -105,6 +130,9 @@ impl Missions {
             .await
             .map_err(|e| format!("the executor did not start the mission: {e}"))?;
         claim.kept = true;
+        if let Some(r) = lock(&self.running).as_mut().filter(|r| r.id == id) {
+            r.cancel = Some(goal.canceller());
+        }
         self.emit(Event::MissionStarted {
             id: id.clone(),
             hash: compiled.sha256.clone(),
@@ -115,7 +143,13 @@ impl Missions {
         let request = self.request();
         tokio::spawn(
             Arc::clone(self)
-                .watch(id.clone(), compiled, goal, (before, held), request)
+                .watch(
+                    id.clone(),
+                    compiled,
+                    goal,
+                    (before, held),
+                    (request, reported),
+                )
                 .instrument(span),
         );
         Ok(id)
@@ -136,7 +170,7 @@ impl Missions {
             return Err(format!("mission {} was still running", r.id));
         }
         compiled.plan.intent = label.to_owned();
-        self.launch(compiled).await
+        self.launch(compiled, Reported::ToModel).await
     }
 
     /// Checks a plan for a schedule: its hash, and its steps as the operator reads them.
@@ -169,13 +203,14 @@ impl Missions {
         compiled: Compiled,
         goal: Goal,
         (before, held): (Option<Arc<Frame>>, Option<crate::guard::ResourceLock>),
-        request: String,
+        (request, reported): (String, Reported),
     ) {
         let started = Instant::now();
         let started_s = crate::now_s();
         let mut times = StepTimes::default();
         let result = self.outcome_of(&id, goal, &mut times).await;
         let elapsed = started.elapsed().as_secs_f64();
+        let outputs = outputs_of(&result);
         let (outcome, step, reason) = summarise(result);
         drop(held);
         self.release(&id);
@@ -185,15 +220,27 @@ impl Missions {
             Outcome::Canceled => "was stopped".to_owned(),
             _ => format!("failed at {step}: {reason}"),
         };
-        *lock(&self.last) = Some((compiled.sha256.clone(), how));
+        // The guard against rerunning a plan unchanged is the model's: a job's look that saw
+        // nothing does not stand against the model's own plan.
+        if reported == Reported::ToModel {
+            *lock(&self.last) = Some((compiled.sha256.clone(), how));
+        }
         self.emit(Event::MissionFinished {
             id: id.clone(),
             outcome,
             failed_step: step.clone(),
             reason: reason.clone(),
             elapsed_s: elapsed,
+            outputs,
+            by_job: reported == Reported::ToJob,
         });
-        self.keep(MissionRecord {
+        let steps: Vec<StepRecord> = compiled
+            .steps
+            .iter()
+            .map(|s| times.record(s, &step, &reason))
+            .collect();
+        let passed_over = passed_over(&compiled, &steps, &step);
+        let kept = self.keep(MissionRecord {
             id: id.clone(),
             hash: compiled.sha256.clone(),
             intent: compiled.plan.intent.clone(),
@@ -203,13 +250,19 @@ impl Missions {
             outcome: outcome.as_str().to_owned(),
             failed_step: step.clone(),
             reason: reason.clone(),
-            steps: compiled
-                .steps
-                .iter()
-                .map(|s| times.record(s, &step, &reason))
-                .collect(),
+            steps,
             plan: json!(compiled.plan.steps),
         });
+        // A taught skill is judged on its runs, this one included.
+        if let Some(kept) = kept {
+            let _ = kept.await;
+        }
+        self.settle_taught(&compiled, outcome, &step).await;
+        // A job hears its mission end from the event; the report, and the failures it counts
+        // against the model's request, are the model's.
+        if reported == Reported::ToJob {
+            return;
+        }
         let seen = self.observe().await;
         // What happened to what the failed step was about: often it was moved, not missed. The
         // robot's own missions with it say so where the world model cannot tell which it is.
@@ -248,7 +301,7 @@ impl Missions {
             &compiled,
             (outcome, &step, &reason),
             elapsed,
-            (&seen, &story, &moves, &camera.lines),
+            (&seen, &story, &moves, &camera.lines, &passed_over),
         );
         if let Some(s) = self.session.get() {
             s.send(Command::Report(report));
@@ -312,15 +365,14 @@ impl Missions {
         result
     }
 
-    /// Writes a finished mission to the ledger, off the async threads.
-    fn keep(&self, record: MissionRecord) {
-        if let Some(ledger) = self.ledger.get().cloned() {
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = ledger.record(&record) {
-                    tracing::warn!(error = %e, mission = %record.id, "the mission was not recorded");
-                }
-            });
-        }
+    /// Writes a finished mission to the ledger, off the async threads; the write, to wait for.
+    fn keep(&self, record: MissionRecord) -> Option<tokio::task::JoinHandle<()>> {
+        let ledger = self.ledger.get().cloned()?;
+        Some(tokio::task::spawn_blocking(move || {
+            if let Err(e) = ledger.record(&record) {
+                tracing::warn!(error = %e, mission = %record.id, "the mission was not recorded");
+            }
+        }))
     }
 
     /// Maps one feedback message's node events onto steps.
@@ -370,6 +422,43 @@ impl Missions {
             .await
             .is_ok_and(|s| s["mission_id"].as_str() == Some(id))
     }
+}
+
+/// Who hears how a mission ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Reported {
+    /// The model, which answers the report.
+    ToModel,
+    /// The job that ran it, which reports once it ends: a model answering each of a search's
+    /// missions would spend its calls on what the job's own report says.
+    ToJob,
+}
+
+/// What a mission's steps handed on, from the executor's `outputs_json`; none from an executor
+/// that does not send it.
+fn outputs_of(result: &Result<GoalResult, RosError>) -> serde_json::Map<String, Value> {
+    result
+        .as_ref()
+        .ok()
+        .and_then(|r| r.result["outputs_json"].as_str())
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|v| match v {
+            Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Steps that failed while the mission went on, such as a look that saw nothing: its success
+/// alone would hide what they did not do.
+fn passed_over(compiled: &Compiled, steps: &[StepRecord], failed: &str) -> Vec<String> {
+    compiled
+        .steps
+        .iter()
+        .zip(steps)
+        .filter(|(s, r)| r.outcome == "failure" && s.id != failed)
+        .map(|(s, _)| format!("{} {}", s.id, s.summary))
+        .collect()
 }
 
 /// `(outcome, failed step, reason)` from the executor's result.

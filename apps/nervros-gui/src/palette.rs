@@ -133,7 +133,11 @@ pub fn entries() -> Vec<Entry> {
 /// The command a chat message names, as `/look`; none for anything else.
 pub fn slash<'a>(entries: &'a [Entry], text: &str) -> Option<&'a Cmd> {
     let name = text.split_whitespace().next()?;
-    entries.iter().find(|e| e.slash == name).map(|e| &e.cmd)
+    // `/Look` is `/look` mistyped, not another command.
+    entries
+        .iter()
+        .find(|e| e.slash.eq_ignore_ascii_case(name))
+        .map(|e| &e.cmd)
 }
 
 /// The palette's view of the commands: matched by what they do, or by `/name` when typed so.
@@ -226,6 +230,7 @@ mod tests {
             Some(&Cmd::Send(Command::StopMission))
         );
         assert_eq!(slash(&all, "/models"), Some(&Cmd::Tab(Tab::Agent)));
+        assert_eq!(slash(&all, "/Models"), Some(&Cmd::Tab(Tab::Agent)));
         assert_eq!(slash(&all, "/nonsense"), None);
         assert_eq!(slash(&all, "stop"), None);
     }

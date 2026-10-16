@@ -125,8 +125,9 @@ pub(super) fn user_bubble(
 
 pub(super) fn reply(ui: &mut egui::Ui, text: &str) {
     // An image in a reply would be fetched from wherever it points, a URL prompt injection can
-    // write: shown as a link, it goes nowhere unless clicked.
-    ui.markdown_ui(&text.replace("![", "["));
+    // write: shown as a link, it goes nowhere unless clicked. A model's single line breaks are
+    // meant, as in any chat; CommonMark would join a list of rooms into one paragraph.
+    ui.markdown_ui(&text.replace("![", "[").replace('\n', "  \n"));
 }
 
 /// A tool call as one row: what ran and the first line of what it said; a click opens its

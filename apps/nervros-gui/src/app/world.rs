@@ -51,6 +51,20 @@ impl Gui {
     }
 }
 
+/// The world model's rooms by number, R2 before R10: canopy lists them in the order it segmented
+/// them.
+fn by_number(rooms: &Value) -> Vec<Value> {
+    let mut list = rooms["rooms"].as_array().cloned().unwrap_or_default();
+    list.sort_by_cached_key(|r| {
+        let id = r["id"].as_str().unwrap_or_default();
+        let number = id
+            .trim_start_matches(|c: char| !c.is_ascii_digit())
+            .parse::<u32>();
+        (number.unwrap_or(u32::MAX), id.to_owned())
+    });
+    list
+}
+
 /// The World tab: the world model's rooms, how much of each the camera has seen, a button that
 /// asks the agent to explore, and the keep-out zones.
 pub(super) fn world_view(
@@ -59,7 +73,7 @@ pub(super) fn world_view(
     objects: Option<usize>,
     zones: &[Zone],
 ) -> Vec<Action> {
-    let list = rooms["rooms"].as_array().cloned().unwrap_or_default();
+    let list = by_number(rooms);
     let fraction = |r: &Value, k: &str| r[k].as_f64().map(|v| v.clamp(0.0, 1.0));
     let seen: Vec<f64> = list
         .iter()
@@ -107,20 +121,20 @@ pub(super) fn world_view(
                 }
                 ui.end_row();
                 for r in &list {
-                    let text = |k: &str| r[k].as_str().unwrap_or_default().to_owned();
-                    let (id, name, kind) = (text("id"), text("name"), text("type"));
-                    // canopy's names are often its types; say it once.
-                    let name = [
-                        id,
-                        name.clone(),
-                        if kind == name { String::new() } else { kind },
-                    ]
-                    .into_iter()
-                    .filter(|t| !t.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                    // As the 3D view names it: its type while its name is canopy's "room C".
+                    let id = r["id"].as_str().unwrap_or_default();
+                    let name = match nervros_core::room_label(r) {
+                        Some(label) => format!("{id} {}", label.replace('_', " ")),
+                        None => id.to_owned(),
+                    };
+                    let whole = [r["name"].as_str(), r["type"].as_str()]
+                        .into_iter()
+                        .flatten()
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     ui.label(RichText::new(&name).size(13.5))
-                        .on_hover_text(&name);
+                        .on_hover_text(format!("{id}: {whole}"));
                     for k in ["floor_coverage", "face_coverage"] {
                         match fraction(r, k) {
                             #[expect(clippy::cast_possible_truncation, reason = "a fraction")]
@@ -244,7 +258,12 @@ pub(super) fn layers_view(ui: &mut egui::Ui, layers: &nervros_viz::Layers) {
     ui.add_space(8.0);
     for (name, mut shown) in list {
         ui.horizontal(|ui| {
-            if ui.toggle_switch(14.0, &mut shown).changed() {
+            let toggle = ui.toggle_switch(14.0, &mut shown);
+            // Named for a screen reader, and for a script that clicks it.
+            toggle.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, shown, &name)
+            });
+            if toggle.changed() {
                 layers.set(&name, shown);
             }
             let text = RichText::new(&name);

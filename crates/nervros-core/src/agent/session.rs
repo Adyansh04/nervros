@@ -31,7 +31,7 @@ use actor::actor;
 use approval::Asked;
 pub use approval::{Unanswered, take_unanswered};
 pub use config::{EVENT_BACKLOG, PULSE_PERIOD, Pulse, SessionConfig};
-pub use event::{Command, Event, is_stop_word, pause_word};
+pub use event::{Command, Event, NotApproved, is_stop_word, only_pause_word, pause_word};
 
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
@@ -43,10 +43,15 @@ struct Shared {
     approvals: Mutex<HashMap<u64, Asked>>,
     /// Approvals the operator turned down in a row since they last approved one or spoke.
     denials: AtomicU32,
+    /// What they turned down since they last spoke, as tool and arguments: asked again unchanged,
+    /// it is refused without asking.
+    denied: Mutex<HashSet<String>>,
     /// This turn's last failed result, as tool and message, and how often it came in a row.
     repeated: Mutex<(String, u32)>,
     /// What the operator said during the running turn, for its next tool result.
     steer: Mutex<Vec<String>>,
+    /// What the robot noticed since the operator last spoke, for their next message.
+    notes: Mutex<Vec<String>>,
     calls: AtomicU64,
     next_approval: AtomicU64,
     /// Milliseconds this turn spent waiting for the operator.
@@ -170,8 +175,10 @@ impl Session {
             calls: AtomicU64::new(0),
             next_approval: AtomicU64::new(0),
             denials: AtomicU32::new(0),
+            denied: Mutex::default(),
             repeated: Mutex::default(),
             steer: Mutex::default(),
+            notes: Mutex::default(),
             waited_ms: AtomicU64::new(0),
             allowed: Mutex::default(),
             waiting: Mutex::default(),

@@ -33,6 +33,16 @@ pub(super) fn report(ui: &mut egui::Ui, text: &str) {
 /// line after it tells the model what to do next.
 pub(super) fn report_text(text: &str) -> String {
     let first = text.lines().next().unwrap_or(text);
+    // A job's result comes fenced as world text; it reads as the job's card shows it.
+    let first = match (first.find("<world>"), first.rfind("</world>")) {
+        (Some(open), Some(close)) if open < close => format!(
+            "{}{}{}",
+            &first[..open],
+            super::job::readable(&first[open + "<world>".len()..close]),
+            &first[close + "</world>".len()..]
+        ),
+        _ => first.to_owned(),
+    };
     first
         .replace("<world>", "")
         .replace("</world>", "")

@@ -36,7 +36,7 @@ pub fn tools(missions: &Arc<Missions>) -> [Arc<dyn Tool>; 3] {
             missions: Arc::clone(missions),
         }),
         Arc::new(SkillGap {
-            spec: gap_spec(),
+            spec: gap_spec(missions.config.define_skill.is_some()),
             missions: Arc::clone(missions),
         }),
     ]
@@ -166,7 +166,8 @@ impl Tool for Recall {
                 let found = find_object(&seen, &[query.as_str()], Some(&query));
                 if found.is_none() && story.is_empty() && moves.is_empty() {
                     return ToolOutcome::failed(format!(
-                        "the world model knows nothing called \"{query}\"; find_objects searches it"
+                        "the world model has never seen anything called \"{query}\"; search, as \
+                         action plan, ranks where such a thing is likely to be without moving"
                     ));
                 }
                 let mut out = json!({});
@@ -251,12 +252,13 @@ fn plans_spec() -> ToolSpec {
     ToolSpec::new(
         "plans",
         "Plans saved by name, such as \"evening check\": action=save keeps a plan checked \
-         before (its hash) under a name; list shows them; forget removes one. To run one, \
-         call run_mission with template set to its name; the operator approves it then.",
+         before (its hash) under a name, or without a hash the newest mission that worked; list \
+         shows them; forget removes one. To run one, call run_mission with template set to its \
+         name; the operator approves it then.",
         json!({"type": "object", "properties": {
             "action": {"type": "string", "enum": ["save", "list", "forget"]},
             "name": {"type": "string", "description": "For save and forget."},
-            "hash": {"type": "string", "description": "For save: a plan run_mission checked."}
+            "hash": {"type": "string", "description": "For save: a plan run_mission checked; leave it out for the newest mission that worked."}
         }, "required": ["action"], "additionalProperties": false}),
         Risk::Annotate,
     )
@@ -276,6 +278,10 @@ impl Tool for Plans {
 
     async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
         let observe = args["action"].as_str() == Some("list");
+        // Before the operator is asked: "saves the plan \"\"" was approved, then failed.
+        if !observe && args["name"].as_str().is_none_or(|n| n.trim().is_empty()) {
+            return Some(Err(ToolOutcome::failed("`name` is what to call the plan")));
+        }
         Some(Ok(Assessment {
             risk: if observe {
                 Risk::Observe
@@ -303,15 +309,16 @@ impl Tool for Plans {
                 if name.is_empty() {
                     return ToolOutcome::failed("`name` is what to call the plan");
                 }
-                let compiled = match self
-                    .missions
-                    .find(args["hash"].as_str().unwrap_or_default())
-                {
-                    Ok(c) => c,
-                    Err(e) => return ToolOutcome::failed(e),
+                let hash = args["hash"].as_str().unwrap_or_default();
+                // "Save that" means the mission that just worked; a hash a condensed
+                // conversation no longer holds is not asked for again.
+                let (intent, steps) = match self.missions.find(hash) {
+                    Ok(c) => (c.plan.intent.clone(), json!(c.plan.steps)),
+                    Err(e) => match read(&self.missions, newest_success).await {
+                        Ok(Some(found)) if hash.is_empty() => found,
+                        _ => return ToolOutcome::failed(e),
+                    },
                 };
-                let steps = json!(compiled.plan.steps);
-                let intent = compiled.plan.intent.clone();
                 let saved = name.clone();
                 match read(&self.missions, move |l| {
                     l.save_template(&saved, &intent, &steps)
@@ -339,12 +346,21 @@ impl Tool for Plans {
     }
 }
 
-fn gap_spec() -> ToolSpec {
+/// The spec, which sends the model to `teach_skill` first when the robot takes taught skills.
+fn gap_spec(teachable: bool) -> ToolSpec {
+    let first = if teachable {
+        " Teach a skill first with teach_skill when its leaves can do it, such as pointing, \
+         waving or looking around; log here only what they cannot."
+    } else {
+        ""
+    };
     ToolSpec::new(
         "skill_gap",
-        "When the robot's skills cannot do what the operator asked, log it here (what is \
-         missing, and the skills that came closest) before you tell the operator: the log \
-         is the list of skills to build next.",
+        &format!(
+            "When the robot's skills cannot do what the operator asked, log it here (what is \
+             missing, and the skills that came closest) before you tell the operator: the log \
+             is the list of skills to build next.{first}"
+        ),
         json!({"type": "object", "properties": {
             "missing": {"type": "string", "description": "What no skill can do, in one sentence."},
             "nearest": {"type": "string", "description": "The skills that came closest, if any."}
@@ -376,6 +392,15 @@ impl Tool for SkillGap {
     }
 }
 
+/// The newest mission that succeeded and kept its plan, as its intent and steps.
+fn newest_success(ledger: &Ledger) -> rusqlite::Result<Option<(String, Value)>> {
+    Ok(ledger
+        .recent(20)?
+        .into_iter()
+        .find(|m| m.outcome == "success" && m.plan.is_array())
+        .map(|m| (m.intent, m.plan)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +411,28 @@ mod tests {
             words("Please bring the small white mug to the tray!"),
             ["bring", "small", "white", "mug", "tray"]
         );
+    }
+
+    #[test]
+    fn save_without_a_hash_takes_the_newest_mission_that_worked() {
+        let ledger = Ledger::in_memory().unwrap();
+        let ran = |id: &str, started: f64, outcome: &str, intent: &str| MissionRecord {
+            id: id.to_owned(),
+            intent: intent.to_owned(),
+            started,
+            outcome: outcome.to_owned(),
+            plan: json!([{"skill": "TurnInPlace", "args": {"degrees": 90}}]),
+            ..MissionRecord::default()
+        };
+        ledger
+            .record(&ran("m1", 100.0, "success", "turn left"))
+            .unwrap();
+        ledger
+            .record(&ran("m2", 200.0, "failure", "walk to the sofa"))
+            .unwrap();
+        let (intent, steps) = newest_success(&ledger).unwrap().unwrap();
+        assert_eq!(intent, "turn left");
+        assert!(steps.is_array());
     }
 
     #[test]

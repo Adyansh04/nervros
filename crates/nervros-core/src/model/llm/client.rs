@@ -259,7 +259,7 @@ const MAX_PARK: Duration = Duration::from_hours(24);
 
 /// What a failure says about the model: limited by a 429 for what the provider's `Retry-After`
 /// asks, else a minute; busy on a server error; unreachable when nothing answered at all. `None`
-/// for any other failure, whatever its text says.
+/// for any other failure, whatever its text says, but for [`malformed_call`].
 pub(super) fn setback(
     kind: ErrorKind,
     status: Option<reqwest::StatusCode>,
@@ -283,18 +283,29 @@ pub(super) fn setback(
     status.is_server_error().then_some(Setback::Busy)
 }
 
+/// Gemini's 400 for a tool call it wrote as broken JSON, which it asks to be retried: the same
+/// request usually comes back whole. The one 400 judged by its text, since its status alone would
+/// also retry a request that can never succeed.
+fn malformed_call(status: Option<reqwest::StatusCode>, text: &str) -> Option<Setback> {
+    (status == Some(reqwest::StatusCode::BAD_REQUEST)
+        && text.contains("Model generated invalid JSON"))
+    .then_some(Setback::Busy)
+}
+
 pub(super) fn prompt_setback(error: &PromptError) -> Option<Setback> {
     match error {
         PromptError::CompletionError(e) => setback(
             e.kind(),
             e.provider_response_status(),
             e.provider_response_headers(),
-        ),
+        )
+        .or_else(|| malformed_call(e.provider_response_status(), &e.to_string())),
         PromptError::Report(e) => setback(
             e.kind,
             e.provider_response_status(),
             e.provider_response_headers(),
-        ),
+        )
+        .or_else(|| malformed_call(e.provider_response_status(), &e.to_string())),
         _ => None,
     }
 }
@@ -305,12 +316,14 @@ pub(super) fn stream_setback(error: &StreamingError) -> Option<Setback> {
             e.kind(),
             e.provider_response_status(),
             e.provider_response_headers(),
-        ),
+        )
+        .or_else(|| malformed_call(e.provider_response_status(), &e.to_string())),
         StreamingError::Report(e) => setback(
             e.kind,
             e.provider_response_status(),
             e.provider_response_headers(),
-        ),
+        )
+        .or_else(|| malformed_call(e.provider_response_status(), &e.to_string())),
         StreamingError::Prompt(e) => prompt_setback(e),
     }
 }

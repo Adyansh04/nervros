@@ -1,7 +1,8 @@
 //! Which tasks a profile starts, and the viewer's layout for the cameras and layers it has.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use nervros_core::profile::{LayerConfig, LookConfig, Profile, TopicRef};
@@ -12,7 +13,7 @@ use tokio::task::JoinSet;
 
 use crate::blueprint::Layout;
 use crate::grid::{draw_coverage, draw_map, known_extent};
-use crate::objects::{draw_object_names, draw_objects};
+use crate::objects::{Drawn, draw_object_names, draw_objects};
 use crate::plan::{draw_plan, draw_trail};
 use crate::rooms::draw_rooms;
 use crate::tasks::{Drawer, camera, draw_detections, robot_model, sample, scan};
@@ -28,6 +29,8 @@ pub(super) struct Layer {
     pub(super) name: String,
     pub(super) path: String,
     pub(super) layers: Arc<Layers>,
+    /// Clears so far, for a drawer that leaves out what it drew before.
+    clears: Arc<AtomicU64>,
 }
 
 impl Layer {
@@ -39,6 +42,12 @@ impl Layer {
     pub(super) fn clear(&self, rec: &RecordingStream) {
         put_static(rec, &self.path, &rerun::Clear::recursive());
         put(rec, &self.path, &rerun::Clear::recursive());
+        self.clears.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts its clears: shown again, the layer is empty, whatever a drawer kept.
+    pub(super) fn clears(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.clears)
     }
 }
 
@@ -57,6 +66,7 @@ impl Spawner {
             name: name.to_owned(),
             path: path.to_owned(),
             layers: Arc::clone(&self.layers),
+            clears: Arc::default(),
         }
     }
 
@@ -158,15 +168,13 @@ impl Spawner {
                 trail,
                 Box::new(draw_trail),
             );
-            let (objects, mut drawn) = (
-                self.layer("Objects", "world/objects", true),
-                BTreeMap::new(),
-            );
+            let objects = self.layer("Objects", "world/objects", true);
+            let mut drawn = Drawn::new(objects.clears());
             self.watch(
                 world.objects.clone(),
                 OBJECTS_PERIOD,
                 objects,
-                Box::new(move |rec, path, msg| draw_objects(rec, path, msg, &mut drawn)),
+                Box::new(move |rec, path, msg| draw_objects(rec, path, msg, drawn.looks())),
             );
             // Off by default: forty names bury the map, and hovering a box names it.
             let names = self.layer("Object names", "world/object_names", false);

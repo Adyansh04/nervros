@@ -43,6 +43,14 @@ pub struct Case {
     pub setup: Vec<String>,
     /// The operator's messages, in order, in one session.
     pub say: Vec<String>,
+    /// A shell command run once the session has watched the robot for a moment, before the
+    /// messages, such as one that stops a node for the agent to find; the case fails if it does
+    /// not succeed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub inject: String,
+    /// A shell command run after the case, however it went, to undo `inject`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub restore: String,
     /// How long the case may take.
     #[serde(default = "default_max_s")]
     pub max_s: u64,
@@ -159,6 +167,8 @@ pub struct Seen {
 pub struct Exchange {
     mine: Option<u64>,
     open: u32,
+    /// Jobs running, such as a program: their report comes when they end.
+    jobs: u32,
     awaiting_report: bool,
 }
 
@@ -172,11 +182,17 @@ impl Exchange {
                 self.open = self.open.saturating_sub(1);
                 self.awaiting_report = true;
             }
+            Event::JobStarted { .. } => self.jobs += 1,
+            Event::JobFinished { .. } => {
+                self.jobs = self.jobs.saturating_sub(1);
+                self.awaiting_report = true;
+            }
             Event::Report { .. } => self.awaiting_report = false,
             Event::User { turn, text: sent } if sent == text => self.mine = Some(*turn),
             Event::TurnFinished { turn } => {
                 return self.mine.is_some_and(|m| *turn >= m)
                     && self.open == 0
+                    && self.jobs == 0
                     && !self.awaiting_report;
             }
             _ => {}
@@ -447,6 +463,8 @@ pub fn from_log(log: &str, id: &str) -> Case {
         id: id.to_owned(),
         setup: Vec::new(),
         say,
+        inject: String::new(),
+        restore: String::new(),
         max_s: default_max_s(),
         expect: Expect {
             tools: tools.into_iter().collect(),

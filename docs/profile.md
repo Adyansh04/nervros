@@ -1,9 +1,15 @@
 # The robot profile
 
-Each robot has one `nervros.toml`, kept in the robot's own repository. It says how to reach the
-robot's ROS graph, what the agent may do, where its camera and world model are, which of its
-services and topics become tools, and which models answer. Paths in it are relative to the file.
-An unknown key is an error, so a typo stops the start instead of being ignored.
+Each robot has one `nervros.toml`, kept in the robot's own repository. It says:
+
+- how to reach the robot's ROS graph,
+- what the agent may do,
+- where its cameras and world model are,
+- which of its services and topics become tools,
+- which models answer.
+
+Paths in it are relative to the file. An unknown key is an error, so a typo stops the start
+instead of being ignored.
 
 [`profiles/example/nervros.toml`](../profiles/example/nervros.toml) is a small one. grove-g1
 keeps one for a simulated Unitree G1 in `workspace/src/g1_bringup/config/nervros/`.
@@ -21,11 +27,13 @@ type = "canopy_msgs/srv/FindObjects"
 risk = "observe"
 ```
 
-The model sees the service's comment as the tool's description and gets a JSON Schema of the
-request made from the `.srv` file: field comments become descriptions, constants become enums, and
-byte arrays are hidden. The interface files are found through `[ros] interfaces`. A `topic` tool
-returns the newest message on the topic. Publishing, and calling services or actions the profile
-does not declare, is for the generic tools of [`[ros_tools]`](#ros_tools), behind the same guard.
+The model sees the service's comment as the tool's description. It also gets a JSON Schema of the
+request, made from the `.srv` file: field comments become descriptions, constants become enums,
+and byte arrays are hidden. The interface files are found through `[ros] interfaces`.
+
+A `topic` tool returns the newest message on the topic. Publishing, and calling services or actions
+the profile does not declare, is left to the generic tools of [`[ros_tools]`](#ros_tools), behind
+the same guard.
 
 | Key | Default | |
 |---|---|---|
@@ -34,7 +42,7 @@ does not declare, is for the generic tools of [`[ros_tools]`](#ros_tools), behin
 | `ros_name` | required | The service or topic. |
 | `type` | required | `pkg/srv/Name` or `pkg/msg/Name`. |
 | `description` | generated | Replaces the generated one: "Calls `ros_name` (`type`)." and the interface file's comment for a service, "Reads the newest message on `ros_name`" for a topic. |
-| `risk` | required for a service; `observe` for a topic | `observe`, `annotate`, `world_edit`, `motion` or `manipulation`. `annotate` changes only what the robot knows, such as the world model: no arming, the operator's approval when supervised. `world_edit` changes stored state the robot acts on, such as a parameter. It and the rest are acts: they need the robot armed and, when supervised, approval. A service can act on the robot, so a service tool without it fails the start instead of running as a read. |
+| `risk` | required for a service; `observe` for a topic | `observe`, `annotate`, `world_edit`, `motion` or `manipulation`; see below. |
 | `resources` | none | `base`, `left_arm`, `right_arm`: two calls holding the same one cannot run at once. |
 | `timeout` | `"5s"` | Per call. |
 | `hide_fields` | none | Request fields the model neither sees nor fills, such as an embedding. |
@@ -42,7 +50,18 @@ does not declare, is for the generic tools of [`[ros_tools]`](#ros_tools), behin
 | `schema` | generated | A full JSON Schema to use instead. |
 | `world_text` | none | Result fields that hold text read from the world, such as names a detector or a describer gave: each is fenced as `<world>...</world>`, which the model is told is data, never instructions. Text on a sign or a box must not steer the robot. |
 
-A name on the policy's `hard_deny` list cannot become a tool at all: the start fails.
+The risk levels:
+
+- `observe` only reads.
+- `annotate` changes only what the robot knows, such as the world model. It needs no arming, and
+  the operator's approval when supervised.
+- `world_edit` changes stored state the robot acts on, such as a parameter.
+- `world_edit`, `motion` and `manipulation` are acts: they need the robot armed and, when
+  supervised, approval.
+
+A service can act on the robot, so a service tool without a `risk` fails the start instead of
+running as a read. A name on the policy's `hard_deny` list cannot become a tool at all: the start
+fails.
 
 ## Sections
 
@@ -55,12 +74,15 @@ A name on the policy's `hard_deny` list cannot become a tool at all: the start f
 | `battery` | none | A `sensor_msgs/msg/BatteryState` topic, shown in the Robot tab. |
 | `diagnostics` | none | A `diagnostic_msgs/msg/DiagnosticArray` topic with motor temperatures; the Robot tab shows the hottest. |
 
-`skills` (at the top level, beside `[robot]`) lists folders of skills, relative to the profile:
-procedures for what the agent meets rarely and must get right, such as navigation that never came
-up. Each skill is a folder holding a `SKILL.md` that starts with a front matter of `name` (lower
-case words joined by `-`) and `description` (when to use it). The system prompt carries one line
-per skill; the `skill` tool reads one in full when it fits. `nervros-cli skills` lists them and
-says what could not be read.
+`skills` (at the top level, beside `[robot]`) lists folders of skills, relative to the profile.
+A skill is a procedure for something the agent meets rarely and must get right, such as navigation
+that never came up.
+
+- Each skill is a folder holding a `SKILL.md`. It starts with a front matter of `name` (lower case
+  words joined by `-`) and `description` (when to use it).
+- The system prompt carries one line per skill, and the `skill` tool reads one in full when it
+  fits.
+- `nervros-cli skills` lists them and says what could not be read.
 
 ### `[ros]`
 
@@ -69,7 +91,7 @@ says what could not be read.
 | `domain_id` | `0` | Must equal `ROS_DOMAIN_ID`, which ROS reads when the node starts; the agent refuses to start otherwise. |
 | `transport` | `default` | `udp` turns Fast DDS shared memory off, for a graph run by another user, such as a root container: shared memory between users fails without an error. The agent then needs `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`, which `scripts/ros-env.sh` exports with `NERVROS_UDP_ONLY=1`. |
 | `node_name` | `nervros` | The agent's node. |
-| `discovery_timeout` | `"20s"` | How long `nervros-cli doctor` waits for the graph, at most 5 s. |
+| `discovery_timeout` | `"20s"` | The longest a `nervros-cli` command waits for discovery to settle before it reads the graph. |
 | `interfaces` | none | Where interface packages are: an install prefix such as `/opt/ros/jazzy`, or a package's source directory. Tool schemas come from these. |
 | `remap` | none | Path prefixes to rewrite, for an install tree whose links point at another machine's paths. |
 | `map_frame` | `map` | The frame of places and poses. |
@@ -107,29 +129,37 @@ then = "deny"                   # or "ask": the operator approves it first, what
 reason = "the bedroom is private"
 ```
 
-A rule reads the call as it was sent and as it will run, matching whatever the case and the
-spaces around a value. For a plan that means its steps with each argument as `{name, value}`, a
-plan run by its hash or a saved name included, and each walk's `place` both as the model wrote it
-and as it resolved: the rule above holds whether the model wrote `R5`, `bedroom` or `Bedroom `.
-Write a rule on a room or an object with its id. A rule naming a tool the agent does not have, or
-an argument that tool does not take, stops start-up, since it would never apply.
+A rule reads the call both as it was sent and as it will run, whatever the case and the spaces
+around a value.
+
+- For a plan, that means its steps with each argument as `{name, value}`, including a plan run by
+  its hash or a saved name. Each walk's `place` is matched both as the model wrote it and as it
+  resolved, so the rule above holds whether the model wrote `R5`, `bedroom` or `Bedroom `.
+- Write a rule on a room or an object with its id.
+- A rule naming a tool the agent does not have, or an argument that tool does not take, stops
+  start-up, since it would never apply.
+- A `run_mission` rule also holds for the missions of a program or a search. There a rule that
+  would ask refuses instead, since a job cannot stop to ask.
 
 The default `hard_deny` covers what commands motors, velocities or controllers directly, under any
 namespace: `rt/lowcmd`, `*/lowcmd`, `*/rt/*`, `*cmd_vel*`, `*/controller_manager/*`,
 `*/set_parameters`, `*/set_parameters_atomically`, `*/joint_trajectory`,
 `*/follow_joint_trajectory`, `*/servo_node/*`, `*/apply_planning_scene` and `*/clear_octomap`. A
-relative name in a `[[tool]]` is checked as the node resolves it, under `/`. The default
-`hard_deny_types` are
-`geometry_msgs/msg/Twist`, `geometry_msgs/msg/TwistStamped`, `trajectory_msgs/msg/*`,
-`control_msgs/action/*`, `control_msgs/msg/JointJog`, `controller_manager_msgs/srv/*`,
-`lifecycle_msgs/srv/ChangeState` and `rcl_interfaces/srv/SetParameters*` (only `param_set` sets
-parameters); a type written `pkg/Name` is checked as every kind it could be. A name the model
-gives an act must be absolute: `cmd_vel` would otherwise reach `/cmd_vel` past a list written for
-absolute names. The read tools take `odom` as `/odom`, and the rules see it so.
+relative name in a `[[tool]]` is checked as the node resolves it, under `/`.
+
+The default `hard_deny_types` are `geometry_msgs/msg/Twist`, `geometry_msgs/msg/TwistStamped`,
+`trajectory_msgs/msg/*`, `control_msgs/action/*`, `control_msgs/msg/JointJog`,
+`controller_manager_msgs/srv/*`, `lifecycle_msgs/srv/ChangeState` and
+`rcl_interfaces/srv/SetParameters*` (only `param_set` sets parameters). A type written `pkg/Name`
+is checked as every kind it could be.
+
+A name the model gives an act must be absolute: `cmd_vel` would otherwise reach `/cmd_vel` past a
+list written for absolute names. The read tools take `odom` as `/odom`, and the rules see it that
+way too.
 
 ### `[ros_tools]`
 
-Generic ROS tools, what `ros2 topic/service/action/param/node` and `tf2_echo` do, natively and
+Generic ROS tools: what `ros2 topic/service/action/param/node` and `tf2_echo` do, natively and
 without a shell. With the table present, six read tools are always there:
 
 | Tool | Does |
@@ -141,11 +171,14 @@ without a shell. With the table present, six read tools are always there:
 | `params` | A node's parameters: names, values (all of them when none are named) and descriptions, at most 80 a call, narrowed by `prefix` or `filter`. |
 | `log_tail` | Recent `/rosout` lines, warnings and errors by default. |
 
-Four act tools exist only when their list names something. Each call needs the robot armed and, when
-supervised, the operator's approval of the resolved target, type and payload. It is checked against
-the interface, the hard deny lists and the profile's list before anyone is asked, and, but for
-`param_set`, it holds every resource while it runs. A running mission holds them all until it ends,
-so neither can overlap the other: the second is refused as busy.
+Four act tools exist only when their list names something.
+
+- Each call needs the robot armed and, when supervised, the operator's approval of the resolved
+  target, type and payload.
+- It is checked against the interface, the hard deny lists and the profile's list before anyone
+  is asked.
+- Except for `param_set`, it holds every resource while it runs. A running mission holds them all
+  until it ends, so the two cannot overlap: the second is refused as busy.
 
 | Tool | Does |
 |---|---|
@@ -157,7 +190,7 @@ so neither can overlap the other: the second is refused as busy.
 | Key | Default | |
 |---|---|---|
 | `hidden` | action internals, `/rosout`, `/parameter_events`, parameter services | Left out of listings unless `all` is asked; not a boundary. |
-| `read_deny` | none | Topics never sampled, echoed, watched, plotted or used to start a schedule. |
+| `read_deny` | none | Topics never sampled, echoed, watched, plotted, read by a playbook or used to start a schedule. |
 | `param_read_deny` | `*key*`, `*token*`, `*secret*`, `*password*` | Parameter values shown as hidden, matched on the name whatever its case: in `params`, `param_set`'s answer, a `service_call` reply, and the files `nervros-cli record` writes. |
 | `service_observe` | `get_*`, `list_*`, `describe_*` | Services that only read: `service_call` runs them unarmed and unapproved. A pattern without `/` matches the last part of the name, so `get_*` covers `/map_server/get_map` but not `/arm/get_ready/execute`. |
 | `service_call` | none | Services `service_call` may call. |
@@ -170,7 +203,7 @@ so neither can overlap the other: the second is refused as busy.
 ### `[look]`
 
 The `look` tool: a camera frame with the current detections drawn on it as numbered marks. The
-operator sees the frame; the chat model gets the marks and the answer of the `vision_check` model,
+operator sees the frame. The chat model gets the marks and the answer of the `vision_check` model,
 which is shown the marked frame (768 px on its long side) with the chat model's `question`. With no
 vision model available, `look` returns the marks alone and says why.
 
@@ -204,7 +237,7 @@ about = "It points down at the floor in front of the robot."
 
 The `segment` tool: masks for whatever a prompt names in a camera's newest frame ("the floor",
 "every mug on the table"), including things no detector marks. The operator sees the regions drawn,
-as a cutout on a dimmed frame or tinted over it; the chat model gets each region's label, box and
+as a cutout on a dimmed frame or tinted over it. The chat model gets each region's label, box and
 share of the frame, as marks of the snapshot. It needs `[look]`'s cameras.
 
 | Key | Default | |
@@ -219,11 +252,14 @@ model.
 ### `[editor]`
 
 canopy's world editor (`editor/canopy_editor.py <world_dir>`), which serves one saved world over
-HTTP. With it the agent gets `review_world` and `inspect_object` (reads), and `edit_world` and
-`world_edits` (edits, approved when supervised, no arming); and the app gets Edit world, the saved
-world on its floor plan, where objects are picked, moved, resized, turned, split, merged and added
-and rooms typed, as on canopy's own editor page. Both go through the editor, so each sees the
-other's edits.
+HTTP. With it:
+
+- the agent gets `review_world` and `inspect_object` (reads), and `edit_world` and `world_edits`
+  (edits, approved when supervised, no arming);
+- the app gets **Edit world**: the saved world on its floor plan, where you pick, move, resize,
+  turn, split, merge and add objects and type rooms, as on canopy's own editor page.
+
+Both go through the editor, so each sees the other's edits.
 
 | Key | Default | |
 |---|---|---|
@@ -233,33 +269,44 @@ other's edits.
 
 ### `[world]`
 
-The world model's topics, each `{ topic, type }` and each optional: `map` (a
-`nav_msgs/msg/OccupancyGrid`), `rooms` and `objects` (canopy's `RoomArray` and
-`WorldObjectArray`, or messages with the same fields), `coverage` (an `OccupancyGrid` of what the
-camera has seen, canopy's `/canopy/coverage`: 0 seen, 90 still to see, 99 written off) and `trail`
-(a `nav_msgs/msg/Path` of where the robot has been). The viewer draws them all, rooms coloured by
-how much of each the camera has seen, and plots that share with the room and object counts;
-`list_places`, `robot_state` and missions read rooms and objects. The app's World tab lists the
-rooms with their floor and walls seen, and its Explore button asks the agent to explore.
+The world model's topics, each `{ topic, type }` and each optional:
+
+| Key | Type |
+|---|---|
+| `map` | a `nav_msgs/msg/OccupancyGrid` |
+| `rooms`, `objects` | canopy's `RoomArray` and `WorldObjectArray`, or messages with the same fields |
+| `coverage` | an `OccupancyGrid` of what the camera has seen, canopy's `/canopy/coverage`: 0 seen, 90 still to see, 99 written off |
+| `trail` | a `nav_msgs/msg/Path` of where the robot has been |
+
+The viewer draws them all, with rooms coloured by how much of each the camera has seen, and plots
+that share beside the room and object counts. `list_places`, `robot_state` and missions read rooms
+and objects. The app's World tab lists the rooms with how much of their floor and walls was seen,
+and its **Explore** button asks the agent to explore.
 
 `history` names canopy's `canopy_msgs/srv/ObjectHistory` service: what happened to each object,
 when it appeared, moved, went missing, was seen again or merged. `recall` reads it, and a failed
 mission's report says where its object was last seen. An id the world model does not hold, such
-as an executor's `mug_4`, names its object only when one object of that kind is known: with
+as an executor's `mug_4`, names its object only when one object of that kind is known. With
 several mugs, the robot's own missions with `mug_4` say where it went instead.
 
 ### `[viz]`
 
-What the viewer draws beyond the world model, each optional: `plan` (`{ topic, type }`, the
-`nav_msgs/msg/Path` the navigation stack follows, Nav2's `/plan`), `camera_info` (`{ topic, type }`,
-the `[look]` camera's `sensor_msgs/msg/CameraInfo`) and `urdf` (the robot's URDF file, relative to
-the profile). With `camera_info`, the camera frame is drawn in the world where the camera is, as a
-frustum placed by TF from `[ros] base_frame` to the image's frame; without it, the frame is drawn
-on its own. With `urdf`, the robot is drawn as its model, posed by TF: the model's root from
-`[ros] base_frame`, and each joint that is not fixed from its parent link to its child link.
-`package://` meshes are found through `ROS_PACKAGE_PATH` or `AMENT_PREFIX_PATH`. The robot's
-heading arrow is drawn either way. Every camera in `[look]` gets its own view, with the detector's
-boxes on its frames.
+What the viewer draws beyond the world model, each optional:
+
+| Key | |
+|---|---|
+| `plan` | `{ topic, type }`: the `nav_msgs/msg/Path` the navigation stack follows, Nav2's `/plan` |
+| `camera_info` | `{ topic, type }`: the `[look]` camera's `sensor_msgs/msg/CameraInfo` |
+| `urdf` | the robot's URDF file, relative to the profile |
+
+- With `camera_info`, the camera frame is drawn in the world where the camera is, as a frustum
+  placed by TF from `[ros] base_frame` to the image's frame. Without it, the frame is drawn on its
+  own.
+- With `urdf`, the robot is drawn as its model, posed by TF: the model's root from
+  `[ros] base_frame`, and each joint that is not fixed from its parent link to its child link.
+  `package://` meshes are found through `ROS_PACKAGE_PATH` or `AMENT_PREFIX_PATH`. The robot's
+  heading arrow is drawn either way.
+- Every camera in `[look]` gets its own view, with the detector's boxes on its frames.
 
 `[[viz.layer]]` adds a topic the viewer draws in the world as RViz would:
 
@@ -285,9 +332,9 @@ furnished room buries the map in them; hovering a box names it either way.
 ### `[mission]`
 
 The robot's mission executor, which runs behaviour trees; see
-[the executor contract](executor.md). With this section the agent gets `run_mission`: it checks
-a plan, shows it, and runs it once the operator approves, so the operator approves once, in the
-app, and the agent never asks first in the chat. `check_only` only checks a plan.
+[the executor contract](executor.md). With this section the agent gets `run_mission`. It checks a
+plan, shows it, and runs it once the operator approves, so the operator approves once, in the app,
+and the agent never asks first in the chat. `check_only` only checks a plan.
 
 | Key | Default | |
 |---|---|---|
@@ -304,11 +351,12 @@ app, and the agent never asks first in the chat. `check_only` only checks a plan
 | `teleop` | none | The `Teleop` service: Drive in the Robot tab hands the base to the operator while no mission runs and the robot is armed; disarming hands it back. W S walk, A D turn, Q E step sideways. |
 | `teleop_cmd` | none | Where the hand-driving `geometry_msgs/msg/Twist` commands go; the executor caps their speed and stops the base when they pause. |
 | `teleop_speed` | `[0.5, 0.3, 0.8]` | Full hand-driving speed forward and sideways (m/s) and turning (rad/s); Slow in the Robot tab halves it. |
+| `define_skill`, `forget_skill` | none | The `DefineSkill` and `ForgetSkill` services: with both, the agent gets `teach_skill` and teaches the robot skills from the executor's learnable leaves; see [the executor contract](executor.md#taught-skills). |
 | `checks` | none | The skills the plan checks know; see below. |
 
-Before a plan reaches the operator it is checked against their words: a left turn planned as a
+Before a plan reaches the operator, it is checked against their words: a left turn planned as a
 right one, a walk the wrong way or of another length, the other hand. Such a plan goes back to the
-model once, and comes to the operator with its concerns and their fixes. Skill names, units and
+model once, then comes to the operator with its concerns and their fixes. Skill names, units and
 signs are the executor's, so these rules check only the skills `[mission.checks]` names:
 
 ```toml
@@ -318,21 +366,24 @@ walk = { skill = "WalkStraight", metres = "distance_m", direction = "direction",
 arm = "arm"                                            # the argument valued left or right
 ```
 
-`max_m` is the longest walk one step makes: a longer request needs more steps, so no single-step
-fix is offered. A request that names what
-to handle only as "it", said first in a session, is refused with word to ask; a request with a
-clock ("every 10 minutes") goes to `schedule`. With a `plan_check` model in the models file, a
-second model judges the plan from the operator's words too; with a `plan` model other than the
-routine one, it advises the planner once a request's plans have failed twice. Missions are kept in
-a ledger beside the quota file: the card shows how each step went before, and `recall`, the
-Mission tab and `nervros-cli missions` read it.
+- `max_m` is the longest walk one step makes. A longer request needs more steps, so no single-step
+  fix is offered.
+- A request that names what to handle only as "it", said first in a session, is refused with a
+  note to ask which.
+- A request with a clock ("every 10 minutes") goes to `schedule`.
+- With a `plan_check` model in the models file, a second model also judges the plan from the
+  operator's words. With a `plan` model other than the routine one, it advises the planner once a
+  request's plans have failed twice.
+
+Missions are kept in a ledger beside the quota file. The card shows how each step went before, and
+`recall`, the Mission tab and `nervros-cli missions` read the ledger.
 
 ### `[[place]]`
 
 Named places, beyond the world model's rooms. The operator can add more from where the robot
-stands ("remember this spot as the reading corner"): `tag_place` keeps them beside the quota ledger,
-one JSON file per robot, and `forget_place` drops them. Neither changes this file, and a remembered
-place cannot take a name the profile already uses.
+stands ("remember this spot as the reading corner"). `tag_place` keeps them beside the quota
+ledger, one JSON file per robot, and `forget_place` drops them. Neither changes this file, and a
+remembered place cannot take a name the profile already uses.
 
 ```toml
 [[place]]
@@ -348,13 +399,16 @@ place first, as it walks to any object the world model knows.
 
 ### `[geofence]`
 
-Keep-out zones: polygons on the map the robot may not be sent into. The profile's zones are fixed;
-the operator adds more in chat with `geofence` ("keep the robot out of the kitchen", "keep it a
-metre from the vase"), around a room, an object, a place or corners on the map, kept per robot in
-the state directory beside the remembered places. Adding a zone only narrows where the robot goes,
-so it is free; removing one asks the operator every time, supervised or autonomous and never
-allowed for the session (an `observe` profile refuses it), and only an edit of this file removes
-the profile's.
+Keep-out zones: polygons on the map the robot may not be sent into.
+
+- The profile's zones are fixed. The operator adds more in chat with `geofence` ("keep the robot
+  out of the kitchen", "keep it a metre from the vase"), around a room, an object, a place or
+  corners on the map. These are kept per robot in the state directory, beside the remembered
+  places.
+- Adding a zone only narrows where the robot goes, so it is free.
+- Removing one asks the operator every time, supervised or autonomous, and is never allowed for
+  the session. An `observe` profile refuses it. Only an edit of this file removes the profile's
+  zones.
 
 ```toml
 [geofence]
@@ -365,29 +419,102 @@ name = "stairs"
 polygon = [[4.0, 0.0], [5.0, 0.0], [5.0, 2.5], [4.0, 2.5]]   # map frame, metres, in order
 ```
 
-The guard refuses a Nav2 goal inside a zone (`NavigateToPose`, `NavigateThroughPoses`,
-`FollowWaypoints`, `FollowPath` and the path planners' actions) and a `PoseStamped` published
-inside one, a pose in another frame taken through TF and refused when TF cannot place it; while
-zones are set it refuses Nav2's straight moves (`DriveOnHeading`, `BackUp`), which only a mission
-step checks, and `action_goal` never starts a mission past `run_mission`. The plan check refuses a
-mission whose walk to a place, pose or target ends in one (for a label several objects share, any
-of them), or whose straight walk passes through one, followed from where the robot stands; a walk
-out of a zone the robot stands in is allowed. A plan run later, by its hash or a schedule, is
-checked again as it starts. Nav2 keeps its own paths out through `mask`: NervROS publishes an
-`OccupancyGrid` the size of `[world] map`, the zones' cells at 100 and latched (transient local),
-for Nav2's `KeepoutFilter` behind a `costmap_filter_info_server`, again whenever the zones or the
-map's grid change; `nervros-cli doctor` says whether anything reads it. Without `mask` Nav2 knows
-nothing of the zones, so only the agent's own checks hold them: a walk whose route crosses a
-zone, driving by hand and skills that move the base themselves are not held back. The straight-walk
-check covers the skill `[mission.checks] walk` names. The viewer draws the zones in red, the World
-tab lists them, and its buttons add and remove them through the agent.
+What the guard refuses:
 
-A zone needs a name, at least three corners and an area of 0.05 m² or more, and names are unique,
-whatever their case, across the profile's zones and the chat's; a bad zone in the profile stops
-the start. In chat a room is found by its id, then its name, then its type, and a type several
-rooms share is refused until one is named by id; an object or a place gets a margin of 0.3 m
-unless the operator says otherwise, and a place is a square reaching half a metre out from it,
-plus the margin.
+- A Nav2 goal inside a zone (`NavigateToPose`, `NavigateThroughPoses`, `FollowWaypoints`,
+  `FollowPath` and the path planners' actions), and a `PoseStamped` published inside one. A pose
+  in another frame is taken through TF, and refused when TF cannot place it.
+- While zones are set, Nav2's straight moves (`DriveOnHeading`, `BackUp`), which only a mission
+  step checks. `action_goal` never starts a mission past `run_mission`.
+
+What the plan check refuses:
+
+- A mission whose walk to a place, pose or target ends in a zone (for a label several objects
+  share, any of them ending in one).
+- A mission whose straight walk passes through a zone, followed from where the robot stands. A
+  walk out of a zone the robot stands in is allowed. The straight-walk check covers the skill
+  `[mission.checks] walk` names.
+- A plan run later, by its hash or a schedule, is checked again as it starts.
+
+Nav2 keeps its own paths out through `mask`. NervROS publishes an `OccupancyGrid` the size of
+`[world] map`, with the zones' cells at 100, latched (transient local), for Nav2's `KeepoutFilter`
+behind a `costmap_filter_info_server`. It publishes again whenever the zones or the map's grid
+change, and `nervros-cli doctor` says whether anything reads it. Without `mask`, Nav2 knows nothing
+of the zones and only the agent's own checks hold them: a walk whose route crosses a zone, driving
+by hand, and skills that move the base themselves are not held back.
+
+The viewer draws the zones in red, the World tab lists them, and its buttons add and remove them
+through the agent.
+
+- A zone needs a name, at least three corners and an area of 0.05 m² or more. Names are unique,
+  whatever their case, across the profile's zones and the chat's. A bad zone in the profile stops
+  the start.
+- In chat, a room is found by its id, then its name, then its type. A type several rooms share is
+  refused until one is named by id.
+- An object or a place gets a margin of 0.3 m unless the operator says otherwise. A place is a
+  square reaching half a metre out from it, plus the margin.
+
+### `[incidents]`
+
+The incident investigator: what its flight recorder watches, and this robot's playbooks. It also
+runs without the section, recording `/rosout`, the nodes and the missions, with the playbooks
+NervROS carries (the robot not placed on the map, a node running twice).
+
+```toml
+[incidents]
+playbooks = ["playbooks"]   # folders of *.toml, relative to this file
+window_s = 300              # how far back the recorder keeps
+watch = [                   # going quiet, after keeping its rate, opens an incident
+    { name = "head camera", topic = "/camera/color/camera_info", type = "sensor_msgs/msg/CameraInfo", min_hz = 1.0 },
+]
+nodes = ["detector_head", "nervros_executor"]   # stopping opens one; full name or last part
+```
+
+A playbook names:
+
+- the incidents it may explain (`mission_failed`, `topic_silent`, `node_gone`, `error_burst`,
+  `asked`; none for all),
+- whether `all` its checks must hold or `any`,
+- the verdict and the fix,
+- the agent skill with the long form, if any.
+
+For example:
+
+```toml
+id = "robot-lost"
+title = "The robot is lost on the map"
+explains = ["mission_failed", "asked"]
+verdict = "Localization settled far from where the simulator has the robot."
+fix = "Set the robot's pose again before any walk."
+procedure = "lost-on-the-map"
+
+[[check]]
+name = "map to pelvis, against the simulator"
+pose_gap = ["map", "pelvis"]
+topic = "/g1_sensor_relay/base_state"
+type = "nav_msgs/msg/Odometry"
+field = "pose.pose"
+metres = 1.0
+degrees = 30
+```
+
+Each check has one test, and may have a `name` for the report and `not = true`:
+
+| Test | Holds when |
+|---|---|
+| `topic`, `type`, `condition` | The topic, read now, meets a `watch` condition: `rate_below` with `hz`, `value` with `field`, `op` and `value`, or `text` with `contains`. |
+| `log` | The recording has a line holding these words, case aside; `node` narrows it to nodes whose name holds that, `level` (`warn` unless given) and `at_least` (1) set the least. |
+| `node_missing`, `node_duplicated` | The node is not running, or runs twice under one name; `*` for any node. |
+| `tf_missing` | `[target, source]`: no transform links them. |
+| `pose_gap` | `[target, source]` differs from the pose at `field` of `topic`'s newest message by more than `metres` or `degrees`. |
+| `failure_has` | The failed mission's reason holds these words. |
+
+- A check that cannot run leaves its playbook unchecked rather than ruled out.
+- `{map_frame}` and `{base_frame}` in a playbook are filled from `[ros]`.
+- A playbook with the same id as an earlier one replaces it. The profile's folders come after
+  NervROS's, and the ones the agent was asked to remember, kept per robot in the state directory,
+  come after those.
+- Incidents are kept in the state directory too, the newest fifty.
 
 ### `[models]`
 
@@ -395,12 +522,15 @@ plus the margin.
 
 ### `[[mcp_server]]`
 
-Tools from an MCP server, behind the same guard as every other tool. Only the tools listed exist
-for the agent, and each only while its definition is the one approved: `nervros-cli mcp pin` keeps
-each tool's definition, by a hash of its canonical form and its text, in `mcp.lock.json` beside the
-profile, and a tool whose definition changed is left out until it is pinned again. A tool acts,
-with arming and approval, unless the profile marks it `observe`; the server's own hints are not
-believed. What a tool returns is cut to a size and fenced with the server and tool it came from.
+Tools from an MCP server, behind the same guard as every other tool.
+
+- Only the tools listed exist for the agent, and each only while its definition is the one
+  approved. `nervros-cli mcp pin` keeps each tool's definition, by a hash of its canonical form and
+  its text, in `mcp.lock.json` beside the profile. A tool whose definition changed is left out
+  until it is pinned again.
+- A tool acts, with arming and approval, unless the profile marks it `observe`. The server's own
+  hints are not believed.
+- What a tool returns is cut to a size and fenced with the server and tool it came from.
 
 ```toml
 [[mcp_server]]
@@ -425,15 +555,17 @@ Doctor tab show a server that did not connect.
 
 ## Builtin tools
 
-Every robot gets `list_places`, `robot_state`, `geofence` and `stop`. `stop` is always allowed, armed or not,
-because it only makes the robot do less. `look` comes with `[look]`, `segment` with `[segment]`,
-and `run_mission` with `[mission]`.
+Every robot gets `list_places`, `robot_state`, `geofence` and `stop`. `stop` is always allowed,
+armed or not, because it only makes the robot do less. `look` comes with `[look]`, `segment` with
+`[segment]`, and `run_mission` with `[mission]`.
 
 The rest are the checks you would run yourself before blaming the model:
 
 | Tool | What it does |
 |---|---|
-| `health_check` | The connection check, plus each camera's frame rate, whether the robot knows where it is on the map, and the executor's state. Returns what is wrong and what is fine. |
+| `health_check` | The connection check, plus each camera's frame rate, whether the robot knows where it is on the map, the executor's state, and the known problems the playbooks check for. Returns what is wrong and what is fine. |
+| `why` | Explains the newest incident (within ten minutes), one by its id or its mission's, or checks the robot now; `list` lists the incidents. See [`[incidents]`](#incidents). |
+| `remember_finding` | Keeps a playbook the agent writes from a debugging session, checked as the profile's are; an `annotate` call. |
 | `watch` | Watches a topic in the background and posts to the chat when a condition holds: its rate drops below a floor, a field crosses a value, or a text field matches. Once, or each time it comes back; at most 8 at a time, all ended with the session. |
 | `watches` | Lists the running watches, or cancels one or all. |
 | `plot` | Draws a number from a topic's messages over time in the app's Plots tab, as `rqt_plot` does, for two minutes unless told longer. |
@@ -442,6 +574,9 @@ The rest are the checks you would run yourself before blaming the model:
 | `recall` | With `[mission]`: what the robot did lately, from the mission ledger, what happened to an object, from `[world] history` and the robot's own missions with it, and the operator's notes. |
 | `plans` | With `[mission]`: saves a plan that worked by name ("evening check"), lists them, and runs one again. |
 | `skill_gap` | With `[mission]`: logs a request no skill can do, and why; planning that gives up logs one itself. The Mission tab and `nervros-cli gaps` list them. |
+| `program` | With `[mission]`: runs a short [Rhai](https://rhai.rs) program for what takes loops, counting or measuring, sandboxed (no files, network or `eval`, bounded in operations and size), on the robot's functions: the world model, topic reads and rates, TF, waits, and skills, each run as a mission. One that moves is approved once, with the skills its text names and its time limit, and runs as a job with Stop; one that only reads runs at once. Programs are kept by name per robot in the state directory, and the Mission tab lists them. |
+| `search` | With `[mission]`: finds something, ranking where to look from the world model's sightings and history and where such things usually are, then walking to each place and looking until the detector sees it; approved once, with the places it will look in order. `plan` lists the places without moving. |
+| `teach_skill` | With `[mission]`'s `define_skill` and `forget_skill`: teaches the robot a skill from the executor's learnable leaves, as a draft kept once a mission with it succeeds; lists and forgets taught skills. |
 | `point` | With a `segment` model in the models file: points at what the operator names in the frame a camera's detector marks, found as `look` finds it, or the newest frame when there are no marks, including things no detector marks, and says which mark a point lands on. |
 | `skill` | With `skills`: reads one skill's procedure. |
 | `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each is an `annotate` call: approval when supervised, no arming. |

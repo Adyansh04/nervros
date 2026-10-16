@@ -477,7 +477,7 @@ impl GeofenceTool {
                 .filter(|r| {
                     r[key]
                         .as_str()
-                        .is_some_and(|v| v.eq_ignore_ascii_case(room))
+                        .is_some_and(|v| crate::places::same_words(v, room))
                 })
                 .collect();
             (!hits.is_empty()).then_some(hits)

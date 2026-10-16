@@ -1,5 +1,6 @@
 //! The robot's skill catalog, as its executor's `GetCatalog` serves it.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use serde::Deserialize;
@@ -10,6 +11,8 @@ pub const GO_TO_POSE: &str = "GoToPose";
 pub const GO_TO_TARGET: &str = "GoToTarget";
 /// The skill plans use to move the base.
 pub const GO_TO_PLACE: &str = "GoToPlace";
+/// The skill that looks for something with the detector, and says what it calls it.
+pub const FIND_IN_VIEW: &str = "FindInView";
 
 /// Every skill the executor can run.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -18,6 +21,38 @@ pub struct Catalog {
     pub catalog_version: String,
     /// The skills.
     pub skills: Vec<Skill>,
+    /// What a skill an agent teaches may be built from, when the executor takes taught skills.
+    #[serde(default)]
+    pub learnable: Option<Learnable>,
+}
+
+/// The leaves a taught skill may use, and its bounds.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Learnable {
+    /// Each leaf by its tag.
+    pub leaves: BTreeMap<String, LearnableLeaf>,
+    /// The longest a taught skill may take.
+    pub max_duration_s: f64,
+    /// Its size, in nodes.
+    pub max_nodes: u32,
+}
+
+/// One leaf a taught skill may use.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct LearnableLeaf {
+    /// What it takes: `base`, `arms`, or empty.
+    #[serde(default)]
+    pub holds: String,
+    /// Its inputs: name to what it is for.
+    #[serde(default)]
+    pub ports: BTreeMap<String, String>,
+    /// Groups of inputs of which a body sets exactly one, such as a target or a frame.
+    #[serde(default)]
+    pub one_of: Vec<Vec<String>>,
+    /// The inputs that take a world-model id, when the executor types them: a `world_id`
+    /// argument may feed only these.
+    #[serde(default)]
+    pub world_ids: Option<Vec<String>>,
 }
 
 /// One skill: a behaviour-tree macro in the executor's library.
@@ -47,6 +82,12 @@ pub struct Skill {
     pub max_duration_s: f64,
     /// The `SubTree` ID in the executor's library.
     pub template: String,
+    /// For a skill an agent taught: `draft` until a mission with it succeeds, then `kept`.
+    #[serde(default)]
+    pub learned: String,
+    /// For a taught skill: the operator's request it was taught for.
+    #[serde(default)]
+    pub taught_for: String,
 }
 
 /// One input of a skill, or one of its outputs.
@@ -180,6 +221,11 @@ impl Catalog {
                 .skip(usize::from(self.can_travel())),
         ) {
             let mut text = format!("- {signature}: {}", s.description);
+            match s.learned.as_str() {
+                "draft" => text.push_str(" (Taught, not yet tried: say so when you plan it.)"),
+                "kept" => text.push_str(" (Taught.)"),
+                _ => {}
+            }
             if !s.requires.is_empty() {
                 let _ = write!(text, " Needs {}.", s.requires.join(" and "));
             }

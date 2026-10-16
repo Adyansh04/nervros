@@ -180,8 +180,8 @@ fn templates(ui: &mut egui::Ui, list: &[Template], actions: &mut Vec<Action>) ->
     for plan in list {
         let runs = match plan.runs {
             0 => "never run".to_owned(),
-            1 => "run once".to_owned(),
-            n => format!("run {n} times"),
+            1 => "ran once".to_owned(),
+            n => format!("ran {n} times"),
         };
         theme::row(
             ui,

@@ -2,7 +2,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use nervros_core::look::LookTool;
@@ -67,8 +66,6 @@ pub(crate) async fn segment(
 
 /// Calls an image tool once, prints its data and saves its image.
 async fn run_once(tool: &dyn Tool, args: serde_json::Value, out: &Path) -> Result<()> {
-    // Frames and discovery need a moment after the node starts.
-    tokio::time::sleep(Duration::from_secs(2)).await;
     let name = tool.spec().name.clone();
     let outcome = tool.call(args).await;
     if outcome.status != Status::Succeeded {
@@ -119,8 +116,7 @@ pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<(
             rule.reason
         );
     }
-    // Discovery needs a moment after the node starts.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
     let risk = match tool.assess(&args).await {
         Some(Ok(a)) => a.risk,
         Some(Err(out)) => bail!("{name}: {}", out.message),
@@ -133,7 +129,10 @@ pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<(
     if !outcome.message.is_empty() {
         eprintln!("{}", outcome.message);
     }
-    println!("{}", serde_json::to_string_pretty(&outcome.data)?);
+    // A failure carries no data: its message says it all.
+    if !outcome.data.is_null() {
+        println!("{}", serde_json::to_string_pretty(&outcome.data)?);
+    }
     if outcome.status != Status::Succeeded {
         bail!("{name} did not succeed");
     }
@@ -154,6 +153,8 @@ pub(crate) struct ChatOptions {
     pub(crate) approve: bool,
     /// A saved conversation to carry on: a path, or `last`.
     pub(crate) resume: Option<String>,
+    /// The only model to talk on.
+    pub(crate) model: Option<String>,
 }
 
 /// A checked plan, each step with how it has gone before, then what may not match the request.
@@ -233,6 +234,32 @@ fn print_mission(e: &Event) {
     }
 }
 
+/// What runs beside the conversation: jobs, and incidents as they open.
+fn print_background(e: &Event) {
+    match e {
+        Event::JobStarted { job } => println!(
+            "  [{} {} started: {}; it {}]",
+            job.kind.as_str(),
+            job.id,
+            job.name,
+            job.allows
+        ),
+        Event::JobLog { id, line } => println!("  [{id}] {line}"),
+        Event::JobFinished { job } => {
+            println!(
+                "  [{} {} {}]",
+                job.kind.as_str(),
+                job.id,
+                job.state.as_str()
+            );
+        }
+        Event::Incident { incident } => {
+            println!("  [incident {}: {}]", incident.id, incident.headline());
+        }
+        _ => {}
+    }
+}
+
 fn print_event(e: &Event, logs: &Path) {
     match e {
         Event::Reply { text, model, .. } => println!("robot> {text}\n        [{model}]"),
@@ -278,9 +305,12 @@ fn print_event(e: &Event, logs: &Path) {
         }
         Event::ApprovalEdited { id, reason, .. } => println!("  approval #{id} edited: {reason}"),
         Event::EditRejected { id, message } => println!("  edit of #{id} refused: {message}"),
-        Event::ApprovalResolved { id, approved } => {
-            println!("  approval #{id}: {}", if *approved { "yes" } else { "no" });
-        }
+        Event::ApprovalResolved {
+            id, not_approved, ..
+        } => match not_approved {
+            None => println!("  approval #{id}: yes"),
+            Some(why) => println!("  approval #{id}: no ({why:?})"),
+        },
         Event::Armed { armed } => println!("  [{}]", if *armed { "armed" } else { "disarmed" }),
         Event::Halted { reason } => println!("  [halted: {reason}]"),
         Event::Stopped { ok: true, detail } => println!("  [the robot stopped: {detail}]"),
@@ -296,6 +326,10 @@ fn print_event(e: &Event, logs: &Path) {
         | Event::MissionProgress { .. }
         | Event::MissionPaused { .. }
         | Event::MissionFinished { .. } => print_mission(e),
+        Event::JobStarted { .. }
+        | Event::JobLog { .. }
+        | Event::JobFinished { .. }
+        | Event::Incident { .. } => print_background(e),
         // Plots are drawn by the app's viewer; the tool's reply already says what it plots.
         Event::User { .. }
         | Event::TurnStarted { .. }
@@ -314,6 +348,7 @@ fn print_event(e: &Event, logs: &Path) {
             before,
             after,
             summarised,
+            ..
         } => {
             let how = if *summarised { "summarised" } else { "cut" };
             println!("  [conversation {how}: {before} -> {after} tokens]");
@@ -382,7 +417,7 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
         log_path,
         blobs,
         ..
-    } = nervros_core::app::start_logged(profile_path, state, resume)
+    } = nervros_core::app::start_logged(profile_path, state, resume, options.model.clone())
         .context("starting the agent")?;
     eprintln!(
         "NervROS: {} with tools {}; log {}",
@@ -403,8 +438,7 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
     if options.arm {
         agent.session.send(SessionCommand::Arm);
     }
-    // Discovery and the camera need a moment after the node starts.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    nervros_core::app::settled(agent.robot.as_ref(), agent.profile.ros.discovery_timeout).await;
     if !options.say.is_empty() {
         return say_all(&agent, &mut events, options.say, options.approve, &blobs).await;
     }
@@ -422,6 +456,15 @@ async fn say_all(
 ) -> Result<()> {
     for text in say {
         println!("you> {text}");
+        // A `/` command or a stop word is the session's, as typed in a chat, not the model's.
+        match parse_line(&text) {
+            Some(SessionCommand::User(_)) => {}
+            Some(cmd) => {
+                agent.session.send(cmd);
+                continue;
+            }
+            None => continue,
+        }
         agent.session.send(SessionCommand::User(text.clone()));
         let mut exchange = nervros_core::evalcase::Exchange::default();
         loop {
@@ -503,7 +546,7 @@ async fn interactive(
 pub(crate) async fn doctor(profile_path: &Path) -> Result<()> {
     let profile = Profile::load(profile_path).context("loading the profile")?;
     let robot = nervros_core::app::connect(&profile)?;
-    tokio::time::sleep(profile.ros.discovery_timeout.min(Duration::from_secs(5))).await;
+    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
     let checks = nervros_core::doctor::run(&profile, robot.as_ref()).await;
     for c in &checks {
         println!("{} {}", if c.ok { "ok     " } else { "MISSING" }, c.what);
@@ -515,12 +558,32 @@ pub(crate) async fn doctor(profile_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Investigates the robot now and prints the incident, kept with the robot's others.
+pub(crate) async fn why(profile_path: &Path) -> Result<()> {
+    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let robot = nervros_core::app::connect(&profile)?;
+    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
+    let (file, remembered) =
+        nervros_core::app::incident_files(&profile, &nervros_core::app::state_dir());
+    let investigator =
+        nervros_core::incident::Investigator::start(&profile, robot, Some(file), Some(remembered));
+    for problem in investigator.problems() {
+        eprintln!("left out: {problem}");
+    }
+    let asked = nervros_core::incident::Trigger::new(
+        nervros_core::incident::Kind::Asked,
+        "asked from the command line",
+    );
+    let incident = investigator.investigate(asked).await;
+    print!("{}", incident.text(nervros_core::now_s()));
+    Ok(())
+}
+
 /// Drafts the robot's self-description from the live robot, or prints the facts it would use.
 pub(crate) async fn whoami(profile_path: &Path, only_facts: bool) -> Result<()> {
     let profile = Profile::load(profile_path).context("loading the profile")?;
     let robot = nervros_core::app::connect(&profile)?;
-    // Discovery needs a moment after the node starts.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
     let facts = nervros_core::whoami::facts(&profile, robot.as_ref()).await;
     if only_facts {
         println!("{}", serde_json::to_string_pretty(&facts)?);

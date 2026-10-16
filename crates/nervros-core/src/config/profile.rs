@@ -42,6 +42,8 @@ pub struct Profile {
     /// Keep-out zones, and where Nav2 reads them.
     #[serde(default)]
     pub geofence: GeofenceConfig,
+    /// The incident investigator: what it watches and the robot's playbooks.
+    pub incidents: Option<IncidentConfig>,
     /// Tools declared by ROS name and type.
     #[serde(rename = "tool", default)]
     pub tools: Vec<ToolConfig>,
@@ -75,6 +77,55 @@ pub struct GeofenceConfig {
     /// The fixed zones.
     #[serde(rename = "zone", default)]
     pub zones: Vec<ZoneConfig>,
+}
+
+/// What the incident investigator watches, and where this robot's playbooks are.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncidentConfig {
+    /// Folders of playbooks, relative to the profile, beside the ones NervROS carries.
+    #[serde(default)]
+    pub playbooks: Vec<PathBuf>,
+    /// How far back the flight recorder keeps, s.
+    #[serde(default = "default_incident_window")]
+    pub window_s: f64,
+    /// Topics whose going quiet opens an incident.
+    #[serde(default)]
+    pub watch: Vec<WatchedTopic>,
+    /// Nodes whose stopping opens an incident, by full name or last part.
+    #[serde(default)]
+    pub nodes: Vec<String>,
+}
+
+impl Default for IncidentConfig {
+    fn default() -> Self {
+        Self {
+            playbooks: Vec::new(),
+            window_s: default_incident_window(),
+            watch: Vec::new(),
+            nodes: Vec::new(),
+        }
+    }
+}
+
+fn default_incident_window() -> f64 {
+    300.0
+}
+
+/// A topic the flight recorder keeps an eye on.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchedTopic {
+    /// Its name.
+    pub topic: String,
+    /// Its type.
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// Under this rate for a few seconds, after keeping it, it has gone quiet.
+    pub min_hz: f64,
+    /// What people call it, such as "head camera".
+    #[serde(default)]
+    pub name: String,
 }
 
 /// A keep-out zone the profile sets.
@@ -400,6 +451,10 @@ pub struct MissionConfig {
     pub pause: Option<String>,
     /// `PreviewMission` service, for the picture of a plan beside its approval card.
     pub preview: Option<String>,
+    /// `DefineSkill` and `ForgetSkill` services, for the skills the agent teaches the robot.
+    pub define_skill: Option<String>,
+    /// See [`MissionConfig::define_skill`].
+    pub forget_skill: Option<String>,
     /// `RobotState` topic.
     pub state: String,
     /// Replans allowed after a failed mission.

@@ -10,6 +10,9 @@
 //!   cargo test -p nervros-gui live_eval -- --ignored --nocapture
 //! ```
 //!
+//! `NERVROS_GUI_EVAL_MODEL=<id>` talks on that model of `models.toml` alone. The run keeps the
+//! robot's files (missions, zones, programs, incidents) in `<dir>/state`.
+//!
 //! A script has one step per line: a prompt, typed and sent, then waited on until the session is
 //! quiet, each approval approved; or a `:command` (see [`Step`]). Settings at its top
 //! (`:follow`, `:tab`, `:edit`, `:approve`, `:speed`, `:missions`) apply before recording starts. Without a
@@ -75,6 +78,8 @@ fn gpu() -> egui_wgpu::WgpuSetup {
 enum Step {
     /// Typed into the composer and sent; the run waits until the session is quiet.
     Say(String),
+    /// `:send text`: typed and sent, and the run goes on at once, as to stop what it starts.
+    Send(String),
     /// `:wait 3`: seconds of window.
     Wait(Duration),
     /// `:follow on|off`: the 3D view keeps to the robot, or frames the map.
@@ -137,6 +142,7 @@ impl Step {
                 .ok_or_else(|| bad("no such tab")),
             "click" => Ok(Self::Click(rest.to_owned())),
             "type" => Ok(Self::Type(rest.to_owned())),
+            "send" if !rest.is_empty() => Ok(Self::Send(rest.to_owned())),
             "key" => key(rest)
                 .map(|(m, k)| Self::Key(m, k))
                 .ok_or_else(|| bad("a key, as ctrl+k or Enter")),
@@ -386,7 +392,11 @@ impl Run<'_> {
 
     fn step(&mut self, step: &Step) {
         match step {
-            Step::Say(text) => self.say(text),
+            Step::Say(text) => {
+                self.send(text);
+                self.settle();
+            }
+            Step::Send(text) => self.send(text),
             Step::Wait(d) => self.wait(*d),
             Step::Follow(on) => self.harness.state().bridge.follow(*on),
             Step::Tab(tab) => {
@@ -489,9 +499,8 @@ impl Run<'_> {
         }
     }
 
-    /// Types `text` into the composer a key at a time, sends it, and waits until the session is
-    /// quiet.
-    fn say(&mut self, text: &str) {
+    /// Types `text` into the composer a key at a time and sends it.
+    fn send(&mut self, text: &str) {
         eprintln!("== {text}");
         self.harness
             .ctx
@@ -514,7 +523,6 @@ impl Run<'_> {
         self.wait(Duration::from_millis(400));
         self.harness.get_by_label("Send").click();
         self.pointer_away();
-        self.settle();
     }
 
     /// The pointer shows where a click landed for a moment, then leaves the window, so it does
@@ -525,7 +533,7 @@ impl Run<'_> {
         self.frame();
     }
 
-    /// Steps until no turn runs, no mission runs, no approval waits (unless approving is left to
+    /// Steps until no turn, mission or job runs, no approval waits (unless approving is left to
     /// the script) and the chat has stayed the same for [`QUIET`].
     fn settle(&mut self) {
         let began = Instant::now();
@@ -544,7 +552,8 @@ impl Run<'_> {
             let gui = self.harness.state();
             // Left to the script, a turn waiting on an approval waits on the script's next step.
             let asking = gui.chat.pending().count() > 0;
-            let busy = (gui.chat.turn.is_some() && !asking) || gui.mission_running();
+            let busy =
+                (gui.chat.turn.is_some() && !asking) || gui.mission_running() || gui.job_running();
             let items = gui.chat.items.len();
             if busy || items != seen {
                 (quiet_since, seen) = (None, items);
@@ -611,6 +620,10 @@ fn a_script_reads_prompts_commands_and_settings() {
         Ok(Step::Hold(Key::W, Duration::from_millis(1500)))
     );
     assert_eq!(Step::parse(":focus 2"), Ok(Step::Focus("2".into())));
+    assert_eq!(
+        Step::parse(":send Find the mug."),
+        Ok(Step::Send("Find the mug.".into()))
+    );
     assert_eq!(Step::parse(":focus Name"), Ok(Step::Focus("Name".into())));
     assert!(Step::parse(":focus 0").is_err());
     assert_eq!(
@@ -635,8 +648,14 @@ fn live_eval() {
     let _entered = runtime.enter();
     let profile = nervros_core::profile::Profile::load(&profile_path).expect("the profile");
     let robot = nervros_core::app::connect(&profile).expect("the ROS node");
+    // Its own robot files, so a run neither finds an earlier one's missions and zones nor leaves
+    // its own; and the model the run is for, when one is named.
     let options = nervros_core::app::StartOptions {
         history: Some(out.join("session.history.json")),
+        state: Some(out.join("state")),
+        model: std::env::var("NERVROS_GUI_EVAL_MODEL")
+            .ok()
+            .filter(|m| !m.is_empty()),
         ..Default::default()
     };
     let state = nervros_core::app::state_dir();

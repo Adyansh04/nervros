@@ -1,0 +1,25 @@
+# Teach the robot a skill: checked against the catalog and the leaves a learned skill may be built
+# from (GetCatalog's `learnable`), then served in the catalog as a draft, or kept for good.
+# PascalCase, unlike any skill or leaf: PointAt, LookAround.
+string name
+# For the planner: what it does and when to use it.
+string description
+# Its arguments, as GetCatalog's catalog_json writes a skill's: a JSON array of {name, type,
+# format, description, enum, min, max}.
+string args_json
+# Its body: one behaviour-tree element of Sequence, Fallback, RetryUntilSuccessful, Timeout,
+# ForceSuccess and the learnable leaves, each attribute a literal or {arg}, an argument's name.
+string body_xml
+# The most it may take, s: its macro's Timeout and what a mission counts it for.
+float32 max_duration_s
+# The operator's request it was taught for, kept with it.
+string taught_for
+# false: a draft, served until the executor restarts or it is forgotten. true: kept on disk.
+bool keep
+---
+bool ok
+# When not ok: a JSON array of {code, line, node, message}, as ValidateMission's.
+string diagnostics_json
+string message
+# The catalog's version after the change.
+string catalog_version

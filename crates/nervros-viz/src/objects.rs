@@ -1,6 +1,8 @@
 //! The world model's objects: boxes coloured by state, with their names.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rerun::RecordingStream;
 use serde_json::{Value, json};
@@ -46,6 +48,34 @@ pub(super) fn draw_object_names(rec: &RecordingStream, path: &str, msg: &Value) 
             .with_show_labels(true)
             .with_radii([0.01]),
     );
+}
+
+/// How each object was drawn, by id, so an unchanged one is not drawn again; forgotten once its
+/// layer was cleared, as when it is hidden, so shown again every object is drawn.
+pub(super) struct Drawn {
+    clears: Arc<AtomicU64>,
+    seen: u64,
+    looks: BTreeMap<String, Value>,
+}
+
+impl Drawn {
+    pub(super) fn new(clears: Arc<AtomicU64>) -> Self {
+        Self {
+            seen: clears.load(Ordering::Relaxed),
+            clears,
+            looks: BTreeMap::new(),
+        }
+    }
+
+    /// What is in the viewer now.
+    pub(super) fn looks(&mut self) -> &mut BTreeMap<String, Value> {
+        let clears = self.clears.load(Ordering::Relaxed);
+        if clears != self.seen {
+            self.seen = clears;
+            self.looks.clear();
+        }
+        &mut self.looks
+    }
 }
 
 /// Objects from a `canopy_msgs/msg/WorldObjectArray`, one entity each so a click in the viewer
@@ -100,4 +130,22 @@ pub(super) fn draw_objects(
         &rerun::Scalars::single(now.len() as f64),
     );
     *drawn = now;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cleared_layer_draws_every_object_again() {
+        let clears = Arc::new(AtomicU64::new(0));
+        let mut drawn = Drawn::new(Arc::clone(&clears));
+        drawn.looks().insert("O1".to_owned(), json!([]));
+        assert_eq!(drawn.looks().len(), 1, "kept while the layer shows");
+        clears.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            drawn.looks().is_empty(),
+            "hidden and shown, nothing is in the viewer"
+        );
+    }
 }

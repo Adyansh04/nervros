@@ -92,6 +92,17 @@ impl Gui {
             ),
         }
         self.schedules_list(ui);
+        if let Some(store) = &self.agent.programs {
+            crate::programs::show(ui, store, &self.agent.jobs, &mut actions);
+        }
+        if let Some(catalog) = self
+            .agent
+            .missions
+            .as_ref()
+            .and_then(|m| m.cached_catalog())
+        {
+            crate::taught::show(ui, &catalog, &mut actions);
+        }
         let ledger = self.agent.missions.as_ref().and_then(|m| m.ledger());
         crate::history::show(ui, &mut self.records, ledger, &mut actions);
         self.act(ui.ctx(), actions);
@@ -123,15 +134,22 @@ impl Gui {
                 ui.label(RichText::new(&s.id).monospace().color(theme::FAINT));
                 ui.vertical(|ui| {
                     ui.add(egui::Label::new(&s.intent).wrap());
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(when).small().color(theme::DIM));
-                        if ui
-                            .add(ReButton::new("Cancel").small().secondary())
-                            .clicked()
-                        {
-                            cancel = Some(s.id.clone());
-                        }
-                    });
+                    // A long "when ..." beside the button squeezed it to a letter a line too.
+                    theme::row(
+                        ui,
+                        |ui| {
+                            if ui
+                                .add(ReButton::new("Cancel").small().secondary())
+                                .clicked()
+                            {
+                                cancel = Some(s.id.clone());
+                            }
+                        },
+                        |ui| {
+                            ui.label(RichText::new(&when).small().color(theme::DIM))
+                                .on_hover_text(&when);
+                        },
+                    );
                 });
             });
         }
@@ -197,7 +215,7 @@ impl Gui {
         }
     }
 
-    fn doctor_tab(&self, ui: &mut egui::Ui) {
+    fn doctor_tab(&mut self, ui: &mut egui::Ui) {
         // What the MCP servers brought at start goes with what the robot answers now.
         let checks = self.live().checks.clone().map(|mut c| {
             c.extend(self.agent.mcp.iter().cloned());
@@ -250,7 +268,34 @@ impl Gui {
             }
         }
         ui.add_space(18.0);
+        self.incidents(ui);
+        ui.add_space(18.0);
         self.self_description(ui);
+    }
+
+    /// The incidents, and a check of the robot now that keeps what it finds.
+    fn incidents(&mut self, ui: &mut egui::Ui) {
+        let incidents = self.agent.incidents.incidents();
+        let checking = self.live().investigating;
+        let mut actions = Vec::new();
+        let now = nervros_core::now_s();
+        if crate::incidents::show(ui, &incidents, now, checking, &mut actions) {
+            self.live().investigating = true;
+            let investigator = std::sync::Arc::clone(&self.agent.incidents);
+            let (live, wake) = (std::sync::Arc::clone(&self.live), ui.ctx().clone());
+            tokio::spawn(async move {
+                let asked = nervros_core::incident::Trigger::new(
+                    nervros_core::incident::Kind::Asked,
+                    "asked from the Doctor tab",
+                );
+                investigator.investigate(asked).await;
+                live.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .investigating = false;
+                wake.request_repaint();
+            });
+        }
+        self.act(ui.ctx(), actions);
     }
 
     /// Drafting what the robot is told about itself, from what it is now.

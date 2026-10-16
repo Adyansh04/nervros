@@ -96,8 +96,11 @@ impl Tool for TopicPublish {
             resources: Resource::ALL.to_vec(),
             args: None,
             reason: format!(
-                "publishes {} on {} ({}) {times} time(s)",
-                p.payload, p.name, p.ty
+                "publishes {} on {} ({}) {}",
+                p.payload,
+                p.name,
+                p.ty,
+                crate::counted(times, "time")
             ),
         }))
     }

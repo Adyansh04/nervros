@@ -475,8 +475,8 @@ impl SegmentTool {
             format!("nothing matched `{prompt}`; the user sees the frame")
         } else {
             format!(
-                "{} region(s); the user sees the segmented image",
-                listed.len()
+                "{}; the user sees the segmented image",
+                crate::counted(listed.len(), "region")
             )
         };
         out.images.push(snapshot.image.clone());
@@ -492,7 +492,7 @@ impl SegmentTool {
             .outliner
             .as_ref()
             .ok_or("no vision model is set up to segment")?;
-        let frame = camera.newest()?;
+        let frame = camera.newest_soon().await?;
         let img = frame.to_rgb().map_err(|e| e.to_string())?;
         let image = ImageInput::jpeg(&img)?;
         let (answer, model) = outliner.outline(&outline_prompt(prompt), image).await?;
@@ -511,6 +511,13 @@ impl SegmentTool {
             .service
             .as_deref()
             .ok_or("no segment service is configured")?;
+        // The service answers about its newest frame, which can be a tick older than the first
+        // one a camera just subscribed to holds: hold two before asking.
+        camera.newest_soon().await?;
+        let deadline = tokio::time::Instant::now() + SECOND_FRAME;
+        while camera.history.recent().len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         // The server may take longer than the frames are kept, so hold on to them.
         let mut frames = camera.history.recent();
         let reply = self
@@ -552,6 +559,8 @@ impl SegmentTool {
 
 /// How far a frame's stamp may be from the masks' and still be the frame they were cut from.
 const FRAME_MATCH: Duration = Duration::from_millis(20);
+/// How long a camera just subscribed to may take to send its second frame: a few frames.
+const SECOND_FRAME: Duration = Duration::from_secs(1);
 
 #[async_trait]
 impl Tool for SegmentTool {

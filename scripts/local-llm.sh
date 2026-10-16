@@ -20,7 +20,10 @@ REPO="${LLM_REPO:-models--unsloth--Qwen3.5-9B-GGUF}"
 MODEL="${LLM_MODEL:-Qwen3.5-9B-Q4_K_M.gguf}"
 MMPROJ=mmproj-F16.gguf
 ALIAS="${LLM_ALIAS:-qwen3.5-9b}"
-CTX="${LLM_CTX:-16384}"
+# 32k with an 8-bit KV cache fits the VRAM 16k took at 16 bits; the tools and persona alone are
+# about 12k, so at 16k the conversation was summarised nearly every turn.
+CTX="${LLM_CTX:-32768}"
+KV="${LLM_KV:-q8_0}"
 
 running() { [ "$(docker inspect -f '{{.State.Running}}' "${NAME}" 2>/dev/null)" = true ]; }
 healthy() { curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null; }
@@ -45,7 +48,8 @@ start() {
     docker run -d --name "${NAME}" --gpus all --memory 12g --cpus 8 \
         -p "127.0.0.1:${PORT}:8080" -v "${HF_CACHE}:/hf:ro" "${IMAGE}" \
         --model "${snapshot}/${MODEL}" --mmproj "${snapshot}/${MMPROJ}" --alias "${ALIAS}" \
-        --ctx-size "${CTX}" --n-gpu-layers all --parallel 1 --jinja --reasoning off \
+        --ctx-size "${CTX}" --flash-attn on --cache-type-k "${KV}" --cache-type-v "${KV}" \
+        --n-gpu-layers all --parallel 1 --jinja --reasoning off \
         --no-webui --host 0.0.0.0 --port 8080 >/dev/null
 
     for _ in $(seq 240); do

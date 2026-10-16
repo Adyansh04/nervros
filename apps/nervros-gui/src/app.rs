@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nervros_core::app::Agent;
 use nervros_core::doctor::Check;
+use nervros_core::job::JobState;
 use nervros_core::mission::{Outcome, held_by};
 use nervros_core::session::{Command, Event};
 use rerun::external::egui::{self, Color32, Frame, Key, Margin, Modifiers, RichText};
@@ -39,6 +40,8 @@ use live::watch;
 
 const EVENT_LOG: usize = 300;
 const COMPOSER: &str = "nervros_composer";
+/// The top bar's height in points: its 30-point buttons and the frame's margins.
+const TOP_BAR_HEIGHT: f32 = 48.0;
 const STOP_HINT: &str = "Halts the mission and cancels every goal; the hands keep their grip. \
                          The e-stop on the robot's remote is the real emergency stop.";
 
@@ -76,6 +79,8 @@ struct Live {
     pub draft: Option<Result<(std::path::PathBuf, String), String>>,
     /// The draft has just landed, below the checks: brought into view once.
     pub draft_fresh: bool,
+    /// A check of the robot started from the Doctor tab runs.
+    pub investigating: bool,
 }
 
 /// What the operator clicked in the viewer, when it is something the agent can act on.
@@ -160,7 +165,8 @@ enum Closing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseChoice {
     StopAndClose,
-    LeaveRunning,
+    /// Closes without a stop: the mission runs on, or the executor's deadman stops it.
+    JustClose,
     Cancel,
 }
 
@@ -176,9 +182,38 @@ fn on_close(closing: Closing, mission_running: bool) -> (bool, Closing) {
 /// How long closing waits for the robot to say it stopped, past the stop's own timeout.
 const STOP_BEFORE_CLOSE: Duration = Duration::from_secs(8);
 
+/// What the close dialog says, and its button for closing without a stop. With a deadman
+/// (`deadman_s`) the executor stops the mission once the window is gone, so nothing runs on.
+fn close_words(failed: bool, deadman_s: Option<f64>) -> (String, &'static str) {
+    let stops =
+        deadman_s.map(|s| format!("the robot stops the mission {s} s after the window closes"));
+    let body = match (failed, stops) {
+        (true, None) => "The mission may still be running. Try the stop again, or close and leave \
+                         it running with nobody watching; the chat says what the robot answered."
+            .to_owned(),
+        (true, Some(stops)) => format!(
+            "The mission may still be running. Try the stop again, or close: {stops}. The chat \
+             says what the robot answered."
+        ),
+        (false, None) => "Closing ends its programs and searches, and leaves a mission running \
+                          with nobody watching. Stop the robot first, or leave it to finish."
+            .to_owned(),
+        (false, Some(stops)) => format!(
+            "Closing ends its programs and searches, and {stops}, since nothing watches it then."
+        ),
+    };
+    let close = if deadman_s.is_some() {
+        "Close anyway"
+    } else {
+        "Leave it running"
+    };
+    (body, close)
+}
+
 /// The question asked when the window is closed with a mission running, or after a stop the robot
 /// did not confirm.
-fn close_dialog(ctx: &egui::Context, failed: bool) -> Option<CloseChoice> {
+fn close_dialog(ctx: &egui::Context, failed: bool, deadman_s: Option<f64>) -> Option<CloseChoice> {
+    let (body, close) = close_words(failed, deadman_s);
     let mut choice = None;
     let modal = egui::Modal::new(egui::Id::new("nervros_close")).show(ctx, |ui| {
         theme::apply(ui);
@@ -190,19 +225,11 @@ fn close_dialog(ctx: &egui::Context, failed: bool) -> Option<CloseChoice> {
                     .size(16.0)
                     .color(theme::ERROR),
             );
-            ui.add_space(6.0);
-            ui.label(
-                "The mission may still be running. Try the stop again, or close and leave it \
-                 running with nobody watching; the chat says what the robot answered.",
-            );
         } else {
-            ui.label(RichText::new("A mission is running").strong().size(16.0));
-            ui.add_space(6.0);
-            ui.label(
-                "Closing leaves it running with nobody watching. Stop the robot first, or leave \
-                 it to finish.",
-            );
+            ui.label(RichText::new("The robot is at work").strong().size(16.0));
         }
+        ui.add_space(6.0);
+        ui.label(body.as_str());
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             let stop = egui::Button::new(RichText::new("Stop it and close").color(Color32::WHITE))
@@ -210,11 +237,8 @@ fn close_dialog(ctx: &egui::Context, failed: bool) -> Option<CloseChoice> {
             if ui.add(stop).clicked() {
                 choice = Some(CloseChoice::StopAndClose);
             }
-            if ui
-                .add(ReButton::new("Leave it running").secondary())
-                .clicked()
-            {
-                choice = Some(CloseChoice::LeaveRunning);
+            if ui.add(ReButton::new(close).secondary()).clicked() {
+                choice = Some(CloseChoice::JustClose);
             }
             if ui.add(ReButton::new("Cancel").ghost()).clicked() {
                 choice = Some(CloseChoice::Cancel);
@@ -263,6 +287,8 @@ pub struct Gui {
     viewer_commands: re_viewer::CommandSender,
     /// The earlier moment the 3D view is paused at, if it is not following the newest data.
     viewing: Option<SystemTime>,
+    /// How wide the top bar's chips and controls were last frame, which the robot's name leaves.
+    bar_reserved: f32,
     /// Driving by hand, when the profile names the executor's teleop.
     drive: Option<crate::robot::Drive>,
     /// The mission ledger's lists, for the Mission tab.
@@ -385,6 +411,7 @@ impl Gui {
             toasts: Toasts::default(),
             viewer_commands,
             viewing: None,
+            bar_reserved: 0.0,
             drive,
             records: crate::history::History::default(),
             attachments: crate::attach::Attachments::new(Arc::clone(&agent_snapshots)),
@@ -398,6 +425,15 @@ impl Gui {
             .as_ref()
             .and_then(|s| s["mission_id"].as_str())
             .is_some_and(|id| !id.is_empty())
+    }
+
+    /// Whether a program or a search runs.
+    fn job_running(&self) -> bool {
+        self.agent
+            .jobs
+            .list()
+            .iter()
+            .any(|j| j.state == JobState::Running)
     }
 
     /// Whether the running mission is paused, or waits to pause once a pick or place ends.
@@ -419,23 +455,26 @@ impl Gui {
         }
     }
 
-    /// Closing the window with a mission running asks first: the mission would go on unwatched.
+    /// Closing the window with a mission or a job running asks first: the job would end, and the
+    /// mission go on unwatched or be stopped by the executor's deadman.
     fn guard_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) {
             let cancel;
-            (cancel, self.closing) = on_close(self.closing, self.mission_running());
+            let working = self.mission_running() || self.job_running();
+            (cancel, self.closing) = on_close(self.closing, working);
             if cancel {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
         match self.closing {
             Closing::Asking | Closing::StopFailed => {
-                match close_dialog(ctx, self.closing == Closing::StopFailed) {
+                let deadman = self.agent.missions.as_ref().and_then(|m| m.deadman_s());
+                match close_dialog(ctx, self.closing == Closing::StopFailed, deadman) {
                     Some(CloseChoice::StopAndClose) => {
                         self.agent.session.send(Command::StopMission);
                         self.closing = Closing::Stopping(std::time::Instant::now());
                     }
-                    Some(CloseChoice::LeaveRunning) => {
+                    Some(CloseChoice::JustClose) => {
                         self.closing = Closing::Allowed;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -493,19 +532,71 @@ impl Gui {
         }
     }
 
-    /// A finished mission gets a toast: the operator may be looking at the viewer or away.
+    /// A finished mission or job gets a toast, and so does an incident with news in it: the
+    /// operator may be looking at the viewer or away.
     fn toast(&mut self, e: &Event) {
+        if let Event::Incident { incident } = e {
+            let text = match incident.causes.first() {
+                Some(c) => Some(format!(
+                    "{}: likely {}. The Doctor tab has why",
+                    incident.id, c.title
+                )),
+                // A failed mission has its own toast, and the reply answers who asked; anything
+                // else is news.
+                None if !matches!(
+                    incident.kind,
+                    nervros_core::incident::Kind::MissionFailed
+                        | nervros_core::incident::Kind::Asked
+                ) =>
+                {
+                    Some(format!("{}: {}", incident.id, incident.trigger))
+                }
+                None => None,
+            };
+            if let Some(text) = text {
+                self.toasts.add(Kind::Failure, text);
+            }
+            return;
+        }
+        if let Event::JobFinished { job } = e {
+            let kind = match job.state {
+                JobState::Done => Kind::Success,
+                JobState::Failed => Kind::Failure,
+                JobState::Stopped | JobState::TimedOut | JobState::Running => Kind::Info,
+            };
+            let ended = format!(
+                "The {} {} {}",
+                job.kind.as_str(),
+                job.name,
+                job.state.as_str()
+            );
+            self.toasts.add(
+                kind,
+                if job.summary.is_empty() {
+                    ended
+                } else {
+                    format!("{ended}: {}", crate::chat::readable(&job.summary))
+                },
+            );
+            return;
+        }
         let Event::MissionFinished {
             id,
             outcome,
             failed_step,
             reason,
             elapsed_s,
+            by_job,
+            ..
         } = e
         else {
             return;
         };
         self.records.stale();
+        // The job's own toast says how it went.
+        if *by_job {
+            return;
+        }
         let what = self.chat.intent_of_mission(id).unwrap_or("the mission");
         let (kind, text) = match outcome {
             Outcome::Success => (Kind::Success, format!("Done: {what} in {elapsed_s:.0} s")),
@@ -529,11 +620,11 @@ impl Gui {
             self.agent.session.send(Command::StopMission);
             return;
         }
-        // Only on a mission that can take it: otherwise "wait" or "go on" is for the model.
+        // Only on a mission that can take it: otherwise "wait" or "go on" is for the model, and a
+        // plain "pause" for the executor, which says what there is to pause.
         if let Some(on) = nervros_core::session::pause_word(text)
-            && self.chat.can_pause
-            && self.mission_running()
-            && on != self.mission_paused()
+            && ((self.chat.can_pause && self.mission_running() && on != self.mission_paused())
+                || nervros_core::session::only_pause_word(text))
         {
             self.pause(on, "chat");
             return;
@@ -630,10 +721,14 @@ impl Gui {
                 Action::Say(text) => self.say(&text),
                 Action::Prefill(text) => {
                     self.input = text;
+                    composer::cursor_to_end(ctx, &self.input);
                     ctx.memory_mut(|m| m.request_focus(egui::Id::new(COMPOSER)));
                 }
                 Action::ShowAt(at) => self.show_at(at),
                 Action::Pause(on) => self.pause(on, "button"),
+                Action::StopJob(id) => {
+                    self.agent.jobs.stop(&id);
+                }
             }
         }
     }
@@ -697,7 +792,10 @@ impl eframe::App for Gui {
         self.keys(ui.ctx());
         self.guard_close(ui.ctx());
         let edge = egui::Stroke::new(1.0, theme::BORDER);
+        // Exact: a panel grown by one crowded frame, as when a chip arrives before the robot's name
+        // has given way, never shrank back.
         egui::Panel::top("nervros_top")
+            .exact_size(TOP_BAR_HEIGHT)
             .frame(
                 Frame::new()
                     .fill(theme::BAR)
@@ -904,10 +1002,11 @@ mod tests {
 
     #[test]
     fn snapshot_world_tab() {
+        // Out of order, as canopy lists them: the tab shows them by number.
         let rooms = serde_json::json!({"rooms": [
+            {"id": "R3", "name": "bedroom", "type": "bedroom", "floor_coverage": 0.05, "face_coverage": 0.0, "object_count": 0},
             {"id": "R1", "name": "kitchen", "type": "kitchen", "floor_coverage": 0.96, "face_coverage": 0.88, "object_count": 9},
-            {"id": "R2", "name": "", "type": "living room", "floor_coverage": 0.61, "face_coverage": 0.34, "object_count": 4},
-            {"id": "R3", "name": "bedroom", "type": "bedroom", "floor_coverage": 0.05, "face_coverage": 0.0, "object_count": 0}
+            {"id": "R2", "name": "", "type": "living room", "floor_coverage": 0.61, "face_coverage": 0.34, "object_count": 4}
         ]});
         let zone = |name: &str, polygon: Vec<[f64; 2]>, fixed| nervros_core::zones::Zone {
             name: name.into(),
@@ -974,6 +1073,17 @@ mod tests {
     }
 
     #[test]
+    fn a_filled_in_composer_is_typed_onto_at_its_end() {
+        let ctx = egui::Context::default();
+        super::composer::cursor_to_end(&ctx, "In snapshot s1, ");
+        let state = egui::TextEdit::load_state(&ctx, egui::Id::new(COMPOSER));
+        let at = state
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| r.primary.index);
+        assert_eq!(at, Some(egui::text::CCursor::new(16).index));
+    }
+
+    #[test]
     fn closing_with_a_mission_running_asks_first() {
         assert_eq!(on_close(Closing::Open, false), (false, Closing::Open));
         assert_eq!(on_close(Closing::Open, true), (true, Closing::Asking));
@@ -981,6 +1091,20 @@ mod tests {
         let stopping = Closing::Stopping(std::time::Instant::now());
         assert_eq!(on_close(stopping, true), (true, stopping));
         assert_eq!(on_close(Closing::Allowed, true), (false, Closing::Allowed));
+    }
+
+    #[test]
+    fn closing_says_whether_the_mission_runs_on() {
+        // With a deadman the executor stops the mission, so the dialog must not promise it runs.
+        for failed in [false, true] {
+            let (body, close) = close_words(failed, Some(2.0));
+            assert!(body.contains("stops the mission 2 s after"), "{body}");
+            assert!(!body.contains("nobody watching"), "{body}");
+            assert_eq!(close, "Close anyway");
+            let (body, close) = close_words(failed, None);
+            assert!(body.contains("nobody watching"), "{body}");
+            assert_eq!(close, "Leave it running");
+        }
     }
 
     #[test]

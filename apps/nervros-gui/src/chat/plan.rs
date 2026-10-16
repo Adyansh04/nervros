@@ -55,6 +55,17 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
                     summary.on_hover_text(note);
                 }
                 track_label(ui, s);
+                match s.learned.as_str() {
+                    "draft" => {
+                        let text = "a skill the agent taught: its first try";
+                        ui.label(RichText::new(text).size(12.5).color(theme::WARN));
+                    }
+                    "kept" => {
+                        let text = "a skill the agent taught";
+                        ui.label(RichText::new(text).size(12.5).color(theme::DIM));
+                    }
+                    _ => {}
+                }
                 // Only a warning earns a line of its own; the rest is in the hover.
                 let warnings = preview_note
                     .filter(|n| n.starts_with("no path"))
@@ -204,6 +215,11 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut
                 (None, None) if p.replaced => {
                     RichText::new("Replaced by an edited plan").color(theme::FAINT)
                 }
+                (None, None) if p.not_run.is_some() => RichText::new(format!(
+                    "Did not run: {}",
+                    p.not_run.as_deref().unwrap_or_default()
+                ))
+                .color(theme::FAINT),
                 (None, None) => RichText::new(format!(
                     "Checked · at most {} · waiting to run",
                     minutes(p.worst_case_s)
@@ -226,8 +242,16 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut
     });
 }
 
-/// `word` with its first letter in capitals.
+/// `word` with its first letter in capitals, unless it begins with a name such as a model's id,
+/// `gemini-3.1-flash-lite`, which is written as it is.
 pub fn capitalise(word: &str) -> String {
+    let first = word.split_whitespace().next().unwrap_or_default();
+    if first
+        .chars()
+        .any(|c| c.is_ascii_digit() || matches!(c, '-' | '_' | '/' | '.'))
+    {
+        return word.to_owned();
+    }
     let mut c = word.chars();
     c.next()
         .map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())

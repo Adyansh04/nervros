@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::time::Duration;
 
-use nervros_core::session::{Command, Unanswered};
+use nervros_core::session::{Command, NotApproved, Unanswered};
 use rerun::external::egui;
 use rerun::external::egui::{Align, CornerRadius, Frame, Layout, Margin, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _, icons};
@@ -68,7 +68,11 @@ pub(super) fn approval_card(
                 }
                 (None, ..) => {
                     ui.label(&a.reason);
-                    code(ui, &pretty(&a.args));
+                    // A program reads as written, not as an escaped string.
+                    match a.args["source"].as_str() {
+                        Some(source) => code(ui, source),
+                        None => code(ui, &pretty(&a.args)),
+                    }
                 }
             }
             if let Some(problem) = a.problem.as_deref() {
@@ -104,10 +108,12 @@ pub(super) fn approval_card(
 
 /// An answered request as one line: the plan's card or the tool's row says the rest.
 fn answered(ui: &mut egui::Ui, a: &Approval, plan: Option<&PlanCard>, approved: bool) {
-    let (icon, colour, verdict) = if approved {
-        (&icons::SUCCESS, theme::SUCCESS, "Approved")
-    } else {
-        (&icons::CLOSE_SMALL, theme::FAINT, "Denied")
+    // Nobody pressed Deny when the card ran out or disarming turned it down.
+    let (icon, colour, verdict) = match (approved, a.not_approved) {
+        (true, _) => (&icons::SUCCESS, theme::SUCCESS, "Approved"),
+        (false, Some(NotApproved::Unanswered)) => (&icons::CLOSE_SMALL, theme::FAINT, "No answer"),
+        (false, Some(NotApproved::Disarmed)) => (&icons::CLOSE_SMALL, theme::FAINT, "Disarmed"),
+        (false, _) => (&icons::CLOSE_SMALL, theme::FAINT, "Denied"),
     };
     let what = plan.map_or_else(|| a.tool.clone(), |p| format!("run \"{}\"", p.intent));
     Frame::new()

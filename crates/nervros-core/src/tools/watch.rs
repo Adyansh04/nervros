@@ -80,11 +80,15 @@ impl Condition {
                     value: args["value"].clone(),
                 })
             }
-            "text" => args["contains"]
-                .as_str()
-                .filter(|t| !t.is_empty())
-                .map(|t| Self::Text(t.to_lowercase()))
-                .ok_or_else(|| "text needs `contains`".to_owned()),
+            "text" => match args["contains"].as_str().filter(|t| !t.is_empty()) {
+                None => Err("text needs `contains`".to_owned()),
+                // qwen wrote "bt_navigator.*begin.*navigate", which plain text never matches.
+                Some(t) if [".*", ".+", "\\"].iter().any(|p| t.contains(p)) => Err(format!(
+                    "`contains` is plain text, not a pattern, so `{t}` would never match: give \
+                     a few words of the message itself, such as \"begin navigating\""
+                )),
+                Some(t) => Ok(Self::Text(t.to_lowercase())),
+            },
             other => Err(format!(
                 "`condition` is rate_below, value or text, not `{other}`"
             )),
@@ -172,6 +176,23 @@ pub(crate) async fn holds(
     ty: &str,
     condition: &Condition,
 ) -> Result<Option<String>, String> {
+    Ok(observe(robot, topic, ty, condition)
+        .await?
+        .and_then(|(held, seen)| held.then_some(seen)))
+}
+
+/// One look, whichever way it went: whether the condition holds and what was seen, or `None`
+/// when a value's topic has said nothing yet.
+///
+/// # Errors
+///
+/// As [`holds`].
+pub(crate) async fn observe(
+    robot: &dyn RobotPort,
+    topic: &str,
+    ty: &str,
+    condition: &Condition,
+) -> Result<Option<(bool, String)>, String> {
     match condition {
         Condition::RateBelow(hz) => {
             let window = rate_window(*hz);
@@ -181,7 +202,7 @@ pub(crate) async fn holds(
                 .map_err(|e| e.to_string())?;
             #[expect(clippy::cast_precision_loss, reason = "a count of messages")]
             let rate = arrivals.len() as f64 / window.as_secs_f64();
-            Ok((rate < *hz).then(|| format!("{rate:.1} Hz")))
+            Ok(Some((rate < *hz, format!("{rate:.1} Hz"))))
         }
         Condition::Value {
             field: path,
@@ -193,9 +214,10 @@ pub(crate) async fn holds(
                 Err(RosError::NoData(_)) => return Ok(None),
                 Err(e) => return Err(e.to_string()),
             };
-            Ok(field(&msg, path)
-                .filter(|found| compare(found, op, value))
-                .map(|found| format!("{path} is {found}")))
+            Ok(Some(field(&msg, path).map_or_else(
+                || (false, format!("{path} is not in its messages")),
+                |found| (compare(found, op, value), format!("{path} is {found}")),
+            )))
         }
         Condition::Text(text) => {
             // Every message in the window, not the newest: a log line is gone by the next look.
@@ -203,7 +225,10 @@ pub(crate) async fn holds(
                 .sample_messages(topic, ty, 1000, RATE_WINDOW)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(msgs.iter().find_map(|m| said(m, text)))
+            Ok(Some(msgs.iter().find_map(|m| said(m, text)).map_or_else(
+                || (false, format!("nothing said \"{text}\"")),
+                |line| (true, line),
+            )))
         }
     }
 }
@@ -301,12 +326,7 @@ pub(crate) async fn topic_of(
 ) -> Result<(String, String), String> {
     let topic = crate::guard::canonical_ros_name(args["topic"].as_str().unwrap_or_default())
         .map_err(|e| format!("`topic`: {e}, such as /scan"))?;
-    if read_deny
-        .iter()
-        .any(|p| crate::guard::glob_match(p, &topic))
-    {
-        return Err(format!("the profile keeps {topic} from being read"));
-    }
+    readable(&topic, read_deny)?;
     let graph = robot.graph().await.map_err(|e| e.to_string())?;
     let ty = graph
         .topics
@@ -321,12 +341,28 @@ pub(crate) async fn topic_of(
                 crate::ros_tools::missing("topic", &topic, names)
             )
         })?;
-    if whole && crate::ros_tools::BULK_TYPES.contains(&ty.as_str()) {
+    if whole {
+        small(&topic, &ty)?;
+    }
+    Ok((topic, ty))
+}
+
+/// Refuses a topic the profile keeps from being read.
+pub(crate) fn readable(topic: &str, read_deny: &[String]) -> Result<(), String> {
+    if read_deny.iter().any(|p| crate::guard::glob_match(p, topic)) {
+        return Err(format!("the profile keeps {topic} from being read"));
+    }
+    Ok(())
+}
+
+/// Refuses reading `topic`, of type `ty`, message by message when its messages are too large.
+pub(crate) fn small(topic: &str, ty: &str) -> Result<(), String> {
+    if crate::ros_tools::BULK_TYPES.contains(&ty) {
         return Err(format!(
             "{topic} carries {ty}, too large to read message by message; watch its rate, or look"
         ));
     }
-    Ok((topic, ty))
+    Ok(())
 }
 
 struct Entry {
@@ -563,7 +599,7 @@ fn watch_spec() -> ToolSpec {
             "field": {"type": "string", "description": "For value: a dotted path into the message."},
             "op": {"type": "string", "enum": ["<", "<=", ">", ">=", "==", "!="]},
             "value": {"description": "For value: what to compare with."},
-            "contains": {"type": "string", "description": "For text."},
+            "contains": {"type": "string", "description": "For text: words of the message as the log words them, in any case; plain text, not a pattern. log_tail shows how a node words its lines."},
             "say": {"type": "string", "description": "What the report should add, such as what to do then."},
             "repeat": {"type": "boolean", "description": "true for \"each time\", \"every time\" or \"whenever\": report each time it comes back. Otherwise it reports once and ends."},
             "for_s": {"type": "integer", "minimum": 1, "maximum": MAX_FOR_S, "description": "How long to watch (1800)."}
@@ -691,6 +727,7 @@ mod tests {
             err(json!({"condition": "value", "field": "x", "op": "~", "value": 1})).contains("op")
         );
         assert!(err(json!({"condition": "soon"})).contains("rate_below"));
+        assert!(err(json!({"condition": "text", "contains": "a.*b"})).contains("plain text"));
         assert_eq!(
             Condition::parse(&json!({"condition": "text", "contains": "ERROR"})).unwrap(),
             Condition::Text("error".into())

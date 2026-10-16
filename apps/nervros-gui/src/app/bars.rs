@@ -1,5 +1,6 @@
 //! The bars above and below the chat: stop, arming, the model and its quota, the robot at a glance.
 
+use std::fmt::Write as _;
 use std::time::{Duration, SystemTime};
 
 use nervros_core::providers::router::{Need, Router};
@@ -29,10 +30,18 @@ impl Gui {
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.label(RichText::new("NervROS").strong().size(17.0));
-            ui.label(RichText::new(&self.agent.profile.robot.name).color(theme::DIM));
+            // The robot's name gives way, cut short with the whole of it on hover: squeezed
+            // instead, a chip ran under the controls and "Armed" broke into a column of letters.
+            let room = (ui.available_width() - self.bar_reserved).max(0.0);
+            ui.allocate_ui(egui::vec2(room, ui.available_height()), |ui| {
+                let name = RichText::new(&self.agent.profile.robot.name).color(theme::DIM);
+                ui.add(egui::Label::new(name).truncate());
+            });
             ui.add_space(6.0);
+            let chips_from = ui.cursor().left();
             self.status_chips(ui);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let chips = ui.cursor().left() - chips_from;
+            let controls = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if window_chrome {
                     ui.native_window_buttons_ui();
                     ui.add_space(4.0);
@@ -80,12 +89,23 @@ impl Gui {
                         "Armed, the agent may move the robot once you approve; observing, it \
                          only looks",
                     );
-                if ui.toggle_switch(15.0, &mut armed).changed() {
+                let toggle = ui.toggle_switch(15.0, &mut armed);
+                toggle.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, armed, "Arm")
+                });
+                if toggle.changed() {
                     self.agent
                         .session
                         .send(if armed { Command::Arm } else { Command::Disarm });
                 }
+                ui.min_rect().width()
             });
+            let reserved = 6.0 + chips + controls.inner + 2.0 * ui.spacing().item_spacing.x;
+            // A chip came or went: the name is laid out again for it at once.
+            if (reserved - self.bar_reserved).abs() > 0.5 {
+                self.bar_reserved = reserved;
+                ui.ctx().request_repaint();
+            }
         });
     }
 
@@ -219,17 +239,21 @@ impl Gui {
             }
             ui.label(item(format!("{} tools", self.agent.tools.len())));
             if let Some((used, window)) = self.chat.context {
-                let text = format!(
+                let mut text = format!(
                     "Context {} / {}",
                     crate::chat::thousands(used),
                     crate::chat::thousands(window)
                 );
+                if self.chat.condensed > 0 {
+                    let _ = write!(text, " · condensed {}×", self.chat.condensed);
+                }
                 // Past three quarters a compaction is near; past the window, a request fails.
                 let full = used.saturating_mul(4) >= window.saturating_mul(3);
                 let colour = if full { theme::WARN } else { theme::DIM };
                 ui.label(RichText::new(text).small().color(colour))
                     .on_hover_text(
-                        "Tokens the latest request took; /compact condenses the conversation",
+                        "Tokens the latest request took. As the model's window fills, older turns \
+                         are condensed on their own; /compact condenses the conversation now",
                     );
             }
             let spent = self.chat.spent;

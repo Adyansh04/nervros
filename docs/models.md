@@ -1,9 +1,9 @@
 # Models
 
 Which models answer is configuration, never code. The models file, which the profile names, lists
-providers (endpoints), models on them, shared quotas and, per role, the order to try models in.
-[`profiles/example/models.toml`](../profiles/example/models.toml) has a local model and a free
-OpenRouter one.
+providers (endpoints), the models on them, shared quotas and, for each role, the order to try
+models in. [`profiles/example/models.toml`](../profiles/example/models.toml) has a local model and
+a free OpenRouter one.
 
 ## Providers
 
@@ -25,17 +25,21 @@ headers = { "X-Title" = "NervROS" }
 
 - `kind` is `openai_compat` for anything that speaks OpenAI's chat completions: llama.cpp, Ollama,
   vLLM, OpenRouter, Groq. `gemini_interactions` is Google's Gemini, whose key travels only in the
-  `x-goog-api-key` header, never in a URL. An `openai_compat` provider needs `base_url`;
-  `headers` go with each of its requests, and `timeout_s` (60 by default) bounds each call.
+  `x-goog-api-key` header, never in a URL.
+- An `openai_compat` provider needs `base_url`. Its `headers` go with each request, and
+  `timeout_s` (60 by default) bounds each call.
 - `key` is `{ file = "..." }` or `{ env = "NAME" }`, and absent for a local server. Keys are never
-  logged. A key that cannot be read leaves its provider's models out, and says why when one is
-  asked, rather than stopping the app.
-- Only free models run. On OpenRouter every id must end in `:free` (and `openrouter/...` and
-  `stealth/...` ids are refused), checked when the file loads and before every request, and
-  `nervros-cli models --check` also checks the prices OpenRouter lists and reads its count of free
-  requests today; `free_only = true` there says so, and `false` is refused. Elsewhere a free tier is
-  a property of the key, which nothing here can check, so `free_only` is refused there: use a
-  free-tier key.
+  logged. A key that cannot be read leaves its provider's models out, and says why when one of
+  them is asked, rather than stopping the app.
+
+Only free models run:
+
+- On OpenRouter every id must end in `:free`, and `openrouter/...` and `stealth/...` ids are
+  refused. This is checked when the file loads and before every request.
+- `nervros-cli models --check` also checks the prices OpenRouter lists and reads its count of free
+  requests today. `free_only = true` says so for OpenRouter, and `false` is refused.
+- Elsewhere a free tier is a property of the key, which nothing here can check, so `free_only` is
+  refused there: use a free-tier key.
 
 ## Models
 
@@ -58,8 +62,14 @@ privacy = { trains = true }                     # free endpoints may train on wh
 | `privacy.local` | `false` | Runs on this machine; see the profile's `[privacy]`. |
 | `privacy.trains` | `false` | The provider may train on what it is sent. |
 | `params` | none | Request fields passed to the provider as they are, such as Gemini's `{ generation_config = { thinking_level = "low" } }`. |
-| `context` | none | Its context window in tokens. Past half of it, the conversation is condensed before a turn: tool results before the operator's newest message are cut to a line, and when that is not enough a `summarise` model sums up the older part as goal, done, open and facts. Within a turn each request is cut to fit. The window shows how full it is; `/compact` condenses it at once, and right-clicking a message condenses up to it. Unset, nothing is cut. |
+| `context` | none | Its context window in tokens; see below. Unset, nothing is cut. |
 | `stream` | `false` | Its replies appear word by word in the window. |
+
+With `context` set, the conversation is condensed before a turn once it passes half the window.
+Tool results before the operator's newest message are cut to a line, and when that is not enough,
+a `summarise` model sums up the older part as goal, done, open and facts. Within a turn, each
+request is cut to fit. The window shows how full it is; `/compact` condenses it at once, and
+right-clicking a message condenses everything up to it.
 
 ```toml
 [pools]
@@ -78,14 +88,19 @@ summarise = ["qwen3.5-9b-local"]      # condensing the conversation
 segment = ["gemini-3.5-flash-lite"]   # outlines for `segment`, points for `point`
 ```
 
-A turn tries its role's models in order and skips a model that lacks what the turn needs, is over a
-limit, or would break the privacy mode. Local models not in the list are tried after the others,
-except for `segment`, `plan_check` and `plan`: outlining is a skill few models have, and a second
-opinion from the same model is no second opinion, so only the models listed are asked. `[roles]`
-must be there, even empty. `plan` is asked once
-a request's plans have failed their checks twice, with the request, the skills, the last plan and
-what was wrong with it; its few lines of advice go back to the routine model with the failure. It
-is asked only when its list differs from `routine`'s, and a model out of quota gives no advice.
+A turn tries its role's models in order. It skips a model that lacks what the turn needs, is over a
+limit, or would break the privacy mode. `[roles]` must be there, even empty.
+
+- Local models not in the list are tried after the others, except for `segment`, `plan_check` and
+  `plan`. For those only the models listed are asked: outlining is a skill few models have, and a
+  second opinion from the same model is no second opinion.
+- `plan` is asked once a request's plans have failed their checks twice, with the request, the
+  skills, the last plan and what was wrong with it. Its few lines of advice go back to the routine
+  model with the failure. It is asked only when its list differs from `routine`'s, and a model out
+  of quota gives no advice.
+- A model that fails before the robot has acted is replaced by the next one. Once the robot has
+  acted, the turn ends instead of repeating the action.
+
 Gemini's free tier outlines well:
 
 ```toml
@@ -102,23 +117,25 @@ vision = true
 limits = { rpm = 10, rpd = 250 }
 privacy = { trains = true }
 ```
-A model that fails before the robot has acted is replaced by the next one; once the robot has
-acted, the turn ends instead of repeating the action.
 
 ## Quotas
 
 Every request is counted, per model and per pool, in `~/.local/state/nervros/quota.json`
-(`$XDG_STATE_HOME/nervros` when set): a turn that calls tools makes several, and one the quota
-refuses ends the turn there. Days roll over at midnight UTC, and for Gemini at midnight
-Pacific time, as the providers count them. A model answering 429 is set aside for as long as its
-`Retry-After` asks, a minute without one, and never past its provider's next midnight, when a
-spent daily quota comes back. A model whose server does not answer, such as a local model that is
-not running, is tried last for a minute, by that process alone, so its turns meanwhile go to the
-next model quietly. A busy one (a 5xx, as Gemini's 503 under load) is asked once more two seconds
-later, unless part of the turn already came back. When every model of a turn is held back and the
-first per-minute limit or 429 lifts within a minute, as after a burst of calls on free tiers, the
-turn says so and waits for it, once; daily limits still end the turn at once. A model that takes
-over from another gets the conversation without the other's reasoning, which Gemma refuses with a
-400, while a model carrying on gets its own back. The app's top bar shows the answering model with
-today's count, and the Agent tab's Models list shows every role's chain and why a model is
-skipped.
+(`$XDG_STATE_HOME/nervros` when set). A turn that calls tools makes several requests, and one the
+quota refuses ends the turn there. Days roll over at midnight UTC, and for Gemini at midnight
+Pacific time, as the providers count them.
+
+- A model answering 429 is set aside for as long as its `Retry-After` asks, a minute without one,
+  and never past its provider's next midnight, when a spent daily quota comes back.
+- A model whose server does not answer, such as a local model that is not running, is tried last
+  for a minute, by that process alone, so its turns meanwhile go quietly to the next model.
+- A busy model (a 5xx, such as Gemini's 503 under load) is asked once more two seconds later,
+  unless part of the turn already came back.
+- When every model of a turn is held back and the first per-minute limit or 429 lifts within a
+  minute, as after a burst of calls on free tiers, the turn says so and waits for it, once. Daily
+  limits still end the turn at once.
+- A model that takes over from another gets the conversation without the other's reasoning, which
+  Gemma refuses with a 400. A model carrying on gets its own reasoning back.
+
+The app's top bar shows the answering model with today's count. The Agent tab's Models list shows
+every role's chain and why a model is skipped.

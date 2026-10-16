@@ -499,6 +499,9 @@ pub struct PlannedStep {
     /// For a walk: the place's name, or the room's or object's id, that its `place` resolved to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// For a skill an agent taught: `draft` on its first try, else `kept`; empty for the rest.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub learned: String,
     /// What its arguments may turn out to be when they are known only as it runs, for the
     /// profile's rules: each object a walk to a label may reach, and what a step it takes an
     /// output from went for.
@@ -587,6 +590,9 @@ pub enum Author {
     Model,
     /// The operator, in the window.
     Operator,
+    /// A job the operator approved once, such as a program the model wrote: held to the model's
+    /// rules, but a failed check is the job's to handle, not one of the model's attempts.
+    Job,
 }
 
 /// Compiles a plan.
@@ -666,6 +672,10 @@ pub fn compile(
                         added,
                         track: None,
                         target,
+                        learned: catalog
+                            .skill(&step.skill)
+                            .map(|s| s.learned.clone())
+                            .unwrap_or_default(),
                         may_take,
                     });
                 }
@@ -789,7 +799,8 @@ fn compile_step<'c>(
                 return Err(problems);
             }
         }
-    } else if (step.skill == GO_TO_POSE || step.skill == GO_TO_TARGET) && author == Author::Model {
+    } else if (step.skill == GO_TO_POSE || step.skill == GO_TO_TARGET) && author != Author::Operator
+    {
         problems.push(Problem::new(
             id,
             "skill",
@@ -830,10 +841,11 @@ fn compile_step<'c>(
         }
         None => skill.max_duration_s,
     };
-    // What later steps take goes under this step's own key, which their arguments name.
-    for out in taken.into_iter().flatten() {
-        if skill.outputs.iter().any(|o| o.name == *out) {
-            ports.push((out.clone(), format!("{{{id}_{out}}}")));
+    // What later steps take goes under this step's own key, which their arguments name. A job
+    // reads what its mission found from the mission's end, so a job's steps hand on everything.
+    for output in &skill.outputs {
+        if author == Author::Job || taken.is_some_and(|t| t.contains(&output.name)) {
+            ports.push((output.name.clone(), format!("{{{id}_{}}}", output.name)));
         }
     }
     if !problems.is_empty() {
@@ -1044,7 +1056,8 @@ fn go_to_place<'c>(
     let Some(place) = arg(&step.args, "place") else {
         return Err(Problem::new(id, "place", "GoToPlace needs `place`"));
     };
-    let same = |a: &str| a.eq_ignore_ascii_case(place);
+    // "living room" is canopy's living_room, and "dining table side" the dining_table_side place.
+    let same = |a: &str| crate::places::same_words(a, place);
     let named = world
         .places
         .iter()
@@ -1057,10 +1070,27 @@ fn go_to_place<'c>(
         };
         return Ok((skill, vec![(port(skill, "station"), station)], spot));
     }
-    let mut target = world
+    let rooms: Vec<&Thing> = world
         .rooms
         .iter()
-        .find(|r| r.id == place || same(&r.name))
+        .filter(|r| r.id == place || same(&r.name))
+        .collect();
+    // Two rooms can be the same thing, two bedrooms: which one is not for the planner to guess.
+    if let [_, _, ..] = rooms.as_slice() {
+        let ids: Vec<&str> = rooms.iter().map(|r| r.id.as_str()).collect();
+        return Err(Problem::new(
+            id,
+            "place",
+            format!(
+                "`{place}` could be {} rooms ({}); use one id, as list_places gives it",
+                rooms.len(),
+                ids.join(", ")
+            ),
+        ));
+    }
+    let mut target = rooms
+        .first()
+        .copied()
         .or_else(|| world.objects.iter().find(|o| o.id == place));
     // "the sofa": an object by what it is, when only one object is that.
     if target.is_none() {
@@ -1348,6 +1378,35 @@ mod tests {
             "nothing found at run time is checked afterwards: {:?}",
             c.goal
         );
+    }
+
+    #[test]
+    fn a_room_two_rooms_share_the_name_of_is_not_guessed() {
+        let walk = plan(&json!([{"skill": "GoToPlace", "args": {"place": "Kitchen"}}]));
+        let mut w = world();
+        let one = compile(&walk, &catalog(), &w, Author::Model).unwrap();
+        assert!(one.xml.contains(r#"target="R2""#), "{}", one.xml);
+        w.rooms.push(thing("R7", "kitchen", -3.0, 2.0));
+        let two = compile(&walk, &catalog(), &w, Author::Model).unwrap_err();
+        assert!(
+            two.iter()
+                .any(|p| p.message.contains("could be 2 rooms (R2, R7)")),
+            "{two:?}"
+        );
+    }
+
+    #[test]
+    fn a_jobs_step_hands_on_what_it_finds_with_no_later_step() {
+        // A program's find() is a one-step look, and reads its answer from the mission's end.
+        let p = plan(&json!([{"skill": "FindInView", "args": {"phrase": "red mug"}}]));
+        let job = compile(&p, &catalog_with_outputs(), &world(), Author::Job).unwrap();
+        assert!(
+            job.xml.contains(r#"object_id="{s1_object_id}""#),
+            "{}",
+            job.xml
+        );
+        let asked = compile(&p, &catalog_with_outputs(), &world(), Author::Model).unwrap();
+        assert!(!asked.xml.contains("object_id="), "{}", asked.xml);
     }
 
     #[test]

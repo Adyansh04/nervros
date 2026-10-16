@@ -54,6 +54,12 @@ pub struct Agent {
     pub unanswered: Vec<crate::session::Unanswered>,
     /// The keep-out zones, for what draws them.
     pub zones: Arc<crate::zones::Zones>,
+    /// Programs and searches the operator approved once, for the window's list and its Stop.
+    pub jobs: Arc<crate::job::Jobs>,
+    /// The programs kept by name, when the robot has an executor to run them.
+    pub programs: Option<Arc<crate::program::Store>>,
+    /// What went wrong, investigated, for the Doctor tab.
+    pub incidents: Arc<crate::incident::Investigator>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -106,6 +112,30 @@ pub fn state_dir() -> PathBuf {
         || crate::secret::expand_home(Path::new("~/.local/state/nervros")),
         |d| PathBuf::from(d).join("nervros"),
     )
+}
+
+/// Waits until discovery stops adding to the graph, at most `most`. A node that has just started
+/// sees only part of it for seconds: over UDP a one-shot command saw 40 of 150 topics after 2 s.
+pub async fn settled(robot: &dyn RobotPort, most: std::time::Duration) {
+    use std::time::Duration;
+    const POLL: Duration = Duration::from_millis(250);
+    // Unchanged this long: discovery adds a participant's names in bursts, a few hundred ms apart.
+    const STEADY: u32 = 6;
+    let deadline = tokio::time::Instant::now() + most;
+    let (mut last, mut steady) = (None, 0);
+    while tokio::time::Instant::now() < deadline {
+        // A robot that cannot list its graph has nothing to wait for.
+        let Ok(g) = robot.graph_detail().await else {
+            return;
+        };
+        let size = Some((g.topics.len(), g.services.len(), g.nodes.len()));
+        steady = if size == last { steady + 1 } else { 0 };
+        if steady >= STEADY {
+            return;
+        }
+        last = size;
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// Starts the ROS node after checking the environment matches the profile; the environment
@@ -299,6 +329,17 @@ pub fn mission_ledger_file(profile: &Profile, state: &Path) -> PathBuf {
         .with_extension("sqlite3")
 }
 
+/// Where a robot's incidents are kept under the state folder `state`, and the playbooks it was
+/// asked to remember.
+#[must_use]
+pub fn incident_files(profile: &Profile, state: &Path) -> (PathBuf, PathBuf) {
+    let file = |kind: &str| {
+        robot_file(profile, &state.join("quota.json"), kind)
+            .unwrap_or_else(|| state.join(kind).join("robot.json"))
+    };
+    (file("incidents"), file("playbooks").with_extension(""))
+}
+
 /// The robot's mission ledger, beside its memory. Missions still run without one, unrecorded.
 fn mission_ledger(profile: &Profile, ledger: &Path) -> Option<Arc<crate::mission::ledger::Ledger>> {
     let path = mission_ledger_file(profile, ledger.parent()?);
@@ -307,12 +348,20 @@ fn mission_ledger(profile: &Profile, ledger: &Path) -> Option<Arc<crate::mission
         .ok()
 }
 
-/// The watches and the health check: what a person runs before blaming the model.
+/// The watches, the incident investigator and the health check: what a person runs before
+/// blaming the model. Incidents and remembered playbooks are kept per robot beside its memory.
 fn debug_tools(
     profile: &Profile,
     robot: &Arc<dyn RobotPort>,
+    ledger: &Path,
     registry: &mut Registry,
-) -> Result<Arc<crate::watch::Watches>, StartError> {
+) -> Result<
+    (
+        Arc<crate::watch::Watches>,
+        Arc<crate::incident::Investigator>,
+    ),
+    StartError,
+> {
     let read_deny = profile
         .ros_tools
         .as_ref()
@@ -322,11 +371,22 @@ fn debug_tools(
     for tool in watches.tools() {
         registry.add(tool)?;
     }
+    let files = ledger.parent().map(|state| incident_files(profile, state));
+    let investigator = crate::incident::Investigator::start(
+        profile,
+        Arc::clone(robot),
+        files.as_ref().map(|f| f.0.clone()),
+        files.map(|f| f.1),
+    );
+    for tool in crate::incident::tools(&investigator) {
+        registry.add(tool)?;
+    }
     registry.add(Arc::new(crate::doctor::HealthCheck::new(
         profile,
         Arc::clone(robot),
+        Some(Arc::clone(&investigator)),
     )))?;
-    Ok(watches)
+    Ok((watches, investigator))
 }
 
 /// How a session starts: where it keeps its conversation, the conversation it carries on, and
@@ -342,9 +402,11 @@ pub struct StartOptions {
     /// What the session talks to in place of `models.toml`'s models, such as a scripted model
     /// for a scenario; the profile's other roles (plan checks, vision) keep theirs.
     pub source: Option<Arc<dyn crate::llm::AgentSource>>,
-    /// Where the operator's keep-out zones are kept in place of the robot's own file: an eval's,
-    /// so its cases neither find the operator's zones nor leave theirs behind.
-    pub zones: Option<PathBuf>,
+    /// Where the robot's own files go (its missions, memory, places, programs, zones and
+    /// incidents) in place of the state folder: an eval's, so its cases neither find the
+    /// operator's nor leave theirs behind. The quota ledger stays where it is, so free-tier
+    /// counts hold.
+    pub state: Option<PathBuf>,
 }
 
 /// A session for the window or the terminal: its conversation saved after every turn and its
@@ -364,7 +426,8 @@ pub struct LoggedSession {
 }
 
 /// Starts a session on the profile's robot, with the quota ledger, conversation and log under
-/// `state`, carrying on `resume` when given. Must run inside a tokio runtime.
+/// `state`, carrying on `resume` when given, and talking on `model` alone when named. Must run
+/// inside a tokio runtime.
 ///
 /// # Errors
 ///
@@ -374,6 +437,7 @@ pub fn start_logged(
     profile_path: &Path,
     state: &Path,
     resume: Option<crate::llm::History>,
+    model: Option<String>,
 ) -> Result<LoggedSession, StartError> {
     let robot = connect(&Profile::load(profile_path)?)?;
     let logs = state.join("logs");
@@ -381,6 +445,7 @@ pub fn start_logged(
     let files = StartOptions {
         history: Some(logs.join(format!("{name}.history.json"))),
         resume,
+        model,
         ..StartOptions::default()
     };
     let agent = start_with(profile_path, robot, &state.join("quota.json"), files)?;
@@ -544,11 +609,43 @@ fn mission_tools(
         .tools()
         .into_iter()
         .chain(crate::mission::history::tools(missions))
+        .chain(crate::mission::learn::tools(missions))
         .chain(schedules.tools())
     {
         registry.add(tool)?;
     }
     Ok(Some(schedules))
+}
+
+/// The tools that start jobs the operator approves once, programs and searches, when the robot
+/// has an executor to run their missions; the kept programs.
+fn job_tools(
+    profile: &Profile,
+    missions: Option<&Arc<Missions>>,
+    jobs: &Arc<crate::job::Jobs>,
+    ledger: &Path,
+    registry: &mut Registry,
+) -> Result<Option<Arc<crate::program::Store>>, StartError> {
+    let Some(missions) = missions else {
+        return Ok(None);
+    };
+    let store = crate::program::Store::open(robot_file(profile, ledger, "programs"));
+    let frames = (
+        profile.ros.map_frame.clone(),
+        profile.ros.base_frame.clone(),
+    );
+    registry.add(Arc::new(crate::program::ProgramTool::new(
+        Arc::clone(missions),
+        Arc::clone(jobs),
+        Arc::clone(&store),
+        frames.clone(),
+    )))?;
+    registry.add(Arc::new(crate::search::SearchTool::new(
+        Arc::clone(missions),
+        Arc::clone(jobs),
+        frames,
+    )))?;
+    Ok(Some(store))
 }
 
 /// Starts an agent as `options` say. Must run inside a tokio runtime.
@@ -564,6 +661,9 @@ pub fn start_with(
 ) -> Result<Agent, StartError> {
     let profile = Profile::load(profile_path)?;
     let models = model_layer(&profile, ledger, options.model)?;
+    // The robot's files live beside the quota ledger unless the caller keeps them elsewhere.
+    let own = options.state.map(|dir| dir.join("quota.json"));
+    let ledger = own.as_deref().unwrap_or(ledger);
     let (pending_file, unanswered) = waiting_requests(options.history.as_deref());
     let llm = Arc::clone(&models.llm);
     let guard = Arc::new(Guard::new(profile.policy.clone()));
@@ -572,9 +672,7 @@ pub fn start_with(
     let snapshots = Arc::new(SnapshotStore::default());
     let seeing = seeing_tools(&profile, &robot, &llm, &snapshots, &mut registry)?;
     let places = place_tools(&profile, &robot, ledger, &mut registry)?;
-    let zones_file = options
-        .zones
-        .or_else(|| robot_file(&profile, ledger, "zones"));
+    let zones_file = robot_file(&profile, ledger, "zones");
     let zones = zone_tools(&profile, &robot, zones_file, &places, &guard, &mut registry)?;
     registry.add(Arc::new(RobotState::new(
         &profile,
@@ -586,7 +684,7 @@ pub fn start_with(
             registry.add(tool)?;
         }
     }
-    let watches = debug_tools(&profile, &robot, &mut registry)?;
+    let (watches, incidents) = debug_tools(&profile, &robot, ledger, &mut registry)?;
     let mcp = mcp_tools(&profile, models.privacy, &mut registry)?;
     let skills = skill_tools(&profile, &mut registry)?;
     let memory = crate::memory::Memory::new(robot_file(&profile, ledger, "memory"));
@@ -606,21 +704,15 @@ pub fn start_with(
         seeing.vision,
     );
     let schedules = mission_tools(missions.as_ref(), &guard, &mut registry)?;
+    let jobs = crate::job::Jobs::new(Arc::clone(&guard));
+    let programs = job_tools(&profile, missions.as_ref(), &jobs, ledger, &mut registry)?;
     check_rules(&profile, &registry)?;
     let tools = registry.iter().map(|t| t.spec().name.clone()).collect();
     let config = SessionConfig {
-        preamble: system_prompt(&profile, &skills),
-        max_model_calls: usize::try_from(profile.policy.budgets.model_calls).unwrap_or(6),
-        approval_ttl: profile.policy.approval_ttl,
-        turn_time: profile.policy.budgets.wall_time,
         pending_file,
         history_file: options.history,
         resume: options.resume,
-        notes: Some(Arc::clone(&memory) as Arc<dyn crate::memory::Notes>),
-        pulse: missions
-            .as_ref()
-            .map(|m| Arc::clone(m) as Arc<dyn crate::session::Pulse>),
-        ..SessionConfig::default()
+        ..session_config(&profile, &skills, &memory, missions.as_ref())
     };
     let source = options
         .source
@@ -639,6 +731,8 @@ pub fn start_with(
         s.attach(session.handle());
     }
     watches.attach(session.handle());
+    jobs.attach(session.handle());
+    incidents.attach(&session.handle());
     say_orphan(&profile, &robot, session.handle());
     let notices = llm
         .missing_keys()
@@ -661,7 +755,28 @@ pub fn start_with(
         mcp,
         unanswered,
         zones,
+        jobs,
+        programs,
+        incidents,
     })
+}
+
+/// The session's prompt, budgets and the parts of the agent it calls on, from the profile.
+fn session_config(
+    profile: &Profile,
+    skills: &[crate::skills::Skill],
+    memory: &Arc<crate::memory::Memory>,
+    missions: Option<&Arc<Missions>>,
+) -> SessionConfig {
+    SessionConfig {
+        preamble: system_prompt(profile, skills),
+        max_model_calls: usize::try_from(profile.policy.budgets.model_calls).unwrap_or(6),
+        approval_ttl: profile.policy.approval_ttl,
+        turn_time: profile.policy.budgets.wall_time,
+        notes: Some(Arc::clone(memory) as Arc<dyn crate::memory::Notes>),
+        pulse: missions.map(|m| Arc::clone(m) as Arc<dyn crate::session::Pulse>),
+        ..SessionConfig::default()
+    }
 }
 
 /// Each `[[policy.rule]]` names a tool of this agent and an argument it takes: a rule that can

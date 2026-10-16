@@ -9,7 +9,7 @@ use nervros_core::mission::Outcome;
 use nervros_core::mission::plan::{PlannedStep, StepArg};
 use nervros_core::mission::preview::PreviewStep;
 use nervros_core::mission::sanity::Concern;
-use nervros_core::session::{Command, Event, Unanswered};
+use nervros_core::session::{Command, Event, NotApproved, Unanswered};
 use nervros_core::tools::Status;
 use rerun::external::egui;
 use rerun::external::egui::{Frame, Margin};
@@ -81,6 +81,7 @@ fn a_resolved_approval_is_no_longer_pending() {
     chat.apply(&Event::ApprovalResolved {
         id: 7,
         approved: false,
+        not_approved: Some(NotApproved::Denied),
     });
     assert_eq!(chat.pending().count(), 0);
 }
@@ -96,6 +97,10 @@ fn a_report_shows_what_happened_with_short_ids() {
     assert_eq!(
         report_text("Camera check: the camera agrees: <world>the mug is in the tray</world>."),
         "Camera check: the camera agrees: the mug is in the tray."
+    );
+    assert_eq!(
+        report_text(r#"The program j2 (count) finished: <world>{"office":1,"study":2}</world>"#),
+        "The program j2 (count) finished: office 1 · study 2"
     );
 }
 
@@ -219,6 +224,7 @@ fn doubtful_plan() -> Chat {
             ),
             concern("", "the walk may end close to the table", None),
         ],
+        by_job: false,
     });
     chat.apply(&Event::ApprovalRequested {
         id: 9,
@@ -310,6 +316,34 @@ fn snapshot_tree_panel() {
 }
 
 #[test]
+fn an_edit_that_changes_nothing_keeps_one_card() {
+    let mut chat = doubtful_plan();
+    let cards = |chat: &Chat| {
+        chat.items
+            .iter()
+            .filter(|i| matches!(i, Item::Plan(_)))
+            .count()
+    };
+    let before = cards(&chat);
+    chat.edit_sent(9);
+    chat.apply(&Event::MissionPlanned {
+        hash: "5be0c1d9f2a4".to_owned(),
+        intent: "turn left and walk half a metre".to_owned(),
+        steps: Vec::new(),
+        worst_case_s: 60.0,
+        concerns: Vec::new(),
+        by_job: false,
+    });
+    chat.apply(&Event::ApprovalEdited {
+        id: 9,
+        args: serde_json::json!({"hash": "5be0c1d9f2a4"}),
+        reason: "runs it".to_owned(),
+    });
+    assert_eq!(cards(&chat), before);
+    assert!(chat.latest_plan().is_some_and(|p| !p.replaced));
+}
+
+#[test]
 fn a_passed_edit_moves_the_approval_below_its_new_plan() {
     let mut chat = doubtful_plan();
     chat.edit_sent(9);
@@ -320,6 +354,7 @@ fn a_passed_edit_moves_the_approval_below_its_new_plan() {
         steps: Vec::new(),
         worst_case_s: 60.0,
         concerns: Vec::new(),
+        by_job: false,
     });
     chat.apply(&Event::ApprovalEdited {
         id: 9,
@@ -338,6 +373,25 @@ fn a_passed_edit_moves_the_approval_below_its_new_plan() {
 }
 
 #[test]
+fn a_jobs_missions_show_on_its_card_not_as_plans() {
+    let mut chat = Chat::default();
+    chat.apply(&Event::MissionPlanned {
+        hash: "a1".to_owned(),
+        intent: "look for keys at R2 (job j1)".to_owned(),
+        steps: Vec::new(),
+        worst_case_s: 60.0,
+        concerns: Vec::new(),
+        by_job: true,
+    });
+    assert!(chat.items.is_empty());
+    assert_eq!(
+        chat.latest_plan().map(|p| p.intent.as_str()),
+        Some("look for keys at R2 (job j1)"),
+        "the Mission tab still shows it"
+    );
+}
+
+#[test]
 fn snapshot_chat() {
     render(sample(), "chat");
 }
@@ -349,7 +403,7 @@ fn snapshot_unanswered_and_allow() {
         Unanswered {
             tool: "run_mission".to_owned(),
             args: serde_json::json!({"intent": "bring the red mug to the sofa", "steps": []}),
-            reason: "runs \"bring the red mug to the sofa\": 4 step(s), at most 6 min".to_owned(),
+            reason: "runs \"bring the red mug to the sofa\": 4 steps, at most 6 min".to_owned(),
         },
         Cell::new(false),
     ));
@@ -370,6 +424,7 @@ fn snapshot_draft_and_compaction() {
         before: 9800,
         after: 2100,
         summarised: true,
+        asked: true,
     });
     chat.apply(&Event::User {
         turn: 3,
@@ -385,8 +440,174 @@ fn snapshot_draft_and_compaction() {
 }
 
 #[test]
+fn snapshot_jobs() {
+    use nervros_core::job::{Envelope, JobInfo, JobKind, JobState};
+    let job = |id: &str, kind, name: &str, state, summary: &str| JobInfo {
+        id: id.to_owned(),
+        kind,
+        name: name.to_owned(),
+        envelope: Envelope::new([], 10),
+        allows: "may move the base (GoToPlace) and look (FindInView), for at most 10 min"
+            .to_owned(),
+        started_s: 0.0,
+        state,
+        summary: summary.to_owned(),
+    };
+    let mut chat = Chat::default();
+    chat.push_user("Find my keys.".to_owned(), true);
+    chat.apply(&Event::JobStarted {
+        job: job("j1", JobKind::Search, "my keys", JobState::Running, ""),
+    });
+    for line in [
+        "1. O12: keys were seen there 3 min ago",
+        "running GoToPlace",
+        "could not get to O12: the goal was aborted",
+        "2. R4: such things are often in the hallway; the camera has seen 40% of it",
+    ] {
+        chat.apply(&Event::JobLog {
+            id: "j1".to_owned(),
+            line: line.to_owned(),
+        });
+    }
+    chat.push_user("Count the chairs in every room.".to_owned(), true);
+    let counted = job(
+        "j2",
+        JobKind::Program,
+        "count chairs per room",
+        JobState::Running,
+        "",
+    );
+    chat.apply(&Event::JobStarted {
+        job: counted.clone(),
+    });
+    chat.apply(&Event::JobFinished {
+        job: JobInfo {
+            state: JobState::Done,
+            summary: r#"{"bedroom":2,"kitchen":4,"living room":3,"office":1}"#.to_owned(),
+            ..counted
+        },
+    });
+    chat.apply(&Event::JobStarted {
+        job: job(
+            "j4",
+            JobKind::Program,
+            "Walk to the office and the bedroom to find the trays",
+            JobState::Running,
+            "",
+        ),
+    });
+    chat.apply(&Event::JobStarted {
+        job: job(
+            "j3",
+            JobKind::Program,
+            "walk and look",
+            JobState::Running,
+            "",
+        ),
+    });
+    chat.apply(&Event::JobFinished {
+        job: job(
+            "j3",
+            JobKind::Program,
+            "walk and look",
+            JobState::Failed,
+            "it failed: Function not found: lenght (line 3, position 12)",
+        ),
+    });
+    render(chat, "chat_jobs");
+}
+
+#[test]
 fn snapshot_empty_state() {
     render(Chat::default(), "chat_empty");
+}
+
+#[test]
+fn a_plan_its_call_refused_says_it_did_not_run() {
+    let mut chat = Chat::default();
+    chat.apply(&Event::ToolStarted {
+        turn: 1,
+        call: 1,
+        tool: "schedule".to_owned(),
+        args: serde_json::json!({}),
+    });
+    chat.apply(&Event::MissionPlanned {
+        hash: "a1b2c3d4e5f6".to_owned(),
+        intent: "turn left three times".to_owned(),
+        steps: Vec::new(),
+        worst_case_s: 30.0,
+        concerns: Vec::new(),
+        by_job: false,
+    });
+    chat.apply(&Event::ToolFinished {
+        turn: 1,
+        call: 1,
+        tool: "schedule".to_owned(),
+        status: Status::Failed,
+        message: "the operator asked for 3 times in all".to_owned(),
+        ms: 5,
+    });
+    assert_eq!(
+        chat.latest_plan().and_then(|p| p.not_run.as_deref()),
+        Some("the operator asked for 3 times in all")
+    );
+}
+
+#[test]
+fn a_denied_plan_says_it_did_not_run() {
+    let mut chat = doubtful_plan();
+    chat.apply(&Event::ApprovalResolved {
+        id: 9,
+        approved: false,
+        not_approved: Some(NotApproved::Denied),
+    });
+    assert_eq!(
+        chat.latest_plan().and_then(|p| p.not_run.as_deref()),
+        Some("not approved")
+    );
+}
+
+#[test]
+fn a_message_said_while_working_shows_once_when_it_starts_a_turn() {
+    let mut chat = Chat::default();
+    chat.apply(&Event::User {
+        turn: 1,
+        text: "Pause.".to_owned(),
+    });
+    chat.apply(&Event::Steer {
+        turn: 1,
+        text: "Resume.".to_owned(),
+    });
+    chat.apply(&Event::Reply {
+        turn: 1,
+        text: "Understood.".to_owned(),
+        model: "m".to_owned(),
+    });
+    // Unread by turn 1, it starts turn 2.
+    chat.apply(&Event::User {
+        turn: 2,
+        text: "Resume.".to_owned(),
+    });
+    let said: Vec<_> = chat
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said, ["Pause.", "Resume."]);
+}
+
+#[test]
+fn arming_first_keeps_the_suggestions() {
+    let mut chat = Chat::default();
+    chat.apply(&Event::Armed { armed: true });
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(440.0, 800.0))
+        .build_ui(move |ui| chat.show(ui, Duration::from_mins(10), &mut Vec::new()));
+    harness.run();
+    assert!(harness.query_by_label("What do you see?").is_some());
 }
 
 #[test]
@@ -416,6 +637,7 @@ fn snapshot_mission() {
         ],
         worst_case_s: 1140.0,
         concerns: Vec::new(),
+        by_job: false,
     });
     chat.apply(&Event::ApprovalRequested {
         id: 3,
@@ -427,6 +649,7 @@ fn snapshot_mission() {
     chat.apply(&Event::ApprovalResolved {
         id: 3,
         approved: true,
+        not_approved: None,
     });
     chat.apply(&Event::MissionStarted {
         id: "m1".to_owned(),
@@ -454,6 +677,8 @@ fn snapshot_mission() {
         failed_step: "s2".to_owned(),
         reason: "the grasp slipped".to_owned(),
         elapsed_s: 94.0,
+        outputs: serde_json::Map::new(),
+        by_job: false,
     });
     chat.apply(&Event::Report {
         turn: 2,
@@ -508,6 +733,7 @@ fn snapshot_plan_with_records_and_a_preview_warning() {
         ],
         worst_case_s: 1500.0,
         concerns: Vec::new(),
+        by_job: false,
     });
     let preview = |id: &str, note: &str| PreviewStep {
         id: id.to_owned(),

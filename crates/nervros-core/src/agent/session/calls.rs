@@ -8,7 +8,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use super::approval::DENIAL_BREAK;
-use super::event::Event;
+use super::event::{Event, NotApproved};
 use super::turn::TurnFlags;
 use super::{Shared, millis};
 use crate::guard::{Decision, Refusal, RuleAction};
@@ -127,31 +127,60 @@ impl Shared {
                  them what they want instead"
             ));
         }
+        let request = format!("{} {args}", spec.name);
+        if caller == Caller::Model && lock(&self.denied).contains(&request) {
+            return ToolOutcome::refused(
+                "the operator turned down this same request already: change it, or ask them what \
+                 they want",
+            );
+        }
         let asked = Approved {
             args,
             resources: spec.resources.clone(),
         };
-        if let Some(a) = self
+        let a = match self
             .ask_approval(tool, &spec.name, reason, spec.risk, asked)
             .await
         {
-            self.denials.store(0, Ordering::SeqCst);
-            // Disarming during the wait outranks an approval given before it.
-            if spec.lane() == Lane::Act && !self.guard.armed() {
-                return ToolOutcome::refused(
-                    "the robot was disarmed while this waited for approval; nothing ran",
-                );
-            }
-            return self.run(tool, a.args, &a.resources).await;
+            Ok(a) => a,
+            Err(why) => return self.not_run(why, request),
+        };
+        self.denials.store(0, Ordering::SeqCst);
+        // Disarming during the wait outranks an approval given before it.
+        if spec.lane() == Lane::Act && !self.guard.armed() {
+            return ToolOutcome::refused(
+                "the robot was disarmed while this waited for approval; nothing ran",
+            );
         }
+        self.run(tool, a.args, &a.resources).await
+    }
+
+    /// What the model is told of a request that did not run, and why, in so many words: a small
+    /// model read a bare refusal as a request still waiting for approval.
+    fn not_run(&self, why: NotApproved, request: String) -> ToolOutcome {
         let n = self.denials.fetch_add(1, Ordering::SeqCst) + 1;
-        ToolOutcome::refused(if n >= DENIAL_BREAK {
-            format!(
-                "the operator did not approve this, {n} times in a row: stop acting and ask them \
-                 what they want"
-            )
-        } else {
-            "the operator did not approve this".to_owned()
+        if n >= DENIAL_BREAK {
+            return ToolOutcome::refused(format!(
+                "the operator did not approve this, {n} times in a row, so nothing ran: stop \
+                 acting and ask them what they want"
+            ));
+        }
+        ToolOutcome::refused(match why {
+            NotApproved::Denied => {
+                // Only a no: a request nobody answered may be asked again.
+                lock(&self.denied).insert(request);
+                // "did not approve" read as "not yet": qwen answered "once approved, it will turn".
+                "the operator said no: it did not run, and it is not waiting for approval. Tell \
+                 them it was not done"
+                    .to_owned()
+            }
+            NotApproved::Disarmed => "the robot was disarmed while this waited for approval, so \
+                                      nothing ran and nothing waits"
+                .to_owned(),
+            NotApproved::Unanswered => format!(
+                "nobody answered within {}, so nothing ran and nothing waits",
+                crate::duration_words(self.config.approval_ttl.as_secs_f64())
+            ),
         })
     }
 

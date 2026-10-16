@@ -1,0 +1,10 @@
+# Nothing places the robot on the map, so every walk is refused or goes nowhere.
+id = "no-localization"
+title = "The robot does not know where it is"
+explains = ["mission_failed", "asked"]
+verdict = "Nothing links {map_frame} to {base_frame}: localization is not running, or has not been given the robot's pose."
+fix = "Start localization (AMCL or SLAM) and give it the robot's pose; no walk works until it has one."
+
+[[check]]
+name = "the robot's place on the map"
+tf_missing = ["{map_frame}", "{base_frame}"]

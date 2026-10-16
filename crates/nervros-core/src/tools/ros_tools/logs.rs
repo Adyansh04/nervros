@@ -35,17 +35,20 @@ struct LogTail {
     ctx: Arc<Ctx>,
 }
 
-fn level_number(word: &str) -> u64 {
+/// A `/rosout` level by name, as `rcl_interfaces/msg/Log` numbers it; empty is `warn`.
+pub(crate) fn level_number(word: &str) -> Option<u8> {
     match word {
-        "debug" => 10,
-        "info" => 20,
-        "error" => 40,
-        "fatal" => 50,
-        _ => 30,
+        "debug" => Some(10),
+        "info" => Some(20),
+        "" | "warn" => Some(30),
+        "error" => Some(40),
+        "fatal" => Some(50),
+        _ => None,
     }
 }
 
-fn level_word(n: u64) -> &'static str {
+/// A `/rosout` level's name.
+pub(crate) fn level_word(n: u64) -> &'static str {
     match n {
         0..=10 => "DEBUG",
         11..=20 => "INFO",
@@ -62,7 +65,8 @@ impl Tool for LogTail {
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
-        let min = level_number(args["min_level"].as_str().unwrap_or("warn"));
+        let min =
+            level_number(args["min_level"].as_str().unwrap_or_default()).map_or(30, u64::from);
         let node = args["node"]
             .as_str()
             .unwrap_or_default()

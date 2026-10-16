@@ -50,6 +50,9 @@ pub enum Command {
     /// Something the robot reports, such as a finished mission; the model answers it in a turn
     /// of its own, after any running turn.
     Report(String),
+    /// Something the robot noticed on its own, such as an incident it opened: no turn of its
+    /// own, the model reads it with the operator's next message.
+    Note(String),
     /// Condense the conversation now, as it is condensed when it grows past half the model's
     /// window.
     Compact,
@@ -61,6 +64,18 @@ pub enum Command {
     },
     /// Carry on an earlier conversation instead of this one.
     Restore(History),
+}
+
+/// Why a request asked of the operator did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotApproved {
+    /// The operator said no.
+    Denied,
+    /// Disarming turned it down while it waited.
+    Disarmed,
+    /// Nobody answered before it ran out.
+    Unanswered,
 }
 
 /// What the session reports.
@@ -199,6 +214,8 @@ pub enum Event {
         after: u64,
         /// A model summarised the older part, rather than its old results only being cut.
         summarised: bool,
+        /// The operator asked for it; otherwise the model's window was filling.
+        asked: bool,
     },
     /// The operator must approve a call.
     ApprovalRequested {
@@ -235,6 +252,9 @@ pub enum Event {
         id: u64,
         /// Whether it may run.
         approved: bool,
+        /// Why not, when it may not.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        not_approved: Option<NotApproved>,
     },
     /// Arming changed.
     Armed {
@@ -283,6 +303,9 @@ pub enum Event {
         /// Ways it may not do what the operator asked.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         concerns: Vec<Concern>,
+        /// Planned by a job, whose own card and report follow it.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        by_job: bool,
     },
     /// Where a checked plan would take the robot, for the viewer; follows its `MissionPlanned`.
     MissionPreview {
@@ -333,6 +356,35 @@ pub enum Event {
         reason: String,
         /// How long it ran.
         elapsed_s: f64,
+        /// What its steps handed on, by key (`s2_object_id`), when the executor says.
+        #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+        outputs: serde_json::Map<String, Value>,
+        /// Run by a job: a failed step is the job's to weigh, such as a look that saw nothing.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        by_job: bool,
+    },
+    /// A job the operator approved started, such as a robot program or a search.
+    JobStarted {
+        /// The job as it started.
+        job: crate::job::JobInfo,
+    },
+    /// One line of what a job does.
+    JobLog {
+        /// The job's id.
+        id: String,
+        /// What it did.
+        line: String,
+    },
+    /// A job ended.
+    JobFinished {
+        /// The job as it ended.
+        job: crate::job::JobInfo,
+    },
+    /// Something went wrong and was investigated: the likely causes, what was ruled out, and
+    /// the minutes before it.
+    Incident {
+        /// The incident as it was kept.
+        incident: crate::incident::Incident,
     },
 }
 
@@ -351,22 +403,38 @@ impl From<&crate::tools::ImageArtifact> for Event {
 /// Whether the operator's message is a plain order to pause the running mission (`Some(true)`)
 /// or to carry on with it (`Some(false)`), which never waits on a model: "pause", "wait", "hold
 /// on"; "resume", "continue", "carry on", "go on". Only while a mission runs: otherwise these are
-/// words for the model.
+/// words for the model, but for those [`only_pause_word`] knows.
 #[must_use]
 pub fn pause_word(text: &str) -> Option<bool> {
-    let text = text
-        .trim()
-        .trim_end_matches(['!', '.'])
-        .trim()
-        .to_lowercase();
-    let text = text.strip_prefix("please ").unwrap_or(&text);
-    match text {
+    match ordered(text).as_str() {
         "pause" | "/pause" | "wait" | "hold on" | "pause the mission" => Some(true),
         "resume" | "/resume" | "continue" | "carry on" | "go on" | "resume the mission" => {
             Some(false)
         }
         _ => None,
     }
+}
+
+/// Whether the words are a pause or a resume and could be nothing else, as "pause" or "resume
+/// the mission" are: the executor answers them even with no mission running, where a model said
+/// "the robot is paused". "Wait" and "go on" stay the model's then.
+#[must_use]
+pub fn only_pause_word(text: &str) -> bool {
+    matches!(
+        ordered(text).as_str(),
+        "pause" | "/pause" | "pause the mission" | "resume" | "/resume" | "resume the mission"
+    )
+}
+
+/// The words of an order, as the matchers compare them: lowercase, "please" and a closing "!"
+/// or "." dropped.
+fn ordered(text: &str) -> String {
+    let text = text
+        .trim()
+        .trim_end_matches(['!', '.'])
+        .trim()
+        .to_lowercase();
+    text.strip_prefix("please ").unwrap_or(&text).to_owned()
 }
 
 /// Whether the operator's message is a plain order to stop, which takes the stop path and never

@@ -85,9 +85,22 @@ impl Gui {
             .inner_margin(Margin::symmetric(10, 6))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
+                // What is selected and its clear button on one line: wrapped in with the actions,
+                // the button ended up alone on a second.
+                ui.horizontal(|ui| {
                     ui.label(RichText::new("Selected").small().color(theme::FAINT));
                     ui.label(RichText::new(what).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .small_icon_button(&icons::CLOSE_SMALL, "Clear the selection")
+                            .on_hover_text("Clear the selection")
+                            .clicked()
+                        {
+                            self.picked.replace(None);
+                        }
+                    });
+                });
+                ui.horizontal_wrapped(|ui| {
                     if ui
                         .add(ReButton::new("Go there").small().blue())
                         .on_hover_text("Plan the walk now; you approve it before the robot moves")
@@ -102,13 +115,6 @@ impl Gui {
                         if ui.add(ReButton::new(label).small().secondary()).clicked() {
                             actions.push(Action::Prefill(text));
                         }
-                    }
-                    if ui
-                        .small_icon_button(&icons::CLOSE_SMALL, "Clear the selection")
-                        .on_hover_text("Clear the selection")
-                        .clicked()
-                    {
-                        self.picked.replace(None);
                     }
                 });
             });
@@ -139,12 +145,14 @@ impl Gui {
             if let Some(h) = self.history.get(pos) {
                 self.input.clone_from(h);
                 self.history_pos = Some(pos);
+                cursor_to_end(ui.ctx(), &self.input);
             }
         }
         if down && let Some(pos) = self.history_pos {
             if let Some(h) = self.history.get(pos + 1) {
                 self.input.clone_from(h);
                 self.history_pos = Some(pos + 1);
+                cursor_to_end(ui.ctx(), &self.input);
             } else {
                 self.input.clear();
                 self.history_pos = None;
@@ -260,4 +268,16 @@ pub(super) fn walk_to_point(x: f32, y: f32, from: Option<crate::robot::Pose>) ->
             {"name": "station", "value": format!("{x:.2};{y:.2};{yaw:.3}")}
         ]}]
     })
+}
+
+/// Puts the composer's cursor after `text`, which was filled in for the operator to type onto:
+/// left where it was, what they typed went in front of it.
+pub(super) fn cursor_to_end(ctx: &egui::Context, text: &str) {
+    let id = egui::Id::new(COMPOSER);
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    let end = egui::text::CCursor::new(text.chars().count());
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::one(end)));
+    state.store(ctx, id);
 }

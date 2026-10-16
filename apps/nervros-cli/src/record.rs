@@ -51,8 +51,8 @@ const AT_ONCE: usize = 8;
 pub(crate) async fn record(profile_path: &Path, out: &Path) -> Result<()> {
     let profile = Profile::load(profile_path).context("loading the profile")?;
     let robot = nervros_core::app::connect(&profile)?;
-    // Discovery needs a moment after the node starts.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // A recording of half the graph would be a different robot.
+    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
     let graph = robot.graph_detail().await.context("reading the graph")?;
     let mut doc = Map::new();
     let first = |items: &[(String, Vec<String>)]| -> Map<String, Value> {
@@ -101,7 +101,8 @@ pub(crate) async fn record(profile_path: &Path, out: &Path) -> Result<()> {
         profile_path.display(),
         humantime::format_rfc3339_seconds(std::time::SystemTime::now())
     );
-    std::fs::write(out, header + &text).with_context(|| format!("writing {}", out.display()))?;
+    std::fs::write(out, header + text.as_str())
+        .with_context(|| format!("writing {}", out.display()))?;
     eprintln!("recorded into {}", out.display());
     Ok(())
 }

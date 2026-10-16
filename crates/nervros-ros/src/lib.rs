@@ -191,7 +191,7 @@ pub struct GraphDetail {
     pub topics: NamesAndTypes,
     /// Services and their types.
     pub services: NamesAndTypes,
-    /// Full node names, `/namespace/name`.
+    /// Full node names, `/namespace/name`, sorted; a name twice when two nodes share it.
     pub nodes: Vec<String>,
 }
 

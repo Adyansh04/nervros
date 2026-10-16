@@ -334,12 +334,14 @@ pub(crate) fn words_of(name: &str) -> String {
         .join(" ")
 }
 
-/// A duration for people: "40 s", "12 min", "3 h".
-pub(crate) fn how_long(seconds: f64) -> String {
+/// A duration for people: "40 s", "12 min", "3 h", "5 days".
+#[must_use]
+pub fn how_long(seconds: f64) -> String {
     match seconds {
         s if s < 90.0 => format!("{s:.0} s"),
         s if s < 90.0 * 60.0 => format!("{:.0} min", s / 60.0),
-        s => format!("{:.0} h", s / 3600.0),
+        s if s < 48.0 * 3600.0 => format!("{:.0} h", s / 3600.0),
+        s => format!("{:.0} days", s / 86_400.0),
     }
 }
 

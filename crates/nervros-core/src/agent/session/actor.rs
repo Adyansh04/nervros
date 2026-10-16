@@ -72,6 +72,7 @@ pub(super) async fn actor(
                     Command::User(text) => {
                         // The operator speaking is a new say on what they want.
                         shared.denials.store(0, Ordering::SeqCst);
+                        lock(&shared.denied).clear();
                         if let Some((turn, _)) = &running {
                             if answering_report {
                                 if queued.is_none() {
@@ -91,6 +92,7 @@ pub(super) async fn actor(
                         running = Some(start(turns, Origin::User(text), &history));
                         answering_report = false;
                     }
+                    Command::Note(text) => lock(&shared.notes).push(text),
                     Command::Report(text) => {
                         reports.push(text);
                         if running.is_none() {
@@ -242,9 +244,9 @@ fn halt(shared: &Arc<Shared>, robot: bool) {
         });
     }
     let reason = if stop.is_some() {
-        "stopped by the operator: reply and robot"
+        "the operator stopped the reply and the robot"
     } else {
-        "reply stopped by the operator"
+        "the operator stopped the reply"
     };
     shared.emit(Event::Halted {
         reason: reason.into(),

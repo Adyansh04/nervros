@@ -11,7 +11,7 @@ use nervros_ros::RobotPort;
 use serde_json::{Value, json};
 
 use crate::profile::{PlaceConfig, PlacePose, Profile};
-use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
+use crate::tools::{Assessment, Risk, Tool, ToolOutcome, ToolSpec};
 
 /// Every named place.
 #[derive(Debug)]
@@ -110,15 +110,23 @@ impl Places {
 }
 
 /// What to call a room from the world model: its name, or what it is (its `type`) while the name
-/// is only canopy's placeholder, such as "room C".
-pub(crate) fn room_label(room: &serde_json::Value) -> Option<&str> {
+/// is only canopy's placeholder, such as "room C" or, past the alphabet, "room 354".
+#[must_use]
+pub fn room_label(room: &serde_json::Value) -> Option<&str> {
     let name = room["name"].as_str().filter(|n| !n.is_empty());
     let placeholder = name.is_none_or(|n| {
-        n.strip_prefix("room ")
-            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_uppercase()))
+        n.strip_prefix("room ").is_some_and(|rest| {
+            rest.chars().all(|c| c.is_ascii_uppercase()) || rest.chars().all(|c| c.is_ascii_digit())
+        })
     });
     let kind = room["type"].as_str().filter(|t| !t.is_empty());
     if placeholder { kind.or(name) } else { name }
+}
+
+/// Two names for one thing: "living room" and canopy's `living_room`, in any case.
+pub(crate) fn same_words(a: &str, b: &str) -> bool {
+    a.replace('_', " ")
+        .eq_ignore_ascii_case(&b.replace('_', " "))
 }
 
 /// Lowercase letters, digits and underscores.
@@ -177,6 +185,27 @@ impl TagPlace {
 impl Tool for TagPlace {
     fn spec(&self) -> Cow<'_, ToolSpec> {
         Cow::Borrowed(&self.spec)
+    }
+
+    /// The approval says what it keeps and where, not only that a memory changes.
+    async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
+        let Some(name) = args["name"].as_str().and_then(place_name) else {
+            return Some(Err(ToolOutcome::failed(
+                "`name` is a short name, such as reading_corner",
+            )));
+        };
+        let (map, base) = &self.frames;
+        let at = self
+            .robot
+            .transform(map, base)
+            .map(|t| format!(" ({:.1}, {:.1})", t.translation[0], t.translation[1]))
+            .unwrap_or_default();
+        Some(Ok(Assessment {
+            risk: Risk::Annotate,
+            resources: Vec::new(),
+            reason: format!("remembers where the robot stands{at} as the place `{name}`"),
+            args: None,
+        }))
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
@@ -249,6 +278,27 @@ impl Tool for ForgetPlace {
         Cow::Borrowed(&self.spec)
     }
 
+    /// A place nobody remembered is refused before the operator is asked to approve forgetting
+    /// it, which then only failed.
+    async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
+        let name = args["name"]
+            .as_str()
+            .and_then(place_name)
+            .unwrap_or_default();
+        if self.places.is_tagged(&name) {
+            Some(Ok(Assessment {
+                risk: Risk::Annotate,
+                resources: Vec::new(),
+                reason: format!("forgets the remembered place `{name}`"),
+                args: None,
+            }))
+        } else {
+            Some(Err(ToolOutcome::failed(format!(
+                "no remembered place `{name}`"
+            ))))
+        }
+    }
+
     async fn call(&self, args: Value) -> ToolOutcome {
         let name = args["name"]
             .as_str()
@@ -274,6 +324,19 @@ mod tests {
              [[place]]\nname = \"dock\"\npose = { x = 0.0, y = 0.0 }\n",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_room_goes_by_its_type_while_its_name_is_a_placeholder() {
+        let room = |name: &str| serde_json::json!({"name": name, "type": "living_room"});
+        assert_eq!(room_label(&room("room C")), Some("living_room"));
+        assert_eq!(room_label(&room("room 354")), Some("living_room"));
+        assert_eq!(room_label(&room("Grandma's room")), Some("Grandma's room"));
+        assert_eq!(
+            room_label(&room("room 3B")),
+            Some("room 3B"),
+            "an operator's own name"
+        );
     }
 
     #[tokio::test]
@@ -313,6 +376,15 @@ mod tests {
             clash.message
         );
         let forget = ForgetPlace::new(Arc::clone(&again));
+        // Nothing to forget is said before anyone is asked to approve it.
+        assert!(matches!(
+            forget.assess(&json!({"name": "secret lab"})).await,
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            forget.assess(&json!({"name": "reading_corner"})).await,
+            Some(Ok(a)) if a.reason.contains("reading_corner")
+        ));
         assert_eq!(
             forget.call(json!({"name": "reading_corner"})).await.status,
             crate::tools::Status::Succeeded

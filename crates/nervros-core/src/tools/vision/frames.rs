@@ -18,6 +18,10 @@ const FRAME_HISTORY: usize = 40;
 /// A camera that has sent nothing for this long has stopped, whatever its last frame shows.
 const CAMERA_QUIET: Duration = Duration::from_secs(3);
 
+/// How long a look waits for a camera's first frame: a node just started has none for a second
+/// or two.
+const FIRST_FRAME: Duration = Duration::from_secs(5);
+
 /// How often masks are looked for again while waiting for the ones of a kept frame.
 const DETECTION_POLL: Duration = Duration::from_millis(200);
 
@@ -78,6 +82,19 @@ pub struct Camera {
 }
 
 impl Camera {
+    /// The newest frame, waiting a moment for a first one just after start-up.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::newest`], once the wait is over.
+    pub async fn newest_soon(&self) -> Result<Arc<Frame>, String> {
+        let deadline = tokio::time::Instant::now() + FIRST_FRAME;
+        while self.history.newest().is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.newest()
+    }
+
     /// The newest frame, or why there is none.
     ///
     /// # Errors

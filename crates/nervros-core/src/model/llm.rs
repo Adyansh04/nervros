@@ -172,6 +172,14 @@ const UNREACHABLE_PARK: Duration = Duration::from_mins(1);
 /// How long before a busy model is asked once more.
 pub const BUSY_RETRY: Duration = Duration::from_secs(2);
 
+/// How long a turn waits before each new try of a busy model: a provider's spike of 503s often
+/// lasts longer than one short wait.
+pub const BUSY_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+];
+
 /// The longest a turn waits for a model's per-minute limit or 429 to lift, when every model is
 /// held back: free tiers count requests a minute, and a burst of calls spends them all.
 pub const MINUTE_WAIT: Duration = Duration::from_mins(1);
