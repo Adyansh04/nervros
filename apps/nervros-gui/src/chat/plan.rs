@@ -242,8 +242,16 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut
     });
 }
 
-/// `word` with its first letter in capitals.
+/// `word` with its first letter in capitals, unless it begins with a name such as a model's id,
+/// `gemini-3.1-flash-lite`, which is written as it is.
 pub fn capitalise(word: &str) -> String {
+    let first = word.split_whitespace().next().unwrap_or_default();
+    if first
+        .chars()
+        .any(|c| c.is_ascii_digit() || matches!(c, '-' | '_' | '/' | '.'))
+    {
+        return word.to_owned();
+    }
     let mut c = word.chars();
     c.next()
         .map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
