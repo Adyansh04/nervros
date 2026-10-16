@@ -56,12 +56,14 @@ pub(crate) async fn run(test: &Test, probe: &Probe<'_>) -> Result<Seen, String> 
             topic,
             ty,
             condition,
-        } => Ok(watch::observe(probe.robot, topic, ty, condition)
-            .await?
-            .map_or_else(
-                || seen(false, format!("{topic} has said nothing")),
-                |(held, saw)| seen(held, saw),
-            )),
+        } => {
+            // Silence rules nothing out: the executor down left the robot's state unsaid, and
+            // "the robot fell" read as ruled out.
+            let (held, saw) = watch::observe(probe.robot, topic, ty, condition)
+                .await?
+                .ok_or_else(|| format!("{topic} has said nothing"))?;
+            Ok(seen(held, saw))
+        }
         Test::Log {
             pattern,
             node,
@@ -177,14 +179,11 @@ async fn pose_gap(
     degrees: f64,
 ) -> Result<Seen, String> {
     let Ok(tf) = robot.transform(target, source) else {
-        return Ok(seen(
-            false,
-            format!("nothing links {target} to {source} yet"),
-        ));
+        return Err(format!("nothing links {target} to {source} yet"));
     };
     let msg = match robot.latest(topic, ty, POSE_WAIT).await {
         Ok(m) => m,
-        Err(RosError::NoData(_)) => return Ok(seen(false, format!("{topic} has said nothing"))),
+        Err(RosError::NoData(_)) => return Err(format!("{topic} has said nothing")),
         Err(e) => return Err(e.to_string()),
     };
     let pose = if field.is_empty() {
@@ -464,20 +463,21 @@ mod tests {
                     failure: "",
                     read_deny: &[],
                 };
-                run(&gap, &probe).await.unwrap()
+                run(&gap, &probe).await
             }
         };
-        let s = check(FakeRobot::new().with_topic("/truth", truth.clone())).await;
-        assert!(
-            !s.held && s.saw.contains("yet"),
-            "{s:?}: no transform is not a gap"
+        assert_eq!(
+            check(FakeRobot::new().with_topic("/truth", truth.clone())).await,
+            Err("nothing links map to base_link yet".to_owned()),
+            "no transform is no check"
         );
         let s = check(FakeRobot::new().with_topic("/truth", truth).with_transform(
             "map",
             "base_link",
             Transform::IDENTITY,
         ))
-        .await;
+        .await
+        .unwrap();
         assert!(s.held, "{s:?}");
         assert_eq!(
             s.saw,
