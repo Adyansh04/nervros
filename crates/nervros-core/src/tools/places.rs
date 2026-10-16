@@ -125,7 +125,8 @@ pub fn room_label(room: &serde_json::Value) -> Option<&str> {
 
 /// Two names for one thing: "living room" and canopy's `living_room`, in any case.
 pub(crate) fn same_words(a: &str, b: &str) -> bool {
-    a.replace('_', " ").eq_ignore_ascii_case(&b.replace('_', " "))
+    a.replace('_', " ")
+        .eq_ignore_ascii_case(&b.replace('_', " "))
 }
 
 /// Lowercase letters, digits and underscores.
@@ -184,6 +185,27 @@ impl TagPlace {
 impl Tool for TagPlace {
     fn spec(&self) -> Cow<'_, ToolSpec> {
         Cow::Borrowed(&self.spec)
+    }
+
+    /// The approval says what it keeps and where, not only that a memory changes.
+    async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
+        let Some(name) = args["name"].as_str().and_then(place_name) else {
+            return Some(Err(ToolOutcome::failed(
+                "`name` is a short name, such as reading_corner",
+            )));
+        };
+        let (map, base) = &self.frames;
+        let at = self
+            .robot
+            .transform(map, base)
+            .map(|t| format!(" ({:.1}, {:.1})", t.translation[0], t.translation[1]))
+            .unwrap_or_default();
+        Some(Ok(Assessment {
+            risk: Risk::Annotate,
+            resources: Vec::new(),
+            reason: format!("remembers where the robot stands{at} as the place `{name}`"),
+            args: None,
+        }))
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
@@ -264,7 +286,12 @@ impl Tool for ForgetPlace {
             .and_then(place_name)
             .unwrap_or_default();
         if self.places.is_tagged(&name) {
-            None
+            Some(Ok(Assessment {
+                risk: Risk::Annotate,
+                resources: Vec::new(),
+                reason: format!("forgets the remembered place `{name}`"),
+                args: None,
+            }))
         } else {
             Some(Err(ToolOutcome::failed(format!(
                 "no remembered place `{name}`"
@@ -354,12 +381,10 @@ mod tests {
             forget.assess(&json!({"name": "secret lab"})).await,
             Some(Err(_))
         ));
-        assert!(
-            forget
-                .assess(&json!({"name": "reading_corner"}))
-                .await
-                .is_none()
-        );
+        assert!(matches!(
+            forget.assess(&json!({"name": "reading_corner"})).await,
+            Some(Ok(a)) if a.reason.contains("reading_corner")
+        ));
         assert_eq!(
             forget.call(json!({"name": "reading_corner"})).await.status,
             crate::tools::Status::Succeeded
