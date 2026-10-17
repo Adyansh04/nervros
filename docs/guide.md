@@ -522,7 +522,7 @@ A patrol walks the round as a job, stands a moment in each place so the world mo
 then reports what moved or went missing meanwhile.
 
 When a step keeps failing, NervROS may propose a lasting fix: a note the planner reads, a
-keep-out zone, or a parameter of a skill's server. It never applies one itself. The Agent tab's
+keep-out zone, or a node parameter the profile lets `param_set` change. It never applies one itself. The Agent tab's
 **Proposed fixes** list each with **Accept**, which runs it as yours, and **Dismiss**; once
 accepted, the step's record before and since shows whether it helped. The Agent tab also lists
 the goals, each with **Drop**.
@@ -776,6 +776,8 @@ nervros-cli --profile my.toml ask "What can you see?" --image frame.jpg
 | `doctor` | Checks the profile's tools, topics and mission services against the live graph |
 | `why`, `incidents` | Checks what is wrong with the robot now against the playbooks and keeps it as an incident; lists the kept incidents, or shows one in full |
 | `missions`, `gaps` | Shows the mission ledger, and the requests no skill could do |
+| `digest` | What the robot did over the last hours (`--hours`), from its ledger, incidents and goals |
+| `inbox` | Lists the proposed fixes, accepted ones with their step's record before and since; `--dismiss N` turns one down while the app is closed |
 | `replay` | Replays a session as it happened |
 | `eval`, `case` | Runs test suites against the live robot or a scripted one, and keeps a session as a new case |
 | `record` | Writes the live robot as a scripted robot for `eval --robot` |

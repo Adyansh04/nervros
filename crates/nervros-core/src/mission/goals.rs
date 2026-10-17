@@ -201,6 +201,13 @@ impl Goals {
             ));
         }
         // A goal on a name only a detector knows could never be seen met: the world model judges.
+        if seen.objects.is_null() && done_when.iter().any(|p| !p.starts_with("holding")) {
+            return Err(
+                "the world model has not said what it knows, so the goal's names cannot be \
+                 checked; set it once the world model runs"
+                    .to_owned(),
+            );
+        }
         if let Some((p, id)) = done_when
             .iter()
             .find_map(|p| Some((p, check::unknown_in(p, seen)?)))
@@ -341,7 +348,8 @@ impl Goals {
         let mut out = Vec::new();
         for goal in goals.iter_mut() {
             let was = goal.state;
-            if was == State::Active {
+            // An exhausted goal that holds after all is met: the world can catch up.
+            if matches!(was, State::Active | State::Exhausted) {
                 judge(goal, seen, at);
             }
             if goal.state.open() || goal.state != was {
@@ -355,8 +363,9 @@ impl Goals {
     }
 }
 
-/// Judges one active goal: met once every predicate holds, else exhausted once its missions or
-/// its time ran out.
+/// Judges one goal: met once every predicate holds, else exhausted once its missions or its time
+/// ran out, but only on what the world model plainly says: one it cannot judge now, as while
+/// perception catches up with a place, is not yet unmet for good.
 fn judge(goal: &mut Goal, seen: &Observed, at: u64) {
     let verdicts = check::check(&goal.done_when, seen);
     goal.unmet = verdicts
@@ -366,7 +375,12 @@ fn judge(goal: &mut Goal, seen: &Observed, at: u64) {
         .collect();
     if goal.unmet.is_empty() {
         goal.state = State::Met;
-    } else if goal.missions.len() >= usize::try_from(goal.max_missions).unwrap_or(usize::MAX) {
+        return;
+    }
+    if goal.state == State::Exhausted || verdicts.iter().any(|v| v.ok.is_none()) {
+        return;
+    }
+    if goal.missions.len() >= usize::try_from(goal.max_missions).unwrap_or(usize::MAX) {
         goal.state = State::Exhausted;
         goal.why = format!("its {} missions were used up", goal.max_missions);
     } else if goal.expires.is_some_and(|e| at >= e) {
@@ -622,6 +636,28 @@ mod tests {
             Goals::new(Some(file)).all().len(),
             2,
             "kept across sessions"
+        );
+    }
+
+    #[test]
+    fn no_verdict_exhausts_nothing_and_an_exhausted_goal_may_be_met_late() {
+        let goals = Goals::new(None);
+        let now = SystemTime::now();
+        let g = goals
+            .set(&new(&["holding(right, O17)"], Some(1)), &seen(""), now)
+            .unwrap();
+        goals.ran(g.id, "m1", true);
+        let silent = Observed::default();
+        assert_eq!(
+            goals.settle(&silent, now)[0].state,
+            State::Active,
+            "no verdict yet"
+        );
+        assert_eq!(goals.settle(&seen(""), now)[0].state, State::Exhausted);
+        assert_eq!(
+            goals.settle(&seen("O17"), now)[0].state,
+            State::Met,
+            "it held after all"
         );
     }
 

@@ -106,7 +106,7 @@ impl Missions {
         // Subscribed before the launch, so even a mission refused at once is heard ending.
         let mut events = session.subscribe();
         compiled.plan.intent = format!("{intent} (job {})", ctx.id());
-        let id = self.launch(compiled, Reported::ToJob).await?;
+        let id = self.launch(compiled, Reported::ToJob, None).await?;
         // Dropped with a stopped job, or let go here, it cancels the mission if it still runs.
         let _cancel = CancelOnDrop {
             missions: Arc::clone(self),

@@ -84,10 +84,21 @@ impl WhenTool {
             .filter(|h| h.is_finite() && *h > 0.0)
             .unwrap_or(24.0)
             .min(self.keep_h);
-        let camera = args["camera"].as_str().filter(|c| !c.trim().is_empty());
+        let camera = args["camera"]
+            .as_str()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned);
         let now_s = crate::now_s();
         let (from_ms, to_ms) = (millis(now_s - hours * 3600.0), millis(now_s));
-        let all = self.keyframes.between(camera, from_ms, to_ms);
+        // A day of frames is tens of thousands of files: listed off the async threads.
+        let (keyframes, asked) = (Arc::clone(&self.keyframes), camera.clone());
+        let all = tokio::task::spawn_blocking(move || {
+            keyframes.between(asked.as_deref(), from_ms, to_ms)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        let camera = camera.as_deref();
         if all.is_empty() {
             return Err(format!(
                 "no frames were kept in the last {}{}",
@@ -112,15 +123,18 @@ impl WhenTool {
                 .filter(|k| k.at_ms > before.at_ms && k.at_ms <= chosen.at_ms)
                 .cloned()
                 .collect();
+            // The first answer stands when the second look gets none.
             if between.len() > 1
                 && let Some((closer, by)) = self
                     .ask(what, &sample(&between, MOST_FRAMES), now_s)
-                    .await?
+                    .await
+                    .ok()
+                    .flatten()
             {
                 (chosen, model) = (closer, by);
             }
         }
-        self.found(&chosen, &model, now_s)
+        self.found(&chosen, &model, now_s).await
     }
 
     /// The frames around the moments the world model saw what `what` names change, when it saw
@@ -184,11 +198,20 @@ impl WhenTool {
     }
 
     /// The tool's answer: the frame, kept as a snapshot the operator sees, and when it was.
-    fn found(&self, frame: &Keyframe, model: &str, now_s: f64) -> Result<ToolOutcome, String> {
-        let jpeg = std::fs::read(&frame.path).map_err(|e| e.to_string())?;
-        let size = image::load_from_memory(&jpeg)
-            .map(|img| (img.width(), img.height()))
-            .map_err(|e| e.to_string())?;
+    async fn found(
+        &self,
+        frame: &Keyframe,
+        model: &str,
+        now_s: f64,
+    ) -> Result<ToolOutcome, String> {
+        let path = frame.path.clone();
+        let (jpeg, size) = tokio::task::spawn_blocking(move || {
+            let jpeg = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let size = image::image_dimensions(&path).map_err(|e| e.to_string())?;
+            Ok::<_, String>((jpeg, size))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         #[expect(clippy::cast_precision_loss, reason = "milliseconds since 1970")]
         let stamp_s = frame.at_ms as f64 / 1000.0;
         let snapshot = self.snapshots.store(jpeg, size, stamp_s, Vec::new());

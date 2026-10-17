@@ -580,9 +580,11 @@ impl Watches {
             async move {
                 let deadline = Instant::now() + Duration::from_secs(for_s);
                 let (mut yes_before, mut fired) = (false, false);
+                let mut last = None;
                 while Instant::now() < deadline {
                     let looked = Instant::now();
-                    let seen = match sight(&cameras, model.as_ref(), &camera, &words).await {
+                    let asked = (camera.as_str(), words.as_str());
+                    let seen = match sight(&cameras, model.as_ref(), asked, &mut last, fired).await {
                         Ok(seen) => seen,
                         Err(e) => {
                             if let Some(s) = &session {
@@ -594,7 +596,7 @@ impl Watches {
                         }
                     };
                     match seen {
-                        Some(seen) if yes_before && !fired => {
+                        Look::Yes(seen) if yes_before && !fired => {
                             let note = if say.is_empty() {
                                 String::new()
                             } else {
@@ -610,9 +612,10 @@ impl Watches {
                             }
                             fired = true;
                         }
-                        Some(_) => yes_before = true,
+                        Look::Yes(_) => yes_before = true,
                         // Gone from view: the next time it shows is news again.
-                        None => (yes_before, fired) = (false, false),
+                        Look::No => (yes_before, fired) = (false, false),
+                        Look::Same => {}
                     }
                     tokio::time::sleep(SIGHT_PERIOD.saturating_sub(looked.elapsed())).await;
                 }
@@ -742,8 +745,25 @@ fn watch_spec() -> ToolSpec {
     )
 }
 
-/// One look at what `camera` shows now: what the model saw when it says yes, none for a no or a
-/// model that did not answer, which the next look may get.
+/// What one look found.
+enum Look {
+    /// The model said yes, and what it saw.
+    Yes(String),
+    /// It said anything but yes.
+    No,
+    /// Nothing new: no model answered, or the view is the one it said no to, or fired on.
+    Same,
+}
+
+/// The frame a watch asked about last, as its thumbnail, and whether the model said yes.
+struct Asked {
+    view: image::GrayImage,
+    yes: bool,
+}
+
+/// One look at what `camera` shows now, `words` the sight waited for. A view unchanged since a
+/// no, or since the watch `fired`, is not asked about again: a quiet room would spend a call
+/// every look on the same answer.
 ///
 /// # Errors
 ///
@@ -751,16 +771,24 @@ fn watch_spec() -> ToolSpec {
 async fn sight(
     cameras: &Cameras,
     seer: &dyn Seer,
-    camera: &str,
-    words: &str,
-) -> Result<Option<String>, String> {
+    (camera, words): (&str, &str),
+    last: &mut Option<Asked>,
+    fired: bool,
+) -> Result<Look, String> {
     let frame = cameras.get(Some(camera))?.newest()?;
     // Tens of milliseconds of pixels: off the threads that serve the stop.
-    let image = tokio::task::spawn_blocking(move || {
-        ImageInput::jpeg(&frame.to_rgb().map_err(|e| e.to_string())?)
+    let (image, view) = tokio::task::spawn_blocking(move || {
+        let rgb = frame.to_rgb().map_err(|e| e.to_string())?;
+        Ok::<_, String>((ImageInput::jpeg(&rgb)?, crate::vision::thumbnail(&rgb)))
     })
     .await
     .map_err(|e| e.to_string())??;
+    if last
+        .as_ref()
+        .is_some_and(|a| (!a.yes || fired) && crate::vision::same_view(&a.view, &view))
+    {
+        return Ok(Look::Same);
+    }
     // Said again beside the image: a model that reads the preamble less answers with a
     // description, which reads as a no.
     let prompt = format!("Does this frame show {words}? Answer yes or no first.");
@@ -775,11 +803,17 @@ async fn sight(
     {
         Ok((reply, model)) => {
             tracing::debug!(%model, %reply, "a camera watch looked");
-            Ok(yes_said(&reply))
+            let sighting = yes_said(&reply);
+            *last = Some(Asked {
+                view,
+                yes: sighting.is_some(),
+            });
+            Ok(sighting.map_or(Look::No, Look::Yes))
         }
+        // The next look may get an answer; until then the watch stands as it was.
         Err(e) => {
             tracing::info!(error = %e, "a camera watch's look got no answer");
-            Ok(None)
+            Ok(Look::Same)
         }
     }
 }
@@ -928,6 +962,69 @@ mod tests {
             assert_eq!(shots.len(), 1);
             Ok((self.0.to_owned(), "fake".to_owned()))
         }
+    }
+
+    /// Says no to every look, counting them.
+    struct CountsNo(std::sync::atomic::AtomicU32);
+
+    #[async_trait]
+    impl Seer for CountsNo {
+        async fn ask_shots(
+            &self,
+            _role: Role,
+            _preamble: &str,
+            _prompt: &str,
+            _shots: Vec<Shot>,
+        ) -> Result<(String, String), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(("No.".to_owned(), "fake".to_owned()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_still_view_after_a_no_is_not_asked_about_again() {
+        let frame = nervros_ros::Frame {
+            stamp_s: 1.0,
+            frame_id: "camera".into(),
+            width: 8,
+            height: 8,
+            encoding: "rgb8".into(),
+            step: 24,
+            is_bigendian: false,
+            data: bytes::Bytes::from(vec![90u8; 8 * 8 * 3]),
+        };
+        let fake = Arc::new(FakeRobot::new().with_frame("/camera", frame.clone()));
+        let robot: Arc<dyn RobotPort> = Arc::clone(&fake) as Arc<dyn RobotPort>;
+        let look: crate::profile::LookConfig = toml::from_str(
+            "image = \"/camera\"\ndetections = { topic = \"/m\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n",
+        )
+        .unwrap();
+        let cameras = Cameras::start(&look, &robot).unwrap();
+        tokio::task::yield_now().await;
+        let model = Arc::new(CountsNo(std::sync::atomic::AtomicU32::new(0)));
+        let watches = Watches::new(Arc::clone(&robot), Vec::new());
+        watches.see_through(Arc::clone(&cameras), Arc::clone(&model) as Arc<dyn Seer>);
+        watches
+            .start(&json!({"condition": "sees", "words": "a cat"}))
+            .await
+            .unwrap();
+        for stamp in [2.0, 3.0, 4.0] {
+            tokio::time::sleep(SIGHT_PERIOD).await;
+            // The same view, newly stamped: the camera keeps sending it.
+            fake.set_frame(
+                "/camera",
+                nervros_ros::Frame {
+                    stamp_s: stamp,
+                    ..frame.clone()
+                },
+            );
+        }
+        tokio::time::sleep(SIGHT_PERIOD).await;
+        assert_eq!(
+            model.0.load(Ordering::SeqCst),
+            1,
+            "one call for an unchanged view"
+        );
     }
 
     #[test]

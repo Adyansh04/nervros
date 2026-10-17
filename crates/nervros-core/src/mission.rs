@@ -311,8 +311,6 @@ pub struct Missions {
     drafts: learn::Drafts,
     /// The operator's goals, judged after every mission.
     goals: OnceLock<Arc<goals::Goals>>,
-    /// The running mission's goal, when it works toward one: (mission id, goal).
-    for_goal: Mutex<Option<(String, u32)>>,
     /// Fixes proposed after a step failed again, when a model drafts them.
     inbox: OnceLock<Arc<inbox::Inbox>>,
 }
@@ -374,7 +372,6 @@ impl Missions {
             paused: AtomicBool::new(false),
             drafts: learn::Drafts::default(),
             goals: OnceLock::new(),
-            for_goal: Mutex::default(),
             inbox: OnceLock::new(),
         }))
     }
@@ -452,12 +449,6 @@ impl Missions {
     pub fn use_inbox(&self, inbox: Arc<inbox::Inbox>) {
         // Set once, at start-up.
         let _ = self.inbox.set(inbox);
-    }
-
-    /// The improvement inbox, when fixes are drafted.
-    #[must_use]
-    pub fn inbox(&self) -> Option<&Arc<inbox::Inbox>> {
-        self.inbox.get()
     }
 
     /// The operator's goals, when they are kept.

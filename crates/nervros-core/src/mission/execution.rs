@@ -77,28 +77,25 @@ impl Missions {
             "the mission is running; a report follows when it ends. Tell the operator it started."
                 .to_owned()
         };
-        match self.launch(compiled, Reported::ToModel).await {
-            Ok(id) => {
-                if let Some(g) = goal {
-                    *lock(&self.for_goal) = Some((id.clone(), g));
-                }
-                ToolOutcome {
-                    status: Status::Accepted,
-                    data: json!({"mission_id": id}),
-                    message,
-                    images: Vec::new(),
-                }
-            }
+        match self.launch(compiled, Reported::ToModel, goal).await {
+            Ok(id) => ToolOutcome {
+                status: Status::Accepted,
+                data: json!({"mission_id": id}),
+                message,
+                images: Vec::new(),
+            },
             Err(e) => ToolOutcome::failed(e),
         }
     }
 
     /// Sends a checked plan to the executor and watches it; its id. The slot is claimed before the
-    /// goal goes out, so two launches at once cannot both pass.
+    /// goal goes out, so two launches at once cannot both pass. `for_goal` is the operator's goal
+    /// it works toward, counted when it ends.
     pub(super) async fn launch(
         self: &Arc<Self>,
         compiled: Compiled,
         reported: Reported,
+        for_goal: Option<u32>,
     ) -> Result<String, String> {
         // Run by its hash or on a schedule, a plan was checked when it was made: a zone may have
         // been added since, and a straight walk starts from where the robot stands now.
@@ -167,8 +164,9 @@ impl Missions {
         // What the operator asked for this mission: they may say more while it runs.
         let request = self.request();
         let started_s = crate::now_s();
-        // Kept as running before it is watched, so a NervROS that stops now leaves a record the
-        // next one settles, and the end's record cannot be overtaken by this one.
+        // Kept as running, so a NervROS that stops now leaves a record the next one settles. Not
+        // awaited here: from the goal on nothing may cancel this launch before `watch` holds the
+        // slot. `watch` waits for it, so the end's record cannot be overtaken by this one.
         let running = MissionRecord {
             id: id.clone(),
             hash: compiled.sha256.clone(),
@@ -180,9 +178,7 @@ impl Missions {
             plan: json!(compiled.plan.steps),
             ..MissionRecord::default()
         };
-        if let Some(write) = self.keep(running) {
-            let _ = write.await;
-        }
+        let launched = self.keep(running);
         tokio::spawn(
             Arc::clone(self)
                 .watch(
@@ -190,8 +186,8 @@ impl Missions {
                     compiled,
                     goal,
                     (before, held),
-                    (request, reported),
-                    started_s,
+                    (request, reported, for_goal),
+                    (started_s, launched),
                 )
                 .instrument(span),
         );
@@ -213,7 +209,7 @@ impl Missions {
             return Err(format!("mission {} was still running", r.id));
         }
         compiled.plan.intent = label.to_owned();
-        self.launch(compiled, Reported::ToModel).await
+        self.launch(compiled, Reported::ToModel, None).await
     }
 
     /// Checks a plan for a schedule: its hash, and its steps as the operator reads them.
@@ -246,8 +242,8 @@ impl Missions {
         compiled: Compiled,
         goal: Goal,
         (before, held): (camera::Frames, Option<crate::guard::ResourceLock>),
-        (request, reported): (String, Reported),
-        started_s: f64,
+        (request, reported, for_goal): (String, Reported, Option<u32>),
+        (started_s, launched): (f64, Option<tokio::task::JoinHandle<()>>),
     ) {
         let started = Instant::now();
         let mut times = StepTimes::default();
@@ -279,6 +275,9 @@ impl Missions {
             .map(|s| times.record(s, &ended.step, &ended.reason, cut))
             .collect();
         let passed_over = passed_over(&compiled, &steps, &ended.step);
+        if let Some(launched) = launched {
+            let _ = launched.await;
+        }
         let kept = self.keep(MissionRecord {
             id: id.clone(),
             hash: compiled.sha256.clone(),
@@ -307,7 +306,8 @@ impl Missions {
         // against the model's request, are the model's.
         if reported == Reported::ToModel {
             let evidence = (before, passed_over, started_s);
-            self.tell_model(&id, &compiled, &ended, evidence).await;
+            self.tell_model(&id, &compiled, &ended, evidence, for_goal)
+                .await;
         }
     }
 
@@ -318,6 +318,7 @@ impl Missions {
         compiled: &Compiled,
         ended: &Ended,
         (before, passed_over, started_s): (camera::Frames, Vec<String>, f64),
+        for_goal: Option<u32>,
     ) {
         let seen = self.observe().await;
         // What happened to what the failed step was about: often it was moved, not missed. The
@@ -366,7 +367,7 @@ impl Missions {
             changes: &changes,
         };
         let mut report = self.report(id, compiled, ended, &evidence);
-        report.push_str(&self.settle_goals(id, ended, &seen));
+        report.push_str(&self.settle_goals(id, ended, &seen, for_goal));
         if let Some(s) = self.session.get() {
             s.send(Command::Report(report));
         }
@@ -427,30 +428,42 @@ impl Missions {
             let Some(proposal) = inbox.propose(&inbox::Failure { track, ..failure }).await else {
                 return;
             };
-            let text = format!(
-                "the inbox has a proposed fix, for the operator to accept or dismiss: {}",
-                proposal.line()
-            );
+            // The model hears only that one waits: its words come from the world and a model,
+            // and are the operator's to read, not instructions for the next turn.
             if let Some(s) = me.session.get() {
-                s.send(Command::Note(text.clone()));
+                s.send(Command::Note(format!(
+                    "proposed fix {} waits for the operator in the Agent tab",
+                    proposal.id
+                )));
             }
-            me.emit(Event::Notice { text });
+            me.emit(Event::Notice {
+                text: format!(
+                    "a proposed fix waits for you in the Agent tab: {}",
+                    proposal.line()
+                ),
+            });
         });
     }
 
-    /// Counts mission `id` for the goal it worked toward, judges every goal, and says where the
-    /// open ones and the ones that just ended stand, as the report's closing lines.
-    fn settle_goals(&self, id: &str, ended: &Ended, seen: &Observed) -> String {
+    /// Counts mission `id` for `for_goal`, the goal it worked toward, judges every goal, and says
+    /// where the open ones and the ones that just ended stand, as the report's closing lines.
+    fn settle_goals(
+        &self,
+        id: &str,
+        ended: &Ended,
+        seen: &Observed,
+        for_goal: Option<u32>,
+    ) -> String {
         let Some(goals) = self.goals.get() else {
             return String::new();
         };
-        let ran = lock(&self.for_goal).take_if(|(m, _)| m == id);
-        if let Some((_, goal)) = ran {
+        if let Some(goal) = for_goal {
             goals.ran(goal, id, ended.fault.is_none());
         }
-        // After a fault, or once the request failed too often, the report says not to run again:
-        // its goals wait for the operator too.
+        // After a stop or a fault, or once the request failed too often, the report says not to
+        // run again: its goals wait for the operator too.
         let may_go_on = ended.fault.is_none()
+            && ended.outcome != Outcome::Canceled
             && self.run_failures.load(Ordering::SeqCst) <= self.config.max_replans;
         goals::report_lines(&goals.settle(seen, SystemTime::now()), may_go_on)
     }
@@ -789,12 +802,14 @@ impl StepTimes {
     /// A planned step as it went; `failed` is the step the mission failed at, with `reason`, or
     /// with `cut` the one a stop ended.
     fn record(&self, step: &PlannedStep, failed: &str, reason: &str, cut: bool) -> StepRecord {
+        // A leaf a stop reaches fails, "stopped": the step it cut is not the skill's failure.
+        let stopped = cut && step.id == failed;
         let (seconds, outcome) = match self.steps.get(&step.id) {
             Some(&StepTime {
                 start,
                 end: Some((end, status)),
-            }) => (Some(end - start), status),
-            _ if step.id == failed && cut => (None, "stopped"),
+            }) => (Some(end - start), if stopped { "stopped" } else { status }),
+            _ if stopped => (None, "stopped"),
             _ if step.id == failed => (None, "failure"),
             _ => (None, "skipped"),
         };

@@ -234,12 +234,34 @@ impl Inbox {
     /// inbox has room.
     #[must_use]
     pub fn wanted(&self, skill: &str, target: &str) -> bool {
-        let proposals = self.lock();
-        !self.fixes.is_empty()
-            && proposals.iter().filter(|p| p.state == State::Open).count() < MAX_OPEN
-            && !proposals
-                .iter()
-                .any(|p| p.skill == skill && p.target == target && p.state != State::Accepted)
+        !self.fixes.is_empty() && wanted_in(&self.lock(), skill, target)
+    }
+
+    /// The proposals, read again from the file first: the command line may have dismissed one
+    /// while this app ran, and a save here would undo it.
+    fn fresh(&self) -> MutexGuard<'_, Vec<Proposal>> {
+        let mut proposals = self.lock();
+        if let Some(file) = self.file.as_deref().filter(|f| f.exists()) {
+            *proposals = Self::read(file);
+        }
+        proposals
+    }
+
+    /// Open proposal `id`, checked again as a fix this robot may take: the file is read as
+    /// trusted, and a hand edit could have changed its call.
+    ///
+    /// # Errors
+    ///
+    /// No open proposal has that number, or its call is no fix this robot may take.
+    pub fn check(&self, id: u32) -> Result<Proposal, String> {
+        let proposal = self
+            .fresh()
+            .iter()
+            .find(|p| p.id == id && p.state == State::Open)
+            .cloned()
+            .ok_or_else(|| format!("no open proposal {id}"))?;
+        check_fix(&proposal.tool, &proposal.args, &self.fixes)?;
+        Ok(proposal)
     }
 
     /// Drafts a fix for `failure` and keeps it when it passes the checks; none when the drafter
@@ -263,7 +285,11 @@ impl Inbox {
                 return None;
             }
         };
-        let mut proposals = self.lock();
+        let mut proposals = self.fresh();
+        // Another failure of the step may have drafted one meanwhile.
+        if !wanted_in(&proposals, &failure.skill, &failure.target) {
+            return None;
+        }
         let proposal = Proposal {
             id: proposals.iter().map(|p| p.id).max().unwrap_or(0) + 1,
             at: crate::unix_secs(SystemTime::now()),
@@ -309,7 +335,7 @@ impl Inbox {
     }
 
     fn settle(&self, id: u32, change: impl FnOnce(&mut Proposal)) -> Result<Proposal, String> {
-        let mut proposals = self.lock();
+        let mut proposals = self.fresh();
         let settled = settle_in(&mut proposals, id, change)?;
         self.save(&proposals)?;
         Ok(settled)
@@ -328,6 +354,14 @@ pub fn dismiss_in(file: &std::path::Path, id: u32) -> Result<Proposal, String> {
     crate::persist::write_atomic(file, &text)
         .map_err(|e| format!("saving {}: {e}", file.display()))?;
     Ok(settled)
+}
+
+/// Whether `skill` on `target` may get a proposal among `proposals`.
+fn wanted_in(proposals: &[Proposal], skill: &str, target: &str) -> bool {
+    proposals.iter().filter(|p| p.state == State::Open).count() < MAX_OPEN
+        && !proposals
+            .iter()
+            .any(|p| p.skill == skill && p.target == target && p.state != State::Accepted)
 }
 
 /// Changes open proposal `id` of `proposals`; the proposal as it is now.
@@ -406,11 +440,26 @@ pub fn validate(
         return Ok(None);
     }
     let tool = value["tool"].as_str().ok_or("no `tool`")?.to_owned();
+    let args = value["args"].clone();
+    check_fix(&tool, &args, fixes)?;
+    let why = value["why"].as_str().map(str::trim).unwrap_or_default();
+    if why.is_empty() {
+        return Err("no `why`".to_owned());
+    }
+    Ok(Some((tool, args, crate::tools::clip(why, 300))))
+}
+
+/// Whether calling `tool` with `args` is a fix this robot may take: a [`FIXES`] tool it has, its
+/// one action, no argument it does not declare, and arguments its schema accepts.
+///
+/// # Errors
+///
+/// What makes it no such fix.
+pub fn check_fix(tool: &str, args: &Value, fixes: &[ToolSpec]) -> Result<(), String> {
     let spec = fixes
         .iter()
         .find(|s| s.name == tool)
         .ok_or_else(|| format!("`{tool}` is not a tool a fix may call"))?;
-    let args = value["args"].clone();
     let fix = FIXES
         .iter()
         .find(|f| f.tool == tool)
@@ -434,15 +483,11 @@ pub fn validate(
             fix.needs_one_of.join(", ")
         ));
     }
-    let problems = crate::agent::argcheck::check(&spec.parameters, &args);
+    let problems = crate::agent::argcheck::check(&spec.parameters, args);
     if !problems.is_empty() {
         return Err(problems.join("; "));
     }
-    let why = value["why"].as_str().map(str::trim).unwrap_or_default();
-    if why.is_empty() {
-        return Err("no `why`".to_owned());
-    }
-    Ok(Some((tool, args, crate::tools::clip(why, 300))))
+    Ok(())
 }
 
 #[cfg(test)]

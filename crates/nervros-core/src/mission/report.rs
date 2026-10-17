@@ -28,6 +28,9 @@ pub(super) struct Evidence<'a> {
     pub(super) changes: &'a [String],
 }
 
+/// The history's newest events a world diff reads: room for the moves among what was only seen.
+const CHANGE_EVENTS: u32 = 200;
+
 /// The most objects a report names as changed by the way.
 const MOST_CHANGES: usize = 5;
 
@@ -223,9 +226,10 @@ impl Missions {
     /// Objects but `leave_out` that moved or went missing since `since_s`, at most
     /// [`MOST_CHANGES`] lines and the rest counted.
     async fn changes(&self, since_s: f64, leave_out: &[&str]) -> Result<Vec<String>, String> {
-        let events: Vec<Value> = self
-            .try_object_events("", since_s)
-            .await?
+        let all = self.try_object_events("", since_s, CHANGE_EVENTS).await?;
+        // The newest come back: at the cap, older moves may be missing from the lines.
+        let capped = all.len() >= usize::try_from(CHANGE_EVENTS).unwrap_or(usize::MAX);
+        let events: Vec<Value> = all
             .into_iter()
             .filter(|e| matches!(e["kind"].as_str(), Some("moved" | "missing")))
             .filter(|e| !leave_out.contains(&e["id"].as_str().unwrap_or_default()))
@@ -236,6 +240,9 @@ impl Missions {
             lines.truncate(MOST_CHANGES);
             lines.push(format!("{more} more"));
         }
+        if capped {
+            lines.push("maybe more before these".to_owned());
+        }
         Ok(lines)
     }
 
@@ -243,7 +250,7 @@ impl Missions {
     /// oldest first, as the world model's `ObjectEvent`s; none when it keeps no history or does
     /// not answer.
     pub(crate) async fn object_events(&self, query: &str, since_s: f64) -> Vec<Value> {
-        self.try_object_events(query, since_s)
+        self.try_object_events(query, since_s, 30)
             .await
             .unwrap_or_else(|e| {
                 tracing::info!(error = %e, "no object history");
@@ -256,7 +263,12 @@ impl Missions {
     /// # Errors
     ///
     /// The profile names no history service, or it did not answer.
-    async fn try_object_events(&self, query: &str, since_s: f64) -> Result<Vec<Value>, String> {
+    async fn try_object_events(
+        &self,
+        query: &str,
+        since_s: f64,
+        most: u32,
+    ) -> Result<Vec<Value>, String> {
         let service = self
             .profile
             .world
@@ -268,7 +280,7 @@ impl Missions {
         let request = json!({
             "query": query,
             "since": {"sec": sec, "nanosec": 0},
-            "max_events": 30
+            "max_events": most
         });
         let reply = self
             .robot

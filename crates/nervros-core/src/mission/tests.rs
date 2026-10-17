@@ -695,6 +695,78 @@ async fn problems_go_back_to_the_model_and_attempts_are_capped() {
 }
 
 #[tokio::test]
+async fn a_stopped_mission_for_a_goal_is_counted_and_asks_for_no_other() {
+    let robot: Arc<dyn RobotPort> = Arc::new(robot(ended(2, "s1", "stopped: operator")));
+    let goals = goals::Goals::new(None);
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot)
+        .unwrap()
+        .with_goals(Arc::clone(&goals));
+    let seen = check::Observed {
+        state: json!({"holding_left": "", "holding_right": ""}),
+        ..check::Observed::default()
+    };
+    let goal = goals
+        .set(
+            &goals::NewGoal {
+                text: "hold the mug".to_owned(),
+                done_when: vec!["holding(left, O18)".to_owned()],
+                ..goals::NewGoal::default()
+            },
+            &seen,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+    let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+    let (events, _rx) = tokio::sync::broadcast::channel(64);
+    missions.attach(SessionHandle::for_tests(&tx, events));
+    let hash = missions.plan(steps(), By::Model).await.data["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        missions
+            .run(&json!({"hash": hash, "goal": goal.id}))
+            .await
+            .status,
+        Status::Accepted
+    );
+
+    let text = report_from(&mut commands).await;
+    assert!(
+        text.contains("Goal: goal 1 (hold the mug): active"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("plan it with run_mission"),
+        "a stop asks for no relaunch: {text}"
+    );
+    assert_eq!(
+        goals.all()[0].missions.len(),
+        1,
+        "counted through its launch"
+    );
+}
+
+#[test]
+fn every_executor_cause_names_its_fault() {
+    let faults: Vec<Option<Fault>> = (0..8).map(Fault::of_cause).collect();
+    assert_eq!(
+        faults,
+        [
+            None,
+            Some(Fault::Robot),
+            Some(Fault::Deadman),
+            Some(Fault::Shutdown),
+            Some(Fault::NoServer),
+            Some(Fault::Teleop),
+            Some(Fault::Busy),
+            None
+        ],
+        "in the order of ExecuteMission's CAUSE_ constants"
+    );
+}
+
+#[tokio::test]
 async fn a_mission_the_robot_cut_short_is_no_failure_of_the_plan() {
     let fell = ScriptedRun {
         result: Ok(GoalResult {

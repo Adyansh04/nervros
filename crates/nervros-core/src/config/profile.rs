@@ -780,6 +780,21 @@ impl Profile {
                 ProfileError::Invalid(format!("[[geofence.zone]] `{}`: {why}", z.name))
             })?;
         }
+        if let Some(k) = &self.keyframes {
+            let sane = |v: f64, most: f64| v.is_finite() && v > 0.0 && v <= most;
+            if !sane(k.period_s, 3600.0) || !sane(k.keep_h, 24.0 * 30.0) || k.edge_px < 64 {
+                return Err(ProfileError::Invalid(
+                    "[keyframes] period_s is above 0 and at most 3600, keep_h above 0 and at most \
+                     720, edge_px at least 64"
+                        .to_owned(),
+                ));
+            }
+            if self.look.is_none() {
+                return Err(ProfileError::Invalid(
+                    "[keyframes] needs [look]: it keeps the frames of its cameras".to_owned(),
+                ));
+            }
+        }
         if self.geofence.mask.is_some() && self.world.as_ref().is_none_or(|w| w.map.is_none()) {
             return Err(ProfileError::Invalid(
                 "[geofence] mask needs [world] map: the mask is drawn on the map's grid".to_owned(),

@@ -11,12 +11,82 @@ use rerun::external::egui;
 use rerun::external::egui::{Align, Layout, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _};
 
+use nervros_core::mission::inbox::{Proposal, State};
+use nervros_core::mission::ledger::Track;
+use nervros_core::session::Event;
+use nervros_core::tools::Status;
+
 use super::Gui;
 use super::bars::quota;
 use crate::theme;
 use crate::toasts::Kind;
 
+/// How often the accepted fixes' records are read again.
+const FIX_RECORDS_FRESH: Duration = Duration::from_secs(5);
+
+/// A fix whose call was sent as the operator's, waiting for it to finish.
+struct Accepting {
+    id: u32,
+    tool: String,
+    /// Its step's record when Accept was clicked.
+    before: Option<Track>,
+}
+
+/// The proposed fixes as the window keeps them.
+#[derive(Default)]
+pub(super) struct Fixes {
+    /// The one being accepted: accepted once its call succeeds.
+    accepting: Option<Accepting>,
+    /// When the records since were read.
+    read: Option<Instant>,
+    /// Each accepted fix's step record since, by the fix's number.
+    since: std::collections::BTreeMap<u32, Option<Track>>,
+}
+
+/// A record as the operator reads it.
+fn record(t: Option<&Track>) -> String {
+    t.map_or_else(
+        || "no runs".to_owned(),
+        |t| format!("{} of {}", t.succeeded, t.runs),
+    )
+}
+
 impl Gui {
+    /// Settles the fix being accepted once its call ends: accepted when it succeeded, still open
+    /// when the operator turned the call down or it failed.
+    pub(super) fn settle_fix(&mut self, e: &Event) {
+        let Event::ToolFinished {
+            tool,
+            status,
+            message,
+            ..
+        } = e
+        else {
+            return;
+        };
+        let Some(asked) = self.fixes.accepting.take_if(|a| a.tool == *tool) else {
+            return;
+        };
+        let Some(inbox) = self.agent.inbox.clone() else {
+            return;
+        };
+        if *status != Status::Succeeded {
+            self.toasts.add(
+                Kind::Failure,
+                format!("Fix {} did not run, so it stays open: {message}", asked.id),
+            );
+            return;
+        }
+        match inbox.accept(asked.id, asked.before) {
+            Ok(_) => {
+                self.fixes.read = None;
+                self.toasts
+                    .add(Kind::Success, format!("Fix {} accepted", asked.id));
+            }
+            Err(e) => self.chat.items.push(crate::chat::Item::error(e)),
+        }
+    }
+
     /// Saves a session as an eval case, and says where.
     fn save_as_case(&mut self, log: &Path) {
         match crate::sessions::save_as_case(log) {
@@ -173,13 +243,17 @@ impl Gui {
             .as_ref()
             .and_then(|m| m.ledger())
             .cloned();
+        self.refresh_fix_records(&proposals, ledger.as_deref());
+        let waiting = self.fixes.accepting.as_ref().map(|a| a.id);
         let (mut accept, mut dismiss) = (None, None);
         for p in proposals.iter().rev() {
-            let open = p.state == nervros_core::mission::inbox::State::Open;
+            let open = p.state == State::Open;
             theme::row(
                 ui,
                 |ui| {
-                    if open {
+                    if waiting == Some(p.id) {
+                        ui.label(RichText::new("Running…").small().color(theme::DIM));
+                    } else if open && waiting.is_none() {
                         if ui
                             .add(ReButton::new("Dismiss").small().secondary())
                             .on_hover_text("No fix like it is proposed for this step again")
@@ -189,10 +263,13 @@ impl Gui {
                         }
                         if ui
                             .add(ReButton::new("Accept").small())
-                            .on_hover_text(format!("Runs {} {} as yours", p.tool, p.args))
+                            .on_hover_text(format!(
+                                "Runs {} {} as yours, through its own approval",
+                                p.tool, p.args
+                            ))
                             .clicked()
                         {
-                            accept = Some(p.clone());
+                            accept = Some(p.id);
                         }
                     }
                 },
@@ -216,46 +293,83 @@ impl Gui {
                 .small()
                 .color(theme::DIM),
             );
-            if let (Some(at), Some(ledger)) = (p.accepted_at, &ledger) {
-                #[expect(clippy::cast_precision_loss, reason = "seconds since 1970")]
-                let since = ledger
-                    .track_since(&p.skill, &p.target, at as f64)
-                    .ok()
-                    .flatten();
-                let record = |t: Option<&nervros_core::mission::ledger::Track>| {
-                    t.map_or_else(
-                        || "no runs".to_owned(),
-                        |t| format!("{} of {}", t.succeeded, t.runs),
-                    )
-                };
+            if p.state == State::Accepted {
+                let since = self.fixes.since.get(&p.id).and_then(Option::as_ref);
                 ui.label(
                     RichText::new(format!(
                         "accepted; before {}, since {}",
                         record(p.before.as_ref()),
-                        record(since.as_ref())
+                        record(since)
                     ))
                     .small()
                     .color(theme::DIM),
                 );
             }
         }
-        if let Some(p) = accept {
-            let before = ledger
-                .as_ref()
-                .and_then(|l| l.track(&p.skill, &p.target).ok().flatten());
-            match inbox.accept(p.id, before) {
-                Ok(_) => self.agent.session.send(Command::Run {
-                    tool: p.tool,
-                    args: p.args,
-                }),
-                Err(e) => self.chat.items.push(crate::chat::Item::error(e)),
-            }
+        if let Some(id) = accept {
+            self.accept_fix(&inbox, id, ledger.as_deref());
         }
         if let Some(id) = dismiss
             && let Err(e) = inbox.dismiss(id)
         {
             self.chat.items.push(crate::chat::Item::error(e));
         }
+    }
+
+    /// Runs fix `id`'s call as the operator's, through its own approval; it is accepted once that
+    /// succeeds.
+    fn accept_fix(
+        &mut self,
+        inbox: &nervros_core::mission::inbox::Inbox,
+        id: u32,
+        ledger: Option<&nervros_core::mission::ledger::Ledger>,
+    ) {
+        // Checked again: the file is read as trusted, and a hand edit could change the call.
+        match inbox.check(id) {
+            Ok(p) => {
+                let before = ledger.and_then(|l| l.track(&p.skill, &p.target).ok().flatten());
+                self.fixes.accepting = Some(Accepting {
+                    id,
+                    tool: p.tool.clone(),
+                    before,
+                });
+                self.agent.session.send(Command::Run {
+                    tool: p.tool,
+                    args: p.args,
+                });
+            }
+            Err(e) => self.chat.items.push(crate::chat::Item::error(e)),
+        }
+    }
+
+    /// Reads the accepted fixes' records since again, off the hot path at most every few seconds.
+    fn refresh_fix_records(
+        &mut self,
+        proposals: &[Proposal],
+        ledger: Option<&nervros_core::mission::ledger::Ledger>,
+    ) {
+        if self
+            .fixes
+            .read
+            .is_some_and(|at| at.elapsed() < FIX_RECORDS_FRESH)
+        {
+            return;
+        }
+        self.fixes.read = Some(Instant::now());
+        let Some(ledger) = ledger else {
+            return;
+        };
+        self.fixes.since = proposals
+            .iter()
+            .filter_map(|p| {
+                #[expect(clippy::cast_precision_loss, reason = "seconds since 1970")]
+                let at = p.accepted_at? as f64;
+                Some((
+                    p.id,
+                    ledger.track_since(&p.skill, &p.target, at).ok().flatten(),
+                ))
+            })
+            .collect();
     }
 
     /// What the operator asked the agent to remember, each with a way to forget it.

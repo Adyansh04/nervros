@@ -69,7 +69,10 @@ pub fn checkable(predicate: &str) -> bool {
         "holding" | "inside" | "on" => 2,
         _ => return false,
     };
-    args.len() == arity && args.iter().all(|a| !a.is_empty())
+    // `holding` is judged by the executor's hands, which are left and right.
+    args.len() == arity
+        && args.iter().all(|a| !a.is_empty())
+        && (name != "holding" || matches!(args[0], "left" | "right"))
 }
 
 /// Checks each predicate.

@@ -222,12 +222,15 @@ impl Ledger {
         )?;
         if !kept_faults {
             // The step a stop cut short was kept as failed, and counted against its skill.
+            // One transaction: a ledger with the column but the old steps would never be fixed.
             db.execute_batch(
-                "ALTER TABLE missions ADD COLUMN fault TEXT NOT NULL DEFAULT '';
+                "BEGIN;
+                 ALTER TABLE missions ADD COLUMN fault TEXT NOT NULL DEFAULT '';
                  UPDATE steps SET outcome = 'stopped'
-                 WHERE outcome = 'failure' AND seconds IS NULL AND EXISTS (
+                 WHERE outcome = 'failure' AND EXISTS (
                      SELECT 1 FROM missions WHERE missions.id = steps.mission
-                       AND missions.outcome = 'canceled' AND missions.failed_step = steps.id);",
+                       AND missions.outcome = 'canceled' AND missions.failed_step = steps.id);
+                 COMMIT;",
             )?;
         }
         Ok(Arc::new(Self { db: Mutex::new(db) }))
@@ -247,7 +250,9 @@ impl Ledger {
         let mut db = self.db();
         let tx = db.transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO missions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT OR REPLACE INTO missions (id, hash, intent, request, started, ended, outcome,
+                 failed_step, reason, plan, fault)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 m.id,
                 m.hash,
@@ -264,7 +269,9 @@ impl Ledger {
         )?;
         {
             let mut step = tx.prepare_cached(
-                "INSERT OR REPLACE INTO steps VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT OR REPLACE INTO steps (mission, id, skill, target, args, seconds, outcome,
+                     reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for s in &m.steps {
                 step.execute(params![

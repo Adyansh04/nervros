@@ -75,9 +75,13 @@ impl Drop for Keyframes {
 
 /// Looks at each camera's newest frame every `period_s`, keeping the ones that changed.
 async fn keep(config: KeyframesConfig, cameras: Arc<Cameras>, dir: PathBuf) {
-    let period = Duration::from_secs_f64(config.period_s.max(0.2));
+    // The profile's check keeps period_s finite and positive; 0.2 s is the floor of sense.
+    let period =
+        Duration::try_from_secs_f64(config.period_s.max(0.2)).unwrap_or(Duration::from_secs(2));
     let mut last: Vec<(String, f64, GrayImage)> = Vec::new();
     let mut looks = 0u32;
+    // Said once a run of failures, not every look: a full disk fails every one.
+    let mut failing = false;
     loop {
         tokio::time::sleep(period).await;
         for name in cameras.names() {
@@ -92,20 +96,30 @@ async fn keep(config: KeyframesConfig, cameras: Arc<Cameras>, dir: PathBuf) {
             let (name, folder, edge) = (name.to_owned(), dir.join(name), config.edge_px);
             // Tens of milliseconds of pixels and a file: off the threads that serve the stop.
             let kept = tokio::task::spawn_blocking(move || {
-                let rgb = frame.to_rgb().ok()?;
+                let rgb = frame.to_rgb().map_err(|e| e.to_string())?;
                 let thumb = thumbnail(&rgb);
-                if before.is_some_and(|b| difference(&b, &thumb) < CHANGE) {
-                    return None;
+                if before.is_some_and(|b| same_view(&b, &thumb)) {
+                    return Ok(None);
                 }
-                save(&folder, &rgb, frame.stamp_s, edge).ok()?;
-                Some((frame.stamp_s, thumb))
+                save(&folder, &rgb, frame.stamp_s, edge).map_err(|e| e.to_string())?;
+                Ok::<_, String>(Some((frame.stamp_s, thumb)))
             })
             .await
-            .ok()
-            .flatten();
-            if let Some((stamp, thumb)) = kept {
-                last.retain(|(n, ..)| *n != name);
-                last.push((name, stamp, thumb));
+            .map_err(|e| e.to_string())
+            .and_then(|kept| kept);
+            match kept {
+                Ok(Some((stamp, thumb))) => {
+                    failing = false;
+                    last.retain(|(n, ..)| *n != name);
+                    last.push((name, stamp, thumb));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    if !failing {
+                        tracing::warn!(error = %e, camera = %name, "a keyframe was not kept");
+                    }
+                    failing = true;
+                }
             }
         }
         looks += 1;
@@ -117,8 +131,13 @@ async fn keep(config: KeyframesConfig, cameras: Arc<Cameras>, dir: PathBuf) {
     }
 }
 
+/// Whether two thumbnails show the same view: noise and a flicker of light aside.
+pub(crate) fn same_view(a: &GrayImage, b: &GrayImage) -> bool {
+    difference(a, b) < CHANGE
+}
+
 /// A frame's grey thumbnail, which a change of view shows in and noise does not.
-fn thumbnail(rgb: &image::RgbImage) -> GrayImage {
+pub(crate) fn thumbnail(rgb: &image::RgbImage) -> GrayImage {
     let grey = image::DynamicImage::ImageRgb8(rgb.clone()).to_luma8();
     image::imageops::resize(
         &grey,
@@ -141,13 +160,17 @@ fn difference(a: &GrayImage, b: &GrayImage) -> f64 {
     mean
 }
 
-/// Writes `rgb` as `<folder>/<ms>.jpg`, its longest side cut to `edge` px.
+/// Writes `rgb` as `<folder>/<ms>.jpg`, its longest side cut to `edge` px: whole when it shows
+/// up, by a rename, but not synced to disk, as a frame lost to a crash costs nothing.
 fn save(folder: &Path, rgb: &image::RgbImage, stamp_s: f64, edge: u32) -> std::io::Result<()> {
     std::fs::create_dir_all(folder)?;
     let small = nervros_ros::image::capped(rgb, edge);
     let jpeg = nervros_ros::image::encode_jpeg(&small, nervros_ros::image::JPEG_QUALITY)
         .map_err(std::io::Error::other)?;
-    crate::persist::write_atomic(&folder.join(format!("{}.jpg", millis(stamp_s))), &jpeg)
+    let name = millis(stamp_s);
+    let partial = folder.join(format!("{name}.part"));
+    std::fs::write(&partial, &jpeg)?;
+    std::fs::rename(&partial, folder.join(format!("{name}.jpg")))
 }
 
 /// Removes the frames older than `keep_h`, then the oldest until all fit in `max_mb`.

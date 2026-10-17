@@ -295,6 +295,8 @@ pub struct Gui {
     records: crate::history::History,
     /// Images waiting to go with the next message.
     attachments: crate::attach::Attachments,
+    /// The proposed fixes as the window keeps them: the one being accepted, and records since.
+    fixes: agent_tab::Fixes,
 }
 
 impl Gui {
@@ -415,6 +417,7 @@ impl Gui {
             drive,
             records: crate::history::History::default(),
             attachments: crate::attach::Attachments::new(Arc::clone(&agent_snapshots)),
+            fixes: agent_tab::Fixes::default(),
         })
     }
 
@@ -502,6 +505,7 @@ impl Gui {
                 Ok(e) => {
                     self.chat.apply(&e);
                     self.toast(&e);
+                    self.settle_fix(&e);
                     // Closed only once the robot confirms the stop; a failed one asks again.
                     if let (Closing::Stopping(_), Event::Stopped { ok, .. }) = (self.closing, &e) {
                         self.closing = if *ok {
