@@ -448,19 +448,7 @@ pub fn describe_seen(found: &Value, seen: &Observed, now_s: f64) -> String {
     }
     let room_id = text(found, "room_id");
     if !room_id.is_empty() {
-        // A room's type says more than its name, which is often a letter ("room C").
-        let room = seen.rooms["rooms"]
-            .as_array()
-            .and_then(|rooms| rooms.iter().find(|r| text(r, "id") == room_id));
-        let place = room.map_or_else(
-            || format!("in {room_id}"),
-            |r| match (text(r, "type"), text(r, "name")) {
-                ("", name) if name.starts_with("room ") => format!("in {name}"),
-                ("", name) => format!("in the {name}"),
-                (kind, _) => format!("in the {} ({room_id})", kind.replace('_', " ")),
-            },
-        );
-        let _ = write!(line, " {place}");
+        let _ = write!(line, " in {}", room_said(seen, room_id));
     }
     if let Some(support) = support_of(found, seen) {
         let _ = write!(
@@ -476,6 +464,36 @@ pub fn describe_seen(found: &Value, seen: &Observed, now_s: f64) -> String {
         _ => {}
     }
     line
+}
+
+/// Room `room_id` as the operator reads it: "the living room (R1)", or its name when it has no
+/// type, as its name is often a letter ("room C").
+#[must_use]
+pub fn room_said(seen: &Observed, room_id: &str) -> String {
+    let room = seen.rooms["rooms"]
+        .as_array()
+        .and_then(|rooms| rooms.iter().find(|r| text(r, "id") == room_id));
+    room.map_or_else(
+        || room_id.to_owned(),
+        |r| match (text(r, "type"), text(r, "name")) {
+            ("", name) if name.starts_with("room ") => name.to_owned(),
+            ("", name) => format!("the {name}"),
+            (kind, _) => format!("the {} ({room_id})", kind.replace('_', " ")),
+        },
+    )
+}
+
+/// The id of the room the robot stands in, by the rooms' outlines; none off them or unknown.
+#[must_use]
+pub fn room_of_robot(seen: &Observed) -> Option<&str> {
+    let pose = seen.pose?;
+    seen.rooms["rooms"].as_array()?.iter().find_map(|r| {
+        let outline: Vec<(f64, f64)> = r["outline"]["points"]
+            .as_array()
+            .map(|pts| pts.iter().map(xy).collect())
+            .unwrap_or_default();
+        inside(pose, &outline).then(|| text(r, "id"))
+    })
 }
 
 /// What `found` rests on: the world model's support, else the smallest object whose footprint holds

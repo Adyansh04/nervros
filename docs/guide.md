@@ -520,8 +520,9 @@ gives each skill's record, and lists what moved in the world model, the incident
 
 > **You:** Check on the apartment: the living room, the bedroom and the office.
 
-A patrol walks the round as a job, stands a moment in each place so the world model sees it, and
-then reports what moved or went missing meanwhile.
+A patrol walks the round as a job and looks around in each place, a full turn on the spot so the
+cameras sweep the room, then reports what it saw in each room and what moved or went missing
+meanwhile.
 
 When a step keeps failing, NervROS may propose a lasting fix: a note the planner reads, a
 keep-out zone, or a node parameter the profile lets `param_set` change. It never applies one itself. The Agent tab's

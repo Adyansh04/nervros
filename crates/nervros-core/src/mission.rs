@@ -438,6 +438,12 @@ impl Missions {
             .map_or(&[], |c| c.read_deny.as_slice())
     }
 
+    /// The profile's turn on the spot, for a look around: none when it names none.
+    #[must_use]
+    pub fn turn_skill(&self) -> Option<&crate::profile::TurnSkill> {
+        self.config.checks.turn.as_ref()
+    }
+
     /// Where finished missions are kept, if anywhere.
     #[must_use]
     pub fn ledger(&self) -> Option<&Arc<Ledger>> {
