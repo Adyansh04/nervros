@@ -16,6 +16,9 @@ const AT_PLACE_M: f64 = 0.5;
 const AT_OBJECT_M: f64 = 1.2;
 /// Slack around a container's footprint for `inside` and `on`.
 const FOOTPRINT_SLACK_M: f64 = 0.05;
+/// How much lower a support's middle is than what rests on it: a mug's box in a tray can share
+/// the tray's height.
+const SUPPORT_BELOW_M: f64 = 0.1;
 
 /// One predicate's verdict.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -75,13 +78,17 @@ pub fn checkable(predicate: &str) -> bool {
         && (name != "holding" || matches!(args[0], "left" | "right"))
 }
 
-/// Checks each predicate.
+/// Checks each predicate. The world model gives an object it saw moved another id, a new one or
+/// that of an old entry where it now stands, so an `inside` or `on` whose object is not there also
+/// holds when an object of its label is, seen there after the object itself was last seen: once
+/// the object is gone from where it was, or when the one there was seen at `since_s` or later, as
+/// after the mission or the goal that put it there.
 #[must_use]
-pub fn check(goal: &[String], seen: &Observed) -> Vec<Verdict> {
-    goal.iter().map(|p| verdict(p, seen)).collect()
+pub fn check(goal: &[String], seen: &Observed, since_s: f64) -> Vec<Verdict> {
+    goal.iter().map(|p| verdict(p, seen, since_s)).collect()
 }
 
-fn verdict(predicate: &str, seen: &Observed) -> Verdict {
+fn verdict(predicate: &str, seen: &Observed, since_s: f64) -> Verdict {
     let out = |ok: Option<bool>, detail: String| Verdict {
         predicate: predicate.to_owned(),
         ok,
@@ -113,26 +120,91 @@ fn verdict(predicate: &str, seen: &Observed) -> Verdict {
                     format!("{} or {} is not in the world model", args[0], args[1]),
                 );
             };
-            if obj["support_id"] == args[1] {
-                return out(Some(true), format!("{} rests on {}", args[0], args[1]));
+            if let Some(how) = placed(obj, host) {
+                return out(Some(true), how.said(args[0], args[1]));
             }
-            let (ox, oy) = xy(&obj["pose"]["position"]);
-            let (hx, hy) = xy(&host["pose"]["position"]);
-            let (sx, sy) = xy(&host["size"]);
-            let within = (ox - hx).abs() <= sx / 2.0 + FOOTPRINT_SLACK_M
-                && (oy - hy).abs() <= sy / 2.0 + FOOTPRINT_SLACK_M;
+            if let Some((moved, how)) = moved_as(&seen.objects, obj, host, since_s) {
+                let moved = format!(
+                    "{}, a {} seen there after {} was,",
+                    text(moved, "id"),
+                    text(obj, "label"),
+                    args[0]
+                );
+                return out(
+                    Some(true),
+                    format!(
+                        "{}: the world model gives a moved object another id",
+                        how.said(&moved, args[1])
+                    ),
+                );
+            }
             out(
-                Some(within),
-                format!(
-                    "{} is {}within {}'s footprint",
-                    args[0],
-                    if within { "" } else { "not " },
-                    args[1]
-                ),
+                Some(false),
+                format!("{} is not within {}'s footprint", args[0], args[1]),
             )
         }
         _ => out(None, "not a predicate NervROS can check".to_owned()),
     }
+}
+
+/// How an object is in or on another.
+#[derive(Debug, Clone, Copy)]
+enum Placed {
+    /// The world model says it rests on it.
+    On,
+    /// It stands within its footprint.
+    Within,
+}
+
+impl Placed {
+    fn said(self, thing: &str, host: &str) -> String {
+        match self {
+            Self::On => format!("{thing} rests on {host}"),
+            Self::Within => format!("{thing} is within {host}'s footprint"),
+        }
+    }
+}
+
+/// How `obj` is in or on `host`; none when it is not.
+fn placed(obj: &Value, host: &Value) -> Option<Placed> {
+    if obj["support_id"] == host["id"] {
+        return Some(Placed::On);
+    }
+    let (ox, oy) = xy(&obj["pose"]["position"]);
+    let (hx, hy) = xy(&host["pose"]["position"]);
+    let (sx, sy) = xy(&host["size"]);
+    ((ox - hx).abs() <= sx / 2.0 + FOOTPRINT_SLACK_M
+        && (oy - hy).abs() <= sy / 2.0 + FOOTPRINT_SLACK_M)
+        .then_some(Placed::Within)
+}
+
+/// The object of `obj`'s label in or on `host`, seen there after `obj` was last seen, the latest
+/// seen: `obj` moved, under the id the world model gave it there. It counts once `obj` is gone
+/// from where it was, or when it was seen there at `since_s` or later; while `obj` is still seen
+/// where it was, the one in `host` is another object.
+fn moved_as<'v>(
+    objects: &'v Value,
+    obj: &Value,
+    host: &Value,
+    since_s: f64,
+) -> Option<(&'v Value, Placed)> {
+    let label = text(obj, "label");
+    if label.is_empty() {
+        return None;
+    }
+    let gone = obj["state"].as_u64().unwrap_or(0) != 0;
+    objects["objects"]
+        .as_array()?
+        .iter()
+        .filter(|o| {
+            text(o, "label").eq_ignore_ascii_case(label)
+                && o["id"] != obj["id"]
+                && o["state"].as_u64() == Some(0)
+                && seen_at(o) > seen_at(obj)
+                && (gone || seen_at(o) >= since_s)
+        })
+        .filter_map(|o| Some((o, placed(o, host)?)))
+        .max_by(|(a, _), (b, _)| seen_at(a).total_cmp(&seen_at(b)))
 }
 
 /// The profile's place called `target`, by its name or an alias.
@@ -153,47 +225,76 @@ fn room<'s>(seen: &'s Observed, target: &str) -> Option<&'s Value> {
     })
 }
 
-/// The first argument of `predicate` that [`check`] cannot find in what is `seen`: an object the
-/// world model does not know, or for `at` a place, room or object; none when it finds them all.
+/// The arguments of `predicate` that [`check`] cannot find in what is `seen`: objects the world
+/// model does not know, or for `at` a place, room or object; none when it finds them all.
 #[must_use]
-pub fn unknown_in<'p>(predicate: &'p str, seen: &Observed) -> Option<&'p str> {
-    let (name, args) = predicate_of(predicate)?;
+pub fn unknown_in<'p>(predicate: &'p str, seen: &Observed) -> Vec<&'p str> {
+    let Some((name, args)) = predicate_of(predicate) else {
+        return Vec::new();
+    };
     let known = |id: &str| object(&seen.objects, id).is_some();
     match (name, args.as_slice()) {
-        ("at", [t]) => {
-            (place(seen, t).is_none() && room(seen, t).is_none() && !known(t)).then_some(*t)
+        ("at", [t]) if place(seen, t).is_none() && room(seen, t).is_none() && !known(t) => {
+            vec![*t]
         }
-        ("inside" | "on", [o, h]) => [*o, *h].into_iter().find(|id| !known(id)),
-        _ => None,
+        ("inside" | "on", [o, h]) => [*o, *h].into_iter().filter(|id| !known(id)).collect(),
+        _ => Vec::new(),
     }
 }
 
-/// Up to three of the world model's objects that `id`'s words name, as `O27 (red mug)`: what a
-/// detector's own name, such as `mug_4`, is likely called there.
+/// `predicate` with each argument `names` maps renamed: `inside(mug_4, tray_1)` as the world
+/// model's `inside(O27, O261)`.
 #[must_use]
-pub fn named_like(seen: &Observed, id: &str) -> Vec<String> {
+pub fn renamed(predicate: &str, names: &[(&str, String)]) -> String {
+    let Some((name, args)) = predicate_of(predicate) else {
+        return predicate.to_owned();
+    };
+    let args: Vec<&str> = args
+        .iter()
+        .map(|a| {
+            names
+                .iter()
+                .find(|(from, _)| from == a)
+                .map_or(*a, |(_, to)| to.as_str())
+        })
+        .collect();
+    format!("{name}({})", args.join(", "))
+}
+
+/// The world model's object that `id`'s words likeliest name, by its id and as `O27 (mug, last
+/// seen 2 min ago in the office, on desk O47)`: what a detector's own name, such as `mug_4`, is
+/// likely called there. A live one seen last wins: a stale one is rarely the one meant.
+#[must_use]
+pub fn likeliest(seen: &Observed, id: &str, now_s: f64) -> Option<(String, String)> {
     let words: Vec<String> = words_of(id)
         .split_whitespace()
         .filter(|w| w.len() > 2)
         .map(str::to_ascii_lowercase)
         .collect();
-    seen.objects["objects"]
-        .as_array()
-        .map_or(&[][..], Vec::as_slice)
+    let gone = |o: &Value| o["state"].as_u64().is_some_and(|s| s != 0);
+    let best = seen.objects["objects"]
+        .as_array()?
         .iter()
         .filter(|o| {
-            let label = o["label"].as_str().unwrap_or_default().to_ascii_lowercase();
+            let label = text(o, "label").to_ascii_lowercase();
             words.iter().any(|w| label.contains(w.as_str()))
         })
-        .take(3)
-        .map(|o| {
-            format!(
-                "{} ({})",
-                o["id"].as_str().unwrap_or_default(),
-                o["label"].as_str().unwrap_or_default()
-            )
-        })
-        .collect()
+        .min_by(|a, b| {
+            gone(a)
+                .cmp(&gone(b))
+                .then(seen_at(b).total_cmp(&seen_at(a)))
+        })?;
+    let described = describe_seen(best, seen, now_s);
+    let (what, when) = described
+        .split_once(": last seen")
+        .unwrap_or((&described, ""));
+    let what = what.rsplit_once(' ').map_or(what, |(w, _)| w);
+    let id = text(best, "id");
+    let said = match when.trim() {
+        "" => format!("{id} ({what})"),
+        when => format!("{id} ({what}, last seen {when})"),
+    };
+    Some((id.to_owned(), said))
 }
 
 fn at(target: &str, seen: &Observed, out: impl Fn(Option<bool>, String) -> Verdict) -> Verdict {
@@ -361,14 +462,13 @@ pub fn describe_seen(found: &Value, seen: &Observed, now_s: f64) -> String {
         );
         let _ = write!(line, " {place}");
     }
-    let support_id = text(found, "support_id");
-    let support = seen.objects["objects"].as_array().and_then(|objects| {
-        objects
-            .iter()
-            .find(|o| !support_id.is_empty() && text(o, "id") == support_id)
-    });
-    if let Some(support) = support {
-        let _ = write!(line, ", on {} {support_id}", text(support, "label"));
+    if let Some(support) = support_of(found, seen) {
+        let _ = write!(
+            line,
+            ", on {} {}",
+            text(support, "label"),
+            text(support, "id")
+        );
     }
     match found["state"].as_u64() {
         Some(1) => line.push_str("; looked for there since and not found"),
@@ -376,6 +476,36 @@ pub fn describe_seen(found: &Value, seen: &Observed, now_s: f64) -> String {
         _ => {}
     }
     line
+}
+
+/// What `found` rests on: the world model's support, else the smallest object whose footprint holds
+/// it and whose middle is [`SUPPORT_BELOW_M`] lower, as a table under a mug: which of three mugs
+/// is the one on the dining table is how a model tells them apart.
+fn support_of<'a>(found: &Value, seen: &'a Observed) -> Option<&'a Value> {
+    let objects = seen.objects["objects"].as_array()?;
+    let support_id = text(found, "support_id");
+    if !support_id.is_empty() {
+        return objects.iter().find(|o| text(o, "id") == support_id);
+    }
+    let (x, y) = xy(&found["pose"]["position"]);
+    let z = found["pose"]["position"]["z"].as_f64()?;
+    let area = |o: &Value| {
+        let (sx, sy) = xy(&o["size"]);
+        sx * sy
+    };
+    objects
+        .iter()
+        .filter(|o| o["id"] != found["id"] && o["state"].as_u64().unwrap_or(0) == 0)
+        .filter(|o| {
+            let (hx, hy) = xy(&o["pose"]["position"]);
+            let (sx, sy) = xy(&o["size"]);
+            o["pose"]["position"]["z"]
+                .as_f64()
+                .is_some_and(|hz| hz <= z - SUPPORT_BELOW_M)
+                && (x - hx).abs() <= sx / 2.0
+                && (y - hy).abs() <= sy / 2.0
+        })
+        .min_by(|a, b| area(a).total_cmp(&area(b)))
 }
 
 fn text<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -479,7 +609,7 @@ mod tests {
         ]
         .map(str::to_owned)
         .to_vec();
-        let v = check(&goal, &seen());
+        let v = check(&goal, &seen(), 0.0);
         let oks: Vec<Option<bool>> = v.iter().map(|v| v.ok).collect();
         assert_eq!(
             oks,
@@ -493,6 +623,122 @@ mod tests {
                 Some(false),
                 None
             ]
+        );
+    }
+
+    #[test]
+    fn an_object_seen_again_under_another_id_stands_in_for_the_one_moved() {
+        let mug = |id: &str, x: f64, last: f64, state: u64| {
+            json!({"id": id, "label": "mug", "state": state, "support_id": "",
+                   "pose": {"position": {"x": x, "y": 3.0}}, "size": {"x": 0.1, "y": 0.1},
+                   "last_seen": {"sec": last, "nanosec": 0}})
+        };
+        let mut seen = seen();
+        seen.objects = json!({"objects": [
+            {"id": "O31", "label": "tray", "pose": {"position": {"x": 3.0, "y": 3.0}},
+             "size": {"x": 0.4, "y": 0.3}},
+            mug("O17", 0.0, 550.0, 0),
+            mug("O90", 3.05, 600.0, 0)]});
+        let goal = ["inside(O17, O31)".to_owned()];
+        let moved = &check(&goal, &seen, 500.0)[0];
+        assert_eq!(
+            moved.ok,
+            Some(true),
+            "seen there since the goal was set: {}",
+            moved.detail
+        );
+        assert!(
+            moved
+                .detail
+                .starts_with("O90, a mug seen there after O17 was, is within O31's footprint"),
+            "{}",
+            moved.detail
+        );
+        assert_eq!(
+            check(&goal, &seen, 700.0)[0].ok,
+            Some(false),
+            "seen there only before the goal was set, with O17 not known to be gone"
+        );
+        seen.objects["objects"][1]["state"] = json!(1);
+        assert_eq!(
+            check(&goal, &seen, 700.0)[0].ok,
+            Some(true),
+            "O17 gone from where it was: the goal set after the move holds at once"
+        );
+        seen.objects["objects"][1]["last_seen"]["sec"] = json!(650.0);
+        assert_eq!(
+            check(&goal, &seen, 500.0)[0].ok,
+            Some(false),
+            "O17 seen elsewhere after the one in the tray: that one is another mug"
+        );
+        seen.objects["objects"][1]["last_seen"]["sec"] = json!(550.0);
+        seen.objects["objects"][2]["state"] = json!(1);
+        assert_eq!(
+            check(&goal, &seen, 500.0)[0].ok,
+            Some(false),
+            "one gone from the tray too"
+        );
+    }
+
+    #[test]
+    fn an_object_with_no_support_known_is_on_the_smallest_thing_under_it() {
+        let mut seen = seen();
+        seen.objects = json!({"objects": [
+            {"id": "O9", "label": "dining table", "state": 0,
+             "pose": {"position": {"x": 0.0, "y": 0.0, "z": 0.4}}, "size": {"x": 2.0, "y": 1.2}},
+            {"id": "O3", "label": "rug", "state": 0,
+             "pose": {"position": {"x": 0.0, "y": 0.0, "z": 0.0}}, "size": {"x": 4.0, "y": 3.0}},
+            {"id": "O244", "label": "mug", "state": 0, "support_id": "",
+             "pose": {"position": {"x": 0.5, "y": 0.2, "z": 0.76}}, "size": {"x": 0.1, "y": 0.1}},
+            {"id": "O27", "label": "mug", "state": 0, "support_id": "",
+             "pose": {"position": {"x": 1.8, "y": 1.0, "z": 0.44}},
+             "size": {"x": 0.1, "y": 0.1}}]});
+        let objects = seen.objects["objects"].as_array().unwrap().clone();
+        let on = |id: &str| {
+            let found = objects.iter().find(|o| o["id"] == id).unwrap();
+            support_of(found, &seen).map(|s| s["id"].as_str().unwrap().to_owned())
+        };
+        assert_eq!(
+            on("O244").as_deref(),
+            Some("O9"),
+            "the table, not the rug under both"
+        );
+        assert_eq!(
+            on("O27").as_deref(),
+            Some("O3"),
+            "off the table: only the rug holds it"
+        );
+        assert_eq!(on("O9").as_deref(), Some("O3"));
+        let mut level = seen.clone();
+        level.objects["objects"][0]["pose"]["position"]["z"] = json!(0.72);
+        let found = &objects[2];
+        assert_eq!(
+            support_of(found, &level).map(|s| s["id"].clone()),
+            Some(json!("O3")),
+            "a box at about its height is no support"
+        );
+    }
+
+    #[test]
+    fn a_detectors_name_is_likeliest_the_live_object_seen_last() {
+        let mut seen = seen();
+        seen.objects = json!({"objects": [
+            {"id": "O27", "label": "mug", "state": 0, "last_seen": {"sec": 100, "nanosec": 0}},
+            {"id": "O46", "label": "mug", "state": 1, "last_seen": {"sec": 990, "nanosec": 0}},
+            {"id": "O818", "label": "mug", "state": 0, "last_seen": {"sec": 880, "nanosec": 0}},
+            {"id": "O9", "label": "dining table"}]});
+        assert_eq!(
+            likeliest(&seen, "mug_4", 1000.0),
+            Some((
+                "O818".to_owned(),
+                "O818 (mug, last seen 2 min ago)".to_owned()
+            )),
+            "not O46, seen later but looked for there since and not found"
+        );
+        assert_eq!(likeliest(&seen, "kettle_2", 1000.0), None);
+        assert_eq!(
+            renamed("inside(mug_4, O31)", &[("mug_4", "O818".to_owned())]),
+            "inside(O818, O31)"
         );
     }
 

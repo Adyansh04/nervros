@@ -1,9 +1,9 @@
-//! Job cards: a robot program or a search the operator approved once, with what it may do, its
-//! latest lines and how it ended.
+//! Job cards: a robot program, a search or a patrol the operator approved once, with what it may
+//! do, its latest lines and how it ended.
 
 use std::collections::VecDeque;
 
-use nervros_core::job::{JobInfo, JobState};
+use nervros_core::job::{JobInfo, JobKind, JobState};
 use rerun::external::egui;
 use rerun::external::egui::RichText;
 use rerun::external::re_ui::ReButton;
@@ -58,9 +58,10 @@ pub(super) fn job_card(ui: &mut egui::Ui, card: &JobCard, actions: &mut Vec<Acti
     };
     theme::status_card(ui, colour, |ui| {
         ui.set_width(ui.available_width());
-        let kind = match job.kind.as_str() {
-            "program" => "Program",
-            _ => "Search",
+        let kind = match job.kind {
+            JobKind::Program => "Program",
+            JobKind::Search => "Search",
+            JobKind::Patrol => "Patrol",
         };
         let header = |ui: &mut egui::Ui| {
             ui.label(RichText::new(kind).strong().size(14.0));

@@ -87,7 +87,7 @@ vision_check = ["qwen3.5-9b-local"]   # what `look` sees: questions about the ca
 summarise = ["qwen3.5-9b-local"]      # condensing the conversation
 segment = ["gemini-3.5-flash-lite"]   # outlines for `segment`, points for `point`
 witness = ["er2-witness"]             # whether frames from before and after a mission show it done
-moment = ["er2-moment"]               # which of a run of frames shows what the operator asks about
+moment = ["er2-moment"]               # which of a run of frames shows it; vision_check confirms
 watch = ["gemini-3.5-flash-lite"]     # whether a frame shows what a watch waits for, every 15 s
 scene_check = ["er2-scene"]           # a plan the checks flagged, against what the cameras show
 ```

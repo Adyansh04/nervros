@@ -409,13 +409,13 @@ instead of asking for a new plan. A program that meets one stops there. A missio
 running when NervROS starts was cut short by NervROS stopping: it is kept as interrupted, and the
 window says so.
 
-With a `plan` model, a step that fails again on fair runs (twice, and a third of its latest runs
-at least) gets a proposed fix, one at a time per step: a call of `memory` (remember), `geofence`
-(add) or `param_set`, drafted by the `plan` model and checked against the tool's own arguments.
-The Agent tab lists it to accept, which runs the call as the operator's through its own approval,
-or to dismiss, which keeps that step from getting another. An accepted fix shows the step's record
-before and since. `nervros-cli inbox` lists them and `--dismiss N` turns one down. Proposals live
-in the state directory, `inbox/<robot>.json`.
+With a `plan` model, a step that fails again on fair runs (twice, and a third of its latest runs at
+least) gets a proposed fix, one at a time per step: a call of `memory` (remember), `geofence` (add)
+or `param_set`, drafted by the `plan` model and checked against the tool's own arguments. The Agent
+tab lists it to accept, which runs the call as the operator's own (asked about first only where the
+profile's rules say so), or to dismiss, which keeps that step from getting another. An accepted fix
+shows the step's record before and since. `nervros-cli inbox` lists them and `--dismiss N` turns one
+down. Proposals live in the state directory, `inbox/<robot>.json`.
 
 ### `[[place]]`
 
@@ -606,7 +606,7 @@ The rest are the checks you would run yourself before blaming the model:
 | `why` | Explains the newest incident (within ten minutes), one by its id or its mission's, or checks the robot now; `list` lists the incidents. See [`[incidents]`](#incidents). |
 | `remember_finding` | Keeps a playbook the agent writes from a debugging session, checked as the profile's are; an `annotate` call. |
 | `watch` | Watches a topic in the background and posts to the chat when a condition holds: its rate drops below a floor, a field crosses a value, or a text field matches. With `[look]`, `sees` watches what a camera shows instead ("a person at the door"), asking the `watch` model every 15 s and posting on two yes in a row; at most 2 of those. Once, or each time it comes back; at most 8 at a time, all ended with the session. |
-| `when` | With `[keyframes]`: finds when something happened ("when did the mug leave the table?") from the frames kept, sampled to a dozen, narrowed to the moments the world model saw the thing change when it did, and asked of the `moment` model; a second look between the chosen frame and the one before closes a wide gap. Returns the time and the frame as a snapshot. |
+| `when` | With `[keyframes]`: finds when something happened ("when did the mug leave the table?") from the frames kept, sampled to a dozen, narrowed to the moments the world model saw the thing change when it did, and asked of the `moment` model; a second look between the chosen frame and the one before closes a wide gap, and the `vision_check` model confirms the frame alone or finds its neighbour that shows it. Returns the time and the frame as a snapshot. |
 | `digest` | With `[mission]`: what the robot did over the last hours, in sections code writes: missions by how they ended, the runs cut short by the robot apart, each skill's record on fair runs, what moved or went missing in the world model, incidents and goals. `nervros-cli digest` prints the same from the robot's files, without the world model. |
 | `patrol` | With `[mission]`: walks a round of places as a job, standing a moment at each so the world model sees it, then reports what moved or went missing meanwhile. Approved once with its round and time limit. |
 | `watches` | Lists the running watches, or cancels one or all. |

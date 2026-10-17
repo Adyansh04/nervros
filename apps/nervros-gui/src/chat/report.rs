@@ -43,10 +43,12 @@ pub(super) fn report_text(text: &str) -> String {
         ),
         _ => first.to_owned(),
     };
-    first
-        .replace("<world>", "")
-        .replace("</world>", "")
-        .split(' ')
+    short_ids(&nervros_core::tools::unfenced(&first))
+}
+
+/// `text` with each mission id cut to its first eight characters, as the operator reads ids.
+pub(super) fn short_ids(text: &str) -> String {
+    text.split(' ')
         .map(|w| {
             let id = w.len() == 36 && w.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
             match w.get(..8) {

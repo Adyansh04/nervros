@@ -1,9 +1,9 @@
 //! The improvement inbox: fixes proposed after a step failed again, which only the operator puts
 //! into effect. A proposal is one call of a small set of tools NervROS can make itself (a note the
 //! planner reads, a keep-out zone, a parameter), drafted by the `plan` role and checked by code
-//! against the tool's own schema. Accepting it runs the call as the operator's, through its own
-//! approval; dismissing it keeps that step from getting another. Once accepted, the step's runs
-//! since are set beside its record before.
+//! against the tool's own schema. Accepting it runs the call as the operator's own, asked about
+//! first only where the profile's rules say so; dismissing it keeps that step from getting another.
+//! Once accepted, the step's runs since are set beside its record before.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;

@@ -350,7 +350,7 @@ impl Missions {
             .filter(|_| ended.outcome == Outcome::Success)
         {
             Some(vision) => {
-                let verdicts = check::check(&compiled.goal, &seen);
+                let verdicts = check::check(&compiled.goal, &seen, started_s);
                 vision.check(&verdicts, &seen, &before).await
             }
             None => camera::Checked::default(),
@@ -365,6 +365,7 @@ impl Missions {
             camera: &camera.lines,
             passed_over: &passed_over,
             changes: &changes,
+            started_s,
         };
         let mut report = self.report(id, compiled, ended, &evidence);
         report.push_str(&self.settle_goals(id, ended, &seen, for_goal));
@@ -591,8 +592,8 @@ impl Missions {
             };
         for m in marked {
             let text = format!(
-                "the mission \"{}\" ({}) was cut short when NervROS stopped",
-                m.intent, m.id
+                "Mission {} ({}) was cut short when NervROS stopped",
+                m.id, m.intent
             );
             // The model hears it with the operator's next words, or it answers from nothing.
             if let Some(s) = self.session.get() {

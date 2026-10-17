@@ -26,6 +26,8 @@ pub(super) struct Evidence<'a> {
     pub(super) passed_over: &'a [String],
     /// Objects the plan did not name that moved or went missing.
     pub(super) changes: &'a [String],
+    /// When the mission started, seconds since 1970.
+    pub(super) started_s: f64,
 }
 
 /// The history's newest events a world diff reads: room for the moves among what was only seen.
@@ -36,8 +38,8 @@ const MOST_CHANGES: usize = 5;
 
 /// The goal checks as one line, each unmet one with the step that should have met it; none when
 /// the plan names no end state.
-fn goal_checks(compiled: &Compiled, seen: &Observed) -> Option<String> {
-    let verdicts = check::check(&compiled.goal, seen);
+fn goal_checks(compiled: &Compiled, seen: &Observed, started_s: f64) -> Option<String> {
+    let verdicts = check::check(&compiled.goal, seen, started_s);
     if verdicts.is_empty() {
         return None;
     }
@@ -132,7 +134,7 @@ impl Missions {
             let _ = write!(report, " It was stopped{at}{why}.");
             next = "Do not run it again unless the operator asks. Tell them where things stand.";
         } else if ended.outcome == Outcome::Success {
-            if let Some(checks) = goal_checks(compiled, evidence.seen) {
+            if let Some(checks) = goal_checks(compiled, evidence.seen, evidence.started_s) {
                 let _ = write!(report, " Goal checks: {checks}.");
             }
             if !evidence.camera.is_empty() {

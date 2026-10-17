@@ -865,7 +865,7 @@ async fn a_mission_left_running_by_an_earlier_nervros_is_settled_at_start() {
     .await
     .unwrap();
     assert!(
-        notice.contains("\"fetch the mug\" (m0) was cut short"),
+        notice.contains("Mission m0 (fetch the mug) was cut short"),
         "{notice}"
     );
     assert!(

@@ -208,8 +208,9 @@ impl RunMission {
         let steps = crate::counted(steps, "step");
         let mut reason = format!("runs \"{intent}\": {steps}, at most {at_most}");
         if let Some(concerns) = out.data["concerns"].as_array() {
+            // The operator's words: the fences of the scene check's doubts are the model's.
             for c in concerns.iter().filter_map(Value::as_str) {
-                let _ = write!(reason, "; check: {c}");
+                let _ = write!(reason, "; check: {}", crate::tools::unfenced(c));
             }
         }
         let missions = Arc::clone(&self.0);

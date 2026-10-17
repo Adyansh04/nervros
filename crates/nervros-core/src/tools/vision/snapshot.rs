@@ -53,6 +53,7 @@ impl SnapshotStore {
                 width,
                 height,
                 marks: marks.iter().map(|m| m.label.clone()).collect(),
+                stamp_s,
             },
             id,
             stamp_s,

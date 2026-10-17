@@ -87,7 +87,13 @@ impl Goal {
     /// One line for the model and the operator.
     #[must_use]
     pub fn line(&self) -> String {
-        let mut line = format!("goal {} ({}): {}", self.id, self.text, self.state.name());
+        format!("goal {} ({}): {}", self.id, self.text, self.status())
+    }
+
+    /// Where it stands: its state, with what is unmet and the missions used, or why it ended.
+    #[must_use]
+    pub fn status(&self) -> String {
+        let mut line = self.state.name().to_owned();
         match self.state {
             State::Active | State::Paused => {
                 if !self.unmet.is_empty() {
@@ -208,20 +214,14 @@ impl Goals {
                     .to_owned(),
             );
         }
-        if let Some((p, id)) = done_when
-            .iter()
-            .find_map(|p| Some((p, check::unknown_in(p, seen)?)))
-        {
-            let like = check::named_like(seen, id);
-            let hint = if like.is_empty() {
-                String::new()
-            } else {
-                format!(", such as {}", like.join(" or "))
-            };
-            return Err(format!(
-                "{p} names {id}, which the world model does not know, so NervROS could never see \
-                 the goal met: use the ids find_objects and list_places return{hint}"
-            ));
+        let mut unknown: Vec<&str> = Vec::new();
+        for id in done_when.iter().flat_map(|p| check::unknown_in(p, seen)) {
+            if !unknown.contains(&id) {
+                unknown.push(id);
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(unknown_names(&done_when, &unknown));
         }
         let max_missions = new.max_missions.unwrap_or(DEFAULT_MISSIONS);
         if !(1..=MOST_MISSIONS).contains(&max_missions) {
@@ -363,11 +363,47 @@ impl Goals {
     }
 }
 
+/// `done_when` with each name the world model does not know, such as a detector's `mug_4`, taken
+/// as the world model's likeliest object of its kind, and a line for each taken: the planner's
+/// names are the detector's, and a model told to set the goal again in other ids ran the mission
+/// first. A name with no likely object is left, for `set` to refuse.
+fn in_world_ids(done_when: &[String], seen: &Observed) -> (Vec<String>, Vec<String>) {
+    let now_s = crate::now_s();
+    let mut taken: Vec<(&str, String)> = Vec::new();
+    let mut lines = Vec::new();
+    for id in done_when.iter().flat_map(|p| check::unknown_in(p, seen)) {
+        if taken.iter().any(|(name, _)| *name == id) {
+            continue;
+        }
+        if let Some((best, line)) = check::likeliest(seen, id, now_s) {
+            lines.push(format!("{id} taken as {line}"));
+            taken.push((id, best));
+        }
+    }
+    let rewritten = done_when
+        .iter()
+        .map(|p| check::renamed(p, &taken))
+        .collect();
+    (rewritten, lines)
+}
+
+/// Why a goal naming `unknown` is refused: the world model could never see it met.
+fn unknown_names(done_when: &[String], unknown: &[&str]) -> String {
+    // "Not set" leads: a model that kept a refusal's first words reported one as set.
+    format!(
+        "not set: the world model does not know {}, so NervROS could never see {} met: set it \
+         with ids find_objects and list_places return",
+        unknown.join(" and "),
+        done_when.join(", ")
+    )
+}
+
 /// Judges one goal: met once every predicate holds, else exhausted once its missions or its time
 /// ran out, but only on what the world model plainly says: one it cannot judge now, as while
 /// perception catches up with a place, is not yet unmet for good.
 fn judge(goal: &mut Goal, seen: &Observed, at: u64) {
-    let verdicts = check::check(&goal.done_when, seen);
+    #[expect(clippy::cast_precision_loss, reason = "seconds since 1970")]
+    let verdicts = check::check(&goal.done_when, seen, goal.set_at as f64);
     goal.unmet = verdicts
         .iter()
         .filter(|v| v.ok != Some(true))
@@ -522,9 +558,10 @@ impl Tool for GoalTool {
 
     async fn call(&self, args: Value) -> ToolOutcome {
         let id = id_of(&args);
+        let mut taken = Vec::new();
         let done = match args["action"].as_str() {
             Some("set") => {
-                let new = NewGoal {
+                let mut new = NewGoal {
                     text: args["text"].as_str().unwrap_or_default().to_owned(),
                     done_when: args["done_when"]
                         .as_array()
@@ -541,6 +578,7 @@ impl Tool for GoalTool {
                     hours: args["hours"].as_f64(),
                 };
                 let seen = self.missions.observe().await;
+                (new.done_when, taken) = in_world_ids(&new.done_when, &seen);
                 self.goals.set(&new, &seen, SystemTime::now())
             }
             Some("pause") => self.goals.pause(id, true),
@@ -563,15 +601,24 @@ impl Tool for GoalTool {
         match done {
             Ok(goal) => {
                 let mut out = ToolOutcome::ok(json!({"goal": goal.line()}));
+                // Worked toward at once, not from the next mission's report.
                 out.message = if goal.state == State::Active {
                     format!(
-                        "{}; a mission toward it names it in run_mission's `goal` {}",
+                        "{}; plan a mission toward it now, naming it in run_mission's `goal` {}",
                         goal.line(),
                         goal.id
                     )
                 } else {
                     goal.line()
                 };
+                if !taken.is_empty() {
+                    let _ = write!(
+                        out.message,
+                        ". Set in the world model's ids: {}; if another object is meant, drop it \
+                         and set it again with that one's id",
+                        taken.join("; ")
+                    );
+                }
                 out
             }
             Err(why) => ToolOutcome::failed(why),
@@ -662,6 +709,34 @@ mod tests {
     }
 
     #[test]
+    fn a_detectors_names_are_taken_as_the_world_models_likeliest_objects() {
+        let seen = Observed {
+            objects: json!({"objects": [
+                {"id": "O27", "label": "mug", "state": 0, "last_seen": {"sec": 100, "nanosec": 0}},
+                {"id": "O783", "label": "mug", "state": 0, "last_seen": {"sec": 900, "nanosec": 0}},
+                {"id": "O261", "label": "tray", "state": 0}]}),
+            ..seen("")
+        };
+        let (done_when, taken) = in_world_ids(
+            &["inside(mug_4, tray_1)".to_owned(), "at(O261)".to_owned()],
+            &seen,
+        );
+        assert_eq!(done_when, ["inside(O783, O261)", "at(O261)"]);
+        assert_eq!(taken.len(), 2, "{taken:?}");
+        assert!(
+            taken[0].starts_with("mug_4 taken as O783 (mug"),
+            "{taken:?}"
+        );
+        let (kept, none) = in_world_ids(&["inside(kettle_2, O261)".to_owned()], &seen);
+        assert_eq!(
+            kept,
+            ["inside(kettle_2, O261)"],
+            "no likely object: left for set to refuse"
+        );
+        assert!(none.is_empty());
+    }
+
+    #[test]
     fn only_checkable_goals_are_set_and_only_open_ones_given_up() {
         let goals = Goals::new(None);
         let now = SystemTime::now();
@@ -679,7 +754,7 @@ mod tests {
             .set(&new(&["inside(mug_4, O31)"], None), &with_mug, now)
             .unwrap_err();
         assert!(
-            unknown.contains("names mug_4") && unknown.contains("such as O27 (red mug)"),
+            unknown.starts_with("not set: the world model does not know mug_4"),
             "a detector's name the world model cannot judge: {unknown}"
         );
         let met = goals

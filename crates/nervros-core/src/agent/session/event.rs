@@ -158,6 +158,8 @@ pub enum Event {
         /// What each numbered mark on it is, mark 1 first.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         marks: Vec<String>,
+        /// When the frame was taken, seconds since 1970: a `when` answer's is long past.
+        stamp_s: f64,
     },
     /// A number in a topic's messages to draw over time, in the viewer's Plots tab.
     Plot {
@@ -399,6 +401,7 @@ impl From<&crate::tools::ImageArtifact> for Event {
             width: image.width,
             height: image.height,
             marks: image.marks.clone(),
+            stamp_s: image.stamp_s,
         }
     }
 }

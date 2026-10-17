@@ -6,6 +6,7 @@ use std::time::Duration;
 use nervros_core::mission::Outcome;
 use nervros_core::mission::plan::PlannedStep;
 use nervros_core::session::Command;
+use nervros_core::tools::unfenced;
 use rerun::external::egui;
 use rerun::external::egui::{Align, Color32, Layout, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _, icons};
@@ -77,7 +78,9 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
                             .map(|c| c.message.as_str()),
                     );
                 for warning in warnings {
-                    let text = RichText::new(warning).size(13.0).color(theme::WARN);
+                    let text = RichText::new(unfenced(warning))
+                        .size(13.0)
+                        .color(theme::WARN);
                     ui.add(egui::Label::new(text).wrap());
                 }
             });
@@ -183,8 +186,12 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut
             ui.horizontal(|ui| {
                 ui.small_icon(&icons::WARNING, Some(theme::WARN));
                 ui.add(
-                    egui::Label::new(RichText::new(&c.message).size(13.0).color(theme::WARN))
-                        .wrap(),
+                    egui::Label::new(
+                        RichText::new(unfenced(&c.message))
+                            .size(13.0)
+                            .color(theme::WARN),
+                    )
+                    .wrap(),
                 );
             });
         }

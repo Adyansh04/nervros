@@ -11,6 +11,7 @@ use rerun::external::egui;
 use rerun::external::egui::{Align, Layout, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _};
 
+use nervros_core::mission::goals::State as GoalState;
 use nervros_core::mission::inbox::{Proposal, State};
 use nervros_core::mission::ledger::Track;
 use nervros_core::session::Event;
@@ -70,6 +71,14 @@ impl Gui {
         let Some(inbox) = self.agent.inbox.clone() else {
             return;
         };
+        // The call's own words are for the model; the operator reads what became of the fix.
+        if *status == Status::Refused {
+            self.toasts.add(
+                Kind::Info,
+                format!("Fix {} was turned down, so it stays open", asked.id),
+            );
+            return;
+        }
         if *status != Status::Succeeded {
             self.toasts.add(
                 Kind::Failure,
@@ -212,11 +221,16 @@ impl Gui {
                             .monospace()
                             .color(theme::FAINT),
                     );
-                    let line = g.line();
-                    ui.label(RichText::new(&line).size(13.0))
-                        .on_hover_text(&line);
+                    ui.label(RichText::new(&g.text).size(13.0))
+                        .on_hover_text(&g.text);
                 },
             );
+            let colour = if g.state == GoalState::Met {
+                theme::SUCCESS
+            } else {
+                theme::DIM
+            };
+            ui.label(RichText::new(g.status()).small().color(colour));
         }
         if let Some(id) = drop
             && let Err(e) = goals.drop_goal(id)
@@ -232,7 +246,13 @@ impl Gui {
             return;
         };
         let proposals = inbox.all();
-        if proposals.is_empty() {
+        // A dismissed one only keeps its step from getting another: nothing to read or do.
+        let shown: Vec<&Proposal> = proposals
+            .iter()
+            .rev()
+            .filter(|p| p.state != State::Dismissed)
+            .collect();
+        if shown.is_empty() {
             return;
         }
         ui.add_space(16.0);
@@ -246,45 +266,20 @@ impl Gui {
         self.refresh_fix_records(&proposals, ledger.as_deref());
         let waiting = self.fixes.accepting.as_ref().map(|a| a.id);
         let (mut accept, mut dismiss) = (None, None);
-        for p in proposals.iter().rev() {
-            let open = p.state == State::Open;
-            theme::row(
-                ui,
-                |ui| {
-                    if waiting == Some(p.id) {
-                        ui.label(RichText::new("Running…").small().color(theme::DIM));
-                    } else if open && waiting.is_none() {
-                        if ui
-                            .add(ReButton::new("Dismiss").small().secondary())
-                            .on_hover_text("No fix like it is proposed for this step again")
-                            .clicked()
-                        {
-                            dismiss = Some(p.id);
-                        }
-                        if ui
-                            .add(ReButton::new("Accept").small())
-                            .on_hover_text(format!(
-                                "Runs {} {} as yours, through its own approval",
-                                p.tool, p.args
-                            ))
-                            .clicked()
-                        {
-                            accept = Some(p.id);
-                        }
-                    }
-                },
-                |ui| {
-                    ui.label(
-                        RichText::new(p.id.to_string())
-                            .monospace()
-                            .color(theme::FAINT),
-                    );
-                    let fix = p.summary();
-                    ui.label(RichText::new(&fix).size(13.0))
-                        .on_hover_text(format!("{fix}\n{} {}", p.tool, p.args));
-                },
-            );
-            // Why, beside what failed: the reason to accept or dismiss it.
+        for (n, p) in shown.into_iter().enumerate() {
+            if n > 0 {
+                ui.add_space(8.0);
+            }
+            // The fix in full, then why, then the buttons: read before Accept runs it.
+            ui.horizontal_top(|ui| {
+                ui.label(
+                    RichText::new(p.id.to_string())
+                        .monospace()
+                        .color(theme::FAINT),
+                );
+                ui.add(egui::Label::new(RichText::new(p.summary()).size(13.0)).wrap())
+                    .on_hover_text(format!("{} {}", p.tool, p.args));
+            });
             ui.label(
                 RichText::new(format!(
                     "{} on {} failed: {}. {}",
@@ -293,17 +288,41 @@ impl Gui {
                 .small()
                 .color(theme::DIM),
             );
-            if p.state == State::Accepted {
-                let since = self.fixes.since.get(&p.id).and_then(Option::as_ref);
-                ui.label(
-                    RichText::new(format!(
-                        "accepted; before {}, since {}",
-                        record(p.before.as_ref()),
-                        record(since)
-                    ))
-                    .small()
-                    .color(theme::DIM),
-                );
+            match p.state {
+                State::Open if waiting == Some(p.id) => {
+                    ui.label(RichText::new("Running…").small().color(theme::DIM));
+                }
+                State::Open if waiting.is_none() => {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(ReButton::new("Accept").small().blue())
+                            .on_hover_text(format!("Runs {} {} as your own call", p.tool, p.args))
+                            .clicked()
+                        {
+                            accept = Some(p.id);
+                        }
+                        if ui
+                            .add(ReButton::new("Dismiss").small().secondary())
+                            .on_hover_text("No fix like it is proposed for this step again")
+                            .clicked()
+                        {
+                            dismiss = Some(p.id);
+                        }
+                    });
+                }
+                State::Accepted => {
+                    let since = self.fixes.since.get(&p.id).and_then(Option::as_ref);
+                    ui.label(
+                        RichText::new(format!(
+                            "accepted; before {}, since {}",
+                            record(p.before.as_ref()),
+                            record(since)
+                        ))
+                        .small()
+                        .color(theme::DIM),
+                    );
+                }
+                State::Open | State::Dismissed => {}
             }
         }
         if let Some(id) = accept {
@@ -316,8 +335,7 @@ impl Gui {
         }
     }
 
-    /// Runs fix `id`'s call as the operator's, through its own approval; it is accepted once that
-    /// succeeds.
+    /// Runs fix `id`'s call as the operator's own; it is accepted once that succeeds.
     fn accept_fix(
         &mut self,
         inbox: &nervros_core::mission::inbox::Inbox,

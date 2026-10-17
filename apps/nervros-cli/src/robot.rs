@@ -181,7 +181,7 @@ fn print_plan(
         } else {
             format!("{}: ", c.step)
         };
-        println!("    ! {step}{}", c.message);
+        println!("    ! {step}{}", nervros_core::tools::unfenced(&c.message));
     }
 }
 

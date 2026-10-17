@@ -1,7 +1,8 @@
 //! The `when` tool: when something happened, from the keyframes. The frames of the window, or of
 //! the moments the world model saw what is asked about move, are sampled to a dozen and labelled
 //! with their times; the `moment` model says which first shows it, and a second look between
-//! that frame and the one before narrows a wide gap. The reply gives the time and the frame.
+//! that frame and the one before narrows a wide gap. The vision check then confirms the frame on
+//! its own, or the one beside it the moment model meant. The reply gives the time and the frame.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -22,6 +23,9 @@ const MOST_FRAMES: usize = 12;
 const NARROW_MS: u64 = 120_000;
 /// How far around a world-model event its frames are looked for.
 const AROUND_MS: u64 = 180_000;
+/// Frames the vision check steps past the chosen one, either way: a model reading a dozen frames
+/// can name a neighbour of the one it means.
+const CONFIRM_STEPS: usize = 3;
 
 /// Tells the moment model its job, and that a guess is no answer.
 const MOMENT_PREAMBLE: &str = "You find when something happened in a robot's camera frames, \
@@ -134,7 +138,8 @@ impl WhenTool {
                 (chosen, model) = (closer, by);
             }
         }
-        self.found(&chosen, &model, now_s).await
+        let (chosen, confirmed) = confirm(self.seer.as_ref(), what, &frames, chosen).await;
+        self.found(&chosen, &model, confirmed, now_s).await
     }
 
     /// The frames around the moments the world model saw what `what` names change, when it saw
@@ -202,6 +207,7 @@ impl WhenTool {
         &self,
         frame: &Keyframe,
         model: &str,
+        confirmed: bool,
         now_s: f64,
     ) -> Result<ToolOutcome, String> {
         let path = frame.path.clone();
@@ -218,12 +224,21 @@ impl WhenTool {
         let ago = crate::how_long(now_s - stamp_s);
         let mut out = ToolOutcome::ok(json!({
             "found": true, "ago": ago, "at_s": stamp_s, "camera": frame.camera,
-            "snapshot": snapshot.id, "seen_by": model
+            "snapshot": snapshot.id, "seen_by": model, "confirmed": confirmed
         }));
-        out.message = format!(
-            "it first shows {ago} ago, in the {} camera's frame {}",
-            frame.camera, snapshot.id
-        );
+        // Unconfirmed leads: a model relaying the answer keeps its first words.
+        out.message = if confirmed {
+            format!(
+                "it first shows {ago} ago, in the {} camera's frame {}",
+                frame.camera, snapshot.id
+            )
+        } else {
+            format!(
+                "not confirmed: the moment model names the {} camera's frame {}, {ago} ago, but \
+                 the vision check did not see it there",
+                frame.camera, snapshot.id
+            )
+        };
         out.images.push(snapshot.image.clone());
         Ok(out)
     }
@@ -245,6 +260,73 @@ fn label(n: usize, frame: &Keyframe, now_s: f64) -> String {
     #[expect(clippy::cast_precision_loss, reason = "milliseconds since 1970")]
     let ago = crate::how_long(now_s - frame.at_ms as f64 / 1000.0);
     format!("Frame {n}, {ago} ago, {} camera:", frame.camera)
+}
+
+/// The first of `frames` near `chosen` that the vision check says shows `what`, and whether one
+/// did: back from `chosen` while the frame before shows it too, or on from it while it does not,
+/// at most [`CONFIRM_STEPS`] frames. `chosen` stands, unconfirmed, when none does or no model
+/// answers.
+async fn confirm(
+    seer: &dyn Seer,
+    what: &str,
+    frames: &[Keyframe],
+    chosen: Keyframe,
+) -> (Keyframe, bool) {
+    let Some(at) = frames.iter().position(|k| k == &chosen) else {
+        return (chosen, false);
+    };
+    match shows(seer, what, &frames[at]).await {
+        Some(true) => {
+            let mut first = at;
+            while first > 0
+                && at - first < CONFIRM_STEPS
+                && shows(seer, what, &frames[first - 1]).await == Some(true)
+            {
+                first -= 1;
+            }
+            (frames[first].clone(), true)
+        }
+        Some(false) => {
+            for later in frames.iter().skip(at + 1).take(CONFIRM_STEPS) {
+                match shows(seer, what, later).await {
+                    Some(true) => return (later.clone(), true),
+                    Some(false) => {}
+                    None => break,
+                }
+            }
+            (chosen, false)
+        }
+        None => (chosen, false),
+    }
+}
+
+/// Whether the vision check says `frame` shows `what`; none when no model answers.
+async fn shows(seer: &dyn Seer, what: &str, frame: &Keyframe) -> Option<bool> {
+    let path = frame.path.clone();
+    let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
+        .await
+        .ok()?
+        .ok()?;
+    let shot = Shot::bare(ImageInput {
+        bytes,
+        format: ImageFormat::Jpeg,
+    });
+    let prompt = format!("Does this frame show this: {what}? Answer yes or no first.");
+    match seer
+        .ask_shots(
+            Role::VisionCheck,
+            super::watch::SIGHT_PREAMBLE,
+            &prompt,
+            vec![shot],
+        )
+        .await
+    {
+        Ok((reply, _)) => Some(super::watch::yes_said(&reply).is_some()),
+        Err(e) => {
+            tracing::info!(error = %e, "the vision check of a moment got no answer");
+            None
+        }
+    }
 }
 
 /// Up to `most` of `frames`, spread evenly from the first to the last.
@@ -288,6 +370,68 @@ mod tests {
         assert_eq!(picked.len(), 12);
         assert_eq!((picked[0], picked[11]), (0, 99), "both ends");
         assert_eq!(sample(&all[..5], 12).len(), 5, "fewer stay as they are");
+    }
+
+    /// Says yes to a frame whose bytes are `y`.
+    struct ByBytes;
+
+    #[async_trait]
+    impl Seer for ByBytes {
+        async fn ask_shots(
+            &self,
+            role: Role,
+            _preamble: &str,
+            _prompt: &str,
+            shots: Vec<Shot>,
+        ) -> Result<(String, String), String> {
+            assert_eq!(role, Role::VisionCheck);
+            let yes = shots[0].image.bytes == b"y";
+            Ok((
+                if yes { "Yes." } else { "No." }.to_owned(),
+                "fake".to_owned(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_vision_check_moves_a_frame_named_early_or_late_to_the_first_that_shows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // The mug shows from the fourth frame on.
+        let frames: Vec<Keyframe> = "nnnyyyy"
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                let path = dir.path().join(format!("{i}.jpg"));
+                std::fs::write(&path, [u8::try_from(c).unwrap()]).unwrap();
+                Keyframe {
+                    camera: "head".to_owned(),
+                    at_ms: u64::try_from(i).unwrap(),
+                    path,
+                }
+            })
+            .collect();
+        let seer = ByBytes;
+        let pick = |n: usize| frames[n].clone();
+        assert_eq!(
+            confirm(&seer, "a red mug", &frames, pick(1)).await,
+            (pick(3), true),
+            "named two early"
+        );
+        assert_eq!(
+            confirm(&seer, "a red mug", &frames, pick(5)).await,
+            (pick(3), true),
+            "named two late"
+        );
+        assert_eq!(
+            confirm(&seer, "a red mug", &frames, pick(3)).await,
+            (pick(3), true)
+        );
+        let none: Vec<Keyframe> = frames[..3].to_vec();
+        assert_eq!(
+            confirm(&seer, "a red mug", &none, pick(0)).await,
+            (pick(0), false),
+            "none shows it: the moment model's answer stands, unconfirmed"
+        );
     }
 
     #[test]

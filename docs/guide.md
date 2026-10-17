@@ -508,7 +508,9 @@ watch posts once it says yes twice in a row, so one glimpse it mistook does not 
 
 With `[keyframes]`, the cameras keep a frame each time their view changes. `when` shows a vision
 model a dozen of them in time order, those around the moments the world model saw the mug move
-when it did, and answers with the time and the frame.
+when it did. A model reading a dozen frames can name the one beside the right one, so the vision
+check then looks at that frame alone, and at its neighbours until one shows it. It answers with the
+time and the frame.
 
 > **You:** How did today go?
 
@@ -604,13 +606,18 @@ history.
 
 > **You:** Keep the mug on the tray until tonight.
 
-The agent sets a goal with what holds once it is met, in the world model's ids, such as
-`inside(O27, O261)`, and you approve it like an edit: a name only the detector knows is refused,
-as the world model could never see that goal met. After every mission NervROS checks the goal itself and tells the agent
-what is still unmet, and the agent plans the next mission for it, which you approve as usual. A
-goal ends when it holds, when its missions (five unless you say) or its time run out, or when the
-agent gives it up as impossible, with the reason. A run the robot cut short counts against no
-goal. Goals outlast a restart: at start the window says where each one stands.
+The agent sets a goal with what holds once it is met, in the world model's ids, such as `inside(O27,
+O261)`, and you approve it like an edit. A name only the detector knows, such as `mug_4`, is taken
+as the world model's likeliest object of its kind, and the agent is told which; with none it is
+refused, as the world model could never see that goal met. The agent then plans a mission for it at
+once. After every mission NervROS checks the goal itself and tells the agent what is still unmet,
+and the agent plans the next mission for it, which you approve as usual. The world model may give an
+object it saw moved another id, so for `inside` and `on` an object of the same kind seen there after
+the goal's own object was last seen counts, once that object is gone from where it was or when the
+one there was seen after the goal was set: a mug on the tray after the mug left the table is the
+goal's mug. A goal ends when it holds, when its missions (five unless you say) or its time run out,
+or when the agent gives it up as impossible, with the reason. A run the robot cut short counts
+against no goal. Goals outlast a restart: at start the window says where each one stands.
 
 ## Keeping it out of places
 
