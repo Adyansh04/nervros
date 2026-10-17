@@ -157,7 +157,7 @@ pub fn spawn(
     bridge.profile_layers(profile);
     bridge.tasks.spawn(agent(
         rec.clone(),
-        Arc::clone(robot),
+        (Arc::clone(robot), profile.ros.map_frame.clone()),
         Arc::clone(&layout),
         events,
     ));
@@ -393,6 +393,7 @@ mod tests {
                 [1.0, 2.0],
                 [0.0, 2.0],
             ],
+            rule: nervros_core::zones::Rule::KeepOut,
             fixed: false,
         };
         let strokes = hatch(&l.polygon, 0.25);

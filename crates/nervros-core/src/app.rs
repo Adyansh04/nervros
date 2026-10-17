@@ -9,6 +9,7 @@ use nervros_ros::RobotPort;
 use crate::builtins::{ListPlaces, RobotState, Stop};
 use crate::context::system_prompt;
 use crate::guard::Guard;
+use crate::integrations::Integrations;
 use crate::llm::Llm;
 use crate::look::LookTool;
 use crate::mission::Missions;
@@ -384,18 +385,16 @@ fn place_tools(
     Ok(places)
 }
 
-/// The keep-out zones, the profile's and the operator's, kept beside the places: the guard
-/// checks every pose goal and plan against them, and Nav2 gets their mask when the profile names
-/// its topic.
-fn zone_tools(
+/// The zones, the profile's and the operator's, kept beside the places: the guard checks every
+/// pose goal and plan against them. And the robot's stacks, Nav2's and MoveIt's, which read them
+/// too, with their tools.
+fn zone_and_stack_tools(
     profile: &Profile,
     robot: &Arc<dyn RobotPort>,
-    file: Option<PathBuf>,
-    places: &Arc<crate::places::Places>,
-    guard: &Arc<Guard>,
+    (ledger, places, guard): (&Path, &Arc<crate::places::Places>, &Arc<Guard>),
     registry: &mut Registry,
-) -> Result<Arc<crate::zones::Zones>, StartError> {
-    let zones = crate::zones::Zones::new(profile, file);
+) -> Result<(Arc<crate::zones::Zones>, Arc<Integrations>), StartError> {
+    let zones = crate::zones::Zones::new(profile, robot_file(profile, ledger, "zones"));
     guard.set_zones(Arc::clone(&zones));
     registry.add(Arc::new(crate::zones::GeofenceTool::new(
         profile,
@@ -403,12 +402,39 @@ fn zone_tools(
         Arc::clone(places),
         Arc::clone(robot),
     )))?;
-    crate::zones::spawn_mask(profile, Arc::clone(robot), &zones);
-    Ok(zones)
+    let integrations = Integrations::start(&crate::integrations::Parts {
+        profile,
+        robot,
+        zones: &zones,
+        places,
+        ledger,
+    });
+    for tool in integrations.tools() {
+        registry.add(tool)?;
+    }
+    Ok((zones, integrations))
+}
+
+/// `memory`, the notes kept across sessions, and `stop`, which cancels what the robot's stacks
+/// and its executor run.
+fn memory_and_stop(
+    profile: &Profile,
+    robot: &Arc<dyn RobotPort>,
+    (ledger, integrations): (&Path, &Arc<Integrations>),
+    registry: &mut Registry,
+) -> Result<(Arc<crate::memory::Memory>, Arc<dyn Tool>), StartError> {
+    let memory = crate::memory::Memory::new(robot_file(profile, ledger, "memory"));
+    registry.add(Arc::new(crate::memory::MemoryTool::new(Arc::clone(
+        &memory,
+    ))))?;
+    let halts = Arc::clone(integrations);
+    let stop: Arc<dyn Tool> = Arc::new(Stop::new(profile, Arc::clone(robot), halts));
+    registry.add(Arc::clone(&stop))?;
+    Ok((memory, stop))
 }
 
 /// `<kind>/<robot>.json` beside the quota ledger: what this robot keeps across sessions.
-fn robot_file(profile: &Profile, ledger: &Path, kind: &str) -> Option<PathBuf> {
+pub(crate) fn robot_file(profile: &Profile, ledger: &Path, kind: &str) -> Option<PathBuf> {
     ledger.parent().map(|dir| {
         let name = Some(crate::places::slug(&profile.robot.name))
             .filter(|n| !n.is_empty())
@@ -799,18 +825,13 @@ pub fn start_with(
     let snapshots = Arc::new(SnapshotStore::default());
     let seeing = seeing_tools(&profile, &robot, (&llm, ledger), &snapshots, &mut registry)?;
     let places = place_tools(&profile, &robot, ledger, &mut registry)?;
-    let zones_file = robot_file(&profile, ledger, "zones");
-    let zones = zone_tools(&profile, &robot, zones_file, &places, &guard, &mut registry)?;
+    let stack_parts = (ledger, &places, &guard);
+    let (zones, integrations) = zone_and_stack_tools(&profile, &robot, stack_parts, &mut registry)?;
     robot_tools(&profile, &robot, (&schemas, &guard), &mut registry)?;
     let (watches, incidents) = debug_tools(&profile, &robot, ledger, &mut registry)?;
     let mcp = mcp_tools(&profile, models.privacy, &mut registry)?;
     let skills = skill_tools(&profile, &mut registry)?;
-    let memory = crate::memory::Memory::new(robot_file(&profile, ledger, "memory"));
-    registry.add(Arc::new(crate::memory::MemoryTool::new(Arc::clone(
-        &memory,
-    ))))?;
-    let stop: Arc<dyn Tool> = Arc::new(Stop::new(&profile, Arc::clone(&robot)));
-    registry.add(Arc::clone(&stop))?;
+    let (memory, stop) = memory_and_stop(&profile, &robot, (ledger, &integrations), &mut registry)?;
     let missions = missions(
         &profile,
         places,
@@ -837,7 +858,12 @@ pub fn start_with(
         pending_file,
         history_file: options.history,
         resume: options.resume,
-        ..session_config(&profile, &skills, &memory, missions.as_ref())
+        ..session_config(
+            &profile,
+            &skills,
+            (&memory, &integrations),
+            missions.as_ref(),
+        )
     };
     let source = options
         .source
@@ -856,6 +882,7 @@ pub fn start_with(
         s.attach(session.handle());
     }
     watches.attach(session.handle());
+    integrations.attach(&session.handle());
     jobs.attach(session.handle());
     incidents.attach(&session.handle());
     say_orphan(&profile, &robot, session.handle());
@@ -891,7 +918,7 @@ pub fn start_with(
 fn session_config(
     profile: &Profile,
     skills: &[crate::skills::Skill],
-    memory: &Arc<crate::memory::Memory>,
+    (memory, integrations): (&Arc<crate::memory::Memory>, &Arc<Integrations>),
     missions: Option<&Arc<Missions>>,
 ) -> SessionConfig {
     SessionConfig {
@@ -900,6 +927,9 @@ fn session_config(
         approval_ttl: profile.policy.approval_ttl,
         turn_time: profile.policy.budgets.wall_time,
         notes: std::iter::once(Arc::clone(memory) as Arc<dyn crate::memory::Notes>)
+            .chain(std::iter::once(
+                Arc::clone(integrations) as Arc<dyn crate::memory::Notes>
+            ))
             .chain(
                 missions
                     .and_then(|m| m.goals())

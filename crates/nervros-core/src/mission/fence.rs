@@ -202,6 +202,7 @@ mod tests {
             .add(Zone {
                 name: "stairs".into(),
                 polygon: vec![[2.0, -5.0], [3.0, -5.0], [3.0, 5.0], [2.0, 5.0]],
+                rule: crate::zones::Rule::KeepOut,
                 fixed: false,
             })
             .unwrap();
@@ -209,6 +210,7 @@ mod tests {
             .add(Zone {
                 name: "kitchen".into(),
                 polygon: vec![[10.0, 10.0], [12.0, 10.0], [12.0, 12.0], [10.0, 12.0]],
+                rule: crate::zones::Rule::KeepOut,
                 fixed: false,
             })
             .unwrap();

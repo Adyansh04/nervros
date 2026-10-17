@@ -64,7 +64,7 @@ struct Params {
 }
 
 /// A `rcl_interfaces/msg/ParameterValue` as plain JSON.
-fn param_value(v: &Value) -> Value {
+pub(crate) fn param_value(v: &Value) -> Value {
     match v["type"].as_u64() {
         Some(1) => v["bool_value"].clone(),
         Some(2) => v["integer_value"].clone(),
@@ -80,7 +80,7 @@ fn param_value(v: &Value) -> Value {
 }
 
 /// Plain JSON as a `ParameterValue` of the parameter's current type, so `1` for a double is `1.0`.
-fn to_param_value(type_id: u64, value: &Value) -> Result<Value, String> {
+pub(crate) fn to_param_value(type_id: u64, value: &Value) -> Result<Value, String> {
     let bad = |what: &str| format!("the parameter holds {what}, which `{value}` is not");
     Ok(match type_id {
         1 => json!({"type": 1, "bool_value": value.as_bool().ok_or_else(|| bad("true or false"))?}),

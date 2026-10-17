@@ -709,18 +709,24 @@ unless you say otherwise), a place, or corners you give on the map. It names the
 it surrounds. From then on the agent refuses a walk that would end in a zone, a straight walk that
 would enter one, and a navigation goal inside one.
 
-The 3D view draws the zones in red (the Layers tab can hide them), and the World tab lists them.
-**Add** starts the request in the composer, and **Remove** asks the agent to remove one, which you
-approve every time.
+A slow zone lets the robot in, no faster than a share of its top speed:
+
+> **You:** Make the corridor a slow zone at 30%.
+
+Slowing a zone down is free; removing one or letting the robot go faster in it asks you first.
+
+The 3D view draws keep-out zones in red and slow zones in amber with their speed (the Layers tab
+can hide them), and the World tab lists them. **Keep out** and **Slow zone** start the request in
+the composer, and **Remove** asks the agent to remove one, which you approve.
 
 <details>
 <summary>Nav2, and what a zone does not hold back</summary>
 
-- When the profile names a `mask` topic ([`[geofence]`](profile.md#geofence)), NervROS publishes
-  the zones there for Nav2's keepout filter, so Nav2 plans around them too, and `doctor` says
-  whether anything reads it. Without it, a few things are not held back at a zone: a walk whose
-  route crosses one, driving by hand, and skills that move the base themselves (exploring, a pick
-  backing off).
+- With [`[nav2]`](profile.md#nav2), NervROS publishes the keep-out zones for Nav2's keepout
+  filter, so Nav2 plans around them too, and the slow zones for its speed filter, which slows the
+  robot inside them; `doctor` says whether anything reads them. Without it, a few things are not
+  held back at a keep-out zone: a walk whose route crosses one, driving by hand, and skills that
+  move the base themselves (exploring, a pick backing off).
 - Adding a zone is refused while the robot stands inside it, and for a room type that several
   rooms share until you name one by its id.
 - Zones added in chat are kept for the robot across sessions. Zones set in the profile stay until

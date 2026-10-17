@@ -336,6 +336,7 @@ fn print_event(e: &Event, logs: &Path) {
         Event::User { .. }
         | Event::TurnStarted { .. }
         | Event::TurnFinished { .. }
+        | Event::Drawn { .. }
         | Event::Plot { .. }
         | Event::Context { .. }
         | Event::ModelCall { .. }

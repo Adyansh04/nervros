@@ -21,7 +21,7 @@ mod config;
 mod graph;
 mod interface;
 pub(crate) mod logs;
-mod params;
+pub(crate) mod params;
 mod publish;
 mod sample;
 mod service;
@@ -123,28 +123,17 @@ impl Ctx {
     /// relative to where the robot stands is checked only as a mission step, so while there are
     /// zones Nav2's own is refused.
     fn zone_refusal(&self, ty: &str, payload: &Value) -> Option<ToolOutcome> {
-        fn list(v: &Value) -> Vec<&Value> {
-            v.as_array().map(|a| a.iter().collect()).unwrap_or_default()
-        }
+        use crate::integrations::nav2::goals::{Destinations, destinations};
         let zones = self.guard.zones()?;
-        let poses: Vec<&Value> = match ty {
-            "nav2_msgs/action/NavigateToPose" => vec![&payload["pose"]],
-            "nav2_msgs/action/ComputePathToPose" => vec![&payload["goal"]],
-            "nav2_msgs/action/NavigateThroughPoses" | "nav2_msgs/action/FollowWaypoints" => {
-                list(&payload["poses"])
-            }
-            "nav2_msgs/action/ComputePathThroughPoses" => list(&payload["goals"]),
-            "nav2_msgs/action/FollowPath" => list(&payload["path"]["poses"]),
-            "geometry_msgs/msg/PoseStamped" => vec![payload],
-            "nav2_msgs/action/DriveOnHeading" | "nav2_msgs/action/BackUp"
-                if !zones.all().is_empty() =>
-            {
+        let poses = match destinations(ty, payload) {
+            Destinations::Poses(poses) => poses,
+            Destinations::Relative if !zones.all().is_empty() => {
                 return Some(ToolOutcome::refused(
                     "with keep-out zones set, a straight move is checked against them only as a \
                      mission step: walk with run_mission",
                 ));
             }
-            _ => return None,
+            Destinations::Relative | Destinations::Elsewhere => return None,
         };
         for stamped in poses {
             let frame = stamped["header"]["frame_id"].as_str().unwrap_or_default();

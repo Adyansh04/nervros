@@ -101,21 +101,7 @@ pub async fn run(profile: &Profile, robot: &dyn RobotPort) -> Vec<Check> {
             report(ok, format!("mission {what} {name}"));
         }
     }
-    // Published for nothing, the mask would leave the zones to the agent's own checks.
-    if let Some(mask) = &profile.geofence.mask {
-        let read = robot
-            .endpoints(mask)
-            .await
-            .is_ok_and(|e| !e.subscribers.is_empty());
-        report(
-            read,
-            if read {
-                format!("keep-out mask {mask}: Nav2 reads it")
-            } else {
-                format!("keep-out mask {mask}: nothing reads it; is Nav2's keepout filter on?")
-            },
-        );
-    }
+    out.extend(crate::integrations::discover(profile, robot).await);
     out
 }
 
@@ -318,8 +304,8 @@ mod tests {
             name = "t"
             [world]
             map = { topic = "/map", type = "nav_msgs/msg/OccupancyGrid" }
-            [geofence]
-            mask = "/keepout_filter_mask"
+            [nav2]
+            keepout_mask = "/keepout_filter_mask"
             [models]
             file = "m.toml"
             "#,

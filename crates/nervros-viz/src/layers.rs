@@ -9,7 +9,7 @@ use rerun::RecordingStream;
 use serde_json::Value;
 
 use crate::grid::{grid, put_grid};
-use crate::{f32s, num, put_static, xyz};
+use crate::{f32s, num, put, put_static, xyz};
 
 /// Every layer the viewer draws, in order, each shown or hidden by the operator.
 #[derive(Debug, Default)]
@@ -84,6 +84,50 @@ pub(crate) fn draw_occupied(
     if let Some(grid) = grid(msg, cell) {
         put_grid(rec, path, grid, rerun::ColorModel::RGBA, lift);
     }
+}
+
+/// A `geometry_msgs/msg/PolygonStamped` as a closed outline on the map, placed by its frame's
+/// transform, `lift` above the floor and named at its first corner; an empty one is cleared, as a
+/// collision monitor's polygon with no shape yet.
+pub(crate) fn draw_polygon(
+    rec: &RecordingStream,
+    path: &str,
+    msg: &Value,
+    to_map: &Transform,
+    (colour, name, lift): ([u8; 3], &str, f32),
+) {
+    let mut corners: Vec<[f32; 3]> = msg["polygon"]["points"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            let [x, y, _] = f32s(to_map.apply([num(&p["x"]), num(&p["y"]), 0.0]));
+            [x, y, lift]
+        })
+        .collect();
+    if corners.len() < 2 {
+        put(rec, path, &rerun::Clear::recursive());
+        return;
+    }
+    let first = corners[0];
+    corners.push(first);
+    let [r, g, b] = colour;
+    let c = rerun::Color::from_rgb(r, g, b);
+    put(
+        rec,
+        path,
+        &rerun::LineStrips3D::new([corners])
+            .with_colors([c])
+            .with_radii([0.015]),
+    );
+    put(
+        rec,
+        &format!("{path}/name"),
+        &rerun::Points3D::new([first])
+            .with_labels([name])
+            .with_colors([c])
+            .with_radii([0.02]),
+    );
 }
 
 /// A `sensor_msgs/msg/LaserScan` as points in the map frame, by the scan frame's transform.

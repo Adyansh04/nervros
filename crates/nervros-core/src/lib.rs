@@ -8,6 +8,7 @@ pub mod app;
 pub mod config;
 pub mod doctor;
 pub mod incident;
+pub mod integrations;
 pub mod job;
 pub mod mission;
 pub mod model;

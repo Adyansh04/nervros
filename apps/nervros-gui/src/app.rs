@@ -1015,6 +1015,7 @@ mod tests {
         let zone = |name: &str, polygon: Vec<[f64; 2]>, fixed| nervros_core::zones::Zone {
             name: name.into(),
             polygon,
+            rule: nervros_core::zones::Rule::KeepOut,
             fixed,
         };
         let zones = [
@@ -1028,6 +1029,16 @@ mod tests {
                 vec![[1.0, 1.0], [2.2, 1.0], [2.2, 2.0], [1.0, 2.0]],
                 false,
             ),
+            nervros_core::zones::Zone {
+                rule: nervros_core::zones::Rule::Slow(nervros_core::zones::SpeedLimit::Percent(
+                    30.0,
+                )),
+                ..zone(
+                    "corridor",
+                    vec![[0.0, 3.0], [6.0, 3.0], [6.0, 4.2], [0.0, 4.2]],
+                    false,
+                )
+            },
         ];
         let mut harness = Harness::builder()
             .wgpu()

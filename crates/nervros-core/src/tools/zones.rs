@@ -1,11 +1,11 @@
-//! Keep-out zones: polygons on the map the robot may not be sent into.
+//! Zones: polygons on the map that keep the robot out, or slow it down.
 //!
 //! The profile's zones are fixed; the operator adds others in chat (`geofence`), around a room,
 //! an object, a place or a polygon, and they are kept across sessions beside the places. The guard
-//! refuses a pose goal inside one, the plan check a mission that would end in one or walk through
-//! one, and Nav2 keeps its own paths out of all of them through a keep-out mask published for its
-//! keepout filter, when the profile names the mask's topic. Adding a zone only narrows where the
-//! robot goes, so it is free; removing one widens it, so the operator approves.
+//! refuses a pose goal inside a keep-out zone, the plan check a mission that would end in one or
+//! walk through one, and with `[nav2]` Nav2 keeps its own paths out of them too and slows down in
+//! the slow zones. Adding a zone or slowing one only makes the robot more careful, so it is free;
+//! removing one or speeding one up asks the operator, a keep-out zone every time.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -28,25 +28,91 @@ const MIN_AREA_M2: f64 = 0.05;
 const MARGIN_M: f64 = 0.3;
 /// Half the side of the square around a place: about the robot's own footprint.
 const PLACE_HALF_M: f64 = 0.5;
-/// The mask's cost in a zone: Nav2's occupied, which its keepout filter makes lethal.
-const KEEP_OUT: i64 = 100;
 const WORLD_WAIT: Duration = Duration::from_secs(3);
-/// How often the mask publisher looks for a new map.
-const MAP_POLL: Duration = Duration::from_secs(10);
 
-/// One keep-out zone.
+/// What a zone does to the robot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rule {
+    /// The robot may not be sent in.
+    #[default]
+    KeepOut,
+    /// The robot may go in, no faster than this.
+    Slow(SpeedLimit),
+}
+
+/// How fast a slow zone lets the robot go.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeedLimit {
+    /// A share of the robot's top speed, in per cent.
+    Percent(f64),
+    /// Metres a second.
+    Mps(f64),
+}
+
+impl SpeedLimit {
+    /// As a share of the robot's top speed, in per cent; a speed in m/s needs the top speed.
+    #[must_use]
+    pub fn percent(self, top_mps: Option<f64>) -> Option<f64> {
+        match self {
+            Self::Percent(p) => Some(p),
+            Self::Mps(v) => top_mps.filter(|t| *t > 0.0).map(|t| v / t * 100.0),
+        }
+    }
+
+    /// As people say it: `30%`, `0.30 m/s`.
+    #[must_use]
+    pub fn words(self) -> String {
+        match self {
+            Self::Percent(p) => format!("{p:.0}%"),
+            Self::Mps(v) => format!("{v:.2} m/s"),
+        }
+    }
+
+    /// Why this is no speed a zone may set, if it is not: a share from `slowest` to 99 per cent,
+    /// or a speed in m/s that is that share of `top_mps`.
+    pub(crate) fn check(self, slowest: f64, top_mps: Option<f64>) -> Result<(), String> {
+        let Some(p) = self.percent(top_mps).filter(|p| p.is_finite()) else {
+            return Err(
+                "this robot's profile gives no top speed (`[geofence] top_speed_mps`), so a slow \
+                 zone takes a share of it in per cent, not m/s"
+                    .to_owned(),
+            );
+        };
+        if p < slowest || p > 99.0 {
+            return Err(format!(
+                "a slow zone lets the robot go {slowest:.0}% to 99% of its top speed, not {}; to \
+                 keep the robot out, add the zone with no speed (a keep-out zone)",
+                self.words()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One zone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Zone {
     /// What the operator calls it.
     pub name: String,
     /// Its corners in the map frame, metres, in order around it.
     pub polygon: Vec<[f64; 2]>,
+    /// What it does to the robot.
+    #[serde(default)]
+    pub rule: Rule,
     /// Set in the profile: only an edit of the profile removes it.
     #[serde(default, skip_serializing)]
     pub fixed: bool,
 }
 
 impl Zone {
+    /// Whether it keeps the robot out.
+    #[must_use]
+    pub fn keeps_out(&self) -> bool {
+        self.rule == Rule::KeepOut
+    }
+
     /// Whether a point is inside, by ray casting.
     #[must_use]
     pub fn contains(&self, x: f64, y: f64) -> bool {
@@ -148,6 +214,10 @@ pub struct Zones {
     added: Mutex<Vec<Zone>>,
     file: Option<PathBuf>,
     frame: String,
+    /// The slowest a slow zone may make the robot, in per cent of its top speed.
+    slowest: f64,
+    /// The robot's top speed, which a slow zone in m/s is a share of.
+    top_mps: Option<f64>,
     version: watch::Sender<u64>,
 }
 
@@ -162,6 +232,7 @@ impl Zones {
             .map(|z| Zone {
                 name: z.name.clone(),
                 polygon: z.polygon.clone(),
+                rule: z.slow.map_or(Rule::KeepOut, Rule::Slow),
                 fixed: true,
             })
             .collect();
@@ -174,8 +245,35 @@ impl Zones {
             added: Mutex::new(added),
             file,
             frame: profile.ros.map_frame.clone(),
+            slowest: profile.geofence.slowest_percent,
+            top_mps: profile.geofence.top_speed_mps,
             version: watch::Sender::new(0),
         })
+    }
+
+    /// The robot's top speed, when the profile gives it.
+    #[must_use]
+    pub fn top_speed_mps(&self) -> Option<f64> {
+        self.top_mps
+    }
+
+    /// The keep-out zones: the profile's, then the operator's.
+    #[must_use]
+    pub fn keep_out(&self) -> Vec<Zone> {
+        self.all().into_iter().filter(Zone::keeps_out).collect()
+    }
+
+    /// The slow zones a point is in, and the share of the top speed the slowest of them allows.
+    #[must_use]
+    pub fn slow_at(&self, x: f64, y: f64) -> Option<(Zone, f64)> {
+        self.all()
+            .into_iter()
+            .filter(|z| z.contains(x, y))
+            .filter_map(|z| match z.rule {
+                Rule::Slow(limit) => limit.percent(self.top_mps).map(|p| (z, p)),
+                Rule::KeepOut => None,
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<Zone>> {
@@ -202,16 +300,16 @@ impl Zones {
         self.version.subscribe()
     }
 
-    /// The zone a point is in, if any.
+    /// The keep-out zone a point is in, if any.
     #[must_use]
     pub fn at(&self, x: f64, y: f64) -> Option<Zone> {
-        self.all().into_iter().find(|z| z.contains(x, y))
+        self.keep_out().into_iter().find(|z| z.contains(x, y))
     }
 
-    /// The first zone a straight move from `a` to `b` enters, and how far along it does.
+    /// The first keep-out zone a straight move from `a` to `b` enters, and how far along it does.
     #[must_use]
     pub fn crossed(&self, a: (f64, f64), b: (f64, f64)) -> Option<(Zone, f64)> {
-        self.all()
+        self.keep_out()
             .into_iter()
             .filter_map(|z| z.entered(a, b).map(|d| (z, d)))
             .min_by(|x, y| x.1.total_cmp(&y.1))
@@ -233,6 +331,9 @@ impl Zones {
     /// The zone is not a usable polygon, its name is taken, or it could not be kept.
     pub fn add(&self, zone: Zone) -> Result<(), String> {
         zone.check()?;
+        if let Rule::Slow(limit) = zone.rule {
+            limit.check(self.slowest, self.top_mps)?;
+        }
         if self
             .all()
             .iter()
@@ -275,6 +376,41 @@ impl Zones {
         Ok(())
     }
 
+    /// Sets a slow zone of the operator's to `limit`; the speed it had.
+    ///
+    /// # Errors
+    ///
+    /// No such slow zone, the profile sets it, the speed is out of range, or the change could not
+    /// be kept.
+    pub fn set_speed(&self, name: &str, limit: SpeedLimit) -> Result<SpeedLimit, String> {
+        self.removable(name)?;
+        limit.check(self.slowest, self.top_mps)?;
+        let mut added = self.lock();
+        let mut next = added.clone();
+        let Some(zone) = next.iter_mut().find(|z| z.name.eq_ignore_ascii_case(name)) else {
+            return Err(format!("there is no zone called `{name}`"));
+        };
+        let Rule::Slow(was) = zone.rule else {
+            return Err(format!(
+                "`{name}` keeps the robot out; only a slow zone has a speed"
+            ));
+        };
+        zone.rule = Rule::Slow(limit);
+        self.save(&next)?;
+        *added = next;
+        drop(added);
+        self.version.send_modify(|v| *v += 1);
+        Ok(was)
+    }
+
+    /// The zone called `name`, if any.
+    #[must_use]
+    pub fn named(&self, name: &str) -> Option<Zone> {
+        self.all()
+            .into_iter()
+            .find(|z| z.name.eq_ignore_ascii_case(name))
+    }
+
     /// Why the zone `name` cannot be removed, if it cannot: none has that name, or the profile
     /// sets it.
     ///
@@ -307,105 +443,7 @@ impl Zones {
     }
 }
 
-/// The keep-out mask for Nav2's keepout filter: `map` (a `nav_msgs/msg/OccupancyGrid` as JSON)
-/// with every cell whose centre is in a zone occupied, and every other free.
-fn mask(map: &Value, zones: &[Zone]) -> Option<Value> {
-    let info = &map["info"];
-    let resolution = info["resolution"].as_f64().filter(|r| *r > 0.0)?;
-    let width = usize::try_from(info["width"].as_u64()?).ok()?;
-    let height = usize::try_from(info["height"].as_u64()?).ok()?;
-    let origin = nervros_ros::Transform::from_pose(&info["origin"])?;
-    let mut data = vec![0_i64; width * height];
-    // A cell's centre in the map frame, by the origin's pose: maps are rarely turned, but may be.
-    let centre = |i: usize, j: usize| {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "grid indices are far below 2^52"
-        )]
-        let local = [
-            (i as f64 + 0.5) * resolution,
-            (j as f64 + 0.5) * resolution,
-            0.0,
-        ];
-        let p = origin.apply(local);
-        (p[0], p[1])
-    };
-    for zone in zones {
-        for j in 0..height {
-            for i in 0..width {
-                let (x, y) = centre(i, j);
-                if zone.contains(x, y) {
-                    data[j * width + i] = KEEP_OUT;
-                }
-            }
-        }
-    }
-    Some(json!({"header": map["header"], "info": info, "data": data}))
-}
-
-/// Publishes the keep-out mask on `topic`, latched, whenever the zones or the map change: Nav2's
-/// keepout filter reads it as one more layer of its costmaps. Starts with the map, and an empty
-/// mask is published too, so the filter never waits for one. Ends with the session the zones are
-/// of.
-pub(crate) fn spawn_mask(profile: &Profile, robot: Arc<dyn RobotPort>, zones: &Arc<Zones>) {
-    let (Some(topic), Some(map)) = (
-        profile.geofence.mask.clone(),
-        profile.world.as_ref().and_then(|w| w.map.clone()),
-    ) else {
-        return;
-    };
-    let mut changes = zones.changes();
-    let zones = Arc::downgrade(zones);
-    tokio::spawn(async move {
-        let publisher = match robot
-            .latched_publisher(&topic, "nav_msgs/msg/OccupancyGrid")
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(%topic, error = %e, "no keep-out mask: its publisher failed");
-                return;
-            }
-        };
-        // The grid the last mask was laid on, and the zones' version: a map that only fills in,
-        // as one being mapped does every few seconds, needs no new mask.
-        let mut sent_for: Option<(Value, u64)> = None;
-        loop {
-            if let Ok(grid) = robot
-                .latest_shared(&map.topic, &map.msg_type, WORLD_WAIT)
-                .await
-            {
-                let version = *changes.borrow_and_update();
-                let info = &grid["info"];
-                let laid_on = json!([
-                    grid["header"]["frame_id"],
-                    info["resolution"],
-                    info["width"],
-                    info["height"],
-                    info["origin"]
-                ]);
-                if sent_for.as_ref() != Some(&(laid_on.clone(), version)) {
-                    let Some(zones) = zones.upgrade() else {
-                        return;
-                    };
-                    let all = zones.all();
-                    drop(zones);
-                    let built = tokio::task::spawn_blocking(move || mask(&grid, &all)).await;
-                    if let Ok(Some(message)) = built {
-                        publisher.send(message);
-                        sent_for = Some((laid_on, version));
-                    }
-                }
-            }
-            tokio::select! {
-                alive = changes.changed() => if alive.is_err() { return },
-                () = tokio::time::sleep(MAP_POLL) => {}
-            }
-        }
-    });
-}
-
-/// `geofence`: keep-out zones, listed, added and removed in chat.
+/// `geofence`: keep-out and slow zones, listed, added, slowed and removed in chat.
 pub(crate) struct GeofenceTool {
     spec: ToolSpec,
     zones: Arc<Zones>,
@@ -425,20 +463,26 @@ impl GeofenceTool {
     ) -> Self {
         let spec = ToolSpec::new(
             "geofence",
-            "Keep-out zones the robot may not be sent into, which Nav2 keeps its paths out of \
-             too. list them; add one around a room (id or name), an object (id), a place (name) \
-             or a polygon of map corners [[x, y], ...]; remove one the operator added. Removing \
-             needs the operator's approval; a zone the profile sets cannot be removed here.",
+            "Zones on the map. A keep-out zone the robot may not be sent into, and Nav2 keeps its \
+             paths out of. A slow zone the robot may enter no faster than slow_percent of its top \
+             speed (or slow_mps), and Nav2 slows down in. list them; add one around a room (id or \
+             name), an object (id), a place (name) or a polygon of map corners [[x, y], ...]: a \
+             keep-out zone, or a slow zone when slow_percent or slow_mps is given above 0; speed \
+             changes a slow zone's speed; remove one the operator added. Removing a zone or \
+             speeding one up needs the operator's approval; a zone the profile sets cannot be \
+             changed here.",
             json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["list", "add", "remove"]},
+                    "action": {"type": "string", "enum": ["list", "add", "speed", "remove"]},
                     "name": {"type": "string", "description": "The zone's name; for add, defaults to what it is around"},
                     "room": {"type": "string"},
                     "object": {"type": "string"},
                     "place": {"type": "string"},
                     "polygon": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}},
                     "margin_m": {"type": "number", "description": "Kept clear around an object or a place; default 0.3"},
+                    "slow_percent": {"type": "number", "description": "A slow zone: how fast the robot may go in it, in per cent of its top speed"},
+                    "slow_mps": {"type": "number", "description": "A slow zone: how fast the robot may go in it, m/s"},
                 },
                 "required": ["action"],
             }),
@@ -540,6 +584,14 @@ impl GeofenceTool {
         Ok((label.to_owned(), square(x, y, half + margin)))
     }
 
+    /// The speed `args` ask for, if they ask for one.
+    fn speed_in(args: &Value) -> Option<SpeedLimit> {
+        args["slow_percent"]
+            .as_f64()
+            .map(SpeedLimit::Percent)
+            .or_else(|| args["slow_mps"].as_f64().map(SpeedLimit::Mps))
+    }
+
     /// The zone `args` ask for, with its name, or why there is none.
     async fn zone_for(&self, args: &Value) -> Result<Zone, String> {
         let margin = args["margin_m"]
@@ -580,6 +632,12 @@ impl GeofenceTool {
         Ok(Zone {
             name,
             polygon,
+            // No speed at all is a zone the robot may not enter: a model asks for 0% to mean it.
+            rule: Self::speed_in(args)
+                .filter(|l| match l {
+                    SpeedLimit::Percent(v) | SpeedLimit::Mps(v) => *v > 0.0,
+                })
+                .map_or(Rule::KeepOut, Rule::Slow),
             fixed: false,
         })
     }
@@ -589,9 +647,11 @@ impl GeofenceTool {
             Ok(z) => z,
             Err(why) => return ToolOutcome::failed(why),
         };
-        // A zone around the robot would leave it nowhere to plan a way out.
+        // A keep-out zone around the robot would leave it nowhere to plan a way out; a slow one
+        // only slows it on its way.
         let (map, base) = (&self.profile.ros.map_frame, &self.profile.ros.base_frame);
-        if let Ok(t) = self.robot.transform(map, base)
+        if zone.keeps_out()
+            && let Ok(t) = self.robot.transform(map, base)
             && zone.contains(t.translation[0], t.translation[1])
         {
             return ToolOutcome::refused(format!(
@@ -601,12 +661,46 @@ impl GeofenceTool {
         }
         let area = zone.area();
         let name = zone.name.clone();
+        let message = match zone.rule {
+            Rule::KeepOut => format!("added the keep-out zone `{name}`"),
+            Rule::Slow(limit) => format!(
+                "added the slow zone `{name}`: the robot goes at most {} in it",
+                limit.words()
+            ),
+        };
         match self.zones.add(zone) {
             Ok(()) => ToolOutcome {
-                message: format!("added the keep-out zone `{name}`"),
+                message,
                 ..ToolOutcome::ok(json!({"added": name, "area_m2": (area * 100.0).round() / 100.0}))
             },
             Err(why) => ToolOutcome::failed(why),
+        }
+    }
+
+    /// The speed a slow zone has, and the speed `args` would give it.
+    fn speeds(&self, args: &Value) -> Result<(SpeedLimit, SpeedLimit), String> {
+        let name = args["name"].as_str().unwrap_or_default();
+        let Some(zone) = self.zones.named(name) else {
+            return Err(format!("there is no zone called `{name}`"));
+        };
+        let Rule::Slow(now) = zone.rule else {
+            return Err(format!(
+                "`{name}` keeps the robot out; only a slow zone has a speed"
+            ));
+        };
+        let Some(next) = Self::speed_in(args) else {
+            return Err("speed needs slow_percent or slow_mps".to_owned());
+        };
+        Ok((now, next))
+    }
+
+    /// Whether `next` lets the robot go faster than `now`; a speed in m/s against one in per cent
+    /// counts as faster when the top speed that would compare them is unknown.
+    fn faster(&self, now: SpeedLimit, next: SpeedLimit) -> bool {
+        let top = self.zones.top_speed_mps();
+        match (now.percent(top), next.percent(top)) {
+            (Some(a), Some(b)) => b > a,
+            _ => true,
         }
     }
 }
@@ -618,24 +712,61 @@ impl Tool for GeofenceTool {
     }
 
     async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
-        if args["action"].as_str() != Some("remove") {
-            return None;
-        }
         let name = args["name"].as_str().unwrap_or_default();
-        // Nothing to ask the operator about a zone that is not there, or that only they can remove.
-        if let Err(why) = self.zones.removable(name) {
-            return Some(Err(ToolOutcome::failed(why)));
-        }
+        let reason = match args["action"].as_str() {
+            Some("remove") => {
+                // Nothing to ask the operator about a zone that is not there, or that only they can
+                // remove.
+                if let Err(why) = self.zones.removable(name) {
+                    return Some(Err(ToolOutcome::failed(why)));
+                }
+                match self.zones.named(name).map(|z| z.rule) {
+                    Some(Rule::Slow(limit)) => format!(
+                        "removes the slow zone `{name}`: the robot may go faster than {} there \
+                         again",
+                        limit.words()
+                    ),
+                    _ => {
+                        format!("removes the keep-out zone `{name}`: the robot may go there again")
+                    }
+                }
+            }
+            Some("speed") => {
+                if let Err(why) = self.zones.removable(name) {
+                    return Some(Err(ToolOutcome::failed(why)));
+                }
+                let (now, next) = match self.speeds(args) {
+                    Ok(s) => s,
+                    Err(why) => return Some(Err(ToolOutcome::failed(why))),
+                };
+                // Slowing a zone only makes the robot more careful: free.
+                if !self.faster(now, next) {
+                    return None;
+                }
+                format!(
+                    "lets the robot go faster in the slow zone `{name}`: {} instead of {}",
+                    next.words(),
+                    now.words()
+                )
+            }
+            _ => return None,
+        };
         Some(Ok(Assessment {
             risk: Risk::Annotate,
             resources: Vec::new(),
-            reason: format!("removes the keep-out zone `{name}`: the robot may go there again"),
+            reason,
             args: None,
         }))
     }
 
     fn always_asks(&self, args: &Value) -> bool {
+        // A keep-out zone's removal is asked every time; a slow zone's may be allowed for the
+        // session.
         args["action"].as_str() == Some("remove")
+            && self
+                .zones
+                .named(args["name"].as_str().unwrap_or_default())
+                .is_none_or(|z| z.keeps_out())
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
@@ -646,30 +777,57 @@ impl Tool for GeofenceTool {
                     .all()
                     .iter()
                     .map(|z| {
-                        json!({
+                        let mut out = json!({
                             "name": z.name,
+                            "kind": if z.keeps_out() { "keep_out" } else { "slow" },
                             "set_in": if z.fixed { "profile" } else { "chat" },
                             "area_m2": (z.area() * 100.0).round() / 100.0,
                             "polygon": z.polygon,
-                        })
+                        });
+                        if let Rule::Slow(limit) = z.rule {
+                            out["speed"] = json!(limit.words());
+                        }
+                        out
                     })
                     .collect();
                 ToolOutcome::ok(json!({"frame": self.zones.frame(), "zones": zones}))
             }
             "add" => self.add(&args).await,
+            "speed" => {
+                let name = args["name"].as_str().unwrap_or_default();
+                let next = match self.speeds(&args) {
+                    Ok((_, next)) => next,
+                    Err(why) => return ToolOutcome::failed(why),
+                };
+                match self.zones.set_speed(name, next) {
+                    Ok(was) => ToolOutcome {
+                        message: format!(
+                            "the slow zone `{name}` now lets the robot go {} (was {})",
+                            next.words(),
+                            was.words()
+                        ),
+                        ..ToolOutcome::ok(json!({"zone": name, "speed": next.words()}))
+                    },
+                    Err(why) => ToolOutcome::failed(why),
+                }
+            }
             "remove" => {
                 let name = args["name"].as_str().unwrap_or_default();
+                let kind = match self.zones.named(name).map(|z| z.rule) {
+                    Some(Rule::Slow(_)) => "slow",
+                    _ => "keep-out",
+                };
                 match self.zones.remove(name) {
                     Ok(()) => ToolOutcome {
-                        message: format!("removed the keep-out zone `{name}`"),
+                        message: format!("removed the {kind} zone `{name}`"),
                         ..ToolOutcome::ok(json!({"removed": name}))
                     },
                     Err(why) => ToolOutcome::failed(why),
                 }
             }
-            other => {
-                ToolOutcome::failed(format!("action `{other}` is not one of list, add, remove"))
-            }
+            other => ToolOutcome::failed(format!(
+                "action `{other}` is not one of list, add, speed, remove"
+            )),
         }
     }
 }
@@ -682,6 +840,7 @@ mod tests {
         Zone {
             name: name.into(),
             polygon: polygon.to_vec(),
+            rule: Rule::KeepOut,
             fixed: false,
         }
     }
@@ -721,19 +880,6 @@ mod tests {
         // Out of one arm of the L, across its notch, and back in through the other.
         let back_in = l_shape().entered((0.5, 3.5), (3.5, 0.5)).unwrap();
         assert!((back_in - 2.5 * 2_f64.sqrt()).abs() < 1e-9, "{back_in}");
-    }
-
-    #[test]
-    fn the_mask_marks_the_cells_whose_centres_are_in_a_zone() {
-        let map = json!({
-            "header": {"frame_id": "map"},
-            "info": {"resolution": 1.0, "width": 4, "height": 2,
-                     "origin": {"position": {"x": 0.0, "y": 0.0}, "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}}},
-        });
-        let zones = [zone("z", &[[1.0, 0.0], [3.0, 0.0], [3.0, 1.0], [1.0, 1.0]])];
-        let m = mask(&map, &zones).unwrap();
-        assert_eq!(m["data"], json!([0, 100, 100, 0, 0, 0, 0, 0]));
-        assert_eq!(m["header"]["frame_id"], "map");
     }
 
     fn tool_on(robot: nervros_ros::fake::FakeRobot) -> (GeofenceTool, Arc<Zones>) {
@@ -778,7 +924,10 @@ mod tests {
             .call(json!({"action": "add", "object": "O17", "name": "mug", "margin_m": 0.2}))
             .await;
         assert_eq!(mug.data["added"], "mug", "{}", mug.message);
-        let dock = tool.call(json!({"action": "add", "place": "dock"})).await;
+        // A slow zone at no speed is how a model asks to keep the robot out.
+        let dock = tool
+            .call(json!({"action": "add", "place": "dock", "slow_percent": 0}))
+            .await;
         assert_eq!(dock.message, "added the keep-out zone `dock`");
         assert!(
             zones.at(8.6, 8.6).is_some(),

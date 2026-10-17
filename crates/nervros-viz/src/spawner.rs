@@ -245,8 +245,23 @@ fn profile_layer(
         });
     }
     let (r, g, b) = OBJECT_PALETTE[index % OBJECT_PALETTE.len()];
+    let colour = config.color.unwrap_or([r, g, b]);
     // Above the map and coverage, one layer over the next.
     #[expect(clippy::cast_precision_loss, reason = "a handful of layers")]
     let lift = 0.02 + 0.005 * index as f32;
-    Box::new(move |rec, path, msg| layers::draw_occupied(rec, path, msg, [r, g, b], lift))
+    if config.msg_type == "geometry_msgs/msg/PolygonStamped" {
+        let (robot, map, name) = (Arc::clone(robot), map.to_owned(), config.name.clone());
+        return Box::new(move |rec, path, msg| {
+            let frame = msg["header"]["frame_id"].as_str().unwrap_or_default();
+            let to_map = if frame.is_empty() || frame == map {
+                Ok(Transform::IDENTITY)
+            } else {
+                robot.transform(&map, frame)
+            };
+            if let Ok(t) = to_map {
+                layers::draw_polygon(rec, path, msg, &t, (colour, &name, lift));
+            }
+        });
+    }
+    Box::new(move |rec, path, msg| layers::draw_occupied(rec, path, msg, colour, lift))
 }

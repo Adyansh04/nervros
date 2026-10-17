@@ -25,6 +25,8 @@ _nervros_idl="${_nervros_idl};type_description_interfaces;visualization_msgs;geo
 _nervros_idl="${_nervros_idl};control_msgs;controller_manager_msgs;diagnostic_msgs;rosgraph_msgs"
 _nervros_idl="${_nervros_idl};statistics_msgs;shape_msgs;map_msgs;octomap_msgs;slam_toolbox"
 _nervros_idl="${_nervros_idl};robot_localization;composition_interfaces;rosbag2_interfaces;example_interfaces"
+# For the MoveIt integration: its messages and the one package they need beside those above.
+_nervros_idl="${_nervros_idl};moveit_msgs;object_recognition_msgs"
 export IDL_PACKAGE_FILTER="${_nervros_idl}${NERVROS_EXTRA_IDL_PACKAGES:+;${NERVROS_EXTRA_IDL_PACKAGES}}"
 unset _nervros_idl
 

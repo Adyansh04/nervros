@@ -76,6 +76,8 @@ rmcp = { version = "=3.5.0", default-features = false, features = ["client", "tr
 rig = "=0.43.0"
 # The mission ledger. Bundled: one SQLite for every build, whatever the host has.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
+# The robot's SRDF: MoveIt's groups, end effectors and named poses.
+roxmltree = "=0.20.0"
 schemars = "=1.2.2"
 sha2 = "=0.10.9"
 secrecy = "=0.10.3"

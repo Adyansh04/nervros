@@ -1,9 +1,9 @@
-//! The World and Layers tabs: the world model's rooms and objects, the keep-out zones, and the
+//! The World and Layers tabs: the world model's rooms and objects, the zones, and the
 //! viewer's layers.
 
 use std::fmt::Write as _;
 
-use nervros_core::zones::Zone;
+use nervros_core::zones::{Rule, Zone};
 use rerun::external::egui;
 use rerun::external::egui::{Align, CornerRadius, Layout, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _};
@@ -66,7 +66,7 @@ fn by_number(rooms: &Value) -> Vec<Value> {
 }
 
 /// The World tab: the world model's rooms, how much of each the camera has seen, a button that
-/// asks the agent to explore, and the keep-out zones.
+/// asks the agent to explore, and the zones.
 pub(super) fn world_view(
     ui: &mut egui::Ui,
     rooms: &Value,
@@ -178,16 +178,29 @@ pub(super) fn world_view(
     actions
 }
 
-/// The keep-out zones, the profile's and the operator's. Zones change only through the agent, so
-/// the buttons ask it: removing one widens where the robot may go, and the operator approves that.
+/// The zones, the profile's and the operator's: keep-out zones in red, slow zones in amber with
+/// their speed. Zones change only through the agent, so the buttons ask it: removing one lets the
+/// robot go where or as fast as it could not, and the operator approves that.
 pub(super) fn zones_view(ui: &mut egui::Ui, zones: &[Zone]) -> Vec<Action> {
     let mut actions = Vec::new();
     ui.add_space(14.0);
     ui.horizontal(|ui| {
-        theme::section(ui, "Keep-out zones");
+        theme::section(ui, "Zones");
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui
-                .add(ReButton::new("Add").small().secondary())
+                .add(ReButton::new("Slow zone").small().secondary())
+                .on_hover_text(
+                    "Say where the robot must slow down, and how much: a room, an object, a \
+                     place, or corners on the map",
+                )
+                .clicked()
+            {
+                actions.push(Action::Prefill(
+                    "Make a slow zone at 30% around ".to_owned(),
+                ));
+            }
+            if ui
+                .add(ReButton::new("Keep out").small().secondary())
                 .on_hover_text(
                     "Say where the robot must not go: a room, an object, a place, or corners on \
                      the map",
@@ -199,16 +212,23 @@ pub(super) fn zones_view(ui: &mut egui::Ui, zones: &[Zone]) -> Vec<Action> {
         });
     });
     if zones.is_empty() {
-        ui.label(RichText::new("None: the robot may go anywhere on the map.").color(theme::DIM));
+        ui.label(
+            RichText::new("None: the robot may go anywhere on the map, at full speed.")
+                .color(theme::DIM),
+        );
         return actions;
     }
     ui.add_space(6.0);
     for zone in zones {
+        let (colour, kind) = match zone.rule {
+            Rule::KeepOut => (theme::ERROR, "keep-out"),
+            Rule::Slow(_) => (theme::WARN, "slow"),
+        };
         ui.horizontal(|ui| {
             // The swatch is the 3D view's colour for a zone.
             let (swatch, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
             ui.painter()
-                .rect_filled(swatch, CornerRadius::same(2), theme::ERROR);
+                .rect_filled(swatch, CornerRadius::same(2), colour);
             let corners = zone
                 .polygon
                 .iter()
@@ -217,6 +237,10 @@ pub(super) fn zones_view(ui: &mut egui::Ui, zones: &[Zone]) -> Vec<Action> {
                 .join(" ");
             ui.label(RichText::new(&zone.name).size(13.5))
                 .on_hover_text(format!("Corners on the map: {corners}"));
+            if let Rule::Slow(limit) = zone.rule {
+                ui.label(RichText::new(format!("at most {}", limit.words())).color(theme::WARN))
+                    .on_hover_text("Nav2 slows the robot to this inside the zone");
+            }
             ui.label(RichText::new(format!("{:.1} m²", zone.area())).color(theme::DIM));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if zone.fixed {
@@ -232,7 +256,7 @@ pub(super) fn zones_view(ui: &mut egui::Ui, zones: &[Zone]) -> Vec<Action> {
                     .clicked()
                 {
                     actions.push(Action::Say(format!(
-                        "Remove the keep-out zone \"{}\".",
+                        "Remove the {kind} zone \"{}\".",
                         zone.name
                     )));
                 }
