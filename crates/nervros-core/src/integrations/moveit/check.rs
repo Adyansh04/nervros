@@ -9,8 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::srdf::Srdf;
-use super::{Arms, error_words};
+use super::{Arms, Goal, error_words, num, point_constraints};
 use crate::session::Event;
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
@@ -21,20 +20,11 @@ const PLAN_WAIT: Duration = Duration::from_secs(15);
 const DRAWN_POINTS: usize = 12;
 /// A previewed move's speed, as the robot would move it: slow.
 const PREVIEW_SCALING: f64 = 0.2;
-/// How far a reached point may be from the goal, m, and the hand's turn from now, rad.
-const POSITION_TOLERANCE: f64 = 0.01;
-const ORIENTATION_TOLERANCE: f64 = 0.1;
 
 /// The tool.
 pub(super) struct ArmCheck {
     spec: ToolSpec,
     arms: Arc<Arms>,
-}
-
-/// Where a move goes: a named pose, or a point for the arm's tip.
-enum Goal {
-    Pose(String, BTreeMap<String, f64>),
-    Point([f64; 3], String),
 }
 
 impl ArmCheck {
@@ -65,93 +55,12 @@ impl ArmCheck {
         Self { spec, arms }
     }
 
-    /// The point `args` name, in the planning frame.
-    async fn point(&self, args: &Value, planning: &str) -> Result<([f64; 3], String), String> {
-        let map = &self.arms.profile.ros.map_frame;
-        let (at, frame, what) = if let Some(id) = args["object"].as_str().filter(|s| !s.is_empty())
-        {
-            let topic = self
-                .arms
-                .profile
-                .world
-                .as_ref()
-                .and_then(|w| w.objects.clone())
-                .ok_or("this robot has no world model with objects")?;
-            let objects = self
-                .arms
-                .robot
-                .latest(&topic.topic, &topic.msg_type, IK_WAIT)
-                .await
-                .map_err(|e| format!("the world model did not answer: {e}"))?;
-            let found = objects["objects"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|o| o["id"].as_str() == Some(id))
-                .ok_or_else(|| format!("the world model has no object `{id}`"))?;
-            let p = &found["pose"]["position"];
-            let label = found["label"].as_str().unwrap_or(id).to_owned();
-            (
-                [num(&p["x"]), num(&p["y"]), num(&p["z"])],
-                map.clone(),
-                label,
-            )
-        } else {
-            let (Some(x), Some(y), Some(z)) =
-                (args["x"].as_f64(), args["y"].as_f64(), args["z"].as_f64())
-            else {
-                return Err("say where: an object, or x, y and z".to_owned());
-            };
-            let frame = args["frame"].as_str().unwrap_or(map).to_owned();
-            ([x, y, z], frame, format!("({x:.2}, {y:.2}, {z:.2})"))
-        };
-        let t = self
-            .arms
-            .robot
-            .transform(planning, &frame)
-            .map_err(|e| format!("cannot place {frame} in {planning}: {e}"))?;
-        Ok((t.apply(at), what))
-    }
-
-    /// The goal `args` name for the group.
-    async fn goal(
-        &self,
-        args: &Value,
-        srdf: &Srdf,
-        group: &str,
-        planning: &str,
-    ) -> Result<Goal, String> {
-        if let Some(name) = args["pose"].as_str().filter(|s| !s.is_empty()) {
-            let pose = srdf
-                .poses_of(group)
-                .find(|p| p.name == name)
-                .ok_or_else(|| {
-                    let names: Vec<&str> = srdf.poses_of(group).map(|p| p.name.as_str()).collect();
-                    format!("{group} has no pose `{name}`; it has {}", names.join(", "))
-                })?;
-            return Ok(Goal::Pose(pose.name.clone(), pose.joints.clone()));
-        }
-        let (at, what) = self.point(args, planning).await?;
-        Ok(Goal::Point(at, what))
-    }
-
-    /// The hand's orientation now, in the planning frame.
-    fn tip_orientation(&self, planning: &str, tip: &str) -> Value {
-        match self.arms.robot.transform(planning, tip) {
-            Ok(tip_now) => {
-                let [qx, qy, qz, qw] = tip_now.rotation;
-                json!({"x": qx, "y": qy, "z": qz, "w": qw})
-            }
-            Err(_) => json!({"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}),
-        }
-    }
-
     async fn reach(&self, args: &Value) -> ToolOutcome {
-        let (_, group, planning, tip) = match self.parts(args).await {
+        let (_, group, planning, tip) = match self.arms.parts(args).await {
             Ok(p) => p,
             Err(why) => return ToolOutcome::failed(why),
         };
-        let (at, what) = match self.point(args, &planning).await {
+        let (at, what) = match self.arms.point(args, &planning).await {
             Ok(p) => p,
             Err(why) => return ToolOutcome::failed(why),
         };
@@ -165,7 +74,7 @@ impl ArmCheck {
                 "header": {"frame_id": planning},
                 "pose": {
                     "position": {"x": at[0], "y": at[1], "z": at[2]},
-                    "orientation": self.tip_orientation(&planning, &tip),
+                    "orientation": self.arms.tip_orientation(&planning, &tip),
                 },
             },
             "timeout": {"sec": 1, "nanosec": 0},
@@ -200,11 +109,11 @@ impl ArmCheck {
     }
 
     async fn valid(&self, args: &Value) -> ToolOutcome {
-        let (srdf, group, planning, _) = match self.parts(args).await {
+        let (srdf, group, planning, _) = match self.arms.parts(args).await {
             Ok(p) => p,
             Err(why) => return ToolOutcome::failed(why),
         };
-        let Goal::Pose(name, at) = (match self.goal(args, &srdf, &group, &planning).await {
+        let Goal::Pose(name, at) = (match self.arms.goal(args, &srdf, &group, &planning).await {
             Ok(g) => g,
             Err(why) => return ToolOutcome::failed(why),
         }) else {
@@ -253,11 +162,11 @@ impl ArmCheck {
     }
 
     async fn preview(&self, args: &Value) -> ToolOutcome {
-        let (srdf, group, planning, tip) = match self.parts(args).await {
+        let (srdf, group, planning, tip) = match self.arms.parts(args).await {
             Ok(p) => p,
             Err(why) => return ToolOutcome::failed(why),
         };
-        let goal = match self.goal(args, &srdf, &group, &planning).await {
+        let goal = match self.arms.goal(args, &srdf, &group, &planning).await {
             Ok(g) => g,
             Err(why) => return ToolOutcome::failed(why),
         };
@@ -271,7 +180,12 @@ impl ArmCheck {
                 format!("`{name}`"),
             ),
             Goal::Point(at, what) => (
-                point_constraints(&planning, &tip, *at, &self.tip_orientation(&planning, &tip)),
+                point_constraints(
+                    &planning,
+                    &tip,
+                    *at,
+                    &self.arms.tip_orientation(&planning, &tip),
+                ),
                 what.clone(),
             ),
         };
@@ -389,19 +303,6 @@ impl ArmCheck {
         });
         true
     }
-
-    /// The SRDF, the group `args` name, the planning frame and the group's tip link.
-    async fn parts(&self, args: &Value) -> Result<(Arc<Srdf>, String, String, String), String> {
-        let srdf = self.arms.srdf().await?;
-        let group = Arms::group_named(&srdf, args["group"].as_str().unwrap_or_default())?
-            .name
-            .clone();
-        let planning = self.arms.planning_frame(&srdf)?;
-        let tip = srdf
-            .tip(&group)
-            .ok_or_else(|| format!("the SRDF gives {group} no tip link"))?;
-        Ok((srdf, group, planning, tip))
-    }
 }
 
 #[async_trait]
@@ -424,29 +325,6 @@ impl Tool for ArmCheck {
 
 /// Goal constraints for the tip at a point, held as it is now: a small sphere for the position,
 /// and the orientation within a tolerance.
-fn point_constraints(planning: &str, tip: &str, at: [f64; 3], orientation: &Value) -> Value {
-    json!({
-        "position_constraints": [{
-            "header": {"frame_id": planning},
-            "link_name": tip,
-            "constraint_region": {
-                "primitives": [{"type": 2, "dimensions": [POSITION_TOLERANCE]}],
-                "primitive_poses": [{"position": {"x": at[0], "y": at[1], "z": at[2]}, "orientation": {"w": 1.0}}],
-            },
-            "weight": 1.0,
-        }],
-        "orientation_constraints": [{
-            "header": {"frame_id": planning},
-            "link_name": tip,
-            "orientation": orientation,
-            "absolute_x_axis_tolerance": ORIENTATION_TOLERANCE,
-            "absolute_y_axis_tolerance": ORIENTATION_TOLERANCE,
-            "absolute_z_axis_tolerance": ORIENTATION_TOLERANCE,
-            "weight": 1.0,
-        }],
-    })
-}
-
 /// How far the joints a solution names would move from where they are now, summed, rad.
 fn travel(now: &BTreeMap<String, f64>, solved: &Value) -> f64 {
     let names = solved["name"].as_array().cloned().unwrap_or_default();
@@ -463,10 +341,6 @@ fn travel(now: &BTreeMap<String, f64>, solved: &Value) -> f64 {
 
 fn secs(d: &Value) -> f64 {
     num(&d["sec"]) + num(&d["nanosec"]) / 1e9
-}
-
-fn num(v: &Value) -> f64 {
-    v.as_f64().unwrap_or(0.0)
 }
 
 #[cfg(test)]

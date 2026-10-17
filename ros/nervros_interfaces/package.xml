@@ -17,6 +17,7 @@
   <depend>builtin_interfaces</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>unique_identifier_msgs</depend>
   <!-- Requires action_msgs to build. -->
   <depend>action_msgs</depend>
 

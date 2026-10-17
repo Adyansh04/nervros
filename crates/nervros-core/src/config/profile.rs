@@ -306,6 +306,11 @@ pub struct RosConfig {
     /// The fixed frame places and poses are in.
     #[serde(default = "default_map_frame")]
     pub map_frame: String,
+    /// Where NervROS keeps the action goals its own motions have open, as
+    /// `nervros_interfaces/msg/OpenGoals`, latched and sent twice a second while any is open: a
+    /// watchdog on the robot cancels them when it goes quiet.
+    #[serde(default)]
+    pub open_goals: Option<String>,
     /// The robot's base frame.
     #[serde(default = "default_base_frame")]
     pub base_frame: String,
@@ -329,6 +334,7 @@ impl Default for RosConfig {
             interfaces: Vec::new(),
             remap: std::collections::BTreeMap::new(),
             map_frame: default_map_frame(),
+            open_goals: None,
             base_frame: default_base_frame(),
         }
     }
@@ -537,6 +543,9 @@ pub struct MissionConfig {
     /// The skills whose arguments a plan is checked against the operator's words with.
     #[serde(default)]
     pub checks: PlanChecks,
+    /// `LendResources` service: the executor lends the arms it holds to the arm moves NervROS
+    /// runs itself, and takes them back after.
+    pub lend: Option<String>,
 }
 
 /// The executor's skills the plan checks know: names, units and signs are the robot's own, so

@@ -11,6 +11,7 @@ pub mod advice;
 pub mod camera;
 pub mod catalog;
 pub mod check;
+pub(crate) mod composite;
 pub mod digest;
 pub mod goals;
 pub mod history;
@@ -315,6 +316,11 @@ pub struct Missions {
     inbox: OnceLock<Arc<inbox::Inbox>>,
 }
 
+/// Who this agent is to the robot, in its heartbeat and when it borrows the arms.
+pub(crate) fn client_id() -> String {
+    format!("nervros {}", std::process::id())
+}
+
 impl crate::session::Pulse for Missions {
     fn pulse(&self) {
         if let Some(publisher) = lock(&self.heartbeat).as_ref() {
@@ -345,8 +351,30 @@ impl Missions {
         places: Arc<crate::places::Places>,
         robot: Arc<dyn RobotPort>,
     ) -> Option<Arc<Self>> {
-        let config = profile.mission.clone()?;
-        Some(Arc::new(Self {
+        Some(Self::with_config(
+            profile,
+            profile.mission.clone()?,
+            places,
+            robot,
+        ))
+    }
+
+    /// The executor's names: the composite executor's when the robot's stacks run motions.
+    #[must_use]
+    pub fn config(&self) -> &MissionConfig {
+        &self.config
+    }
+
+    /// Over the executor `config` names, reached through `robot`: the composite executor when the
+    /// robot's stacks run motions of their own.
+    #[must_use]
+    pub fn with_config(
+        profile: &Profile,
+        config: MissionConfig,
+        places: Arc<crate::places::Places>,
+        robot: Arc<dyn RobotPort>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             robot,
             places,
             profile: profile.clone(),
@@ -361,7 +389,7 @@ impl Missions {
             last: Mutex::default(),
             session: OnceLock::new(),
             heartbeat: Mutex::default(),
-            client: format!("nervros {}", std::process::id()),
+            client: client_id(),
             ledger: OnceLock::new(),
             request: Mutex::default(),
             critic: OnceLock::new(),
@@ -373,7 +401,7 @@ impl Missions {
             drafts: learn::Drafts::default(),
             goals: OnceLock::new(),
             inbox: OnceLock::new(),
-        }))
+        })
     }
 
     /// Keeps finished missions in `ledger` from now on.

@@ -7,7 +7,9 @@
 //! disturb a motion the robot's executor runs.
 
 mod check;
+mod motion;
 mod scene;
+mod settings;
 pub(crate) mod srdf;
 mod status;
 
@@ -20,7 +22,7 @@ use nervros_ros::RobotPort;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Integration, Parts, get_params, resolve};
+use super::{Goals, Integration, NativeSkill, Parts, get_params, resolve};
 use crate::doctor::Check;
 use crate::profile::Profile;
 use crate::tools::Tool;
@@ -42,6 +44,20 @@ pub struct MoveItConfig {
     /// The `sensor_msgs/msg/JointState` topic with the arms' joints.
     #[serde(default = "default_joint_states")]
     pub joint_states: String,
+    /// The share of the arms' top speed NervROS's own arm moves start at.
+    #[serde(default = "default_scaling")]
+    pub scaling: f64,
+    /// The most the operator may raise that share to.
+    #[serde(default = "default_max_scaling")]
+    pub max_scaling: f64,
+}
+
+fn default_scaling() -> f64 {
+    0.2
+}
+
+fn default_max_scaling() -> f64 {
+    0.5
 }
 
 impl Default for MoveItConfig {
@@ -50,6 +66,8 @@ impl Default for MoveItConfig {
             move_group: default_move_group(),
             planning_frame: None,
             joint_states: default_joint_states(),
+            scaling: default_scaling(),
+            max_scaling: default_max_scaling(),
         }
     }
 }
@@ -79,6 +97,9 @@ pub(crate) struct Arms {
     robot: Arc<dyn RobotPort>,
     srdf: Mutex<Option<Arc<Srdf>>>,
     session: OnceLock<crate::session::SessionHandle>,
+    settings: Mutex<settings::Settings>,
+    /// Where the settings are kept, if anywhere.
+    settings_file: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for Arms {
@@ -90,6 +111,29 @@ impl std::fmt::Debug for Arms {
 }
 
 impl Arms {
+    /// The settings NervROS's own arm moves use now.
+    pub(crate) fn settings(&self) -> settings::Settings {
+        crate::lock(&self.settings).clone()
+    }
+
+    /// Changes the settings and keeps them.
+    pub(crate) fn change(&self, f: impl FnOnce(&mut settings::Settings)) {
+        let now = {
+            let mut s = crate::lock(&self.settings);
+            f(&mut s);
+            s.clone()
+        };
+        let Some(file) = &self.settings_file else {
+            return;
+        };
+        if let Err(e) = serde_json::to_vec_pretty(&now)
+            .map_err(|e| e.to_string())
+            .and_then(|text| crate::persist::write_atomic(file, &text).map_err(|e| e.to_string()))
+        {
+            tracing::warn!(error = %e, "the arm settings were not kept");
+        }
+    }
+
     /// The SRDF, read from `move_group` the first time it is asked for.
     pub(crate) async fn srdf(&self) -> Result<Arc<Srdf>, String> {
         if let Some(s) = crate::lock(&self.srdf).clone() {
@@ -152,6 +196,117 @@ impl Arms {
         })
     }
 
+    /// The point `args` name, in the planning frame.
+    pub(crate) async fn point(
+        &self,
+        args: &Value,
+        planning: &str,
+    ) -> Result<([f64; 3], String), String> {
+        let map = &self.profile.ros.map_frame;
+        let (at, frame, what) = if let Some(id) = args["object"].as_str().filter(|s| !s.is_empty())
+        {
+            let topic = self
+                .profile
+                .world
+                .as_ref()
+                .and_then(|w| w.objects.clone())
+                .ok_or("this robot has no world model with objects")?;
+            let objects = self
+                .robot
+                .latest(&topic.topic, &topic.msg_type, READ_WAIT)
+                .await
+                .map_err(|e| format!("the world model did not answer: {e}"))?;
+            let found = objects["objects"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|o| o["id"].as_str() == Some(id))
+                .ok_or_else(|| format!("the world model has no object `{id}`"))?;
+            let p = &found["pose"]["position"];
+            let label = found["label"].as_str().unwrap_or(id).to_owned();
+            (
+                [num(&p["x"]), num(&p["y"]), num(&p["z"])],
+                map.clone(),
+                label,
+            )
+        } else {
+            let (Some(x), Some(y), Some(z)) =
+                (args["x"].as_f64(), args["y"].as_f64(), args["z"].as_f64())
+            else {
+                return Err("say where: an object, or x, y and z".to_owned());
+            };
+            let frame = args["frame"].as_str().unwrap_or(map).to_owned();
+            ([x, y, z], frame, format!("({x:.2}, {y:.2}, {z:.2})"))
+        };
+        let t = self
+            .robot
+            .transform(planning, &frame)
+            .map_err(|e| format!("cannot place {frame} in {planning}: {e}"))?;
+        Ok((t.apply(at), what))
+    }
+
+    /// The goal `args` name for the group.
+    pub(crate) async fn goal(
+        &self,
+        args: &Value,
+        srdf: &Srdf,
+        group: &str,
+        planning: &str,
+    ) -> Result<Goal, String> {
+        if let Some(name) = args["pose"].as_str().filter(|s| !s.is_empty()) {
+            if let Some(pose) = srdf.poses_of(group).find(|p| p.name == name) {
+                return Ok(Goal::Pose(pose.name.clone(), pose.joints.clone()));
+            }
+            let kept = self
+                .settings()
+                .poses
+                .get(group)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(joints) = kept.get(name) {
+                return Ok(Goal::Pose(name.to_owned(), joints.clone()));
+            }
+            let names: Vec<&str> = srdf
+                .poses_of(group)
+                .map(|p| p.name.as_str())
+                .chain(kept.keys().map(String::as_str))
+                .collect();
+            return Err(format!(
+                "{group} has no pose `{name}`; it has {}",
+                names.join(", ")
+            ));
+        }
+        let (at, what) = self.point(args, planning).await?;
+        Ok(Goal::Point(at, what))
+    }
+
+    /// The hand's orientation now, in the planning frame.
+    pub(crate) fn tip_orientation(&self, planning: &str, tip: &str) -> Value {
+        match self.robot.transform(planning, tip) {
+            Ok(tip_now) => {
+                let [qx, qy, qz, qw] = tip_now.rotation;
+                json!({"x": qx, "y": qy, "z": qz, "w": qw})
+            }
+            Err(_) => json!({"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}),
+        }
+    }
+
+    /// The SRDF, the group `args` name, the planning frame and the group's tip link.
+    pub(crate) async fn parts(
+        &self,
+        args: &Value,
+    ) -> Result<(Arc<Srdf>, String, String, String), String> {
+        let srdf = self.srdf().await?;
+        let group = Arms::group_named(&srdf, args["group"].as_str().unwrap_or_default())?
+            .name
+            .clone();
+        let planning = self.planning_frame(&srdf)?;
+        let tip = srdf
+            .tip(&group)
+            .ok_or_else(|| format!("the SRDF gives {group} no tip link"))?;
+        Ok((srdf, group, planning, tip))
+    }
+
     /// The group an operator's name means: `right_arm`, or `right` for the one arm group with it.
     pub(crate) fn group_named<'s>(srdf: &'s Srdf, wanted: &str) -> Result<&'s srdf::Group, String> {
         let wanted = wanted.trim();
@@ -172,6 +327,49 @@ impl Arms {
                 )
             })
     }
+}
+
+/// Where a move goes: a named pose, or a point for the arm's tip.
+pub(crate) enum Goal {
+    Pose(String, BTreeMap<String, f64>),
+    Point([f64; 3], String),
+}
+
+/// How far a reached point may be from the goal, m, and the hand's turn from now, rad.
+const POSITION_TOLERANCE: f64 = 0.01;
+const ORIENTATION_TOLERANCE: f64 = 0.1;
+
+/// Constraints that put `tip` at `at` in `planning`, turned as `orientation`.
+pub(crate) fn point_constraints(
+    planning: &str,
+    tip: &str,
+    at: [f64; 3],
+    orientation: &Value,
+) -> Value {
+    json!({
+        "position_constraints": [{
+            "header": {"frame_id": planning},
+            "link_name": tip,
+            "constraint_region": {
+                "primitives": [{"type": 2, "dimensions": [POSITION_TOLERANCE]}],
+                "primitive_poses": [{"position": {"x": at[0], "y": at[1], "z": at[2]}, "orientation": {"w": 1.0}}],
+            },
+            "weight": 1.0,
+        }],
+        "orientation_constraints": [{
+            "header": {"frame_id": planning},
+            "link_name": tip,
+            "orientation": orientation,
+            "absolute_x_axis_tolerance": ORIENTATION_TOLERANCE,
+            "absolute_y_axis_tolerance": ORIENTATION_TOLERANCE,
+            "absolute_z_axis_tolerance": ORIENTATION_TOLERANCE,
+            "weight": 1.0,
+        }],
+    })
+}
+
+pub(crate) fn num(v: &Value) -> f64 {
+    v.as_f64().unwrap_or(0.0)
 }
 
 /// MoveIt's error codes in words.
@@ -202,6 +400,7 @@ pub struct MoveIt {
     arms: Arc<Arms>,
     watcher: Arc<status::Watcher>,
     tools: Vec<Arc<dyn Tool>>,
+    natives: Vec<Arc<dyn NativeSkill>>,
 }
 
 impl std::fmt::Debug for MoveIt {
@@ -214,24 +413,41 @@ impl std::fmt::Debug for MoveIt {
 
 impl MoveIt {
     /// The integration over the robot's `move_group`.
-    pub(crate) fn start(config: &MoveItConfig, parts: &Parts<'_>) -> Arc<Self> {
+    pub(crate) fn start(config: &MoveItConfig, parts: &Parts<'_>, goals: &Arc<Goals>) -> Arc<Self> {
+        let settings_file = parts.file("arm_settings");
+        let mut kept: settings::Settings = settings_file
+            .as_deref()
+            .map(crate::persist::read_or_default)
+            .unwrap_or_default();
+        if !settings_file
+            .as_deref()
+            .is_some_and(std::path::Path::exists)
+        {
+            kept.scaling = config.scaling;
+        }
+        kept.scaling = kept.scaling.min(config.max_scaling);
         let arms = Arc::new(Arms {
             config: config.clone(),
             profile: parts.profile.clone(),
             robot: Arc::clone(parts.robot),
             srdf: Mutex::new(None),
             session: OnceLock::new(),
+            settings: Mutex::new(kept),
+            settings_file,
         });
         let watcher = status::Watcher::start(Arc::clone(&arms));
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(status::ArmStatus::new(Arc::clone(&arms))),
             Arc::new(check::ArmCheck::new(Arc::clone(&arms))),
             scene::Scene::new(Arc::clone(&arms), parts.file("planning_scene")),
+            Arc::new(settings::ArmSettings::new(Arc::clone(&arms))),
         ];
+        let natives = motion::Motions::natives(&arms, goals);
         Arc::new(Self {
             arms,
             watcher,
             tools,
+            natives,
         })
     }
 }
@@ -252,6 +468,14 @@ impl Integration for MoveIt {
 
     fn attach(&self, session: &crate::session::SessionHandle) {
         let _ = self.arms.session.set(session.clone());
+    }
+
+    fn natives(&self) -> Vec<Arc<dyn NativeSkill>> {
+        self.natives.clone()
+    }
+
+    fn procedures(&self) -> &'static [&'static str] {
+        &[include_str!("moveit/procedures/arm-cannot-reach.md")]
     }
 
     async fn stop(&self) {

@@ -18,3 +18,5 @@ grove-g1's `g1_orchestration`.
 | `PreviewMission` | service | Where each step of a tree would leave the robot and the path there, without running it; one `StepPreview` per step |
 | `Teleop` | service | Hand the base to the operator for driving by hand, or take it back |
 | `Heartbeat` | message | The agent's heartbeat while a mission runs, for the executor's deadman |
+| `LendResources` | service | Lend the arms (or the base) the executor holds to the agent for a motion it runs itself through MoveIt or Nav2, and take them back; refused while busy, and taken back on a heartbeat loss, StopAll or the time limit |
+| `OpenGoals` | message | The action goals the agent's own motions have open, for `nervros_watchdog` to cancel if the agent goes quiet |

@@ -6,7 +6,7 @@
 //! table does, leaves the pose unknown until the next walk to a place, and a straight walk from an
 //! unknown pose is left to Nav2's keepout filter, which stops it at the zone's edge.
 
-use super::catalog::{Catalog, GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET};
+use super::catalog::{Catalog, GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, WALK_ROUTE};
 use super::plan::{PlannedStep, Problem, World, arg};
 use crate::profile::PlanChecks;
 use crate::zones::Zones;
@@ -51,6 +51,52 @@ fn destination(step: &PlannedStep, world: &World) -> Option<Pose> {
         .chain(&world.objects)
         .find(|t| t.id == target)?;
     thing.xy.map(|(x, y)| (x, y, None))
+}
+
+/// Where a route ends, each place it passes checked against the zones.
+fn route(
+    step: &PlannedStep,
+    world: &World,
+    zones: &Zones,
+    problems: &mut Vec<Problem>,
+) -> Option<Pose> {
+    let mut pose = None;
+    let names = arg(&step.args, "places").unwrap_or_default();
+    for name in names
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        pose = waypoint(name, world);
+        if let Some((x, y, _)) = pose
+            && let Some(zone) = zones.at(x, y)
+        {
+            problems.push(Problem::new(
+                &step.id,
+                "places",
+                format!(
+                    "{} passes through `{name}`, inside the keep-out zone `{}`: leave it out, or \
+                     ask the operator to remove the zone",
+                    step.summary, zone.name
+                ),
+            ));
+        }
+    }
+    pose
+}
+
+/// Where a route passes `name`: a place, or a room's centre.
+fn waypoint(name: &str, world: &World) -> Option<Pose> {
+    let same = |a: &str| crate::places::same_words(a, name);
+    let place = world
+        .places
+        .iter()
+        .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)));
+    if let Some(p) = place {
+        return Some((p.pose.x, p.pose.y, Some(p.pose.yaw)));
+    }
+    let room = world.rooms.iter().find(|r| r.id == name || same(&r.name))?;
+    room.xy.map(|(x, y)| (x, y, None))
 }
 
 /// Every step of `steps` that would take the robot into a zone, from `start` (x, y, heading).
@@ -101,6 +147,10 @@ pub(crate) fn check(
                     ),
                 ));
             }
+            continue;
+        }
+        if step.skill == WALK_ROUTE {
+            pose = route(step, world, zones, &mut problems);
             continue;
         }
         if let Some(walk) = checks.walk.as_ref().filter(|w| w.skill == step.skill) {
@@ -241,6 +291,32 @@ mod tests {
 
     fn catalog() -> Catalog {
         serde_json::from_value(serde_json::json!({"catalog_version": "t", "skills": []})).unwrap()
+    }
+
+    #[test]
+    fn a_route_through_a_place_in_a_zone_is_refused() {
+        let mut world = world();
+        world.places.push(PlaceConfig {
+            name: "landing".into(),
+            aliases: Vec::new(),
+            frame: "map".into(),
+            pose: PlacePose {
+                x: 2.5,
+                y: 0.0,
+                yaw: 0.0,
+            },
+            near: Vec::new(),
+        });
+        let route = [step("s1", WALK_ROUTE, &[("places", "dock, landing")], None)];
+        let problems = check(&route, None, &world, &catalog(), &checks(), &zones());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0]
+                .message
+                .contains("`landing`, inside the keep-out zone `stairs`")
+        );
+        let fine = [step("s1", WALK_ROUTE, &[("places", "dock")], None)];
+        assert!(check(&fine, None, &world, &catalog(), &checks(), &zones()).is_empty());
     }
 
     #[test]

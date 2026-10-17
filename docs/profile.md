@@ -96,6 +96,7 @@ that never came up.
 | `remap` | none | Path prefixes to rewrite, for an install tree whose links point at another machine's paths. |
 | `map_frame` | `map` | The frame of places and poses. |
 | `base_frame` | `base_footprint` | The robot's base. |
+| `open_goals` | none | Where NervROS keeps the action goals of the motions it runs itself, as `nervros_interfaces/msg/OpenGoals`, latched and sent twice a second while any is open, for [`nervros_watchdog`](../ros/nervros_watchdog/README.md) on the robot to cancel if NervROS goes quiet. |
 
 ### `[privacy]`
 
@@ -355,7 +356,8 @@ furnished room buries the map in them; hovering a box names it either way.
 ### `[mission]`
 
 The robot's mission executor, which runs behaviour trees; see
-[the executor contract](executor.md). With this section the agent gets `run_mission`. It checks a
+[the executor contract](executor.md). A robot with `[nav2]` or `[moveit]` and no executor still
+gets missions, of the motions NervROS runs itself ([integrations](integrations.md#native-steps)). With this section the agent gets `run_mission`. It checks a
 plan, shows it, and runs it once the operator approves, so the operator approves once, in the app,
 and the agent never asks first in the chat. `check_only` only checks a plan.
 
@@ -376,6 +378,7 @@ and the agent never asks first in the chat. `check_only` only checks a plan.
 | `teleop_speed` | `[0.5, 0.3, 0.8]` | Full hand-driving speed forward and sideways (m/s) and turning (rad/s); Slow in the Robot tab halves it. |
 | `define_skill`, `forget_skill` | none | The `DefineSkill` and `ForgetSkill` services: with both, the agent gets `teach_skill` and teaches the robot skills from the executor's learnable leaves; see [the executor contract](executor.md#taught-skills). |
 | `checks` | none | The skills the plan checks know; see below. |
+| `lend` | none | The `LendResources` service: an executor that holds the arms lends them for an arm move NervROS runs itself through MoveIt, and takes them back after; see [integrations](integrations.md#native-steps). |
 
 Before a plan reaches the operator, it is checked against their words: a left turn planned as a
 right one, a walk the wrong way or of another length, the other hand. Such a plan goes back to the
@@ -530,6 +533,13 @@ info = "/speed_filter_info"             # optional: NervROS publishes the filter
 | `lifecycle_manager` | `lifecycle_manager_navigation` | The lifecycle manager of the navigation servers: `is_active` for the status, `manage_nodes` for `nav_admin`. |
 | `collision_monitor` | `collision_monitor` | The collision monitor node. |
 | `costmaps` | `["global_costmap/global_costmap", "local_costmap/local_costmap"]` | The costmap nodes, whose clear and cost services `nav_admin` and `nav_check` call. |
+| `drive_speed_mps` | `0.25` | How fast a straight walk NervROS runs itself goes. |
+| `docking` | `false` | Whether the robot runs Nav2's docking server: then missions may dock and undock. |
+
+Missions also get Nav2's motions as steps NervROS runs itself, where the robot's executor has no
+skill of the name: `GoToPose`, `GoToTarget` (with a world model), `WalkRoute`, `TurnInPlace`,
+`WalkStraight`, `Wait`, and `Dock` and `Undock` with `docking`; see
+[integrations](integrations.md#native-steps).
 
 `nervros-cli doctor` says whether Nav2's navigation server is up and whether a costmap filter reads
 each mask.
@@ -543,18 +553,26 @@ its shape from a topic stops nothing until a shape arrives.
 
 ### `[moveit]`
 
-MoveIt, when the robot runs it. The section gives the agent `arm_status`, `arm_check` and `scene`
-(see [Builtin tools](#builtin-tools)), a line on where each arm is and what MoveIt's planning scene
-holds in every turn, and an arm preview drawn in the 3D view. Stop also tells MoveIt to stop any
-trajectory it runs; the hands keep their grip. NervROS reads the groups, end effectors and named
-poses from `move_group`'s `robot_description_semantic`, and asks MoveIt's services, never its move
-action, so nothing it asks disturbs a motion the robot's executor runs.
+MoveIt, when the robot runs it. The section gives the agent `arm_status`, `arm_check`, `scene` and
+`arm_settings` (see [Builtin tools](#builtin-tools)), a line on where each arm is and what MoveIt's
+planning scene holds in every turn, and an arm preview drawn in the 3D view. Stop also tells MoveIt
+to stop any trajectory it runs; the hands keep their grip. NervROS reads the groups, end effectors
+and named poses from `move_group`'s `robot_description_semantic`. Its tools ask MoveIt's services,
+never its move action, so nothing they ask disturbs a motion the robot's executor runs; only a
+mission step moves an arm.
+
+Missions also get MoveIt's motions as steps NervROS runs itself, where the robot's executor has no
+skill of the name: `ArmTo` (a named or remembered pose), `HandTo` (just above an object, or a
+point), `HandLine` (a short straight hand move) and `Grip` (a hand's named state; never opening a
+hand that holds something). See [integrations](integrations.md#native-steps).
 
 | Key | Default | |
 |---|---|---|
 | `move_group` | `/move_group` | The `move_group` node; its services sit beside it, as MoveIt names them. |
 | `planning_frame` | the SRDF's virtual joint | The frame MoveIt plans in, its robot model's root, such as `pelvis`. |
 | `joint_states` | `/joint_states` | The `sensor_msgs/msg/JointState` topic with the arms' joints. |
+| `scaling` | `0.2` | The share of the arms' top speed NervROS's own arm moves start at; `arm_settings` changes it. |
+| `max_scaling` | `0.5` | The most `arm_settings` may raise it to. |
 
 `nervros-cli doctor` says whether it runs. The host needs `ros-jazzy-moveit-msgs` to build NervROS
 with MoveIt's messages.
@@ -702,6 +720,7 @@ The rest are the checks you would run yourself before blaming the model:
 | `arm_status` | With `[moveit]`: each arm group, its named poses and the one it is at, each hand and its poses, MoveIt's planners, and the obstacles in its planning scene and what each hand holds. |
 | `arm_check` | With `[moveit]`: whether an arm's hand reaches an object or a point, held as it is now (IK); whether a named pose is clear of collisions now; and the path an arm would take to a named pose, an object or a point, and how long it takes, drawn in the 3D view. Nothing moves. |
 | `scene` | With `[moveit]`: lists MoveIt's planning scene; adds an obstacle (a box, a cylinder or a sphere on the map, or an object of the world model by its box), free; removes one NervROS added, attaches an object to a hand or detaches it, and clears the octomap, each asking the operator. |
+| `arm_settings` | With `[moveit]`: how the arm moves NervROS runs itself go: their speed (slower is free, faster asks, up to `max_scaling`), the planning pipeline, planner and time (asks), and arm poses remembered by name from where an arm is now, for `ArmTo` and `arm_check`. |
 
 `look` can also answer about an earlier snapshot, and look closer at one mark: it crops the mark
 from the full frame at a higher resolution for the vision model, for a label or a small part.

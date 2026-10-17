@@ -8,6 +8,7 @@ mod check;
 pub(crate) mod goals;
 mod masks;
 mod monitor;
+mod motion;
 mod status;
 
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use async_trait::async_trait;
 use nervros_ros::RobotPort;
 use serde::Deserialize;
 
-use super::{Integration, Parts, has_action, resolve};
+use super::{Goals, Integration, NativeSkill, Parts, has_action, resolve};
 use crate::doctor::Check;
 use crate::tools::Tool;
 
@@ -43,6 +44,16 @@ pub struct Nav2Config {
     /// The costmaps, by the name their nodes run under: their clear services hang off these.
     #[serde(default = "default_costmaps")]
     pub costmaps: Vec<String>,
+    /// How fast a straight walk NervROS runs goes, m/s.
+    #[serde(default = "default_drive_speed")]
+    pub drive_speed_mps: f64,
+    /// Whether the robot runs Nav2's docking server, for docking and undocking steps.
+    #[serde(default)]
+    pub docking: bool,
+}
+
+fn default_drive_speed() -> f64 {
+    0.25
 }
 
 fn default_lifecycle_manager() -> String {
@@ -69,6 +80,8 @@ impl Default for Nav2Config {
             lifecycle_manager: default_lifecycle_manager(),
             collision_monitor: default_collision_monitor(),
             costmaps: default_costmaps(),
+            drive_speed_mps: default_drive_speed(),
+            docking: false,
         }
     }
 }
@@ -104,6 +117,8 @@ impl Nav2Config {
 pub struct Nav2 {
     watcher: Arc<status::Watcher>,
     tools: Vec<Arc<dyn Tool>>,
+    natives: Vec<Arc<dyn NativeSkill>>,
+    goals: Arc<Goals>,
 }
 
 impl std::fmt::Debug for Nav2 {
@@ -116,7 +131,7 @@ impl std::fmt::Debug for Nav2 {
 
 impl Nav2 {
     /// Starts publishing what Nav2 reads of the zones.
-    pub(crate) fn start(config: &Nav2Config, parts: &Parts<'_>) -> Arc<Self> {
+    pub(crate) fn start(config: &Nav2Config, parts: &Parts<'_>, goals: &Arc<Goals>) -> Arc<Self> {
         let robot = || Arc::clone(parts.robot);
         let map = parts.profile.world.as_ref().and_then(|w| w.map.clone());
         if let (Some(topic), Some(map)) = (config.keepout_mask.clone(), map.clone()) {
@@ -158,7 +173,18 @@ impl Nav2 {
                 Arc::clone(parts.places),
             )),
         ];
-        Arc::new(Self { watcher, tools })
+        let natives = motion::Motions::natives(
+            config,
+            parts.profile,
+            (robot(), Arc::clone(parts.places), goals),
+        );
+        let goals = Arc::clone(goals);
+        Arc::new(Self {
+            watcher,
+            tools,
+            natives,
+            goals,
+        })
     }
 }
 
@@ -176,7 +202,20 @@ impl Integration for Nav2 {
         self.watcher.seen().line()
     }
 
-    async fn stop(&self) {}
+    fn natives(&self) -> Vec<Arc<dyn NativeSkill>> {
+        self.natives.clone()
+    }
+
+    fn procedures(&self) -> &'static [&'static str] {
+        &[
+            include_str!("nav2/procedures/robot-held-back.md"),
+            include_str!("nav2/procedures/no-path-there.md"),
+        ]
+    }
+
+    async fn stop(&self) {
+        self.goals.cancel_all().await;
+    }
 }
 
 /// What of Nav2 runs, and whether its keepout filter reads the mask.

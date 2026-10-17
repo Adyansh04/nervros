@@ -17,7 +17,8 @@ set +u
 # shellcheck source=/dev/null
 source "${ROS_SETUP}"
 set -u
+# The watchdog runs on the robot, not beside the agent: only the interfaces are built here.
 colcon --log-base "${OVERLAY}/log" build \
-    --base-paths "${ROOT}/ros" "$@" \
+    --base-paths "${ROOT}/ros" "$@" --packages-skip nervros_watchdog \
     --build-base "${OVERLAY}/build" --install-base "${OVERLAY}/install" \
     --parallel-workers 2 --event-handlers console_cohesion- summary+

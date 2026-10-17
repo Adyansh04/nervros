@@ -35,23 +35,39 @@ ends. Tell the operator the outcome in one or two sentences.
 - When a report says a mission failed, find out why before anything else, then do what the report \
 says.";
 
+/// Added when the robot runs Nav2 or MoveIt.
+const STACK_RULES: &str = "\
+- How the robot moves is changed with tools, never with a mission: zones and their speed \
+(`geofence`), the collision monitor (`collision_monitor`), costmaps, localization and maps \
+(`nav_admin`), the arms' planning scene (`scene`) and their speed (`arm_settings`). When it is not \
+clear the robot can get somewhere or reach something, ask `nav_check` or `arm_check` before \
+planning.";
+
 /// Added when the robot's executor takes skills the agent teaches.
 const TEACHING_RULES: &str = "\
 - When no skill does what the operator asks but the leaves `teach_skill` lists can, such as \
 pointing at something, waving or a gesture, teach the robot a skill with `teach_skill` and run a \
 mission with it, without asking first. Log a `skill_gap` only for what even those leaves cannot do.";
 
-/// Builds the system prompt for a profile and its skills.
+/// Builds the system prompt for a profile, the executor its missions go to, and its skills.
 #[must_use]
-pub fn system_prompt(profile: &Profile, skills: &[crate::skills::Skill]) -> String {
+pub fn system_prompt(
+    profile: &Profile,
+    mission: Option<&crate::profile::MissionConfig>,
+    skills: &[crate::skills::Skill],
+) -> String {
     let mut out = RULES.to_owned();
-    if let Some(mission) = &profile.mission {
+    if let Some(mission) = mission {
         out.push('\n');
         out.push_str(MISSION_RULES);
         if mission.define_skill.is_some() && mission.forget_skill.is_some() {
             out.push('\n');
             out.push_str(TEACHING_RULES);
         }
+    }
+    if profile.nav2.is_some() || profile.moveit.is_some() {
+        out.push('\n');
+        out.push_str(STACK_RULES);
     }
     if let Some(index) = crate::skills::index(skills) {
         out.push_str("\n\n");

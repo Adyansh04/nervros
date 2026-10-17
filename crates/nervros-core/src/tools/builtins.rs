@@ -273,11 +273,12 @@ pub struct Stop {
 }
 
 impl Stop {
-    /// From the profile, over the integrations whose goals it cancels too.
+    /// Through `robot` to the executor `mission` names, if any, over the integrations whose goals
+    /// it cancels too.
     #[must_use]
     pub fn new(
-        profile: &Profile,
         robot: Arc<dyn RobotPort>,
+        mission: Option<MissionConfig>,
         integrations: Arc<crate::integrations::Integrations>,
     ) -> Self {
         let spec = ToolSpec::new(
@@ -293,7 +294,7 @@ impl Stop {
         Self {
             spec,
             robot,
-            mission: profile.mission.clone(),
+            mission,
             integrations,
         }
     }
@@ -446,7 +447,7 @@ mod tests {
             Ok(json!({"ok": true, "state_after": "holding posture"}))
         }));
         let port: Arc<dyn RobotPort> = Arc::clone(&robot) as Arc<dyn RobotPort>;
-        let out = Stop::new(&profile(), port, Arc::default())
+        let out = Stop::new(port, profile().mission, Arc::default())
             .call(json!({"reason": "user"}))
             .await;
         assert_eq!(out.data["stopped"], true);

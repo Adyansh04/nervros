@@ -67,7 +67,7 @@ fn read(file: &Path) -> Result<Skill, String> {
 }
 
 /// A `SKILL.md`: its front matter's `name` and `description`, then the procedure.
-fn parse(text: &str) -> Result<Skill, String> {
+pub(crate) fn parse(text: &str) -> Result<Skill, String> {
     let rest = text
         .strip_prefix("---")
         .ok_or("it starts without its front matter (---)")?;

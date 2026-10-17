@@ -11,6 +11,8 @@ pub const GO_TO_POSE: &str = "GoToPose";
 pub const GO_TO_TARGET: &str = "GoToTarget";
 /// The skill plans use to move the base.
 pub const GO_TO_PLACE: &str = "GoToPlace";
+/// Walks through places in turn without stopping at each, as Nav2 runs it for NervROS.
+pub const WALK_ROUTE: &str = "WalkRoute";
 /// The skill that looks for something with the detector, and says what it calls it.
 pub const FIND_IN_VIEW: &str = "FindInView";
 

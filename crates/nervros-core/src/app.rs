@@ -385,15 +385,19 @@ fn place_tools(
     Ok(places)
 }
 
+/// What runs missions: the port missions go through and its `[mission]` config. With native
+/// motions it is the composite executor, the robot's executor (if any) and the natives together.
+type MissionPort = (Arc<dyn RobotPort>, Option<crate::profile::MissionConfig>);
+
 /// The zones, the profile's and the operator's, kept beside the places: the guard checks every
 /// pose goal and plan against them. And the robot's stacks, Nav2's and MoveIt's, which read them
-/// too, with their tools.
+/// too, with their tools, and what runs missions.
 fn zone_and_stack_tools(
     profile: &Profile,
     robot: &Arc<dyn RobotPort>,
     (ledger, places, guard): (&Path, &Arc<crate::places::Places>, &Arc<Guard>),
     registry: &mut Registry,
-) -> Result<(Arc<crate::zones::Zones>, Arc<Integrations>), StartError> {
+) -> Result<(Arc<crate::zones::Zones>, Arc<Integrations>, MissionPort), StartError> {
     let zones = crate::zones::Zones::new(profile, robot_file(profile, ledger, "zones"));
     guard.set_zones(Arc::clone(&zones));
     registry.add(Arc::new(crate::zones::GeofenceTool::new(
@@ -412,14 +416,23 @@ fn zone_and_stack_tools(
     for tool in integrations.tools() {
         registry.add(tool)?;
     }
-    Ok((zones, integrations))
+    let natives = integrations.natives();
+    let port: MissionPort = if natives.is_empty() {
+        (Arc::clone(robot), profile.mission.clone())
+    } else {
+        let real = profile.mission.clone();
+        let config = crate::mission::composite::config(real.as_ref());
+        let composite = crate::mission::composite::Composite::new(Arc::clone(robot), real, natives);
+        (Arc::new(composite), Some(config))
+    };
+    Ok((zones, integrations, port))
 }
 
 /// `memory`, the notes kept across sessions, and `stop`, which cancels what the robot's stacks
 /// and its executor run.
 fn memory_and_stop(
     profile: &Profile,
-    robot: &Arc<dyn RobotPort>,
+    (port, mission): &MissionPort,
     (ledger, integrations): (&Path, &Arc<Integrations>),
     registry: &mut Registry,
 ) -> Result<(Arc<crate::memory::Memory>, Arc<dyn Tool>), StartError> {
@@ -428,7 +441,7 @@ fn memory_and_stop(
         &memory,
     ))))?;
     let halts = Arc::clone(integrations);
-    let stop: Arc<dyn Tool> = Arc::new(Stop::new(profile, Arc::clone(robot), halts));
+    let stop: Arc<dyn Tool> = Arc::new(Stop::new(Arc::clone(port), mission.clone(), halts));
     registry.add(Arc::clone(&stop))?;
     Ok((memory, stop))
 }
@@ -610,7 +623,7 @@ pub fn start(
     start_with(profile_path, robot, ledger, StartOptions::default())
 }
 
-/// Missions, when the profile has a `[mission]` section: kept in the robot's ledger, checked by
+/// Missions, when the robot has an executor or native motions: kept in the robot's ledger, checked by
 /// `critic` too when a model has the `plan_check` role, helped by `advisor` when the `plan` role
 /// has models of its own, and their ends seen through the camera with `vision`.
 #[expect(
@@ -620,7 +633,7 @@ pub fn start(
 fn missions(
     profile: &Profile,
     places: Arc<crate::places::Places>,
-    robot: &Arc<dyn RobotPort>,
+    (robot, config): MissionPort,
     guard: &Arc<Guard>,
     ledger: &Path,
     critic: Option<Arc<dyn crate::mission::sanity::Critic>>,
@@ -628,7 +641,7 @@ fn missions(
     vision: Option<crate::mission::camera::Vision>,
 ) -> Option<Arc<Missions>> {
     let goals = crate::mission::goals::Goals::new(robot_file(profile, ledger, "goals"));
-    let mut m = Missions::new(profile, places, Arc::clone(robot))?
+    let mut m = Missions::with_config(profile, config?, places, robot)
         .with_guard(Arc::clone(guard))
         .with_goals(goals);
     if let Some(l) = mission_ledger(profile, ledger) {
@@ -826,16 +839,17 @@ pub fn start_with(
     let seeing = seeing_tools(&profile, &robot, (&llm, ledger), &snapshots, &mut registry)?;
     let places = place_tools(&profile, &robot, ledger, &mut registry)?;
     let stack_parts = (ledger, &places, &guard);
-    let (zones, integrations) = zone_and_stack_tools(&profile, &robot, stack_parts, &mut registry)?;
+    let (zones, integrations, port) =
+        zone_and_stack_tools(&profile, &robot, stack_parts, &mut registry)?;
     robot_tools(&profile, &robot, (&schemas, &guard), &mut registry)?;
     let (watches, incidents) = debug_tools(&profile, &robot, ledger, &mut registry)?;
     let mcp = mcp_tools(&profile, models.privacy, &mut registry)?;
-    let skills = skill_tools(&profile, &mut registry)?;
-    let (memory, stop) = memory_and_stop(&profile, &robot, (ledger, &integrations), &mut registry)?;
+    let skills = skill_tools(&profile, &integrations, &mut registry)?;
+    let (memory, stop) = memory_and_stop(&profile, &port, (ledger, &integrations), &mut registry)?;
     let missions = missions(
         &profile,
         places,
-        &robot,
+        port,
         &guard,
         ledger,
         models.critic,
@@ -922,7 +936,7 @@ fn session_config(
     missions: Option<&Arc<Missions>>,
 ) -> SessionConfig {
     SessionConfig {
-        preamble: system_prompt(profile, skills),
+        preamble: system_prompt(profile, missions.map(|m| m.config()), skills),
         max_model_calls: usize::try_from(profile.policy.budgets.model_calls).unwrap_or(6),
         approval_ttl: profile.policy.approval_ttl,
         turn_time: profile.policy.budgets.wall_time,
@@ -970,12 +984,21 @@ fn check_rules(profile: &Profile, registry: &Registry) -> Result<(), StartError>
 /// that cannot be read is logged and left out.
 fn skill_tools(
     profile: &Profile,
+    integrations: &Integrations,
     registry: &mut Registry,
 ) -> Result<Vec<crate::skills::Skill>, StartError> {
     let dirs: Vec<PathBuf> = profile.skills.iter().map(|d| profile.resolve(d)).collect();
-    let (skills, problems) = crate::skills::load(&dirs);
+    let (mut skills, problems) = crate::skills::load(&dirs);
     for problem in problems {
         tracing::warn!(%problem, "a skill was left out");
+    }
+    // The stacks' own procedures, unless the robot has one of the same name.
+    for text in integrations.procedures() {
+        match crate::skills::parse(text) {
+            Ok(s) if skills.iter().all(|k| k.name != s.name) => skills.push(s),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "a stack's procedure was left out"),
+        }
     }
     if !skills.is_empty() {
         registry.add(Arc::new(crate::skills::SkillTool::new(skills.clone())))?;
