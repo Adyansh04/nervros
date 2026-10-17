@@ -2,18 +2,19 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use nervros_ros::{Goal, GoalResult, RosError};
 use serde_json::{Value, json};
 use tracing::Instrument as _;
 
+use super::check::Observed;
 use super::ledger::{MissionRecord, StepRecord};
 use super::plan::{Author as By, Compiled, PlannedStep, arg};
 use super::report::Evidence;
 use super::{
     Claim, EXECUTE, Fault, LIVENESS, LOST_AFTER, Missions, Outcome, Running, SERVICE_TIMEOUT,
-    STATE, STATE_FRESH, STATUSES, camera, check, history, ledger,
+    STATE, STATE_FRESH, STATUSES, camera, check, goals, history, ledger,
 };
 use crate::lock;
 use crate::session::{Command, Event};
@@ -43,6 +44,20 @@ impl Missions {
         {
             return refusal;
         }
+        let goal = match args["goal"].as_u64() {
+            None => None,
+            Some(n) => match u32::try_from(n)
+                .ok()
+                .filter(|g| self.goals.get().is_some_and(|goals| goals.active(*g)))
+            {
+                Some(g) => Some(g),
+                None => {
+                    return ToolOutcome::refused(format!(
+                        "no active goal {n}; list the goals, or run it without `goal`"
+                    ));
+                }
+            },
+        };
         let message = if by == By::Operator {
             // An edit in the window keeps the plan's name, and the model told what it had planned:
             // the steps that run name the mission, here and in its report.
@@ -63,12 +78,17 @@ impl Missions {
                 .to_owned()
         };
         match self.launch(compiled, Reported::ToModel).await {
-            Ok(id) => ToolOutcome {
-                status: Status::Accepted,
-                data: json!({"mission_id": id}),
-                message,
-                images: Vec::new(),
-            },
+            Ok(id) => {
+                if let Some(g) = goal {
+                    *lock(&self.for_goal) = Some((id.clone(), g));
+                }
+                ToolOutcome {
+                    status: Status::Accepted,
+                    data: json!({"mission_id": id}),
+                    message,
+                    images: Vec::new(),
+                }
+            }
             Err(e) => ToolOutcome::failed(e),
         }
     }
@@ -345,9 +365,45 @@ impl Missions {
             passed_over: &passed_over,
             changes: &changes,
         };
-        let report = self.report(id, compiled, ended, &evidence);
+        let mut report = self.report(id, compiled, ended, &evidence);
+        report.push_str(&self.settle_goals(id, ended, &seen));
         if let Some(s) = self.session.get() {
             s.send(Command::Report(report));
+        }
+    }
+
+    /// Counts mission `id` for the goal it worked toward, judges every goal, and says where the
+    /// open ones and the ones that just ended stand, as the report's closing lines.
+    fn settle_goals(&self, id: &str, ended: &Ended, seen: &Observed) -> String {
+        let Some(goals) = self.goals.get() else {
+            return String::new();
+        };
+        let ran = lock(&self.for_goal).take_if(|(m, _)| m == id);
+        if let Some((_, goal)) = ran {
+            goals.ran(goal, id, ended.fault.is_none());
+        }
+        // After a fault, or once the request failed too often, the report says not to run again:
+        // its goals wait for the operator too.
+        let may_go_on = ended.fault.is_none()
+            && self.run_failures.load(Ordering::SeqCst) <= self.config.max_replans;
+        goals::report_lines(&goals.settle(seen, SystemTime::now()), may_go_on)
+    }
+
+    /// Judges the goals as the robot stands at start, and tells the operator of the open ones and
+    /// of any that ended while NervROS was not running.
+    pub(super) async fn settle_goals_at_start(&self) {
+        let Some(goals) = self.goals.get() else {
+            return;
+        };
+        if goals.all().is_empty() {
+            return;
+        }
+        let seen = self.observe().await;
+        let lines = goals::report_lines(&goals.settle(&seen, SystemTime::now()), false);
+        if !lines.is_empty() {
+            self.emit(Event::Notice {
+                text: lines.trim().to_owned(),
+            });
         }
     }
 
@@ -455,12 +511,15 @@ impl Missions {
                 Err(_) => return,
             };
         for m in marked {
-            self.emit(Event::Notice {
-                text: format!(
-                    "the mission \"{}\" ({}) was cut short when NervROS stopped",
-                    m.intent, m.id
-                ),
-            });
+            let text = format!(
+                "the mission \"{}\" ({}) was cut short when NervROS stopped",
+                m.intent, m.id
+            );
+            // The model hears it with the operator's next words, or it answers from nothing.
+            if let Some(s) = self.session.get() {
+                s.send(Command::Note(text.clone()));
+            }
+            self.emit(Event::Notice { text });
         }
     }
 

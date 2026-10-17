@@ -11,6 +11,7 @@ pub mod advice;
 pub mod camera;
 pub mod catalog;
 pub mod check;
+pub mod goals;
 pub mod history;
 pub mod learn;
 pub mod ledger;
@@ -306,6 +307,10 @@ pub struct Missions {
     paused: AtomicBool,
     /// The skills taught in this session that wait for a mission to keep them.
     drafts: learn::Drafts,
+    /// The operator's goals, judged after every mission.
+    goals: OnceLock<Arc<goals::Goals>>,
+    /// The running mission's goal, when it works toward one: (mission id, goal).
+    for_goal: Mutex<Option<(String, u32)>>,
 }
 
 impl crate::session::Pulse for Missions {
@@ -364,6 +369,8 @@ impl Missions {
             questioned: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             drafts: learn::Drafts::default(),
+            goals: OnceLock::new(),
+            for_goal: Mutex::default(),
         }))
     }
 
@@ -400,6 +407,14 @@ impl Missions {
         self
     }
 
+    /// Judges `goals` after every mission and at start, and counts the missions run for one.
+    #[must_use]
+    pub fn with_goals(self: Arc<Self>, goals: Arc<goals::Goals>) -> Arc<Self> {
+        // Set once, at start-up.
+        let _ = self.goals.set(goals);
+        self
+    }
+
     /// Checks each successful mission's goals through the camera too.
     #[must_use]
     pub fn with_vision(self: Arc<Self>, vision: camera::Vision) -> Arc<Self> {
@@ -427,6 +442,12 @@ impl Missions {
         self.ledger.get()
     }
 
+    /// The operator's goals, when they are kept.
+    #[must_use]
+    pub fn goals(&self) -> Option<&Arc<goals::Goals>> {
+        self.goals.get()
+    }
+
     /// `run_mission`, the one tool: it checks a plan, and runs it once the operator approves.
     #[must_use]
     pub fn tools(self: &Arc<Self>) -> [Arc<dyn Tool>; 1] {
@@ -443,7 +464,10 @@ impl Missions {
         // What an earlier NervROS left is settled beside the loop below, which must hear the
         // operator's first words before the model plans for them.
         let settle = Arc::clone(self);
-        tokio::spawn(async move { settle.settle_interrupted().await });
+        tokio::spawn(async move {
+            settle.settle_interrupted().await;
+            settle.settle_goals_at_start().await;
+        });
         // Held weakly, so that the missions end with the session.
         let me = Arc::downgrade(self);
         let first = Arc::clone(self);

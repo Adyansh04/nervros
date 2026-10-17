@@ -496,7 +496,10 @@ fn missions(
     advisor: Option<Arc<dyn crate::mission::advice::Advisor>>,
     vision: Option<crate::mission::camera::Vision>,
 ) -> Option<Arc<Missions>> {
-    let mut m = Missions::new(profile, places, Arc::clone(robot))?.with_guard(Arc::clone(guard));
+    let goals = crate::mission::goals::Goals::new(robot_file(profile, ledger, "goals"));
+    let mut m = Missions::new(profile, places, Arc::clone(robot))?
+        .with_guard(Arc::clone(guard))
+        .with_goals(goals);
     if let Some(l) = mission_ledger(profile, ledger) {
         m = m.with_ledger(l);
     }
@@ -618,6 +621,12 @@ fn mission_tools(
         .chain(schedules.tools())
     {
         registry.add(tool)?;
+    }
+    if let Some(goals) = missions.goals() {
+        registry.add(Arc::new(crate::mission::goals::GoalTool::new(
+            Arc::clone(goals),
+            Arc::clone(missions),
+        )))?;
     }
     Ok(Some(schedules))
 }
@@ -778,7 +787,13 @@ fn session_config(
         max_model_calls: usize::try_from(profile.policy.budgets.model_calls).unwrap_or(6),
         approval_ttl: profile.policy.approval_ttl,
         turn_time: profile.policy.budgets.wall_time,
-        notes: Some(Arc::clone(memory) as Arc<dyn crate::memory::Notes>),
+        notes: std::iter::once(Arc::clone(memory) as Arc<dyn crate::memory::Notes>)
+            .chain(
+                missions
+                    .and_then(|m| m.goals())
+                    .map(|g| Arc::clone(g) as Arc<dyn crate::memory::Notes>),
+            )
+            .collect(),
         pulse: missions.map(|m| Arc::clone(m) as Arc<dyn crate::session::Pulse>),
         ..SessionConfig::default()
     }

@@ -195,6 +195,7 @@ impl Missions {
         if let Some(fields) = args.as_object_mut() {
             fields.remove("check_only");
             fields.remove("hash");
+            fields.remove("goal");
         }
         let mut plan: Plan = match serde_json::from_value(args) {
             Ok(p) => p,

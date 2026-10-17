@@ -572,6 +572,18 @@ join what the agent knows on every turn, and the Agent tab lists them with **For
 you done so far?" and "what happened to the mug?" read the mission ledger and the world model's
 history.
 
+## Keeping a goal
+
+> **You:** Keep the mug on the tray until tonight.
+
+The agent sets a goal with what holds once it is met, in the world model's ids, such as
+`inside(O27, O261)`, and you approve it like an edit: a name only the detector knows is refused,
+as the world model could never see that goal met. After every mission NervROS checks the goal itself and tells the agent
+what is still unmet, and the agent plans the next mission for it, which you approve as usual. A
+goal ends when it holds, when its missions (five unless you say) or its time run out, or when the
+agent gives it up as impossible, with the reason. A run the robot cut short counts against no
+goal. Goals outlast a restart: at start the window says where each one stands.
+
 ## Keeping it out of places
 
 https://github.com/user-attachments/assets/3df05f4a-344a-4d54-a824-6ecfa8bebf57

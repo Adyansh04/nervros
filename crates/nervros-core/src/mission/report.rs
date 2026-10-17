@@ -118,7 +118,11 @@ impl Missions {
         // walks does not start the count again, and the operator's next message does. A fault
         // is no failure of the plan, so it counts for nothing.
         if let Some(fault) = ended.fault {
-            let _ = write!(report, " It was cut short{at}{why}.");
+            if ended.outcome == Outcome::Rejected {
+                let _ = write!(report, " It could not start{why}.");
+            } else {
+                let _ = write!(report, " It was cut short{at}{why}.");
+            }
             next = fault.next();
         } else if ended.outcome == Outcome::Canceled {
             // A stop the operator or the agent asked for: not a failure to fix.

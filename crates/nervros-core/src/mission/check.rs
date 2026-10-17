@@ -57,6 +57,21 @@ fn xy(v: &Value) -> (f64, f64) {
     )
 }
 
+/// Whether [`check`] can judge `predicate`: `at` of one thing, or `holding`, `inside` or `on` of
+/// two.
+#[must_use]
+pub fn checkable(predicate: &str) -> bool {
+    let Some((name, args)) = predicate_of(predicate) else {
+        return false;
+    };
+    let arity = match name {
+        "at" => 1,
+        "holding" | "inside" | "on" => 2,
+        _ => return false,
+    };
+    args.len() == arity && args.iter().all(|a| !a.is_empty())
+}
+
 /// Checks each predicate.
 #[must_use]
 pub fn check(goal: &[String], seen: &Observed) -> Vec<Verdict> {
@@ -116,26 +131,76 @@ fn verdict(predicate: &str, seen: &Observed) -> Verdict {
     }
 }
 
+/// The profile's place called `target`, by its name or an alias.
+fn place<'s>(seen: &'s Observed, target: &str) -> Option<&'s PlaceConfig> {
+    let same = |a: &str| a.eq_ignore_ascii_case(target);
+    seen.places
+        .iter()
+        .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)))
+}
+
+/// The world model's room `target`, by its id or name.
+fn room<'s>(seen: &'s Observed, target: &str) -> Option<&'s Value> {
+    seen.rooms["rooms"].as_array()?.iter().find(|r| {
+        r["id"] == target
+            || r["name"]
+                .as_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(target))
+    })
+}
+
+/// The first argument of `predicate` that [`check`] cannot find in what is `seen`: an object the
+/// world model does not know, or for `at` a place, room or object; none when it finds them all.
+#[must_use]
+pub fn unknown_in<'p>(predicate: &'p str, seen: &Observed) -> Option<&'p str> {
+    let (name, args) = predicate_of(predicate)?;
+    let known = |id: &str| object(&seen.objects, id).is_some();
+    match (name, args.as_slice()) {
+        ("at", [t]) => {
+            (place(seen, t).is_none() && room(seen, t).is_none() && !known(t)).then_some(*t)
+        }
+        ("inside" | "on", [o, h]) => [*o, *h].into_iter().find(|id| !known(id)),
+        _ => None,
+    }
+}
+
+/// Up to three of the world model's objects that `id`'s words name, as `O27 (red mug)`: what a
+/// detector's own name, such as `mug_4`, is likely called there.
+#[must_use]
+pub fn named_like(seen: &Observed, id: &str) -> Vec<String> {
+    let words: Vec<String> = words_of(id)
+        .split_whitespace()
+        .filter(|w| w.len() > 2)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    seen.objects["objects"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter(|o| {
+            let label = o["label"].as_str().unwrap_or_default().to_ascii_lowercase();
+            words.iter().any(|w| label.contains(w.as_str()))
+        })
+        .take(3)
+        .map(|o| {
+            format!(
+                "{} ({})",
+                o["id"].as_str().unwrap_or_default(),
+                o["label"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
 fn at(target: &str, seen: &Observed, out: impl Fn(Option<bool>, String) -> Verdict) -> Verdict {
     let Some((x, y)) = seen.pose else {
         return out(None, "the robot's pose is not available".to_owned());
     };
-    let same = |a: &str| a.eq_ignore_ascii_case(target);
-    if let Some(p) = seen
-        .places
-        .iter()
-        .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)))
-    {
+    if let Some(p) = place(seen, target) {
         let d = (p.pose.x - x).hypot(p.pose.y - y);
         return out(Some(d <= AT_PLACE_M), format!("{d:.2} m from {}", p.name));
     }
-    let rooms = seen.rooms["rooms"]
-        .as_array()
-        .map_or(&[][..], Vec::as_slice);
-    if let Some(room) = rooms
-        .iter()
-        .find(|r| r["id"] == target || r["name"].as_str().is_some_and(same))
-    {
+    if let Some(room) = room(seen, target) {
         let outline: Vec<(f64, f64)> = room["outline"]["points"]
             .as_array()
             .map(|pts| pts.iter().map(xy).collect())

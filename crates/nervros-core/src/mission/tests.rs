@@ -779,7 +779,7 @@ async fn a_mission_left_running_by_an_earlier_nervros_is_settled_at_start() {
     let missions = Missions::new(&profile(), Places::new(&profile(), None), robot)
         .unwrap()
         .with_ledger(Arc::clone(&ledger));
-    let (tx, _commands) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
     let (events, mut seen) = tokio::sync::broadcast::channel(64);
     missions.attach(SessionHandle::for_tests(&tx, events));
 
@@ -795,6 +795,10 @@ async fn a_mission_left_running_by_an_earlier_nervros_is_settled_at_start() {
     assert!(
         notice.contains("\"fetch the mug\" (m0) was cut short"),
         "{notice}"
+    );
+    assert!(
+        matches!(commands.try_recv(), Ok(Command::Note(note)) if note == notice),
+        "the model hears it too"
     );
     let kept = &ledger.mission("m0").unwrap()[0];
     assert_eq!(
