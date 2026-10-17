@@ -115,19 +115,24 @@ async fn patrol(
             }
         }
     }
-    let changes = missions.changes_since(began).await;
     let mut text = format!("visited {}", list(&visited));
     if !missed.is_empty() {
         let _ = write!(text, "; could not get to {}", list(&missed));
     }
-    if changes.is_empty() {
-        text.push_str("; nothing moved or went missing in the world model meanwhile");
-    } else {
-        let _ = write!(
-            text,
-            "; changed in the world model meanwhile: {}",
-            changes.join("; ")
-        );
+    match missions.changes_since(began).await {
+        Ok(changes) if changes.is_empty() => {
+            text.push_str("; nothing moved or went missing in the world model meanwhile");
+        }
+        Ok(changes) => {
+            let _ = write!(
+                text,
+                "; changed in the world model meanwhile: {}",
+                changes.join("; ")
+            );
+        }
+        Err(e) => {
+            let _ = write!(text, "; what changed is unknown: {e}");
+        }
     }
     Ok(text)
 }
@@ -171,8 +176,11 @@ impl Tool for PatrolTool {
             Ok(c) => c,
             Err(e) => return ToolOutcome::failed(e),
         };
-        if catalog.skill(GO_TO_PLACE).is_none() {
-            return ToolOutcome::failed("this robot has no GoToPlace skill to walk a round with");
+        // GoToPlace is the planner's, folded over the navigation skills the catalog has.
+        if !catalog.can_travel() {
+            return ToolOutcome::failed(
+                "this robot cannot walk a round: it has no navigation skill",
+            );
         }
         let approval = Approval::of(Envelope::new([GO_TO_PLACE.to_owned()], minutes), &catalog);
         let missions = Arc::clone(&self.missions);

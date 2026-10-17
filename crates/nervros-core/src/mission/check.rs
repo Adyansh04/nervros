@@ -100,7 +100,7 @@ fn verdict(predicate: &str, seen: &Observed) -> Verdict {
                 None => out(None, "the executor's state is not available".to_owned()),
             }
         }
-        Some((name @ ("inside" | "on"), args)) if args.len() == 2 => {
+        Some(("inside" | "on", args)) if args.len() == 2 => {
             let (Some(obj), Some(host)) = (
                 object(&seen.objects, args[0]),
                 object(&seen.objects, args[1]),
@@ -121,9 +121,10 @@ fn verdict(predicate: &str, seen: &Observed) -> Verdict {
             out(
                 Some(within),
                 format!(
-                    "{} is {}within {name}'s footprint",
+                    "{} is {}within {}'s footprint",
                     args[0],
-                    if within { "" } else { "not " }
+                    if within { "" } else { "not " },
+                    args[1]
                 ),
             )
         }

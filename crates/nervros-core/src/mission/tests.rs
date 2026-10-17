@@ -815,6 +815,8 @@ async fn an_unmet_goal_names_the_step_that_should_have_met_it_and_what_else_chan
             json!({"id": id, "label": label, "kind": "moved", "room_id": "R2", "other_id": "",
                    "detail": "", "stamp": {"sec": now.floor(), "nanosec": 0}})
         };
+        // The real service takes int32 seconds, and refused a float.
+        assert!(req["since"]["sec"].is_i64(), "{req}");
         let events = if req["query"] == "" {
             json!([moved("O99", "chair"), moved("O18", "blue cup")])
         } else {

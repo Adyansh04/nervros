@@ -202,11 +202,19 @@ impl Gui {
                             .monospace()
                             .color(theme::FAINT),
                     );
-                    let line = format!("{} on {}: {}", p.skill, p.target, p.why);
-                    let more = format!("{}\n{} {}", p.failure, p.tool, p.args);
-                    ui.label(RichText::new(&line).size(13.0))
-                        .on_hover_text(more);
+                    let fix = p.summary();
+                    ui.label(RichText::new(&fix).size(13.0))
+                        .on_hover_text(format!("{fix}\n{} {}", p.tool, p.args));
                 },
+            );
+            // Why, beside what failed: the reason to accept or dismiss it.
+            ui.label(
+                RichText::new(format!(
+                    "{} on {} failed: {}. {}",
+                    p.skill, p.target, p.failure, p.why
+                ))
+                .small()
+                .color(theme::DIM),
             );
             if let (Some(at), Some(ledger)) = (p.accepted_at, &ledger) {
                 #[expect(clippy::cast_precision_loss, reason = "seconds since 1970")]

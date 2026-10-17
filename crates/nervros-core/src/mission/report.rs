@@ -207,20 +207,25 @@ impl Missions {
             .iter()
             .flat_map(|s| s.args.iter().map(|a| a.value.as_str()))
             .collect();
-        self.changes(since_s, &named).await
+        // Evidence beside the report's own: a history that does not answer leaves it out.
+        self.changes(since_s, &named).await.unwrap_or_default()
     }
 
     /// Every object that moved or went missing since `since_s`, a line each.
-    pub(crate) async fn changes_since(&self, since_s: f64) -> Vec<String> {
+    ///
+    /// # Errors
+    ///
+    /// The world model's history did not say, so what changed is unknown, not nothing.
+    pub(crate) async fn changes_since(&self, since_s: f64) -> Result<Vec<String>, String> {
         self.changes(since_s, &[]).await
     }
 
     /// Objects but `leave_out` that moved or went missing since `since_s`, at most
     /// [`MOST_CHANGES`] lines and the rest counted.
-    async fn changes(&self, since_s: f64, leave_out: &[&str]) -> Vec<String> {
+    async fn changes(&self, since_s: f64, leave_out: &[&str]) -> Result<Vec<String>, String> {
         let events: Vec<Value> = self
-            .object_events("", since_s)
-            .await
+            .try_object_events("", since_s)
+            .await?
             .into_iter()
             .filter(|e| matches!(e["kind"].as_str(), Some("moved" | "missing")))
             .filter(|e| !leave_out.contains(&e["id"].as_str().unwrap_or_default()))
@@ -231,22 +236,41 @@ impl Missions {
             lines.truncate(MOST_CHANGES);
             lines.push(format!("{more} more"));
         }
-        lines
+        Ok(lines)
     }
 
     /// What happened to the objects `query` names since `since_s` (zero for all that is kept),
     /// oldest first, as the world model's `ObjectEvent`s; none when it keeps no history or does
     /// not answer.
     pub(crate) async fn object_events(&self, query: &str, since_s: f64) -> Vec<Value> {
-        let Some(service) = self.profile.world.as_ref().and_then(|w| w.history.as_ref()) else {
-            return Vec::new();
-        };
+        self.try_object_events(query, since_s)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::info!(error = %e, "no object history");
+                Vec::new()
+            })
+    }
+
+    /// As [`Self::object_events`], or why the world model did not say.
+    ///
+    /// # Errors
+    ///
+    /// The profile names no history service, or it did not answer.
+    async fn try_object_events(&self, query: &str, since_s: f64) -> Result<Vec<Value>, String> {
+        let service = self
+            .profile
+            .world
+            .as_ref()
+            .and_then(|w| w.history.as_ref())
+            .ok_or("the world model keeps no history")?;
+        // `builtin_interfaces/Time` takes whole seconds as an int32, not a float.
+        let sec = i32::try_from(crate::vision::millis(since_s) / 1000).unwrap_or(i32::MAX);
         let request = json!({
             "query": query,
-            "since": {"sec": since_s.floor(), "nanosec": 0},
+            "since": {"sec": sec, "nanosec": 0},
             "max_events": 30
         });
-        match self
+        let reply = self
             .robot
             .call(
                 service,
@@ -255,12 +279,7 @@ impl Missions {
                 SERVICE_TIMEOUT,
             )
             .await
-        {
-            Ok(reply) => reply["events"].as_array().cloned().unwrap_or_default(),
-            Err(e) => {
-                tracing::info!(error = %e, "no object history");
-                Vec::new()
-            }
-        }
+            .map_err(|e| e.to_string())?;
+        Ok(reply["events"].as_array().cloned().unwrap_or_default())
     }
 }

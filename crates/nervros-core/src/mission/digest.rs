@@ -206,7 +206,12 @@ impl Tool for DigestTool {
             Ok(m) => m,
             Err(e) => return ToolOutcome::failed(format!("the mission ledger: {e}")),
         };
-        let world = self.missions.changes_since(since_s).await;
+        // Unknown is not nothing: the section says the history did not answer.
+        let world = self
+            .missions
+            .changes_since(since_s)
+            .await
+            .unwrap_or_else(|e| vec![format!("unknown: {e}")]);
         let incidents: Vec<Incident> = self
             .incidents
             .incidents()

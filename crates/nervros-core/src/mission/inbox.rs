@@ -111,12 +111,41 @@ pub struct Proposal {
 }
 
 impl Proposal {
+    /// What the fix does, in a few words, for the operator to decide on.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let arg = |k: &str| self.args[k].as_str().unwrap_or_default();
+        match self.tool.as_str() {
+            "memory" => format!("Remember: {}", arg("text")),
+            "geofence" => {
+                let around = ["room", "object", "place"]
+                    .iter()
+                    .map(|k| arg(k))
+                    .find(|v| !v.is_empty())
+                    .unwrap_or("the corners given");
+                format!("Keep out of {around}")
+            }
+            "param_set" => format!(
+                "Set {} {} to {}",
+                arg("node"),
+                arg("name"),
+                self.args["value"]
+            ),
+            _ => format!("{} {}", self.tool, self.args),
+        }
+    }
+
     /// One line for the operator.
     #[must_use]
     pub fn line(&self) -> String {
         format!(
-            "{}. after {} on {} failed ({}): {} {} - {}",
-            self.id, self.skill, self.target, self.failure, self.tool, self.args, self.why
+            "{}. {}, after {} on {} failed ({}): {}",
+            self.id,
+            self.summary(),
+            self.skill,
+            self.target,
+            self.failure,
+            self.why
         )
     }
 }
@@ -225,7 +254,10 @@ impl Inbox {
         };
         let (tool, args, why) = match validate(&reply, &self.fixes) {
             Ok(Some(fix)) => fix,
-            Ok(None) => return None,
+            Ok(None) => {
+                tracing::info!(%reply, "the drafter proposed no fix");
+                return None;
+            }
             Err(e) => {
                 tracing::info!(error = %e, %reply, "a drafted proposal failed its checks");
                 return None;

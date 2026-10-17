@@ -761,7 +761,9 @@ async fn sight(
     })
     .await
     .map_err(|e| e.to_string())??;
-    let prompt = format!("Does this frame show {words}?");
+    // Said again beside the image: a model that reads the preamble less answers with a
+    // description, which reads as a no.
+    let prompt = format!("Does this frame show {words}? Answer yes or no first.");
     match seer
         .ask_shots(
             Role::Watch,
@@ -771,7 +773,10 @@ async fn sight(
         )
         .await
     {
-        Ok((reply, _)) => Ok(yes_said(&reply)),
+        Ok((reply, model)) => {
+            tracing::debug!(%model, %reply, "a camera watch looked");
+            Ok(yes_said(&reply))
+        }
         Err(e) => {
             tracing::info!(error = %e, "a camera watch's look got no answer");
             Ok(None)
@@ -791,11 +796,13 @@ fn yes_said(reply: &str) -> Option<String> {
     if !words.next()?.eq_ignore_ascii_case("yes") {
         return None;
     }
+    // The report ends the sentence itself.
     let rest = answer
         .trim_start_matches(|c: char| !c.is_alphanumeric())
         .get(3..)
         .unwrap_or_default()
-        .trim_start_matches(|c: char| !c.is_alphanumeric());
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim_end_matches(['.', ' ']);
     Some(crate::tools::from_world(if rest.is_empty() {
         "yes"
     } else {
@@ -914,7 +921,10 @@ mod tests {
             shots: Vec<Shot>,
         ) -> Result<(String, String), String> {
             assert_eq!(role, Role::Watch);
-            assert_eq!(prompt, "Does this frame show a cat on the sofa?");
+            assert_eq!(
+                prompt,
+                "Does this frame show a cat on the sofa? Answer yes or no first."
+            );
             assert_eq!(shots.len(), 1);
             Ok((self.0.to_owned(), "fake".to_owned()))
         }
@@ -924,7 +934,7 @@ mod tests {
     fn only_a_first_word_yes_is_a_sighting() {
         assert_eq!(
             yes_said("**Yes** - a grey cat lies on it.").as_deref(),
-            Some("<world>a grey cat lies on it.</world>")
+            Some("<world>a grey cat lies on it</world>")
         );
         assert_eq!(yes_said("yes").as_deref(), Some("<world>yes</world>"));
         assert_eq!(yes_said("No, the sofa is empty."), None);
@@ -968,7 +978,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(&fired, Some(Command::Report(r)) if r.contains("fired") && r.contains("<world>a cat.</world>")),
+            matches!(&fired, Some(Command::Report(r)) if r.contains("fired") && r.contains("<world>a cat</world>.")),
             "{fired:?}"
         );
         assert!(
