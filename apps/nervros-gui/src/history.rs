@@ -112,25 +112,36 @@ fn missions(ui: &mut egui::Ui, list: &[MissionRecord], actions: &mut Vec<Action>
     heading(ui, "Recent missions");
     if list.is_empty() {
         ui.label(
-            RichText::new("None yet: a mission is kept here when it ends.")
+            RichText::new("None yet: a mission is kept here from its start.")
                 .small()
                 .color(theme::DIM),
         );
         return;
     }
     for m in list {
+        let running = m.outcome == "running";
+        // A run the robot or NervROS cut short is no failure of its plan: not red.
         let colour = match m.outcome.as_str() {
-            "success" => ui.visuals().text_color(),
+            "success" | "running" => ui.visuals().text_color(),
+            _ if !m.fault.is_empty() => theme::DIM,
             "canceled" => theme::DIM,
             _ => theme::ERROR,
         };
-        let header = format!(
-            "{} · {} · {} · {:.0} s",
-            m.intent,
-            m.outcome,
-            ago(m.started),
-            m.ended - m.started
-        );
+        let how = if m.fault.is_empty() {
+            m.outcome.clone()
+        } else {
+            format!("{} ({})", m.outcome, m.fault.replace('_', " "))
+        };
+        let header = if running {
+            format!("{} · running · {}", m.intent, ago(m.started))
+        } else {
+            format!(
+                "{} · {how} · {} · {:.0} s",
+                m.intent,
+                ago(m.started),
+                m.ended - m.started
+            )
+        };
         let id = ui.make_persistent_id(("mission", &m.id));
         let label = RichText::new(header).size(13.0).color(colour);
         theme::disclosure(ui, id, label, |ui| {
@@ -153,10 +164,11 @@ fn missions(ui: &mut egui::Ui, list: &[MissionRecord], actions: &mut Vec<Action>
                 let line = format!("{} {} {}{time}{why}", s.id, s.skill, s.outcome);
                 ui.label(RichText::new(line).monospace());
             }
-            if ui
-                .add(ReButton::new("Run again").small().secondary())
-                .on_hover_text("Plan the same steps; you approve them before the robot moves")
-                .clicked()
+            if !running
+                && ui
+                    .add(ReButton::new("Run again").small().secondary())
+                    .on_hover_text("Plan the same steps; you approve them before the robot moves")
+                    .clicked()
             {
                 actions.push(run(again(m)));
             }

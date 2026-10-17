@@ -35,6 +35,24 @@ pub trait Eyes: Send + Sync {
     async fn see(&self, prompt: &str, image: ImageInput) -> Result<(String, String), String>;
 }
 
+/// A vision model asked about several labelled frames at once, through a role's chain: a start
+/// and an end to compare, or a clip to search.
+#[async_trait]
+pub trait Seer: Send + Sync {
+    /// The answer and the id of the model that gave it.
+    ///
+    /// # Errors
+    ///
+    /// Why no model answered.
+    async fn ask_shots(
+        &self,
+        role: crate::providers::Role,
+        preamble: &str,
+        prompt: &str,
+        shots: Vec<crate::llm::Shot>,
+    ) -> Result<(String, String), String>;
+}
+
 /// What one look found: the marked frame as kept, and what the vision model said of it.
 pub(crate) struct Looked {
     pub(crate) snapshot: Arc<crate::vision::Snapshot>,
@@ -93,13 +111,27 @@ impl LookTool {
     }
 
     /// Looks now: the frame the newest detections were cut from with them drawn as marks, kept
-    /// as a snapshot, and the vision model's answer to `question` about it. The mission's camera
-    /// check asks through this too, so it sees the marks and their labels as the agent does.
+    /// as a snapshot, and the vision model's answer to `question` about it.
     pub(crate) async fn look_now(
         &self,
         question: Option<&str>,
         camera: Option<&str>,
     ) -> Result<Looked, String> {
+        let about = self.cameras.get(camera)?.config.about.clone();
+        let (mut looked, img) = self.mark_now(camera).await?;
+        looked.seen = self
+            .see(question, &img, &looked.snapshot.marks, about.as_deref())
+            .await;
+        Ok(looked)
+    }
+
+    /// The frame the newest detections were cut from, with them drawn as marks and kept as a
+    /// snapshot, asking no model; and the drawn image. The mission's camera check reads the
+    /// detector's word here before it spends a model call.
+    pub(crate) async fn mark_now(
+        &self,
+        camera: Option<&str>,
+    ) -> Result<(Looked, RgbImage), String> {
         let camera = self.cameras.get(camera)?;
         let newest = camera.newest_soon().await?;
         let (mut dets, frame, age, left_out) = camera.marked(self.robot.as_ref(), newest).await;
@@ -117,25 +149,18 @@ impl LookTool {
         .await
         .map_err(|e| e.to_string())??;
         let marks = marks_json(&dets.instances);
-        let seen = self
-            .see(
-                question,
-                &img,
-                &dets.instances,
-                camera.config.about.as_deref(),
-            )
-            .await;
         let snapshot = self
             .snapshots
             .store(jpeg, img.dimensions(), frame.stamp_s, dets.instances);
-        Ok(Looked {
+        let looked = Looked {
             snapshot,
             camera: camera.name.clone(),
             age_s: age,
             marks,
             left_out,
-            seen,
-        })
+            seen: None,
+        };
+        Ok((looked, img))
     }
 
     async fn run(

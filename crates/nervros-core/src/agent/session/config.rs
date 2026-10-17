@@ -24,8 +24,9 @@ pub struct SessionConfig {
     pub history_file: Option<std::path::PathBuf>,
     /// A conversation to carry on.
     pub resume: Option<History>,
-    /// Added to the system prompt on every turn, such as what the operator asked to remember.
-    pub notes: Option<Arc<dyn crate::memory::Notes>>,
+    /// Added to the system prompt on every turn, such as what the operator asked to remember and
+    /// the goals still open.
+    pub notes: Vec<Arc<dyn crate::memory::Notes>>,
     /// Called from the session's own loop, the one that serves Stop, every [`PULSE_PERIOD`]:
     /// a heartbeat fed from it stops when that loop does.
     pub pulse: Option<Arc<dyn Pulse>>,
@@ -57,7 +58,7 @@ impl Default for SessionConfig {
             turn_time: Duration::from_secs(90),
             history_file: None,
             resume: None,
-            notes: None,
+            notes: Vec::new(),
             pulse: None,
             pending_file: None,
         }

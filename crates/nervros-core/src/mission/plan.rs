@@ -419,6 +419,14 @@ impl Sim {
         out
     }
 
+    /// What holds now that did not in `before`, an earlier [`Self::end_state`].
+    fn since(&self, before: &[String]) -> Vec<String> {
+        self.end_state()
+            .into_iter()
+            .filter(|p| !before.contains(p))
+            .collect()
+    }
+
     /// The walk a step needs first: a `GoToPlace` up to the object or room, known to the world
     /// model, that the step's skill needs the robot near and the plan has not reached yet.
     fn walk_for(&self, step: &Step, catalog: &Catalog, world: &World) -> Option<Step> {
@@ -507,6 +515,11 @@ pub struct PlannedStep {
     /// output from went for.
     #[serde(skip)]
     pub may_take: Vec<StepArg>,
+    /// What should hold once it succeeds, from its effects: `at(R3)` after a walk, `holding(right,
+    /// O17)` after a pick, `inside(O17, tray_1)` after a place. Code derives it from the plan, so
+    /// no model can weaken it; an end check that fails names the step that should have made it.
+    #[serde(skip)]
+    pub expect: Vec<String>,
 }
 
 impl PlannedStep {
@@ -647,12 +660,14 @@ pub fn compile(
                     }
                     let target = spot.as_ref().map(|s| s.id.clone());
                     let may_take = may_take(step, spot.as_ref(), world, &steps);
+                    let before = sim.end_state();
                     if let Some(spot) = spot {
                         sim.at = Some(spot.id);
                         sim.xy = spot.xy;
                     } else if let Some(skill) = catalog.skill(&step.skill) {
                         problems.append(&mut sim.run(&id, step, skill, world));
                     }
+                    let expect = sim.since(&before);
                     let attempts = f64::from(step.retries) + 1.0;
                     worst += timeout_s * attempts;
                     body.push_str(&wrap(&node, step, timeout_s));
@@ -677,6 +692,7 @@ pub fn compile(
                             .map(|s| s.learned.clone())
                             .unwrap_or_default(),
                         may_take,
+                        expect,
                     });
                 }
                 Err(mut p) => problems.append(&mut p),
@@ -1240,6 +1256,17 @@ mod tests {
         assert!(c.xml.contains(r#"target="O31""#), "{}", c.xml);
         // The mug ends in the basket and the hand empty; the pick and place moved the base.
         assert_eq!(c.goal, ["inside(O17, O31)"]);
+        let expect: Vec<&[String]> = c.steps.iter().map(|s| s.expect.as_slice()).collect();
+        assert_eq!(
+            expect,
+            [
+                &["at(O31)".to_owned()][..],
+                &["holding(right, O17)".to_owned()],
+                &["at(O31)".to_owned()],
+                &["inside(O17, O31)".to_owned()]
+            ],
+            "what each step should leave, the walk added after the pick moved the base too"
+        );
         let mut two = world();
         two.objects.push(thing("O32", "basket", 1.0, 1.0));
         let problems = compile(&p, &catalog(), &two, Author::Model).unwrap_err();

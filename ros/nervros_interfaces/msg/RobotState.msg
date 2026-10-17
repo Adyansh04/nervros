@@ -2,6 +2,9 @@
 # Published on change and at 1 Hz, transient local, so a late subscriber gets the current state.
 
 builtin_interfaces/Time stamp
+# Set once when the executor starts: a new one says it restarted, and that the missions it ran
+# before are gone.
+string boot_id
 # Id of the running mission, empty when idle.
 string mission_id
 # Name of the running step, such as "s2_GoToPlace", empty when idle.

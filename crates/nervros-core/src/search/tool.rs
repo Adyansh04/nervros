@@ -65,7 +65,7 @@ impl SearchTool {
         let named = phrase.clone().unwrap_or_else(|_| bare(&what));
         let (seen, events) = tokio::join!(
             self.missions.observe(),
-            self.missions.object_events(label_word(&named))
+            self.missions.object_events(label_word(&named), 0.0)
         );
         if seen.rooms.is_null() && seen.objects.is_null() {
             return Err(

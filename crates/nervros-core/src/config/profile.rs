@@ -30,6 +30,8 @@ pub struct Profile {
     pub policy: Policy,
     /// Inputs of the `look` builtin.
     pub look: Option<LookConfig>,
+    /// Each camera's frames kept on disk as its view changes, for `when`; it needs `[look]`.
+    pub keyframes: Option<KeyframesConfig>,
     /// The `segment` builtin; it needs `[look]`'s cameras.
     pub segment: Option<SegmentConfig>,
     /// The world editor the agent and the app edit the saved world through.
@@ -77,6 +79,41 @@ pub struct GeofenceConfig {
     /// The fixed zones.
     #[serde(rename = "zone", default)]
     pub zones: Vec<ZoneConfig>,
+}
+
+/// How keyframes are kept: a camera's frame is kept when it differs from that camera's last kept
+/// one, looked at every `period_s`, and the oldest go past `keep_h` or `max_mb`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyframesConfig {
+    /// How often each camera's newest frame is looked at, s.
+    #[serde(default = "default_keyframe_period")]
+    pub period_s: f64,
+    /// How long frames are kept, h.
+    #[serde(default = "default_keyframe_hours")]
+    pub keep_h: f64,
+    /// The most disk they take together, MB.
+    #[serde(default = "default_keyframe_mb")]
+    pub max_mb: u64,
+    /// The longest side of a kept frame, px.
+    #[serde(default = "default_keyframe_edge")]
+    pub edge_px: u32,
+}
+
+fn default_keyframe_period() -> f64 {
+    2.0
+}
+
+fn default_keyframe_hours() -> f64 {
+    24.0
+}
+
+fn default_keyframe_mb() -> u64 {
+    2000
+}
+
+fn default_keyframe_edge() -> u32 {
+    640
 }
 
 /// What the incident investigator watches, and where this robot's playbooks are.
@@ -742,6 +779,21 @@ impl Profile {
             zone.check().map_err(|why| {
                 ProfileError::Invalid(format!("[[geofence.zone]] `{}`: {why}", z.name))
             })?;
+        }
+        if let Some(k) = &self.keyframes {
+            let sane = |v: f64, most: f64| v.is_finite() && v > 0.0 && v <= most;
+            if !sane(k.period_s, 3600.0) || !sane(k.keep_h, 24.0 * 30.0) || k.edge_px < 64 {
+                return Err(ProfileError::Invalid(
+                    "[keyframes] period_s is above 0 and at most 3600, keep_h above 0 and at most \
+                     720, edge_px at least 64"
+                        .to_owned(),
+                ));
+            }
+            if self.look.is_none() {
+                return Err(ProfileError::Invalid(
+                    "[keyframes] needs [look]: it keeps the frames of its cameras".to_owned(),
+                ));
+            }
         }
         if self.geofence.mask.is_some() && self.world.as_ref().is_none_or(|w| w.map.is_none()) {
             return Err(ProfileError::Invalid(

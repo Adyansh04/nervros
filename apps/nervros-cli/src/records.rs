@@ -142,8 +142,14 @@ pub fn missions(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
         None => ledger.recent(limit)?,
     };
     for m in &list {
+        // A faulted run says nothing about its plan; it is told apart from the plan's failures.
+        let fault = if m.fault.is_empty() {
+            String::new()
+        } else {
+            format!(", fault: {}", m.fault)
+        };
         println!(
-            "{} {} ago: {} ({}, {:.0} s)",
+            "{} {} ago: {} ({}{fault}, {:.0} s)",
             // A version 7 id begins with its millisecond: this much tells missions apart.
             &m.id[..m.id.len().min(13)],
             nervros_core::how_long(now - m.started),
@@ -200,6 +206,75 @@ pub fn gaps(profile: &Path, limit: usize) -> Result<()> {
             g.reason
         );
     }
+    Ok(())
+}
+
+/// The proposed fixes, each accepted one with its step's record before and since; with
+/// `dismiss`, that one turned down first.
+pub fn inbox(profile_path: &Path, dismiss: Option<u32>) -> Result<()> {
+    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let file = nervros_core::app::inbox_file(&profile, &nervros_core::app::state_dir());
+    if let Some(id) = dismiss {
+        nervros_core::mission::inbox::dismiss_in(&file, id).map_err(anyhow::Error::msg)?;
+        println!("dismissed {id}");
+    }
+    let proposals = nervros_core::mission::inbox::Inbox::read(&file);
+    let ledger = open_ledger(profile_path)?;
+    for p in &proposals {
+        println!("{} [{:?}]", p.line(), p.state);
+        if let (Some(at), Some(ledger)) = (p.accepted_at, &ledger) {
+            #[expect(clippy::cast_precision_loss, reason = "seconds since 1970")]
+            let since = ledger.track_since(&p.skill, &p.target, at as f64)?;
+            let record = |t: Option<&nervros_core::mission::ledger::Track>| {
+                t.map_or_else(
+                    || "no runs".to_owned(),
+                    |t| format!("{} of {}", t.succeeded, t.runs),
+                )
+            };
+            println!(
+                "    before: {}; since: {}",
+                record(p.before.as_ref()),
+                record(since.as_ref())
+            );
+        }
+    }
+    if proposals.is_empty() {
+        println!("no proposals");
+    }
+    Ok(())
+}
+
+/// What the robot did over the last `hours`, from its ledger, incidents and goals.
+pub fn digest(profile: &Path, hours: f64) -> Result<()> {
+    if !(hours.is_finite() && hours > 0.0) {
+        bail!("--hours is more than 0");
+    }
+    let since = nervros_core::now_s() - hours * 3600.0;
+    let missions = match open_ledger(profile)? {
+        Some(ledger) => ledger.since(since)?,
+        None => Vec::new(),
+    };
+    let profile = Profile::load(profile).context("loading the profile")?;
+    let state = nervros_core::app::state_dir();
+    let (file, _) = nervros_core::app::incident_files(&profile, &state);
+    let incidents: Vec<_> = nervros_core::incident::read(&file)
+        .into_iter()
+        .filter(|i| i.opened_s >= since)
+        .collect();
+    let goals = nervros_core::mission::goals::Goals::new(Some(nervros_core::app::goals_file(
+        &profile, &state,
+    )))
+    .all();
+    println!(
+        "{}",
+        nervros_core::mission::digest::compose(&nervros_core::mission::digest::Period {
+            hours,
+            missions: &missions,
+            world: &[],
+            incidents: &incidents,
+            goals: &goals,
+        })
+    );
     Ok(())
 }
 

@@ -2,17 +2,19 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use nervros_ros::{Frame, Goal, GoalResult, RosError};
+use nervros_ros::{Goal, GoalResult, RosError};
 use serde_json::{Value, json};
 use tracing::Instrument as _;
 
+use super::check::Observed;
 use super::ledger::{MissionRecord, StepRecord};
 use super::plan::{Author as By, Compiled, PlannedStep, arg};
+use super::report::Evidence;
 use super::{
-    Claim, EXECUTE, LIVENESS, LOST_AFTER, Missions, Outcome, Running, SERVICE_TIMEOUT, STATE,
-    STATE_FRESH, STATUSES, camera, check, history, ledger,
+    Claim, EXECUTE, Fault, LIVENESS, LOST_AFTER, Missions, Outcome, Running, SERVICE_TIMEOUT,
+    STATE, STATE_FRESH, STATUSES, camera, check, goals, history, inbox, ledger,
 };
 use crate::lock;
 use crate::session::{Command, Event};
@@ -42,6 +44,20 @@ impl Missions {
         {
             return refusal;
         }
+        let goal = match args["goal"].as_u64() {
+            None => None,
+            Some(n) => match u32::try_from(n)
+                .ok()
+                .filter(|g| self.goals.get().is_some_and(|goals| goals.active(*g)))
+            {
+                Some(g) => Some(g),
+                None => {
+                    return ToolOutcome::refused(format!(
+                        "no active goal {n}; list the goals, or run it without `goal`"
+                    ));
+                }
+            },
+        };
         let message = if by == By::Operator {
             // An edit in the window keeps the plan's name, and the model told what it had planned:
             // the steps that run name the mission, here and in its report.
@@ -61,7 +77,7 @@ impl Missions {
             "the mission is running; a report follows when it ends. Tell the operator it started."
                 .to_owned()
         };
-        match self.launch(compiled, Reported::ToModel).await {
+        match self.launch(compiled, Reported::ToModel, goal).await {
             Ok(id) => ToolOutcome {
                 status: Status::Accepted,
                 data: json!({"mission_id": id}),
@@ -73,11 +89,13 @@ impl Missions {
     }
 
     /// Sends a checked plan to the executor and watches it; its id. The slot is claimed before the
-    /// goal goes out, so two launches at once cannot both pass.
+    /// goal goes out, so two launches at once cannot both pass. `for_goal` is the operator's goal
+    /// it works toward, counted when it ends.
     pub(super) async fn launch(
         self: &Arc<Self>,
         compiled: Compiled,
         reported: Reported,
+        for_goal: Option<u32>,
     ) -> Result<String, String> {
         // Run by its hash or on a schedule, a plan was checked when it was made: a zone may have
         // been added since, and a straight walk starts from where the robot stands now.
@@ -137,10 +155,30 @@ impl Missions {
             id: id.clone(),
             hash: compiled.sha256.clone(),
         });
-        let before = self.vision.get().and_then(camera::Vision::frame);
+        let before = self
+            .vision
+            .get()
+            .map(camera::Vision::frames)
+            .unwrap_or_default();
         let span = crate::telemetry::job("mission", &id, &compiled.plan.intent);
         // What the operator asked for this mission: they may say more while it runs.
         let request = self.request();
+        let started_s = crate::now_s();
+        // Kept as running, so a NervROS that stops now leaves a record the next one settles. Not
+        // awaited here: from the goal on nothing may cancel this launch before `watch` holds the
+        // slot. `watch` waits for it, so the end's record cannot be overtaken by this one.
+        let running = MissionRecord {
+            id: id.clone(),
+            hash: compiled.sha256.clone(),
+            intent: compiled.plan.intent.clone(),
+            request: request.clone(),
+            started: started_s,
+            ended: started_s,
+            outcome: "running".to_owned(),
+            plan: json!(compiled.plan.steps),
+            ..MissionRecord::default()
+        };
+        let launched = self.keep(running);
         tokio::spawn(
             Arc::clone(self)
                 .watch(
@@ -148,7 +186,8 @@ impl Missions {
                     compiled,
                     goal,
                     (before, held),
-                    (request, reported),
+                    (request, reported, for_goal),
+                    (started_s, launched),
                 )
                 .instrument(span),
         );
@@ -170,7 +209,7 @@ impl Missions {
             return Err(format!("mission {} was still running", r.id));
         }
         compiled.plan.intent = label.to_owned();
-        self.launch(compiled, Reported::ToModel).await
+        self.launch(compiled, Reported::ToModel, None).await
     }
 
     /// Checks a plan for a schedule: its hash, and its steps as the operator reads them.
@@ -202,44 +241,43 @@ impl Missions {
         id: String,
         compiled: Compiled,
         goal: Goal,
-        (before, held): (Option<Arc<Frame>>, Option<crate::guard::ResourceLock>),
-        (request, reported): (String, Reported),
+        (before, held): (camera::Frames, Option<crate::guard::ResourceLock>),
+        (request, reported, for_goal): (String, Reported, Option<u32>),
+        (started_s, launched): (f64, Option<tokio::task::JoinHandle<()>>),
     ) {
         let started = Instant::now();
-        let started_s = crate::now_s();
         let mut times = StepTimes::default();
         let result = self.outcome_of(&id, goal, &mut times).await;
-        let elapsed = started.elapsed().as_secs_f64();
         let outputs = outputs_of(&result);
-        let (outcome, step, reason) = summarise(result);
+        let ended = summarise(result, started.elapsed().as_secs_f64());
         drop(held);
         self.release(&id);
-        tracing::Span::current().record("nervros.outcome", outcome.as_str());
-        let how = match outcome {
-            Outcome::Success => "succeeded".to_owned(),
-            Outcome::Canceled => "was stopped".to_owned(),
-            _ => format!("failed at {step}: {reason}"),
-        };
+        tracing::Span::current().record("nervros.outcome", ended.outcome.as_str());
         // The guard against rerunning a plan unchanged is the model's: a job's look that saw
         // nothing does not stand against the model's own plan.
         if reported == Reported::ToModel {
-            *lock(&self.last) = Some((compiled.sha256.clone(), how));
+            *lock(&self.last) = Some((compiled.sha256.clone(), ended.how()));
         }
         self.emit(Event::MissionFinished {
             id: id.clone(),
-            outcome,
-            failed_step: step.clone(),
-            reason: reason.clone(),
-            elapsed_s: elapsed,
+            outcome: ended.outcome,
+            failed_step: ended.step.clone(),
+            reason: ended.reason.clone(),
+            elapsed_s: ended.elapsed_s,
             outputs,
             by_job: reported == Reported::ToJob,
+            fault: ended.fault,
         });
+        let cut = ended.outcome == Outcome::Canceled;
         let steps: Vec<StepRecord> = compiled
             .steps
             .iter()
-            .map(|s| times.record(s, &step, &reason))
+            .map(|s| times.record(s, &ended.step, &ended.reason, cut))
             .collect();
-        let passed_over = passed_over(&compiled, &steps, &step);
+        let passed_over = passed_over(&compiled, &steps, &ended.step);
+        if let Some(launched) = launched {
+            let _ = launched.await;
+        }
         let kept = self.keep(MissionRecord {
             id: id.clone(),
             hash: compiled.sha256.clone(),
@@ -247,29 +285,48 @@ impl Missions {
             request,
             started: started_s,
             ended: crate::now_s(),
-            outcome: outcome.as_str().to_owned(),
-            failed_step: step.clone(),
-            reason: reason.clone(),
+            outcome: ended.outcome.as_str().to_owned(),
+            failed_step: ended.step.clone(),
+            reason: ended.reason.clone(),
             steps,
             plan: json!(compiled.plan.steps),
+            fault: ended
+                .fault
+                .map_or_else(String::new, |f| f.as_str().to_owned()),
         });
         // A taught skill is judged on its runs, this one included.
         if let Some(kept) = kept {
             let _ = kept.await;
         }
-        self.settle_taught(&compiled, outcome, &step).await;
+        if ended.fault.is_none() {
+            self.settle_taught(&compiled, ended.outcome, &ended.step)
+                .await;
+        }
         // A job hears its mission end from the event; the report, and the failures it counts
         // against the model's request, are the model's.
-        if reported == Reported::ToJob {
-            return;
+        if reported == Reported::ToModel {
+            let evidence = (before, passed_over, started_s);
+            self.tell_model(&id, &compiled, &ended, evidence, for_goal)
+                .await;
         }
+    }
+
+    /// Finds out what the model needs to know of a mission that ended, and sends it the report.
+    async fn tell_model(
+        self: &Arc<Self>,
+        id: &str,
+        compiled: &Compiled,
+        ended: &Ended,
+        (before, passed_over, started_s): (camera::Frames, Vec<String>, f64),
+        for_goal: Option<u32>,
+    ) {
         let seen = self.observe().await;
         // What happened to what the failed step was about: often it was moved, not missed. The
         // robot's own missions with it say so where the world model cannot tell which it is.
         let failed = compiled
             .steps
             .iter()
-            .find(|s| s.id == step && outcome != Outcome::Success);
+            .find(|s| s.id == ended.step && ended.outcome != Outcome::Success);
         let object = failed
             .and_then(|s| check::step_object(s, &seen))
             .and_then(|o| o["id"].as_str());
@@ -281,30 +338,152 @@ impl Missions {
         };
         let moves = async {
             match failed.and_then(|s| arg(&s.args, "object_id")) {
-                Some(id) => history::moves_of(&self, id).await,
+                Some(id) => history::moves_of(self, id).await,
                 None => Vec::new(),
             }
         };
-        let (story, moves) = tokio::join!(story, moves);
-        let camera = match self.vision.get().filter(|_| outcome == Outcome::Success) {
+        let (story, moves, changes) =
+            tokio::join!(story, moves, self.world_changes(compiled, started_s));
+        let camera = match self
+            .vision
+            .get()
+            .filter(|_| ended.outcome == Outcome::Success)
+        {
             Some(vision) => {
-                let verdicts = check::check(&compiled.goal, &seen);
-                vision.check(&verdicts, &seen, before.as_ref()).await
+                let verdicts = check::check(&compiled.goal, &seen, started_s);
+                vision.check(&verdicts, &seen, &before).await
             }
             None => camera::Checked::default(),
         };
         if let Some(image) = &camera.image {
             self.emit(image.into());
         }
-        let report = self.report(
-            &id,
-            &compiled,
-            (outcome, &step, &reason),
-            elapsed,
-            (&seen, &story, &moves, &camera.lines, &passed_over),
-        );
+        let evidence = Evidence {
+            seen: &seen,
+            story: &story,
+            moves: &moves,
+            camera: &camera.lines,
+            passed_over: &passed_over,
+            changes: &changes,
+            started_s,
+        };
+        let mut report = self.report(id, compiled, ended, &evidence);
+        report.push_str(&self.settle_goals(id, ended, &seen, for_goal));
         if let Some(s) = self.session.get() {
             s.send(Command::Report(report));
+        }
+        self.propose_fix(id, compiled, ended, &seen);
+    }
+
+    /// After a step failed again on a fair run, asks the inbox for a fix, off the report's way:
+    /// one failure may be bad luck, and a fault is no failure of the step.
+    fn propose_fix(
+        self: &Arc<Self>,
+        id: &str,
+        compiled: &Compiled,
+        ended: &Ended,
+        seen: &Observed,
+    ) {
+        let (Some(inbox), Some(ledger)) = (self.inbox.get().cloned(), self.ledger.get().cloned())
+        else {
+            return;
+        };
+        if ended.fault.is_some() || !matches!(ended.outcome, Outcome::Failure | Outcome::Timeout) {
+            return;
+        }
+        let Some(step) = compiled.steps.iter().find(|s| s.id == ended.step) else {
+            return;
+        };
+        let target = ledger::target_of(&step.args);
+        if !inbox.wanted(&step.skill, &target) {
+            return;
+        }
+        let failure = inbox::Failure {
+            mission: id.to_owned(),
+            intent: compiled.plan.intent.clone(),
+            skill: step.skill.clone(),
+            target,
+            step: format!("{} {}", step.id, step.summary),
+            reason: ended.reason.clone(),
+            track: ledger::Track {
+                runs: 0,
+                succeeded: 0,
+                typical_s: None,
+                last_failure: None,
+            },
+            world: check::last_seen(step, seen, crate::now_s()),
+        };
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let key = (failure.skill.clone(), failure.target.clone());
+            let track = tokio::task::spawn_blocking(move || ledger.track(&key.0, &key.1))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten();
+            // Twice, and a third of its runs at least: a pattern, not bad luck.
+            let failing = |t: &ledger::Track| t.runs - t.succeeded;
+            let Some(track) = track.filter(|t| failing(t) >= 2 && failing(t) * 3 >= t.runs) else {
+                return;
+            };
+            let Some(proposal) = inbox.propose(&inbox::Failure { track, ..failure }).await else {
+                return;
+            };
+            // The model hears only that one waits: its words come from the world and a model,
+            // and are the operator's to read, not instructions for the next turn.
+            if let Some(s) = me.session.get() {
+                s.send(Command::Note(format!(
+                    "proposed fix {} waits for the operator in the Agent tab",
+                    proposal.id
+                )));
+            }
+            me.emit(Event::Notice {
+                text: format!(
+                    "a proposed fix waits for you in the Agent tab: {}",
+                    proposal.line()
+                ),
+            });
+        });
+    }
+
+    /// Counts mission `id` for `for_goal`, the goal it worked toward, judges every goal, and says
+    /// where the open ones and the ones that just ended stand, as the report's closing lines.
+    fn settle_goals(
+        &self,
+        id: &str,
+        ended: &Ended,
+        seen: &Observed,
+        for_goal: Option<u32>,
+    ) -> String {
+        let Some(goals) = self.goals.get() else {
+            return String::new();
+        };
+        if let Some(goal) = for_goal {
+            goals.ran(goal, id, ended.fault.is_none());
+        }
+        // After a stop or a fault, or once the request failed too often, the report says not to
+        // run again: its goals wait for the operator too.
+        let may_go_on = ended.fault.is_none()
+            && ended.outcome != Outcome::Canceled
+            && self.run_failures.load(Ordering::SeqCst) <= self.config.max_replans;
+        goals::report_lines(&goals.settle(seen, SystemTime::now()), may_go_on)
+    }
+
+    /// Judges the goals as the robot stands at start, and tells the operator of the open ones and
+    /// of any that ended while NervROS was not running.
+    pub(super) async fn settle_goals_at_start(&self) {
+        let Some(goals) = self.goals.get() else {
+            return;
+        };
+        if goals.all().is_empty() {
+            return;
+        }
+        let seen = self.observe().await;
+        let lines = goals::report_lines(&goals.settle(&seen, SystemTime::now()), false);
+        if !lines.is_empty() {
+            self.emit(Event::Notice {
+                text: lines.trim().to_owned(),
+            });
         }
     }
 
@@ -327,6 +506,9 @@ impl Missions {
         alive.tick().await;
         let mut unheard = 0;
         let mut paused = false;
+        // The executor's run as it ran the mission: a new one says it restarted, and the mission
+        // with it.
+        let mut boot = None;
         let result = loop {
             tokio::select! {
                 Some(fb) = feedback.recv() => {
@@ -344,7 +526,18 @@ impl Missions {
                         .and_then(|r| r);
                 }
                 _ = alive.tick() => {
-                    unheard = if self.executor_runs(id).await { 0 } else { unheard + 1 };
+                    let state = self.executor_state().await;
+                    let runs = state.as_ref().is_some_and(|s| s["mission_id"].as_str() == Some(id));
+                    let now = state.as_ref().and_then(boot_of);
+                    if boot.as_ref().zip(now.as_ref()).is_some_and(|(was, is)| was != is) {
+                        break Err(RosError::Middleware(
+                            "the executor restarted, and the mission with it".into(),
+                        ));
+                    }
+                    if runs {
+                        boot = boot.or(now);
+                    }
+                    unheard = if runs { 0 } else { unheard + 1 };
                     if unheard >= LOST_AFTER {
                         break Err(RosError::Middleware(format!(
                             "the executor has not said it runs this mission for {} s: it may have \
@@ -373,6 +566,41 @@ impl Missions {
                 tracing::warn!(error = %e, mission = %record.id, "the mission was not recorded");
             }
         }))
+    }
+
+    /// Settles the missions an earlier NervROS left running: the executor's deadman stopped each,
+    /// so they are kept as interrupted, and none is followed again. One the executor still runs,
+    /// as with no deadman, is left running; `say_orphan` tells the operator of it.
+    pub(super) async fn settle_interrupted(&self) {
+        let Some(ledger) = self.ledger.get().cloned() else {
+            return;
+        };
+        let still = self.executor_state().await.and_then(|s| {
+            s["mission_id"]
+                .as_str()
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned)
+        });
+        let marked =
+            match tokio::task::spawn_blocking(move || ledger.interrupted(still.as_deref())).await {
+                Ok(Ok(marked)) => marked,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "the missions left running were not settled");
+                    return;
+                }
+                Err(_) => return,
+            };
+        for m in marked {
+            let text = format!(
+                "Mission {} ({}) was cut short when NervROS stopped",
+                m.id, m.intent
+            );
+            // The model hears it with the operator's next words, or it answers from nothing.
+            if let Some(s) = self.session.get() {
+                s.send(Command::Note(text.clone()));
+            }
+            self.emit(Event::Notice { text });
+        }
     }
 
     /// Maps one feedback message's node events onto steps.
@@ -410,8 +638,8 @@ impl Missions {
         }
     }
 
-    /// Whether the executor says, freshly, that it runs mission `id`.
-    async fn executor_runs(&self, id: &str) -> bool {
+    /// The executor's state, if it sent one lately.
+    pub(super) async fn executor_state(&self) -> Option<Value> {
         self.robot
             .latest_fresh(
                 &self.config.state,
@@ -420,8 +648,16 @@ impl Missions {
                 STATE_FRESH,
             )
             .await
-            .is_ok_and(|s| s["mission_id"].as_str() == Some(id))
+            .ok()
     }
+}
+
+/// The executor run a state comes from; none from an executor that does not say.
+fn boot_of(state: &Value) -> Option<String> {
+    state["boot_id"]
+        .as_str()
+        .filter(|b| !b.is_empty())
+        .map(str::to_owned)
 }
 
 /// Who hears how a mission ended.
@@ -461,8 +697,31 @@ fn passed_over(compiled: &Compiled, steps: &[StepRecord], failed: &str) -> Vec<S
         .collect()
 }
 
-/// `(outcome, failed step, reason)` from the executor's result.
-fn summarise(result: Result<GoalResult, RosError>) -> (Outcome, String, String) {
+/// How a mission ended, from the executor's result.
+pub(super) struct Ended {
+    pub(super) outcome: Outcome,
+    /// The step it failed or stopped at, or empty.
+    pub(super) step: String,
+    /// Why, in the executor's words.
+    pub(super) reason: String,
+    pub(super) fault: Option<Fault>,
+    /// How long it ran.
+    pub(super) elapsed_s: f64,
+}
+
+impl Ended {
+    /// How it went, in a few words, for the guard against an unchanged rerun.
+    fn how(&self) -> String {
+        match (self.outcome, self.fault) {
+            (_, Some(_)) => format!("was cut short: {}", self.reason),
+            (Outcome::Success, None) => "succeeded".to_owned(),
+            (Outcome::Canceled, None) => "was stopped".to_owned(),
+            _ => format!("failed at {}: {}", self.step, self.reason),
+        }
+    }
+}
+
+fn summarise(result: Result<GoalResult, RosError>, elapsed_s: f64) -> Ended {
     match result {
         Ok(r) => {
             let code = r.result["outcome"]
@@ -484,9 +743,21 @@ fn summarise(result: Result<GoalResult, RosError>) -> (Outcome, String, String) 
             if reason.is_empty() {
                 reason = text("diagnostics_json");
             }
-            (outcome, text("failed_step_id"), reason)
+            Ended {
+                outcome,
+                step: text("failed_step_id"),
+                reason,
+                fault: r.result["cause"].as_u64().and_then(Fault::of_cause),
+                elapsed_s,
+            }
         }
-        Err(e) => (Outcome::Error, String::new(), e.to_string()),
+        Err(e) => Ended {
+            outcome: Outcome::Error,
+            step: String::new(),
+            reason: e.to_string(),
+            fault: Some(Fault::ExecutorLost),
+            elapsed_s,
+        },
     }
 }
 
@@ -529,13 +800,17 @@ impl StepTimes {
         }
     }
 
-    /// A planned step as it went; `failed` is the step the mission failed at, with `reason`.
-    fn record(&self, step: &PlannedStep, failed: &str, reason: &str) -> StepRecord {
+    /// A planned step as it went; `failed` is the step the mission failed at, with `reason`, or
+    /// with `cut` the one a stop ended.
+    fn record(&self, step: &PlannedStep, failed: &str, reason: &str, cut: bool) -> StepRecord {
+        // A leaf a stop reaches fails, "stopped": the step it cut is not the skill's failure.
+        let stopped = cut && step.id == failed;
         let (seconds, outcome) = match self.steps.get(&step.id) {
             Some(&StepTime {
                 start,
                 end: Some((end, status)),
-            }) => (Some(end - start), status),
+            }) => (Some(end - start), if stopped { "stopped" } else { status }),
+            _ if stopped => (None, "stopped"),
             _ if step.id == failed => (None, "failure"),
             _ => (None, "skipped"),
         };
@@ -554,7 +829,7 @@ impl StepTimes {
             // The mission's reason is the failed step's; an optional step that failed before it
             // has none of its own.
             reason: match outcome {
-                "failure" if step.id == failed => reason.to_owned(),
+                "failure" | "stopped" if step.id == failed => reason.to_owned(),
                 "failure" => "failed; the mission went on".to_owned(),
                 _ => String::new(),
             },

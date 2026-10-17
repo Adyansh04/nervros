@@ -150,7 +150,7 @@ async fn a_provider_without_its_key_is_passed_over_with_the_reason() {
             role: Role::Segment,
             preamble: "",
             prompt: "the floor",
-            image: None,
+            images: Vec::new(),
         })
         .await
         .unwrap_err()
@@ -167,12 +167,29 @@ fn the_image_goes_first_unless_the_text_must() {
         bytes: vec![0xFF, 0xD8],
         format: ImageFormat::Jpeg,
     };
-    let first = |text_first| match user_message("t", Some(&image), text_first) {
+    let shots = [Shot::bare(image)];
+    let first = |text_first| match user_message("t", &shots, text_first) {
         Message::User { content } => matches!(content.first(), Some(UserContent::Text(_))),
         _ => unreachable!("a user message"),
     };
     assert!(!first(false));
     assert!(first(true));
+    let labelled = Shot {
+        label: "end:".to_owned(),
+        image: shots[0].image.clone(),
+    };
+    let kinds = match user_message("t", &[shots[0].clone(), labelled], false) {
+        Message::User { content } => content
+            .iter()
+            .map(|c| match c {
+                UserContent::Text(t) => t.text.clone(),
+                UserContent::Image(_) => "image".to_owned(),
+                _ => unreachable!("text and images only"),
+            })
+            .collect::<Vec<_>>(),
+        _ => unreachable!("a user message"),
+    };
+    assert_eq!(kinds, ["image", "end:", "image", "t"]);
 }
 
 #[test]

@@ -181,7 +181,7 @@ fn print_plan(
         } else {
             format!("{}: ", c.step)
         };
-        println!("    ! {step}{}", c.message);
+        println!("    ! {step}{}", nervros_core::tools::unfenced(&c.message));
     }
 }
 
@@ -221,6 +221,7 @@ fn print_mission(e: &Event) {
             failed_step,
             reason,
             elapsed_s,
+            fault,
             ..
         } => {
             let why = if failed_step.is_empty() {
@@ -228,7 +229,8 @@ fn print_mission(e: &Event) {
             } else {
                 format!(" at {failed_step}: {reason}")
             };
-            println!("  [mission {outcome} after {elapsed_s:.0} s{why}]");
+            let fault = fault.map_or_else(String::new, |f| format!(", fault: {}", f.as_str()));
+            println!("  [mission {outcome}{fault} after {elapsed_s:.0} s{why}]");
         }
         _ => {}
     }

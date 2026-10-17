@@ -102,6 +102,17 @@ fn a_report_shows_what_happened_with_short_ids() {
         report_text(r#"The program j2 (count) finished: <world>{"office":1,"study":2}</world>"#),
         "The program j2 (count) finished: office 1 · study 2"
     );
+    let mut chat = Chat::default();
+    chat.apply(&Event::Notice {
+        text: "Mission 01a14977-1908-7c14-8a60-c1da02d23783 (walk to the office) was cut short \
+               when NervROS stopped"
+            .to_owned(),
+    });
+    assert!(
+        matches!(&chat.items[..], [Item::Notice(n)]
+            if n == "Mission 01a14977 (walk to the office) was cut short when NervROS stopped"),
+        "a notice's ids read as a report's"
+    );
 }
 
 #[test]
@@ -600,6 +611,61 @@ fn a_message_said_while_working_shows_once_when_it_starts_a_turn() {
 }
 
 #[test]
+fn a_scene_checks_doubt_reads_without_its_fences() {
+    let mut chat = Chat::default();
+    chat.apply(&Event::MissionPlanned {
+        hash: "5be0c1d9f2a4".to_owned(),
+        intent: "look for the tray".to_owned(),
+        steps: vec![PlannedStep {
+            id: "s1".to_owned(),
+            skill: "FindInView".to_owned(),
+            summary: "FindInView(phrase=tray)".to_owned(),
+            ..PlannedStep::default()
+        }],
+        worst_case_s: 30.0,
+        concerns: vec![Concern {
+            step: "s1".to_owned(),
+            message: nervros_core::tools::from_world("no tray is in view from here"),
+            fix: None,
+        }],
+        by_job: false,
+    });
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(440.0, 800.0))
+        .build_ui(move |ui| chat.show(ui, Duration::from_mins(10), &mut Vec::new()));
+    harness.run();
+    assert!(
+        harness
+            .query_by_label("no tray is in view from here")
+            .is_some()
+    );
+}
+
+#[test]
+fn a_patrol_card_says_patrol() {
+    use nervros_core::job::{Envelope, JobInfo, JobKind, JobState};
+    let mut chat = Chat::default();
+    chat.apply(&Event::JobStarted {
+        job: JobInfo {
+            id: "j1".to_owned(),
+            kind: JobKind::Patrol,
+            name: "living_room, bedroom".to_owned(),
+            envelope: Envelope::new([], 30),
+            allows: String::new(),
+            started_s: 0.0,
+            state: JobState::Running,
+            summary: String::new(),
+        },
+    });
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(440.0, 800.0))
+        .build_ui(move |ui| chat.show(ui, Duration::from_mins(10), &mut Vec::new()));
+    harness.run();
+    assert!(harness.query_by_label("Patrol").is_some());
+    assert!(harness.query_by_label("Search").is_none());
+}
+
+#[test]
 fn arming_first_keeps_the_suggestions() {
     let mut chat = Chat::default();
     chat.apply(&Event::Armed { armed: true });
@@ -679,6 +745,7 @@ fn snapshot_mission() {
         elapsed_s: 94.0,
         outputs: serde_json::Map::new(),
         by_job: false,
+        fault: None,
     });
     chat.apply(&Event::Report {
         turn: 2,
@@ -777,6 +844,7 @@ fn snapshot_error_and_image() {
         width: 96,
         height: 54,
         marks: vec!["red mug".to_owned(), "fruit bowl".to_owned()],
+        stamp_s: 0.0,
     });
     chat.apply(&Event::Notice {
         text: "The robot is running mission m7, at s2_GoToPlace, started before this session. \

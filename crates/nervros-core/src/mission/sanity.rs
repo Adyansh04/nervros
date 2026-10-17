@@ -541,6 +541,57 @@ pub fn verdict(reply: &str) -> Option<Verdict> {
     }
 }
 
+/// The most doubts the scene check may add to a card.
+const MOST_DOUBTS: usize = 3;
+
+/// Why a plan's steps deserve a look at the scene before it runs: each step whose skill failed on
+/// its target in at least half of its last runs, from its track record.
+#[must_use]
+pub fn flags(steps: &[PlannedStep]) -> Vec<String> {
+    steps
+        .iter()
+        .filter_map(|s| {
+            let t = s.track.as_ref()?;
+            if t.runs < 2 || t.succeeded * 2 > t.runs {
+                return None;
+            }
+            let last = t
+                .last_failure
+                .as_ref()
+                .map_or_else(String::new, |f| format!(", last failing with: {f}"));
+            Some(format!(
+                "{} {} succeeded in {} of its last {} runs{last}",
+                s.id, s.summary, t.succeeded, t.runs
+            ))
+        })
+        .collect()
+}
+
+/// The scene check's doubts, as concerns about the plan's own steps: each `sN: doubt` line, at
+/// most [`MOST_DOUBTS`]; none for `ok` or anything else.
+#[must_use]
+pub fn doubts(reply: &str, steps: &[PlannedStep]) -> Vec<Concern> {
+    let answer = reply.rsplit_once("</think>").map_or(reply, |(_, a)| a);
+    answer
+        .lines()
+        .filter_map(|line| {
+            let (step, doubt) = line
+                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '-'))
+                .split_once(':')?;
+            let step = step.trim_matches(|c: char| !c.is_alphanumeric());
+            let doubt = doubt.trim().trim_matches('*').trim();
+            (steps.iter().any(|s| s.id == step) && !doubt.is_empty()).then(|| {
+                Concern::new(
+                    step,
+                    crate::tools::from_world(&crate::tools::clip(doubt, 200)),
+                    None,
+                )
+            })
+        })
+        .take(MOST_DOUBTS)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +609,38 @@ mod tests {
                 .collect(),
             ..PlannedStep::default()
         }
+    }
+
+    #[test]
+    fn a_step_that_failed_half_its_runs_flags_the_plan_and_doubts_are_read_by_step() {
+        let track = |runs, succeeded| {
+            Some(crate::mission::ledger::Track {
+                runs,
+                succeeded,
+                typical_s: None,
+                last_failure: Some("no grasp".to_owned()),
+            })
+        };
+        let mut walk = step("s1", "GoToPlace", &[("place", "dock")]);
+        walk.track = track(5, 4);
+        let mut pick = step("s2", "PickObject", &[("object_id", "O17")]);
+        pick.summary = "PickObject(object_id=O17)".to_owned();
+        pick.track = track(4, 2);
+        let steps = [walk, pick];
+
+        assert_eq!(
+            flags(&steps),
+            [
+                "s2 PickObject(object_id=O17) succeeded in 2 of its last 4 runs, last failing with: \
+              no grasp"
+            ]
+        );
+        let reply = "<think>s1: hm</think>\n**s2:** the mug is behind the box\ns9: not a step";
+        let found = doubts(reply, &steps);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].step, "s2");
+        assert_eq!(found[0].message, "<world>the mug is behind the box</world>");
+        assert!(doubts("ok", &steps).is_empty());
     }
 
     fn turn(degrees: &str) -> PlannedStep {

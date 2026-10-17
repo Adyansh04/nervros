@@ -195,6 +195,7 @@ impl Missions {
         if let Some(fields) = args.as_object_mut() {
             fields.remove("check_only");
             fields.remove("hash");
+            fields.remove("goal");
         }
         let mut plan: Plan = match serde_json::from_value(args) {
             Ok(p) => p,
@@ -259,6 +260,10 @@ impl Missions {
             return questioned(&concerns);
         }
         self.add_tracks(&mut compiled.steps).await;
+        let mut concerns = concerns;
+        if by == By::Model {
+            concerns.extend(self.scene_doubts(&compiled, &catalog).await);
+        }
         let worst = reply["worst_case_duration_s"]
             .as_f64()
             .filter(|w| *w > 0.0)
@@ -348,6 +353,35 @@ impl Missions {
             None => {
                 tracing::info!(%reply, "the critic gave no verdict");
                 none
+            }
+        }
+    }
+
+    /// Doubts about a plan its track records flag, from what the cameras show now: added to the
+    /// card, never sending the plan back. None while no step is flagged or no model has the
+    /// `scene_check` role, so the scarce model is asked only about plans that have failed before.
+    async fn scene_doubts(&self, compiled: &Compiled, catalog: &Catalog) -> Vec<Concern> {
+        let Some(vision) = self.vision.get().filter(|v| v.scene_check) else {
+            return Vec::new();
+        };
+        let flags = sanity::flags(&compiled.steps);
+        if flags.is_empty() {
+            return Vec::new();
+        }
+        let prompt = format!(
+            "{}\nFlagged: {}.",
+            sanity::critic_prompt(&self.request(), &compiled.steps, catalog),
+            flags.join("; ")
+        );
+        match tokio::time::timeout(CRITIC_TIMEOUT, vision.doubts(&prompt)).await {
+            Ok(Ok(reply)) => sanity::doubts(&reply, &compiled.steps),
+            Ok(Err(e)) => {
+                tracing::info!(error = %e, "no scene check for this plan");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::info!("the scene check took too long");
+                Vec::new()
             }
         }
     }

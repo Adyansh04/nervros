@@ -16,6 +16,7 @@ pub mod segment;
 pub mod skills;
 pub mod vision;
 pub mod watch;
+pub(crate) mod when;
 pub mod zones;
 
 use std::borrow::Cow;
@@ -183,6 +184,8 @@ pub struct ImageArtifact {
     pub height: u32,
     /// What each numbered mark on it is, mark 1 first.
     pub marks: Vec<String>,
+    /// When the frame was taken, seconds since 1970.
+    pub stamp_s: f64,
 }
 
 /// What a call returned.
@@ -249,6 +252,12 @@ impl ToolOutcome {
 #[must_use]
 pub fn from_world(text: &str) -> String {
     format!("<world>{}</world>", fence_text(text, "world"))
+}
+
+/// `text` without its [`from_world`] fences, for a person: the fences are for the model.
+#[must_use]
+pub fn unfenced(text: &str) -> String {
+    text.replace("<world>", "").replace("</world>", "")
 }
 
 /// `text` ready to go inside a `<tag>` fence: without control or invisible characters, and with

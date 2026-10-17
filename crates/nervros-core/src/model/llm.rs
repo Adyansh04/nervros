@@ -64,6 +64,27 @@ impl ImageInput {
     }
 }
 
+/// An image and the words said just before it, such as "head camera, at the start": several in
+/// one request let a model compare frames, as a start and an end, or follow a clip.
+#[derive(Debug, Clone)]
+pub struct Shot {
+    /// Said before the image; empty for nothing.
+    pub label: String,
+    /// The image.
+    pub image: ImageInput,
+}
+
+impl Shot {
+    /// `image` with nothing said before it.
+    #[must_use]
+    pub fn bare(image: ImageInput) -> Self {
+        Self {
+            label: String::new(),
+            image,
+        }
+    }
+}
+
 /// Encodings the providers all accept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {
@@ -82,8 +103,8 @@ pub struct Ask<'a> {
     pub preamble: &'a str,
     /// The user text.
     pub prompt: &'a str,
-    /// An optional image.
-    pub image: Option<ImageInput>,
+    /// Images, each after its label; none for a text prompt.
+    pub images: Vec<Shot>,
 }
 
 /// A model's reply and which model gave it.
@@ -184,21 +205,26 @@ pub const BUSY_BACKOFF: [Duration; 3] = [
 /// held back: free tiers count requests a minute, and a burst of calls spends them all.
 pub const MINUTE_WAIT: Duration = Duration::from_mins(1);
 
-/// A user message with optional image content, image first as most vision models prefer, or
-/// after the text when `text_first`.
+/// A user message with its images, the images first as most vision models prefer, or after the
+/// text when `text_first`.
 #[must_use]
-pub fn user_message(text: &str, image: Option<&ImageInput>, text_first: bool) -> Message {
-    let mut content = vec![UserContent::text(text)];
-    if let Some(image) = image {
-        let media = match image.format {
+pub fn user_message(text: &str, shots: &[Shot], text_first: bool) -> Message {
+    let mut content = Vec::with_capacity(1 + 2 * shots.len());
+    for shot in shots {
+        if !shot.label.is_empty() {
+            content.push(UserContent::text(&shot.label));
+        }
+        let media = match shot.image.format {
             ImageFormat::Jpeg => ImageMediaType::JPEG,
             ImageFormat::Png => ImageMediaType::PNG,
         };
-        let data = base64::engine::general_purpose::STANDARD.encode(&image.bytes);
+        let data = base64::engine::general_purpose::STANDARD.encode(&shot.image.bytes);
         content.push(UserContent::image_base64(data, Some(media), None));
     }
-    if !text_first {
-        content.rotate_left(1);
+    if text_first {
+        content.insert(0, UserContent::text(text));
+    } else {
+        content.push(UserContent::text(text));
     }
     Message::User { content }
 }

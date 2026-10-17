@@ -158,6 +158,8 @@ pub enum Event {
         /// What each numbered mark on it is, mark 1 first.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         marks: Vec<String>,
+        /// When the frame was taken, seconds since 1970: a `when` answer's is long past.
+        stamp_s: f64,
     },
     /// A number in a topic's messages to draw over time, in the viewer's Plots tab.
     Plot {
@@ -362,6 +364,9 @@ pub enum Event {
         /// Run by a job: a failed step is the job's to weigh, such as a look that saw nothing.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         by_job: bool,
+        /// What made the run no test of its plan, when something did.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fault: Option<crate::mission::Fault>,
     },
     /// A job the operator approved started, such as a robot program or a search.
     JobStarted {
@@ -396,6 +401,7 @@ impl From<&crate::tools::ImageArtifact> for Event {
             width: image.width,
             height: image.height,
             marks: image.marks.clone(),
+            stamp_s: image.stamp_s,
         }
     }
 }

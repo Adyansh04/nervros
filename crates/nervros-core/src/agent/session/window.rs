@@ -49,12 +49,7 @@ pub(super) fn report_context(
 
 /// The system prompt for this turn: the fixed one and the notes as they are now.
 pub(super) fn preamble(shared: &Shared) -> String {
-    let notes = shared
-        .config
-        .notes
-        .as_ref()
-        .map(|n| n.text())
-        .unwrap_or_default();
+    let notes: String = shared.config.notes.iter().map(|n| n.text()).collect();
     format!("{}{notes}", shared.config.preamble)
 }
 

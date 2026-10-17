@@ -35,6 +35,8 @@ pub enum JobKind {
     Program,
     /// A search for something.
     Search,
+    /// A round of places, and what changed meanwhile.
+    Patrol,
 }
 
 impl JobKind {
@@ -44,6 +46,7 @@ impl JobKind {
         match self {
             Self::Program => "program",
             Self::Search => "search",
+            Self::Patrol => "patrol",
         }
     }
 }

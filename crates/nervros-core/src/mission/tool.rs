@@ -48,6 +48,7 @@ impl Missions {
                 "template": {"type": "string", "description": "Instead of steps: the name of a saved plan"},
                 "check_only": {"type": "boolean", "description": "Only check the plan; do not run it"},
                 "intent": {"type": "string", "description": "What the operator asked for, in a few words"},
+                "goal": {"type": "integer", "description": "The open goal this mission works toward, by its number"},
                 "steps": {"type": "array", "minItems": 1, "maxItems": plan::MAX_STEPS, "items": {
                     "type": "object",
                     "properties": {
@@ -177,13 +178,17 @@ impl RunMission {
                 compiled.plan.intent,
                 crate::counted(compiled.steps.len(), "step")
             ),
-            args: Some(json!({"hash": compiled.sha256})),
+            args: Some(with_goal(
+                json!({"hash": compiled.sha256}),
+                args.get("goal"),
+            )),
         }))
     }
 
     /// A plan checked and ready for the operator: run by its hash once approved, with its
     /// preview on the way.
     async fn approvable(&self, args: Value, by: By) -> Result<Assessment, ToolOutcome> {
+        let goal = args.get("goal").cloned();
         let out = self.0.plan(args, by).await;
         if out.status != Status::Succeeded {
             return Err(out);
@@ -203,8 +208,9 @@ impl RunMission {
         let steps = crate::counted(steps, "step");
         let mut reason = format!("runs \"{intent}\": {steps}, at most {at_most}");
         if let Some(concerns) = out.data["concerns"].as_array() {
+            // The operator's words: the fences of the scene check's doubts are the model's.
             for c in concerns.iter().filter_map(Value::as_str) {
-                let _ = write!(reason, "; check: {c}");
+                let _ = write!(reason, "; check: {}", crate::tools::unfenced(c));
             }
         }
         let missions = Arc::clone(&self.0);
@@ -213,7 +219,7 @@ impl RunMission {
         // Marked as the operator's only here: a model's call by hash has its arguments replaced.
         let args = match by {
             By::Operator => json!({"hash": hash, "by": "operator"}),
-            By::Model | By::Job => json!({"hash": hash}),
+            By::Model | By::Job => with_goal(json!({"hash": hash}), goal.as_ref()),
         };
         Ok(Assessment {
             risk: Risk::Manipulation,
@@ -222,6 +228,14 @@ impl RunMission {
             args: Some(args),
         })
     }
+}
+
+/// `run`'s arguments by hash, with the goal the model's call named: approval replaces the rest.
+fn with_goal(mut run: Value, goal: Option<&Value>) -> Value {
+    if let Some(goal) = goal {
+        run["goal"] = goal.clone();
+    }
+    run
 }
 
 /// A concern as one line, its step first.

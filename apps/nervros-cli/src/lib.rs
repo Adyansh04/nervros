@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use anyhow::{Context as _, Result, bail};
 use clap::builder::PossibleValuesParser;
 use clap::{Parser, Subcommand};
-use nervros_core::llm::{Ask, ImageFormat, ImageInput, Llm};
+use nervros_core::llm::{Ask, ImageFormat, ImageInput, Llm, Shot};
 use nervros_core::profile::Profile;
 use nervros_core::providers::router::Router;
 use nervros_core::providers::{Role, free_only, openrouter};
@@ -40,16 +40,16 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Send one prompt, optionally with an image, and print the reply.
+    /// Send one prompt, optionally with images, and print the reply.
     Ask {
         /// The prompt.
         prompt: String,
         /// Which role's chain to use.
         #[arg(long, default_value = "routine", value_parser = PossibleValuesParser::new(Role::ALL.map(Role::name)))]
         role: String,
-        /// A JPEG or PNG to attach.
+        /// A JPEG or PNG to attach; repeated, several in order, each labelled with its file name.
         #[arg(long)]
-        image: Option<PathBuf>,
+        image: Vec<PathBuf>,
     },
     /// Chat with the robot. Lines starting with `/` are commands: `/arm`, `/disarm`, `/stop`,
     /// `/pause`, `/resume`, `/yes N`, `/allow N` (yes, and no more asking for that tool this
@@ -149,6 +149,20 @@ enum Command {
     /// NervROS carries, and keep it as an incident.
     #[cfg(feature = "ros")]
     Why,
+    /// What the robot did over the last hours: missions by how they ended, skills' records,
+    /// incidents and goals, from its files. The world model's changes need the agent's `digest`.
+    Digest {
+        /// How far back.
+        #[arg(long, default_value_t = 24.0)]
+        hours: f64,
+    },
+    /// The fixes proposed after a step failed again: each with its step's record before and
+    /// since, once accepted. Accepting runs a tool, so it is the app's or the chat's to do.
+    Inbox {
+        /// Turn down this proposal, by its number.
+        #[arg(long)]
+        dismiss: Option<u32>,
+    },
     /// The incidents kept for the robot, newest first, or one in full by its id.
     Incidents {
         /// An incident's id, such as i3.
@@ -296,6 +310,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Command::Replay { log } => records::replay(&log),
         Command::Missions { id, limit } => records::missions(&cli.profile, id.as_deref(), limit),
+        Command::Digest { hours } => records::digest(&cli.profile, hours),
+        Command::Inbox { dismiss } => records::inbox(&cli.profile, dismiss),
         Command::Gaps { limit } => records::gaps(&cli.profile, limit),
         Command::Case { log, id, append } => records::case(&log, &id, append.as_deref()),
         Command::Mcp {
@@ -420,10 +436,11 @@ async fn models(profile: &Path, check: bool) -> Result<()> {
     Ok(())
 }
 
-async fn ask(profile: &Path, prompt: &str, role: Role, image: Option<PathBuf>) -> Result<()> {
-    let image = match image {
-        None => None,
-        Some(file) => {
+async fn ask(profile: &Path, prompt: &str, role: Role, images: Vec<PathBuf>) -> Result<()> {
+    let one = images.len() == 1;
+    let images = images
+        .iter()
+        .map(|file| {
             let format = match file
                 .extension()
                 .and_then(|e| e.to_str())
@@ -435,17 +452,27 @@ async fn ask(profile: &Path, prompt: &str, role: Role, image: Option<PathBuf>) -
                 _ => bail!("{} is not a .png or .jpg file", file.display()),
             };
             let bytes =
-                std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
-            Some(ImageInput { bytes, format })
-        }
-    };
+                std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+            let image = ImageInput { bytes, format };
+            // A lone image needs no name; several are told apart by theirs.
+            Ok(if one {
+                Shot::bare(image)
+            } else {
+                let name = file.file_name().unwrap_or_default().to_string_lossy();
+                Shot {
+                    label: format!("{name}:"),
+                    image,
+                }
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let llm = Llm::new(router(profile)?);
     let answer = llm
         .ask(Ask {
             role,
             preamble: "You are NervROS, a robot's assistant. Be brief.",
             prompt,
-            image,
+            images,
         })
         .await?;
     println!("{}", answer.text);

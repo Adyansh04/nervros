@@ -11,7 +11,10 @@ pub mod advice;
 pub mod camera;
 pub mod catalog;
 pub mod check;
+pub mod digest;
+pub mod goals;
 pub mod history;
+pub mod inbox;
 pub mod learn;
 pub mod ledger;
 pub mod plan;
@@ -124,6 +127,101 @@ impl std::fmt::Display for Outcome {
     }
 }
 
+/// Why a run says nothing about its plan or its skills: the robot, the executor or NervROS ended
+/// it. It keeps its outcome, but track records, taught skills and the request's replans leave it
+/// out, and its report asks what the fault needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Fault {
+    /// The robot could not move: refused at the start, or it stopped being able to walk.
+    Robot,
+    /// NervROS's heartbeat stopped reaching the executor.
+    Deadman,
+    /// The executor shut down.
+    Shutdown,
+    /// A skill's server was not up.
+    NoServer,
+    /// The base was being driven by hand.
+    Teleop,
+    /// Another mission was running on the executor.
+    Busy,
+    /// No result came: the executor went quiet or restarted.
+    ExecutorLost,
+    /// NervROS stopped while it ran.
+    Interrupted,
+}
+
+impl Fault {
+    /// In the order of the executor's `cause` codes, after `CAUSE_NONE`.
+    const BY_CAUSE: [Self; 6] = [
+        Self::Robot,
+        Self::Deadman,
+        Self::Shutdown,
+        Self::NoServer,
+        Self::Teleop,
+        Self::Busy,
+    ];
+
+    /// The fault an executor's `cause` names; none for `CAUSE_NONE` or a code it does not know.
+    #[must_use]
+    pub fn of_cause(cause: u64) -> Option<Self> {
+        let index = usize::try_from(cause.checked_sub(1)?).ok()?;
+        Self::BY_CAUSE.get(index).copied()
+    }
+
+    /// Its name, as the ledger keeps it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Robot => "robot",
+            Self::Deadman => "deadman",
+            Self::Shutdown => "shutdown",
+            Self::NoServer => "no_server",
+            Self::Teleop => "teleop",
+            Self::Busy => "busy",
+            Self::ExecutorLost => "executor_lost",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    /// What the model is told to do about it, after the report says what happened.
+    #[must_use]
+    pub fn next(self) -> &'static str {
+        match self {
+            Self::Robot => {
+                "The robot could not move, which says nothing about the plan. Do not retry: tell \
+                 the operator why, and wait until they say it can move again."
+            }
+            Self::Deadman => {
+                "The executor stopped it because NervROS's heartbeat stopped reaching it. Tell the \
+                 operator; run it again only if they ask."
+            }
+            Self::Shutdown => {
+                "The executor shut down. Do not retry until the operator says it is back."
+            }
+            Self::NoServer => {
+                "A skill's server was not running, so the robot's stack may not be fully up. Do \
+                 not retry: ask the operator to check it."
+            }
+            Self::Teleop => {
+                "Someone was driving the base by hand. Do not retry until the operator ends teleop."
+            }
+            Self::Busy => {
+                "Another mission was running on the robot. Do not retry until the operator says \
+                 it is free."
+            }
+            Self::ExecutorLost => {
+                "The link to the executor was lost, so how the mission ended is unknown. Do not \
+                 retry: ask the operator to check the robot and its executor."
+            }
+            Self::Interrupted => {
+                "NervROS stopped while it ran. Tell the operator where things stand; run it \
+                 again only if they ask."
+            }
+        }
+    }
+}
+
 /// What a hand holds when the executor cannot say: after a pick that was cut off, it trusts the
 /// hand again only once a place with it succeeds.
 pub const UNKNOWN_HELD: &str = "something unknown";
@@ -211,6 +309,10 @@ pub struct Missions {
     paused: AtomicBool,
     /// The skills taught in this session that wait for a mission to keep them.
     drafts: learn::Drafts,
+    /// The operator's goals, judged after every mission.
+    goals: OnceLock<Arc<goals::Goals>>,
+    /// Fixes proposed after a step failed again, when a model drafts them.
+    inbox: OnceLock<Arc<inbox::Inbox>>,
 }
 
 impl crate::session::Pulse for Missions {
@@ -269,6 +371,8 @@ impl Missions {
             questioned: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             drafts: learn::Drafts::default(),
+            goals: OnceLock::new(),
+            inbox: OnceLock::new(),
         }))
     }
 
@@ -305,6 +409,14 @@ impl Missions {
         self
     }
 
+    /// Judges `goals` after every mission and at start, and counts the missions run for one.
+    #[must_use]
+    pub fn with_goals(self: Arc<Self>, goals: Arc<goals::Goals>) -> Arc<Self> {
+        // Set once, at start-up.
+        let _ = self.goals.set(goals);
+        self
+    }
+
     /// Checks each successful mission's goals through the camera too.
     #[must_use]
     pub fn with_vision(self: Arc<Self>, vision: camera::Vision) -> Arc<Self> {
@@ -326,10 +438,29 @@ impl Missions {
             .map_or(&[], |c| c.read_deny.as_slice())
     }
 
+    /// The profile's turn on the spot, for a look around: none when it names none.
+    #[must_use]
+    pub fn turn_skill(&self) -> Option<&crate::profile::TurnSkill> {
+        self.config.checks.turn.as_ref()
+    }
+
     /// Where finished missions are kept, if anywhere.
     #[must_use]
     pub fn ledger(&self) -> Option<&Arc<Ledger>> {
         self.ledger.get()
+    }
+
+    /// Proposes fixes into `inbox` after a step fails again. Set once the agent's tools are
+    /// known, as a fix calls one of them.
+    pub fn use_inbox(&self, inbox: Arc<inbox::Inbox>) {
+        // Set once, at start-up.
+        let _ = self.inbox.set(inbox);
+    }
+
+    /// The operator's goals, when they are kept.
+    #[must_use]
+    pub fn goals(&self) -> Option<&Arc<goals::Goals>> {
+        self.goals.get()
     }
 
     /// `run_mission`, the one tool: it checks a plan, and runs it once the operator approves.
@@ -345,6 +476,13 @@ impl Missions {
         if self.session.set(session).is_err() {
             return;
         }
+        // What an earlier NervROS left is settled beside the loop below, which must hear the
+        // operator's first words before the model plans for them.
+        let settle = Arc::clone(self);
+        tokio::spawn(async move {
+            settle.settle_interrupted().await;
+            settle.settle_goals_at_start().await;
+        });
         // Held weakly, so that the missions end with the session.
         let me = Arc::downgrade(self);
         let first = Arc::clone(self);

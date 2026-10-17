@@ -4,7 +4,7 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nervros_core::mission::Outcome;
 use nervros_core::mission::plan::PlannedStep;
@@ -308,13 +308,14 @@ impl Chat {
                 width,
                 height,
                 marks,
+                stamp_s,
             } => match decode(jpeg) {
                 Some(pixels) => self.items.push(Item::Image {
                     id: id.clone(),
                     pixels: RefCell::new(Some(Arc::new(pixels))),
                     texture: OnceCell::new(),
                     marks: marks.clone(),
-                    at: SystemTime::now(),
+                    at: taken_at(*stamp_s),
                 }),
                 None => self.items.push(Item::Notice(format!(
                     "Snapshot {id} ({width}×{height}) could not be decoded"
@@ -336,7 +337,9 @@ impl Chat {
                 )));
             }
             // As every notice reads: the robot's answers come as phrases, "no mission is running".
-            Event::Notice { text } => self.items.push(Item::Notice(plan::capitalise(text))),
+            Event::Notice { text } => self
+                .items
+                .push(Item::Notice(plan::capitalise(&report::short_ids(text)))),
             Event::Error { turn, text } => self.items.push(Item::Error {
                 text: text.clone(),
                 retry: self.asked.get(turn).cloned(),
@@ -870,4 +873,14 @@ impl Chat {
                 _ => None,
             })
     }
+}
+
+/// When a snapshot's frame was taken, for its caption and Show in 3D; its arrival when the stamp
+/// is not on the wall clock, as a clock that started with its process (before 2001) is not.
+fn taken_at(stamp_s: f64) -> SystemTime {
+    Duration::try_from_secs_f64(stamp_s)
+        .ok()
+        .filter(|d| d.as_secs() > 1_000_000_000)
+        .and_then(|d| UNIX_EPOCH.checked_add(d))
+        .unwrap_or_else(SystemTime::now)
 }

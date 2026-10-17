@@ -24,9 +24,12 @@ Setup is in the [README](../README.md). Every setting is in the [profile](profil
 - **By hand:** [Clicking in the 3D view](#clicking-in-the-3d-view) ·
   [Commands without the model](#commands-without-the-model) · [Driving by hand](#driving-by-hand)
 - **Watching and fixing:** [Keeping an eye on it](#keeping-an-eye-on-it) ·
+  [Waiting for what a camera shows](#waiting-for-what-a-camera-shows) ·
+  [A patrol and the digest](#a-patrol-and-the-digest) · [Proposed fixes](#proposed-fixes) ·
   [Debugging the ROS side](#debugging-the-ros-side) ·
-  [When something goes wrong](#when-something-goes-wrong)
-- **Memory and limits:** [Remembering](#remembering) ·
+  [When something goes wrong](#when-something-goes-wrong) ·
+  [Runs the robot cut short](#runs-the-robot-cut-short)
+- **Memory and limits:** [Remembering](#remembering) · [Keeping a goal](#keeping-a-goal) ·
   [Keeping it out of places](#keeping-it-out-of-places) ·
   [The robot's self-description](#the-robots-self-description)
 - **Maps:** [Mapping a new building](#mapping-a-new-building) ·
@@ -142,6 +145,16 @@ right, send it again unchanged and the operator sees these concerns when approvi
 
 If the model sends the same plan again, the concern stays on the card with a one-click fix.
 **Edit** changes, drops or moves a step before you approve.
+
+https://github.com/user-attachments/assets/91718cec-719c-4fad-96ff-6c210f32c287
+
+> **You:** Look for the wooden tray from here with FindInView, without walking.
+
+A plan with a step that has worked at most half the time on this robot, over two runs or more, also
+goes to the scene check: a vision model shown what each camera sees now. It can only add doubts.
+Here `FindInView` for the tray had worked once in five, and the doubt "there is no tray in the
+current view" shows under the step and in the approval, before anything moves. Gemini 3.5
+Flash-Lite answered in this clip, and Gemini Robotics-ER 2 made the scene check.
 
 ### Fetching something
 
@@ -499,6 +512,64 @@ tells you: "Tell me when a mug appears in the bedroom" needs no approval.
 "Check the robot's health" runs the same connection check as the Doctor tab. You can ask it even
 while a mission runs.
 
+### Waiting for what a camera shows
+
+https://github.com/user-attachments/assets/1ebe06cc-de7a-490f-b902-597ea91f72d6
+
+> **You:** Tell me when the head camera shows a red mug.
+>
+> **You:** Walk to the dining table.
+
+A watch can also wait for what a camera shows, such as someone putting a box on the sofa. A vision
+model looks every 15 seconds, and the watch posts once it says yes twice in a row, so one glimpse it
+mistook does not count. Here it fires once the robot stands at the table: "the camera model says a
+red mug on the table".
+
+> **You:** When did the head camera first show the red mug?
+
+With `[keyframes]`, the cameras keep a frame each time their view changes. `when` shows a vision
+model a dozen of them in time order, those around the moments the world model saw the mug change
+when it did, as for "when did the red mug leave the dining table?". A model reading a dozen frames
+can name the one beside the right one, so the vision check then looks at that frame alone, and at
+its neighbours until one shows it. It answers with the time and the frame: here 60 s ago, the frame
+where the mug comes into view, and **Show in 3D** takes the viewer back to that moment.
+
+### A patrol and the digest
+
+https://github.com/user-attachments/assets/e0343475-e62f-4f6a-8e6a-5a693125325d
+
+> **You:** Check on the living room and the bedroom.
+
+A patrol walks the round as a job and looks around in each place: a full turn on the spot in
+quarter turns, each view held still so the world model takes it in. It then reports what it saw in
+each room and what moved or went missing meanwhile:
+
+```text
+report> The patrol j1 (living room, bedroom) finished: visited living room, bedroom; saw the
+        living room (R1): 4 chairs, an armchair, a book, a bookshelf, a coffee table, a dining
+        table and a sofa; the bedroom (R3): a bed, a clock, a nightstand and a potted plant, and
+        in view the study (R7): a wardrobe; nothing moved or went missing in the world model
+        meanwhile
+```
+
+> **You:** How did today go?
+
+The digest counts the missions by how they ended, sets the runs the robot itself cut short apart,
+gives each skill's record, and lists what moved in the world model, the incidents and the goals.
+`nervros-cli digest --hours 24` prints the same in a terminal. Gemini 3.5 Flash-Lite answered in
+this clip.
+
+### Proposed fixes
+
+https://github.com/user-attachments/assets/c23c8e5b-65c4-4367-88e8-5c94d21a6e42
+
+When a step keeps failing, NervROS may propose a lasting fix: a note the planner reads, a keep-out
+zone, or a node parameter the profile lets `param_set` change. It never applies one itself. The
+Agent tab's **Proposed fixes** list each with what failed and why the fix would help, then
+**Accept**, which runs it as yours, and **Dismiss**, which keeps that step from getting another.
+Here Accept on the note adds it to **Memory**, and the fix then shows the step's record before and
+since, which says whether it helped.
+
 ### Debugging the ROS side
 
 With a `[ros_tools]` table in the profile, the agent reads the graph as `ros2` does: "what is
@@ -554,6 +625,26 @@ fit any robot, and the profile adds its own robot's ([`[incidents]`](profile.md#
 
 The investigator only reads: it never moves the robot.
 
+### Runs the robot cut short
+
+https://github.com/user-attachments/assets/3c3d470d-7af2-498e-b83c-8c70945c5c65
+
+Not every failed mission is a failed plan. The executor's result says when the robot or the executor
+ended one: the robot could not move or fell, the app's heartbeat stopped, the executor was shutting
+down, a skill's server was not up, the base was being driven by hand, or another mission held the
+robot. NervROS adds two of its own: it lost the executor, or it stopped while the mission ran, which
+the next start says. In the clip, a walk NervROS was running when it stopped is marked at start, and
+a walk approved while the base is driven by hand from the Robot tab cannot start:
+
+```text
+report> Mission 01a149ab (Walk to the office, room R4) ended: rejected after 0 s. It could not
+        start (teleop is driving the base).
+```
+
+Such a run counts against no skill's record and no goal, its report says what it needs instead of a
+new plan ("do not retry until the operator ends teleop"), and the Mission tab dims it, with its
+cause beside how it ended.
+
 ## Remembering
 
 https://github.com/user-attachments/assets/4e948469-2f78-470e-b5e3-1755cc7346aa
@@ -571,6 +662,37 @@ A named place works from then on, in this session and the next: "go to the charg
 join what the agent knows on every turn, and the Agent tab lists them with **Forget**. "What have
 you done so far?" and "what happened to the mug?" read the mission ledger and the world model's
 history.
+
+## Keeping a goal
+
+https://github.com/user-attachments/assets/2cbd5b3b-22d3-4f12-84ce-f697941a21d9
+
+> **You:** Set a goal to keep the red mug on the wooden tray, then work toward it.
+
+The agent sets a goal with what holds once it is met, in the world model's ids, such as `inside(O27,
+O261)`, and you approve it like an edit. A name only the detector knows, such as `mug_4`, is taken
+as the world model's likeliest object of its kind, and the agent is told which; with none it is
+refused, as the world model could never see that goal met. The agent then plans a mission for it at
+once. After every mission NervROS checks the goal itself and tells the agent what is still unmet,
+and the agent plans the next mission for it, which you approve as usual. The world model may give an
+object it saw moved another id, so for `inside` and `on` an object of the same kind seen there after
+the goal's own object was last seen counts, once that object is gone from where it was or when the
+one there was seen after the goal was set: a mug on the tray after the mug left the table is the
+goal's mug. A goal ends when it holds, when its missions (five unless you say) or its time run out,
+or when the agent gives it up as impossible, with the reason. A run the robot cut short counts
+against no goal. Goals outlast a restart: at start the window says where each one stands.
+
+The clip plays four times faster while the mission runs. Its report ends with the goal, met:
+
+```text
+report> Mission 01a14b19 (Pick up the red mug and place it into the wooden tray) ended: success
+        after 211 s. … Camera check: inside(mug_4, tray_1): the camera agrees: the detector marks
+        a mug (mark 1) in or on the tray (mark 5).
+        Goal: goal 1 (keep the red mug on the wooden tray): met.
+```
+
+The Agent tab lists the goals and where each stands, each with **Drop**. Gemini 3.5 Flash-Lite
+answered in this clip.
 
 ## Keeping it out of places
 
@@ -730,12 +852,14 @@ nervros-cli --profile my.toml ask "What can you see?" --image frame.jpg
 | Command | Does |
 |---|---|
 | `chat` | Chats with the robot; `--say` sends a script of messages and exits, `--model <id>` talks on one model alone |
-| `ask` | Sends one prompt, optionally with an image, to one role's models |
+| `ask` | Sends one prompt to one role's models, with any images in order (`--image` once each) |
 | `look`, `segment` | Saves the camera's marks, or the regions a prompt names, as an image |
 | `ros` | Runs one read-only ROS tool with no model: graph, topic sample, interface, TF, parameters, logs |
 | `doctor` | Checks the profile's tools, topics and mission services against the live graph |
 | `why`, `incidents` | Checks what is wrong with the robot now against the playbooks and keeps it as an incident; lists the kept incidents, or shows one in full |
 | `missions`, `gaps` | Shows the mission ledger, and the requests no skill could do |
+| `digest` | What the robot did over the last hours (`--hours`), from its ledger, incidents and goals |
+| `inbox` | Lists the proposed fixes, accepted ones with their step's record before and since; `--dismiss N` turns one down while the app is closed |
 | `replay` | Replays a session as it happened |
 | `eval`, `case` | Runs test suites against the live robot or a scripted one, and keeps a session as a new case |
 | `record` | Writes the live robot as a scripted robot for `eval --robot` |
@@ -780,7 +904,7 @@ $ nervros-cli --profile nervros.toml missions --limit 3
     asked: Every ten minutes, walk to the bedroom, room R3, three times.
 01a0fe10-ae04 34 min ago: Walk to the bedroom, room R3 (canceled, 9 s)
     asked: Walk to the bedroom, room R3.
-    s1 GoToPlace R3 failure: stopped: operator
+    s1 GoToPlace R3 stopped: stopped: operator
 ```
 
 ### Evals

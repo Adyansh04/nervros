@@ -180,7 +180,7 @@ impl Llm {
     /// [`LlmError::NoModel`] when every candidate is skipped or fails.
     pub async fn ask(&self, ask: Ask<'_>) -> Result<Answer, LlmError> {
         let need = Need {
-            vision: ask.image.is_some(),
+            vision: !ask.images.is_empty(),
             ..Need::default()
         };
         let (candidates, skipped) = self.router.candidates(ask.role, need, SystemTime::now());
@@ -201,7 +201,7 @@ impl Llm {
             }
             // Gemini segments from the prompt before the image; given the image first, Flash-Lite
             // answered with boxes where the outlines belong.
-            let message = user_message(ask.prompt, ask.image.as_ref(), ask.role == Role::Segment);
+            let message = user_message(ask.prompt, &ask.images, ask.role == Role::Segment);
             let again = || {
                 self.router
                     .take_request(&model.id, SystemTime::now())

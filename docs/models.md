@@ -86,6 +86,10 @@ plan_check = ["gemini-3.8-flash"]     # a second opinion on each plan before it 
 vision_check = ["qwen3.5-9b-local"]   # what `look` sees: questions about the camera frame
 summarise = ["qwen3.5-9b-local"]      # condensing the conversation
 segment = ["gemini-3.5-flash-lite"]   # outlines for `segment`, points for `point`
+witness = ["er2-witness"]             # whether frames from before and after a mission show it done
+moment = ["er2-moment"]               # which of a run of frames shows it; vision_check confirms
+watch = ["gemini-3.5-flash-lite"]     # whether a frame shows what a watch waits for, every 15 s
+scene_check = ["er2-scene"]           # a plan the checks flagged, against what the cameras show
 ```
 
 A turn tries its role's models in order. It skips a model that lacks what the turn needs, is over a
@@ -94,6 +98,13 @@ limit, or would break the privacy mode. `[roles]` must be there, even empty.
 - Local models not in the list are tried after the others, except for `segment`, `plan_check` and
   `plan`. For those only the models listed are asked: outlining is a skill few models have, and a
   second opinion from the same model is no second opinion.
+- `witness`, `moment` and `watch` left out use `vision_check`'s list. `plan_check` and
+  `scene_check` are off while their lists are empty; `scene_check` sees camera frames and
+  `plan_check` never does, so text in the scene cannot talk to the plan's critic.
+- To share a scarce model's day between uses, give it one `[[model]]` id per use, each with its
+  own `rpd`, and one pool for the provider's whole quota: on the G1, Gemini Robotics-ER 2's 20 a
+  day are 10 for `witness`, 6 for `moment` and 4 for `scene_check`, and a use whose share is spent
+  moves on to its next model. `nervros-cli models` shows what each has used today.
 - `plan` is asked once a request's plans have failed their checks twice, with the request, the
   skills, the last plan and what was wrong with it. Its few lines of advice go back to the routine
   model with the failure. It is asked only when its list differs from `routine`'s, and a model out

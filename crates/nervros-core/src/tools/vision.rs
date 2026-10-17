@@ -3,12 +3,15 @@
 
 mod detect;
 mod frames;
+mod keyframes;
 mod marks;
 mod snapshot;
 
 pub(crate) use detect::DETECTION_MATCH_S;
 pub use detect::{Detections, Instance, parse_detections};
 pub use frames::{Camera, Cameras};
+pub use keyframes::{Keyframe, Keyframes, millis};
+pub(crate) use keyframes::{same_view, thumbnail};
 #[cfg(test)]
 pub(crate) use marks::CLOSE_UP_PX;
 pub use marks::draw_marks;

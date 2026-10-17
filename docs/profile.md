@@ -222,6 +222,12 @@ and `detection_image` (without detections `look` shows that camera's frame unmar
 then take a `camera` argument, `[look]`'s own by default, and the chat model sees each camera's
 `about` to choose one.
 
+With `[look]` and `[mission]`, a mission that succeeds is checked through the cameras too, for
+each goal that puts one thing in or on another, up to four. The detector's marks on the newest
+frame come first. Goals they do not settle go to the `witness` model in one request, with every
+camera's frame from the mission's start and from its end. Its "no" flags a success the world model
+believed; its "yes" never clears a goal the world model found unmet.
+
 ```toml
 [look]
 name = "chest"
@@ -232,6 +238,20 @@ detections = { topic = "/detector_chest/instance_masks", type = "canopy_msgs/msg
 image = "/camera/color/image_raw"
 about = "It points down at the floor in front of the robot."
 ```
+
+### `[keyframes]`
+
+Each camera's frames kept on disk as its view changes, for `when`. It needs `[look]`. Every
+`period_s` each camera's newest frame is compared with that camera's last kept one, by a small grey
+thumbnail, and kept when it differs: a still robot in a still room keeps almost nothing. Frames go
+under the state directory, `keyframes/<robot>/<camera>/<milliseconds>.jpg`.
+
+| Key | Default | |
+|---|---|---|
+| `period_s` | `2.0` | How often each camera is looked at. |
+| `keep_h` | `24.0` | How long frames are kept, and how far back `when` looks at most. |
+| `max_mb` | `2000` | The most disk they take together; the oldest go first. |
+| `edge_px` | `640` | The longest side of a kept frame. |
 
 ### `[segment]`
 
@@ -374,9 +394,28 @@ arm = "arm"                                            # the argument valued lef
 - With a `plan_check` model in the models file, a second model also judges the plan from the
   operator's words. With a `plan` model other than the routine one, it advises the planner once a
   request's plans have failed twice.
+- With `[look]` and a `scene_check` model, a plan with a step that failed in at least half of its
+  last runs is also checked against what the cameras show now, with the steps' track records. Its
+  doubts are added to the card; they never send the plan back.
 
 Missions are kept in a ledger beside the quota file. The card shows how each step went before, and
 `recall`, the Mission tab and `nervros-cli missions` read the ledger.
+
+A run the robot or the executor ended, rather than the plan, is kept with its fault: the robot could
+not move, the deadman stopped it, the executor shut down or restarted, a skill's server was not up,
+someone drove the base by hand, or another mission ran. It counts in no track record, judges no
+taught skill and uses none of the request's replans, and its report says what the fault needs
+instead of asking for a new plan. A program that meets one stops there. A mission still kept as
+running when NervROS starts was cut short by NervROS stopping: it is kept as interrupted, and the
+window says so.
+
+With a `plan` model, a step that fails again on fair runs (twice, and a third of its latest runs at
+least) gets a proposed fix, one at a time per step: a call of `memory` (remember), `geofence` (add)
+or `param_set`, drafted by the `plan` model and checked against the tool's own arguments. The Agent
+tab lists it to accept, which runs the call as the operator's own (asked about first only where the
+profile's rules say so), or to dismiss, which keeps that step from getting another. An accepted fix
+shows the step's record before and since. `nervros-cli inbox` lists them and `--dismiss N` turns one
+down. Proposals live in the state directory, `inbox/<robot>.json`.
 
 ### `[[place]]`
 
@@ -566,10 +605,14 @@ The rest are the checks you would run yourself before blaming the model:
 | `health_check` | The connection check, plus each camera's frame rate, whether the robot knows where it is on the map, the executor's state, and the known problems the playbooks check for. Returns what is wrong and what is fine. |
 | `why` | Explains the newest incident (within ten minutes), one by its id or its mission's, or checks the robot now; `list` lists the incidents. See [`[incidents]`](#incidents). |
 | `remember_finding` | Keeps a playbook the agent writes from a debugging session, checked as the profile's are; an `annotate` call. |
-| `watch` | Watches a topic in the background and posts to the chat when a condition holds: its rate drops below a floor, a field crosses a value, or a text field matches. Once, or each time it comes back; at most 8 at a time, all ended with the session. |
+| `watch` | Watches a topic in the background and posts to the chat when a condition holds: its rate drops below a floor, a field crosses a value, or a text field matches. With `[look]`, `sees` watches what a camera shows instead ("a person at the door"), asking the `watch` model every 15 s and posting on two yes in a row; at most 2 of those. Once, or each time it comes back; at most 8 at a time, all ended with the session. |
+| `when` | With `[keyframes]`: finds when something happened ("when did the mug leave the table?") from the frames kept, sampled to a dozen, narrowed to the moments the world model saw the thing change when it did, and asked of the `moment` model; a second look between the chosen frame and the one before closes a wide gap, and the `vision_check` model confirms the frame alone or finds its neighbour that shows it. Returns the time and the frame as a snapshot. |
+| `digest` | With `[mission]`: what the robot did over the last hours, in sections code writes: missions by how they ended, the runs cut short by the robot apart, each skill's record on fair runs, what moved or went missing in the world model, incidents and goals. `nervros-cli digest` prints the same from the robot's files, without the world model. |
+| `patrol` | With `[mission]`: walks a round of places as a job, looking around at each with a full turn on the spot (the `[mission.checks]` `turn` skill), then reports what it saw in each room and what moved or went missing meanwhile. Approved once with its round and time limit. |
 | `watches` | Lists the running watches, or cancels one or all. |
 | `plot` | Draws a number from a topic's messages over time in the app's Plots tab, as `rqt_plot` does, for two minutes unless told longer. |
 | `memory` | Keeps what the operator asks it to remember across sessions ("the kitchen door sticks"), in the state directory, one file per robot; lists and forgets notes. The notes join the system prompt on every turn, and the Agent tab lists them. Remembering and forgetting are approved like an edit. |
+| `goal` | With `[mission]`: keeps a goal the operator wants to hold across missions and sessions ("keep the mug on the tray"), with the predicates that hold once it is met (`at`, `holding`, `inside`, `on`), a budget of missions and an optional time limit, in the state directory, one file per robot. NervROS judges it after every mission the agent runs and reports, and at start, and the agent works toward it with missions that name it in `run_mission`'s `goal`. It ends met, exhausted, or impossible when the agent gives it up with the reason. Setting, pausing and giving up are approved like an edit. |
 | `schedule` | With `[mission]`: runs a plan again and again, such as a patrol every 30 minutes, a set number of times, or each time something happens: an object of a kind appears, in a room or anywhere, or a condition on a topic as `watch` takes it becomes true. The operator approves it once for all its runs; a run is skipped while the robot is disarmed or busy, and stopping the robot cancels every schedule. The Mission tab lists them. |
 | `recall` | With `[mission]`: what the robot did lately, from the mission ledger, what happened to an object, from `[world] history` and the robot's own missions with it, and the operator's notes. |
 | `plans` | With `[mission]`: saves a plan that worked by name ("evening check"), lists them, and runs one again. |
