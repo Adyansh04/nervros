@@ -76,9 +76,8 @@ pub(crate) fn config(real: Option<&MissionConfig>) -> MissionConfig {
         catalog: CATALOG.to_owned(),
         stop: STOP.to_owned(),
         pause: Some(PAUSE.to_owned()),
-        preview: real
-            .and_then(|r| r.preview.as_ref())
-            .map(|_| PREVIEW.to_owned()),
+        // Native steps preview themselves, with or without the executor's preview.
+        preview: Some(PREVIEW.to_owned()),
         define_skill: real.and_then(|r| r.define_skill.clone()),
         forget_skill: real.and_then(|r| r.forget_skill.clone()),
         state: STATE.to_owned(),
@@ -245,6 +244,8 @@ struct Running {
     /// The step running here, empty while the executor runs one.
     step: String,
     stop: watch::Sender<bool>,
+    /// Why it was stopped, as the stop said.
+    stopped_for: String,
     paused: watch::Sender<bool>,
     /// The executor's goal while it runs a stretch of the mission.
     executor: Option<CancelFn>,
@@ -419,6 +420,10 @@ impl Composite {
                             problems.push(json!({"code": "BAD_ARG", "line": 0, "node": step.name, "message": message}));
                         }
                     }
+                    if let Some(why) = native.check(&step.args).await {
+                        problems.push(json!({"code": "BAD_ARG", "line": 0, "node": step.name,
+                            "message": format!("{}: {why}", step.template)}));
+                    }
                     let topics = self.inner.graph().await.map(|g| g.topics);
                     for action in native.needs() {
                         if topics
@@ -477,8 +482,59 @@ impl Composite {
         }
     }
 
+    /// Where the plan would take the robot: the executor's preview of the steps before the first
+    /// native one, which it chains from where the robot stands, and each native step's own.
+    async fn preview(
+        &self,
+        request: &Value,
+        service_type: &str,
+        timeout: Duration,
+    ) -> Result<Value, RosError> {
+        let tree = request["tree_xml"].as_str().unwrap_or_default();
+        let steps = parse(tree).map_err(RosError::Rejected)?;
+        let natives = self.natives_in(&steps).await;
+        let real = self.real.as_ref().and_then(|r| r.preview.clone());
+        if natives.iter().all(Option::is_none) {
+            return match real {
+                Some(real) => {
+                    self.inner
+                        .call(&real, service_type, request.clone(), timeout)
+                        .await
+                }
+                None => Err(RosError::Unavailable(PREVIEW.to_owned())),
+            };
+        }
+        let mut out = Vec::new();
+        let lead = natives.iter().take_while(|n| n.is_none()).count();
+        if let (true, Some(real)) = (lead > 0, &real) {
+            let first: Vec<String> = steps[..lead].iter().map(|s| unbind(&s.xml)).collect();
+            let ahead = json!({"tree_xml": tree_of(&first)});
+            if let Ok(r) = self.inner.call(real, service_type, ahead, timeout).await
+                && r["ok"].as_bool() == Some(true)
+            {
+                out.extend(r["steps"].as_array().cloned().unwrap_or_default());
+            }
+        }
+        for (step, native) in steps.iter().zip(&natives) {
+            let Some(native) = native else {
+                continue;
+            };
+            if let Some(mut seen) = native.preview(&step.args).await {
+                let id = step.name.split('_').next().unwrap_or_default();
+                seen["step_id"] = json!(id);
+                seen["name"] = json!(step.name);
+                out.push(seen);
+            }
+        }
+        Ok(json!({"ok": true, "message": "", "steps": out}))
+    }
+
     async fn stop(&self, request: &Value) -> Result<Value, RosError> {
-        if let Some(r) = crate::lock(&self.running).as_ref() {
+        if let Some(r) = crate::lock(&self.running).as_mut() {
+            request["reason"]
+                .as_str()
+                .unwrap_or("stop")
+                .clone_into(&mut r.stopped_for);
             r.stop.send_replace(true);
         }
         match &self.real {
@@ -590,6 +646,7 @@ impl Composite {
                 id: id.clone(),
                 step: String::new(),
                 stop: stop.clone(),
+                stopped_for: String::new(),
                 paused,
                 executor: None,
             });
@@ -801,19 +858,9 @@ impl Run {
         if let Some(r) = crate::lock(&self.running).as_mut() {
             r.executor = None;
         }
-        let ended = match done {
-            Ok(Ok(r)) => r.result,
-            Ok(Err(e)) => {
-                return Some(self.result(OUTCOME_FAILURE, &steps[0].name, &e.to_string(), outputs));
-            }
-            Err(_) => {
-                return Some(self.result(
-                    OUTCOME_FAILURE,
-                    &steps[0].name,
-                    "the executor dropped the mission",
-                    outputs,
-                ));
-            }
+        let ended = match self.ended(done, &steps[0].name, outputs) {
+            Ok(ended) => ended,
+            Err(mission) => return Some(mission),
         };
         if let Ok(Value::Object(handed)) =
             serde_json::from_str(ended["outputs_json"].as_str().unwrap_or("{}"))
@@ -827,6 +874,32 @@ impl Run {
         failed["elapsed_s"] = json!(self.elapsed());
         failed["outputs_json"] = json!(Value::Object(outputs.clone()).to_string());
         Some(failed)
+    }
+
+    /// The executor's result for its stretch, or the mission's when it gave none: a goal cancelled
+    /// under a stop can come back without the executor's own result.
+    fn ended(
+        &self,
+        done: Result<Result<GoalResult, RosError>, oneshot::error::RecvError>,
+        first: &str,
+        outputs: &Map<String, Value>,
+    ) -> Result<Value, Value> {
+        match done {
+            Ok(Ok(r)) if r.status == GoalStatus::Canceled && r.result["outcome"].is_null() => {
+                let why = crate::lock(&self.running)
+                    .as_ref()
+                    .map_or_else(String::new, |r| r.stopped_for.clone());
+                Err(self.result(OUTCOME_CANCELED, first, &format!("stopped: {why}"), outputs))
+            }
+            Ok(Ok(r)) => Ok(r.result),
+            Ok(Err(e)) => Err(self.result(OUTCOME_FAILURE, first, &e.to_string(), outputs)),
+            Err(_) => Err(self.result(
+                OUTCOME_FAILURE,
+                first,
+                "the executor dropped the mission",
+                outputs,
+            )),
+        }
     }
 
     /// A native step, with its wrappers; its result when the mission ends on it.
@@ -908,12 +981,12 @@ impl Run {
             tracing::info!(step = %step.name, attempt, %last, "a native step failed");
         }
         if self.ctl.stopped() {
-            return Some(self.result(
-                OUTCOME_CANCELED,
-                &step.name,
-                &format!("stopped: {last}"),
-                outputs,
-            ));
+            // As an executor words it: "stopped:" and what the stop said.
+            let why = crate::lock(&self.running)
+                .as_ref()
+                .map_or_else(String::new, |r| r.stopped_for.clone());
+            let why = format!("stopped: {}", if why.is_empty() { last } else { why });
+            return Some(self.result(OUTCOME_CANCELED, &step.name, &why, outputs));
         }
         if step.forced {
             return None;
@@ -954,19 +1027,7 @@ impl RobotPort for Composite {
             VALIDATE => self.validate(&request).await,
             STOP => self.stop(&request).await,
             PAUSE => self.pause(&request).await,
-            PREVIEW => {
-                let tree = request["tree_xml"].as_str().unwrap_or_default();
-                let steps = parse(tree).map_err(RosError::Rejected)?;
-                if self.natives_in(&steps).await.iter().any(Option::is_some) {
-                    return Err(RosError::Unsupported(
-                        "a preview of native steps".to_owned(),
-                    ));
-                }
-                match self.real.as_ref().and_then(|r| r.preview.clone()) {
-                    Some(real) => self.inner.call(&real, service_type, request, timeout).await,
-                    None => Err(RosError::Unavailable(PREVIEW.to_owned())),
-                }
-            }
+            PREVIEW => self.preview(&request, service_type, timeout).await,
             _ => {
                 self.inner
                     .call(service, service_type, request, timeout)

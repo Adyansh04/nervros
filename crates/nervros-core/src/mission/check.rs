@@ -44,6 +44,8 @@ pub struct Observed {
     pub objects: Value,
     /// The executor's `RobotState`, or null.
     pub state: Value,
+    /// The named pose each arm is at, from the robot's arm stack; empty when it has none.
+    pub arms: std::collections::BTreeMap<String, String>,
 }
 
 pub(crate) fn object<'v>(objects: &'v Value, id: &str) -> Option<&'v Value> {
@@ -51,6 +53,27 @@ pub(crate) fn object<'v>(objects: &'v Value, id: &str) -> Option<&'v Value> {
         .as_array()?
         .iter()
         .find(|o| o["id"] == id)
+}
+
+/// Whether `arm`, a group or its side, is at the named `pose`.
+fn arm_at(
+    arm: &str,
+    pose: &str,
+    seen: &Observed,
+    out: impl Fn(Option<bool>, String) -> Verdict,
+) -> Verdict {
+    if seen.arms.is_empty() {
+        return out(None, "the arms' poses are not known".to_owned());
+    }
+    let side = |group: &str| {
+        group
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| w == arm)
+    };
+    match seen.arms.iter().find(|(g, _)| *g == arm || side(g)) {
+        Some((group, at)) => out(Some(at == pose), format!("{group} is at `{at}`")),
+        None => out(Some(false), format!("{arm} is between named poses")),
+    }
 }
 
 fn xy(v: &Value) -> (f64, f64) {
@@ -69,7 +92,7 @@ pub fn checkable(predicate: &str) -> bool {
     };
     let arity = match name {
         "at" => 1,
-        "holding" | "inside" | "on" => 2,
+        "holding" | "inside" | "on" | "arm_at" => 2,
         _ => return false,
     };
     // `holding` is judged by the executor's hands, which are left and right.
@@ -110,6 +133,7 @@ fn verdict(predicate: &str, seen: &Observed, since_s: f64) -> Verdict {
                 None => out(None, "the executor's state is not available".to_owned()),
             }
         }
+        Some(("arm_at", args)) if args.len() == 2 => arm_at(args[0], args[1], seen, out),
         Some(("inside" | "on", args)) if args.len() == 2 => {
             let (Some(obj), Some(host)) = (
                 object(&seen.objects, args[0]),
@@ -589,6 +613,7 @@ mod tests {
                 {"id": "O17", "support_id": "", "pose": {"position": {"x": 3.15, "y": 3.02}}, "size": {"x": 0.1, "y": 0.1}},
                 {"id": "O31", "support_id": "", "pose": {"position": {"x": 3.0, "y": 3.0}}, "size": {"x": 0.4, "y": 0.3}}]}),
             state: json!({"holding_left": "", "holding_right": "O17"}),
+            arms: [("right_arm".to_owned(), "ready".to_owned())].into(),
         }
     }
 
@@ -611,6 +636,26 @@ mod tests {
                 "O31 mug: appeared 40 min ago in R3, maybe O12 moved there",
             ]
         );
+    }
+
+    #[test]
+    fn an_arm_is_checked_at_its_named_pose_by_group_or_side() {
+        let goal: Vec<String> = [
+            "arm_at(right_arm, ready)",
+            "arm_at(right, ready)",
+            "arm_at(right_arm, home)",
+            "arm_at(left_arm, home)",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let oks: Vec<Option<bool>> = check(&goal, &seen(), 0.0).iter().map(|v| v.ok).collect();
+        assert_eq!(oks, [Some(true), Some(true), Some(false), Some(false)]);
+        assert!(checkable("arm_at(right_arm, ready)"));
+        let unknown = Observed {
+            arms: std::collections::BTreeMap::new(),
+            ..seen()
+        };
+        assert_eq!(check(&goal[..1], &unknown, 0.0)[0].ok, None);
     }
 
     #[test]

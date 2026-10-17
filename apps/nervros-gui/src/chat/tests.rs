@@ -827,6 +827,49 @@ fn snapshot_plan_with_records_and_a_preview_warning() {
 }
 
 #[test]
+fn snapshot_plan_with_native_steps() {
+    let mut chat = Chat::default();
+    chat.apply(&Event::User {
+        turn: 1,
+        text: "Walk through the hallway to the kitchen, pick up the mug and lift it a little"
+            .to_owned(),
+    });
+    let step = |id: &str, summary: &str, native: &str| PlannedStep {
+        id: id.to_owned(),
+        skill: summary.split('(').next().unwrap_or_default().to_owned(),
+        summary: summary.to_owned(),
+        timeout_s: 240.0,
+        native: native.to_owned(),
+        ..PlannedStep::default()
+    };
+    chat.apply(&Event::MissionPlanned {
+        hash: "5e2b90c1d4a7".to_owned(),
+        intent: "walk to the kitchen, pick up the mug and lift it".to_owned(),
+        steps: vec![
+            step("s1", "WalkRoute(places=hallway, kitchen)", "Nav2"),
+            step("s2", "PickObject(object_id=O17, arm=right)", ""),
+            step(
+                "s3",
+                "HandLine(arm=right_arm, direction=up, distance_m=0.1)",
+                "MoveIt",
+            ),
+            step("s4", "Wait(seconds=10)", "Nav2"),
+        ],
+        worst_case_s: 1380.0,
+        concerns: Vec::new(),
+        by_job: false,
+    });
+    chat.apply(&Event::ApprovalRequested {
+        id: 5,
+        tool: "run_mission".to_owned(),
+        args: serde_json::json!({"hash": "5e2b90c1d4a7"}),
+        reason: "`run_mission` acts on the robot".to_owned(),
+        can_allow: false,
+    });
+    render(chat, "chat_plan_native");
+}
+
+#[test]
 fn snapshot_error_and_image() {
     let mut chat = Chat::default();
     chat.apply(&Event::User {

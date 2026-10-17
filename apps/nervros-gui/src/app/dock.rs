@@ -169,6 +169,13 @@ impl Gui {
                 battery: l.battery.clone(),
                 motors: l.motors.clone(),
                 armed: self.agent.guard.armed(),
+                stacks: self
+                    .agent
+                    .integrations
+                    .iter()
+                    .map(|i| i.status())
+                    .filter(|parts| !parts.is_empty())
+                    .collect(),
             }
         };
         crate::robot::tab(ui, &status, self.drive.as_mut());

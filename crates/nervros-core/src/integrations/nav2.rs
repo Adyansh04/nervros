@@ -113,10 +113,17 @@ impl Nav2Config {
     }
 }
 
+/// The procedures Nav2's faults call for.
+pub(crate) const PROCEDURES: [&str; 2] = [
+    include_str!("nav2/procedures/robot-held-back.md"),
+    include_str!("nav2/procedures/no-path-there.md"),
+];
+
 /// The Nav2 integration.
 pub struct Nav2 {
     watcher: Arc<status::Watcher>,
     tools: Vec<Arc<dyn Tool>>,
+    motions: Arc<motion::Motions>,
     natives: Vec<Arc<dyn NativeSkill>>,
     goals: Arc<Goals>,
 }
@@ -173,7 +180,7 @@ impl Nav2 {
                 Arc::clone(parts.places),
             )),
         ];
-        let natives = motion::Motions::natives(
+        let (motions, natives) = motion::Motions::natives(
             config,
             parts.profile,
             (robot(), Arc::clone(parts.places), goals),
@@ -182,6 +189,7 @@ impl Nav2 {
         Arc::new(Self {
             watcher,
             tools,
+            motions,
             natives,
             goals,
         })
@@ -198,19 +206,16 @@ impl Integration for Nav2 {
         self.tools.clone()
     }
 
-    fn status(&self) -> String {
-        self.watcher.seen().line()
+    fn status(&self) -> Vec<String> {
+        self.watcher.seen().parts()
     }
 
     fn natives(&self) -> Vec<Arc<dyn NativeSkill>> {
         self.natives.clone()
     }
 
-    fn procedures(&self) -> &'static [&'static str] {
-        &[
-            include_str!("nav2/procedures/robot-held-back.md"),
-            include_str!("nav2/procedures/no-path-there.md"),
-        ]
+    fn attach(&self, session: &crate::session::SessionHandle) {
+        self.motions.attach(session);
     }
 
     async fn stop(&self) {

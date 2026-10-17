@@ -56,6 +56,10 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
                     summary.on_hover_text(note);
                 }
                 track_label(ui, s);
+                if !s.native.is_empty() {
+                    let text = format!("NervROS runs it through {}", s.native);
+                    ui.label(RichText::new(text).size(12.5).color(theme::DIM));
+                }
                 match s.learned.as_str() {
                     "draft" => {
                         let text = "a skill the agent taught: its first try";

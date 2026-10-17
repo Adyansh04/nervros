@@ -32,8 +32,9 @@ pub trait Integration: Send + Sync + std::fmt::Debug {
     /// The tools it adds.
     fn tools(&self) -> Vec<Arc<dyn Tool>>;
 
-    /// A line on what it last saw of its stack, for each turn; empty when it has nothing to say.
-    fn status(&self) -> String;
+    /// What it last saw of its stack, for each turn and the window: a headline such as
+    /// "Nav2: up", then details; empty when it has nothing to say.
+    fn status(&self) -> Vec<String>;
 
     /// Cancels every goal it sent that still runs.
     async fn stop(&self);
@@ -46,9 +47,9 @@ pub trait Integration: Send + Sync + std::fmt::Debug {
         Vec::new()
     }
 
-    /// The procedures (`SKILL.md` text) it brings for its stack's faults.
-    fn procedures(&self) -> &'static [&'static str] {
-        &[]
+    /// The named pose each arm group of its stack is at, for goal checks.
+    async fn arm_poses(&self) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::new()
     }
 }
 
@@ -63,6 +64,18 @@ pub trait NativeSkill: Send + Sync {
     /// The actions it sends goals to, which must be on the graph for a plan with it to pass.
     fn needs(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// What makes these arguments wrong now, before the operator is asked to approve them, such as
+    /// opening a hand that holds something.
+    async fn check(&self, _args: &std::collections::BTreeMap<String, String>) -> Option<String> {
+        None
+    }
+
+    /// Where it would take the base, for the approval card, as a `StepPreview` without its ids;
+    /// none when that is not known before it runs.
+    async fn preview(&self, _args: &std::collections::BTreeMap<String, String>) -> Option<Value> {
+        None
     }
 
     /// Runs it with its arguments by name; what it hands on by output name, or why it failed.
@@ -360,15 +373,6 @@ impl Integrations {
             .collect()
     }
 
-    /// The procedures they bring.
-    #[must_use]
-    pub fn procedures(&self) -> Vec<&'static str> {
-        self.all
-            .iter()
-            .flat_map(|i| i.procedures().iter().copied())
-            .collect()
-    }
-
     /// Gives each the session to report to.
     pub fn attach(&self, session: &crate::session::SessionHandle) {
         for i in &self.all {
@@ -382,12 +386,20 @@ impl Integrations {
     }
 }
 
+#[async_trait]
+impl crate::mission::ArmPoses for Integrations {
+    async fn arm_poses(&self) -> std::collections::BTreeMap<String, String> {
+        let all = futures::future::join_all(self.all.iter().map(|i| i.arm_poses())).await;
+        all.into_iter().flatten().collect()
+    }
+}
+
 impl crate::memory::Notes for Integrations {
     fn text(&self) -> String {
         let lines: Vec<String> = self
             .all
             .iter()
-            .map(|i| i.status())
+            .map(|i| i.status().join("; "))
             .filter(|s| !s.is_empty())
             .collect();
         if lines.is_empty() {
@@ -395,6 +407,19 @@ impl crate::memory::Notes for Integrations {
         }
         format!("\n\nThe robot's stacks now:\n- {}", lines.join("\n- "))
     }
+}
+
+/// The procedures (`SKILL.md` text) the profile's stacks bring for their faults.
+#[must_use]
+pub fn procedures(profile: &Profile) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if profile.nav2.is_some() {
+        out.extend(nav2::PROCEDURES);
+    }
+    if profile.moveit.is_some() {
+        out.extend(moveit::PROCEDURES);
+    }
+    out
 }
 
 /// What the profile's integrations find of their stacks on the graph, for the doctor.
@@ -675,8 +700,8 @@ mod tests {
         fn tools(&self) -> Vec<Arc<dyn Tool>> {
             Vec::new()
         }
-        fn status(&self) -> String {
-            self.0.to_owned()
+        fn status(&self) -> Vec<String> {
+            vec![self.0.to_owned()]
         }
         async fn stop(&self) {}
     }

@@ -307,14 +307,16 @@ impl Tool for Stop {
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
-        self.integrations.stop().await;
         let Some(m) = &self.mission else {
+            self.integrations.stop().await;
             return ToolOutcome::ok(
                 json!({"stopped": true, "note": "this robot has no mission executor; NervROS cancelled its own goals"}),
             );
         };
         let reason = args["reason"].as_str().unwrap_or("stop tool").to_owned();
-        match self
+        // The mission hears of the stop before its goals are cancelled under it, so a step
+        // NervROS runs itself ends as stopped, not as failed.
+        let stopped = self
             .robot
             .call(
                 &m.stop,
@@ -322,8 +324,9 @@ impl Tool for Stop {
                 json!({"reason": reason}),
                 Duration::from_secs(5),
             )
-            .await
-        {
+            .await;
+        self.integrations.stop().await;
+        match stopped {
             Ok(r) if r["ok"].as_bool() == Some(true) => {
                 ToolOutcome::ok(json!({"stopped": true, "state": r["state_after"]}))
             }

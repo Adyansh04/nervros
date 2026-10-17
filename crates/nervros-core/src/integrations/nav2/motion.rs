@@ -3,7 +3,7 @@
 //! take the names an executor's skills would, so plans read the same either way.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -26,6 +26,11 @@ const TURN_S: f64 = 60.0;
 const STRAIGHT_S: f64 = 60.0;
 /// The longest straight walk one step takes, as executors' walks keep it.
 const STRAIGHT_MAX_M: f64 = 2.0;
+/// How near the end of a route the robot may stand for the route to be a round, m: well past
+/// Nav2's goal tolerance.
+const ROUND_M: f64 = 1.0;
+/// How high a walk's drawing floats over the floor, m.
+const DRAWN_Z: f64 = 0.05;
 
 /// The motions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +52,8 @@ pub(super) struct Motions {
     robot: Arc<dyn RobotPort>,
     places: Arc<Places>,
     goals: Arc<Goals>,
+    /// Where a walk's goal or route is drawn while it runs.
+    session: OnceLock<crate::session::SessionHandle>,
 }
 
 impl Motions {
@@ -56,7 +63,7 @@ impl Motions {
         config: &Nav2Config,
         profile: &Profile,
         (robot, places, goals): (Arc<dyn RobotPort>, Arc<Places>, &Arc<Goals>),
-    ) -> Vec<Arc<dyn NativeSkill>> {
+    ) -> (Arc<Self>, Vec<Arc<dyn NativeSkill>>) {
         let world = profile
             .world
             .as_ref()
@@ -67,6 +74,7 @@ impl Motions {
             robot,
             places,
             goals: Arc::clone(goals),
+            session: OnceLock::new(),
         });
         let mut kinds = vec![
             Kind::GoToPose,
@@ -81,7 +89,7 @@ impl Motions {
         if config.docking {
             kinds.extend([Kind::Dock, Kind::Undock]);
         }
-        kinds
+        let natives = kinds
             .into_iter()
             .map(|kind| {
                 Arc::new(Native {
@@ -89,7 +97,36 @@ impl Motions {
                     shared: Arc::clone(&shared),
                 }) as Arc<dyn NativeSkill>
             })
-            .collect()
+            .collect();
+        (shared, natives)
+    }
+
+    /// Where to draw walks, once the session has started.
+    pub(super) fn attach(&self, session: &crate::session::SessionHandle) {
+        let _ = self.session.set(session.clone());
+    }
+
+    /// Draws the way from where the robot stands through `to`, until the guard drops.
+    fn show(&self, label: &str, to: &[(f64, f64)]) -> Shown<'_> {
+        let mut points: Vec<[f64; 3]> = self
+            .here()
+            .map(|(x, y, _)| [x, y, DRAWN_Z])
+            .into_iter()
+            .collect();
+        points.extend(to.iter().map(|&(x, y)| [x, y, DRAWN_Z]));
+        self.draw(label, points);
+        Shown(self)
+    }
+
+    fn draw(&self, label: &str, points: Vec<[f64; 3]>) {
+        if let Some(session) = self.session.get() {
+            session.emit(crate::session::Event::Drawn {
+                layer: "walk".to_owned(),
+                frame: self.profile.ros.map_frame.clone(),
+                points,
+                label: label.to_owned(),
+            });
+        }
     }
 
     fn here(&self) -> Option<(f64, f64, f64)> {
@@ -221,6 +258,15 @@ fn nearest(objects: &Value, label: &str, from: Option<(f64, f64)>) -> Option<Str
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, id)| id)
+}
+
+/// A walk's drawing, cleared however the walk ends.
+struct Shown<'a>(&'a Motions);
+
+impl Drop for Shown<'_> {
+    fn drop(&mut self) {
+        self.0.draw("", Vec::new());
+    }
 }
 
 /// A finished Nav2 goal: its result, or what went wrong in words.
@@ -360,7 +406,8 @@ impl NativeSkill for Native {
                         "description": "How long to wait, in seconds."}]),
                 json!([]),
                 json!([]),
-                json!([]),
+                // Standing still holds the base.
+                base,
                 600.0,
             ),
             Kind::Dock => (
@@ -386,7 +433,7 @@ impl NativeSkill for Native {
         json!({
             "name": name, "description": description, "args": args, "outputs": outputs,
             "requires": [], "effects": effects, "resources": resources, "risk": "motion",
-            "idempotent": false, "max_duration_s": max, "template": name,
+            "idempotent": false, "max_duration_s": max, "template": name, "native": "Nav2",
         })
     }
 
@@ -403,6 +450,44 @@ impl NativeSkill for Native {
         }
     }
 
+    async fn preview(&self, args: &BTreeMap<String, String>) -> Option<Value> {
+        let m = &self.shared;
+        let arg = |name: &str| args.get(name).map_or("", |v| v.trim());
+        let (goal, path, note) = match self.kind {
+            Kind::GoToPose => {
+                let at = station(arg("station")).ok()?;
+                (
+                    Some(at),
+                    Vec::new(),
+                    "walks there along Nav2's path".to_owned(),
+                )
+            }
+            Kind::GoToTarget => {
+                let (spot, _) = m.target(arg("target")).await.ok()?;
+                let at = (spot.x, spot.y, spot.yaw.unwrap_or_default());
+                (Some(at), Vec::new(), format!("walks to {}", spot.what))
+            }
+            Kind::WalkRoute => {
+                let route = m.route(arg("places")).await.ok()?;
+                let note = format!(
+                    "walks through {} without stopping; Nav2 plans the way between",
+                    arg("places")
+                );
+                (route.last().copied(), route, note)
+            }
+            Kind::Wait => (None, Vec::new(), format!("waits {} s", arg("seconds"))),
+            Kind::Dock => (None, Vec::new(), format!("docks at {}", arg("dock"))),
+            _ => return None,
+        };
+        let map = &m.profile.ros.map_frame;
+        let poses: Vec<Value> = path.iter().map(|&(x, y, yaw)| m.pose(x, y, yaw)).collect();
+        Some(json!({
+            "goal": goal.map_or_else(|| json!({"header": {"frame_id": ""}}), |(x, y, yaw)| m.pose(x, y, yaw)),
+            "path": {"header": {"frame_id": map}, "poses": poses},
+            "note": note,
+        }))
+    }
+
     async fn run(
         &self,
         args: &BTreeMap<String, String>,
@@ -414,10 +499,12 @@ impl NativeSkill for Native {
         match self.kind {
             Kind::GoToPose => {
                 let (x, y, yaw) = station(arg("station"))?;
+                let _shown = m.show(&format!("to ({x:.1}, {y:.1})"), &[(x, y)]);
                 m.walk(m.pose(x, y, yaw), ctl).await.map(|()| none)
             }
             Kind::GoToTarget => {
                 let (spot, id) = m.target(arg("target")).await?;
+                let _shown = m.show(&format!("to {}", spot.what), &[(spot.x, spot.y)]);
                 let yaw = spot.yaw.unwrap_or_else(|| {
                     m.here()
                         .map_or(0.0, |(x, y, _)| (spot.y - y).atan2(spot.x - x))
@@ -426,9 +513,22 @@ impl NativeSkill for Native {
                 Ok(BTreeMap::from([("target_id".to_owned(), id)]))
             }
             Kind::WalkRoute => {
-                let poses: Vec<Value> = m
-                    .route(arg("places"))
-                    .await?
+                let route = m.route(arg("places")).await?;
+                let through: Vec<(f64, f64)> = route.iter().map(|&(x, y, _)| (x, y)).collect();
+                let _shown = m.show(&format!("through {}", arg("places")), &through);
+                // Nav2 ends a route at once when the robot already stands at its end, as a round
+                // does: such a route walks the rest first, then back to its end.
+                let (way, end) = match route.split_last() {
+                    Some((&(x, y, yaw), rest))
+                        if !rest.is_empty()
+                            && m.here()
+                                .is_some_and(|(hx, hy, _)| (x - hx).hypot(y - hy) < ROUND_M) =>
+                    {
+                        (rest.to_vec(), Some((x, y, yaw)))
+                    }
+                    _ => (route, None),
+                };
+                let poses: Vec<Value> = way
                     .into_iter()
                     .map(|(x, y, yaw)| m.pose(x, y, yaw))
                     .collect();
@@ -437,9 +537,11 @@ impl NativeSkill for Native {
                     "navigate_through_poses",
                     "nav2_msgs/action/NavigateThroughPoses",
                 );
-                m.send(types, goal, ctl, Some(&route_left))
-                    .await
-                    .map(|_| none)
+                m.send(types, goal, ctl, Some(&route_left)).await?;
+                if let Some((x, y, yaw)) = end {
+                    m.walk(m.pose(x, y, yaw), ctl).await?;
+                }
+                Ok(none)
             }
             Kind::TurnInPlace => {
                 let degrees = number(args, "degrees")?.clamp(-180.0, 180.0);

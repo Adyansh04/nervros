@@ -90,6 +90,10 @@ pub struct Skill {
     /// For a taught skill: the operator's request it was taught for.
     #[serde(default)]
     pub taught_for: String,
+    /// The stack NervROS runs it through itself, such as Nav2, where the robot's executor has no
+    /// skill of the name; empty for the executor's own.
+    #[serde(default)]
+    pub native: String,
 }
 
 /// One input of a skill, or one of its outputs.

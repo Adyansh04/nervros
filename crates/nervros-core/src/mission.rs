@@ -301,6 +301,8 @@ pub struct Missions {
     advisor: OnceLock<Arc<dyn advice::Advisor>>,
     /// The camera's view of a mission's end, when the robot has a camera and a vision model.
     vision: OnceLock<camera::Vision>,
+    /// Where the arms are among their named poses, when the robot has an arm stack.
+    arm_poses: OnceLock<Arc<dyn ArmPoses>>,
     /// Whose resource locks a running mission holds, so no other act overlaps it.
     guard: OnceLock<Arc<crate::guard::Guard>>,
     /// Whether a plan for this request already went back for not matching the operator's words:
@@ -314,6 +316,13 @@ pub struct Missions {
     goals: OnceLock<Arc<goals::Goals>>,
     /// Fixes proposed after a step failed again, when a model drafts them.
     inbox: OnceLock<Arc<inbox::Inbox>>,
+}
+
+/// Where the robot's arms are among their named poses, for the goal checks after a mission.
+#[async_trait::async_trait]
+pub trait ArmPoses: Send + Sync {
+    /// The named pose each arm group is at; an arm between poses is left out.
+    async fn arm_poses(&self) -> std::collections::BTreeMap<String, String>;
 }
 
 /// Who this agent is to the robot, in its heartbeat and when it borrows the arms.
@@ -395,6 +404,7 @@ impl Missions {
             critic: OnceLock::new(),
             advisor: OnceLock::new(),
             vision: OnceLock::new(),
+            arm_poses: OnceLock::new(),
             guard: OnceLock::new(),
             questioned: AtomicBool::new(false),
             paused: AtomicBool::new(false),
@@ -443,6 +453,12 @@ impl Missions {
         // Set once, at start-up.
         let _ = self.goals.set(goals);
         self
+    }
+
+    /// Checks where the arms ended against their named poses too.
+    pub fn set_arm_poses(&self, poses: Arc<dyn ArmPoses>) {
+        // Set once, at start-up.
+        let _ = self.arm_poses.set(poses);
     }
 
     /// Checks each successful mission's goals through the camera too.

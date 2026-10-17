@@ -733,7 +733,10 @@ impl Tool for GeofenceTool {
             }
             Some("speed") => {
                 if let Err(why) = self.zones.removable(name) {
-                    return Some(Err(ToolOutcome::failed(why)));
+                    return Some(Err(ToolOutcome::failed(format!(
+                        "{why}. A new slow zone is added: action add, around a room, an object or \
+                         a place, with slow_percent"
+                    ))));
                 }
                 let (now, next) = match self.speeds(args) {
                     Ok(s) => s,

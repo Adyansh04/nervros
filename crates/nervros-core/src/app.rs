@@ -63,6 +63,8 @@ pub struct Agent {
     pub incidents: Arc<crate::incident::Investigator>,
     /// Fixes proposed after a step failed again, for the Inbox tab.
     pub inbox: Option<Arc<crate::mission::inbox::Inbox>>,
+    /// The robot's stacks, Nav2's and MoveIt's, for the Robot tab.
+    pub integrations: Arc<Integrations>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -844,7 +846,7 @@ pub fn start_with(
     robot_tools(&profile, &robot, (&schemas, &guard), &mut registry)?;
     let (watches, incidents) = debug_tools(&profile, &robot, ledger, &mut registry)?;
     let mcp = mcp_tools(&profile, models.privacy, &mut registry)?;
-    let skills = skill_tools(&profile, &integrations, &mut registry)?;
+    let skills = skill_tools(&profile, &mut registry)?;
     let (memory, stop) = memory_and_stop(&profile, &port, (ledger, &integrations), &mut registry)?;
     let missions = missions(
         &profile,
@@ -891,6 +893,7 @@ pub fn start_with(
     );
     if let Some(m) = &missions {
         m.attach(session.handle());
+        m.set_arm_poses(Arc::clone(&integrations) as Arc<dyn crate::mission::ArmPoses>);
     }
     if let Some(s) = &schedules {
         s.attach(session.handle());
@@ -900,11 +903,7 @@ pub fn start_with(
     jobs.attach(session.handle());
     incidents.attach(&session.handle());
     say_orphan(&profile, &robot, session.handle());
-    let notices = llm
-        .missing_keys()
-        .into_iter()
-        .chain(mcp.iter().filter(|c| !c.ok).map(|c| c.what.clone()))
-        .collect();
+    let notices = start_notices(&llm, &mcp);
     Ok(Agent {
         session,
         profile,
@@ -925,7 +924,17 @@ pub fn start_with(
         programs,
         incidents,
         inbox,
+        integrations,
     })
+}
+
+/// What the operator should hear as the session starts: a provider without its key, an MCP server
+/// that did not connect.
+fn start_notices(llm: &Llm, mcp: &[crate::doctor::Check]) -> Vec<String> {
+    llm.missing_keys()
+        .into_iter()
+        .chain(mcp.iter().filter(|c| !c.ok).map(|c| c.what.clone()))
+        .collect()
 }
 
 /// The session's prompt, budgets and the parts of the agent it calls on, from the profile.
@@ -984,21 +993,11 @@ fn check_rules(profile: &Profile, registry: &Registry) -> Result<(), StartError>
 /// that cannot be read is logged and left out.
 fn skill_tools(
     profile: &Profile,
-    integrations: &Integrations,
     registry: &mut Registry,
 ) -> Result<Vec<crate::skills::Skill>, StartError> {
-    let dirs: Vec<PathBuf> = profile.skills.iter().map(|d| profile.resolve(d)).collect();
-    let (mut skills, problems) = crate::skills::load(&dirs);
+    let (skills, problems) = crate::skills::load_for(profile);
     for problem in problems {
         tracing::warn!(%problem, "a skill was left out");
-    }
-    // The stacks' own procedures, unless the robot has one of the same name.
-    for text in integrations.procedures() {
-        match crate::skills::parse(text) {
-            Ok(s) if skills.iter().all(|k| k.name != s.name) => skills.push(s),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "a stack's procedure was left out"),
-        }
     }
     if !skills.is_empty() {
         registry.add(Arc::new(crate::skills::SkillTool::new(skills.clone())))?;

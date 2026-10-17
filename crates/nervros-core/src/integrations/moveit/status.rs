@@ -83,14 +83,14 @@ pub(super) fn arms_at(
 /// Keeps a line on MoveIt fresh in the background while the session lives.
 #[derive(Debug)]
 pub(super) struct Watcher {
-    line: Mutex<String>,
+    parts: Mutex<Vec<String>>,
 }
 
 impl Watcher {
     /// Starts watching.
     pub(super) fn start(arms: Arc<Arms>) -> Arc<Self> {
         let watcher = Arc::new(Self {
-            line: Mutex::new(String::new()),
+            parts: Mutex::new(Vec::new()),
         });
         let weak = Arc::downgrade(&watcher);
         tokio::spawn(async move {
@@ -98,8 +98,8 @@ impl Watcher {
                 let Some(watcher) = weak.upgrade() else {
                     return;
                 };
-                let line = look(&arms).await;
-                *crate::lock(&watcher.line) = line;
+                let parts = look(&arms).await;
+                *crate::lock(&watcher.parts) = parts;
                 drop(watcher);
                 tokio::time::sleep(PERIOD).await;
             }
@@ -107,27 +107,28 @@ impl Watcher {
         watcher
     }
 
-    /// The line for each turn.
-    pub(super) fn line(&self) -> String {
-        crate::lock(&self.line).clone()
+    /// What it last saw, a headline first.
+    pub(super) fn parts(&self) -> Vec<String> {
+        crate::lock(&self.parts).clone()
     }
 }
 
-async fn look(arms: &Arms) -> String {
+async fn look(arms: &Arms) -> Vec<String> {
     let (srdf, joints, scene) = tokio::join!(arms.srdf(), arms.joints(), scene_summary(arms));
     let Ok(srdf) = srdf else {
-        return "MoveIt: not heard from".to_owned();
+        return vec!["MoveIt: not heard from".to_owned()];
     };
     let mut parts = Vec::new();
     if let Ok(joints) = joints {
-        let at: Vec<String> = arms_at(&srdf, &joints)
-            .into_iter()
-            .map(|(arm, pose)| match pose {
-                Some(p) => format!("{arm} at `{p}`"),
-                None => format!("{arm} between named poses"),
-            })
-            .collect();
-        parts.push(format!("MoveIt: {}", at.join(", ")));
+        parts.push("MoveIt: up".to_owned());
+        parts.extend(
+            arms_at(&srdf, &joints)
+                .into_iter()
+                .map(|(arm, pose)| match pose {
+                    Some(p) => format!("{arm} at `{p}`"),
+                    None => format!("{arm} between named poses"),
+                }),
+        );
     } else {
         parts.push("MoveIt: up, no joint states".to_owned());
     }
@@ -142,7 +143,7 @@ async fn look(arms: &Arms) -> String {
             parts.push(format!("`{object}` attached to {link}"));
         }
     }
-    parts.join("; ")
+    parts
 }
 
 /// `arm_status`: MoveIt's groups, poses, planners and scene, read fresh.

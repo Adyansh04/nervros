@@ -90,7 +90,8 @@ impl Scene {
             "scene",
             "MoveIt's planning scene: the obstacles the arms plan around, and what a hand holds. \
              list them. add an obstacle: a box (size [x, y, z]), a cylinder (height, radius) or a \
-             sphere (radius) at x, y, z on the map, or an object from the world model by its id, \
+             sphere (radius) at x, y, z on the map, or in a frame of the robot for one near it, or \
+             an object from the world model by its id, \
              its box as the world model has it. remove one NervROS added. attach an object to an \
              arm's hand, so plans carry it, and detach it. clear_octomap forgets what the sensors \
              filled in, as when the arm's own past positions block it. Adding is free; the rest \
@@ -109,6 +110,7 @@ impl Scene {
                     "y": {"type": "number"},
                     "z": {"type": "number"},
                     "yaw": {"type": "number"},
+                    "frame": {"type": "string", "description": "For add: the frame x, y, z and yaw are in, such as the robot's base frame for one ahead of it; the map's by default"},
                     "group": {"type": "string", "description": "For attach: the arm whose hand holds it"},
                 },
                 "required": ["action"],
@@ -303,14 +305,25 @@ impl Scene {
         let (Some(x), Some(y), Some(z)) =
             (args["x"].as_f64(), args["y"].as_f64(), args["z"].as_f64())
         else {
-            return Err("say where on the map: x, y and z of its centre".to_owned());
+            return Err("say where: x, y and z of its centre".to_owned());
         };
+        // Kept on the map, wherever it was given: a frame of the robot moves with the robot.
+        let map = &self.arms.profile.ros.map_frame;
+        let frame = args["frame"]
+            .as_str()
+            .filter(|f| !f.is_empty())
+            .unwrap_or(map);
+        let to_map = self
+            .arms
+            .robot
+            .transform(map, frame)
+            .map_err(|e| format!("cannot place {frame} on the map: {e}"))?;
         Ok((
             id.to_owned(),
             Obstacle {
                 shape,
-                at: [x, y, z],
-                yaw: args["yaw"].as_f64().unwrap_or(0.0),
+                at: to_map.apply([x, y, z]),
+                yaw: args["yaw"].as_f64().unwrap_or(0.0) + to_map.yaw(),
             },
         ))
     }

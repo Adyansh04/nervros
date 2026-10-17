@@ -395,6 +395,9 @@ pub(crate) fn error_words(code: i64) -> &'static str {
     }
 }
 
+/// The procedures MoveIt's faults call for.
+pub(crate) const PROCEDURES: [&str; 1] = [include_str!("moveit/procedures/arm-cannot-reach.md")];
+
 /// The MoveIt integration.
 pub struct MoveIt {
     arms: Arc<Arms>,
@@ -462,8 +465,8 @@ impl Integration for MoveIt {
         self.tools.clone()
     }
 
-    fn status(&self) -> String {
-        self.watcher.line()
+    fn status(&self) -> Vec<String> {
+        self.watcher.parts()
     }
 
     fn attach(&self, session: &crate::session::SessionHandle) {
@@ -474,8 +477,14 @@ impl Integration for MoveIt {
         self.natives.clone()
     }
 
-    fn procedures(&self) -> &'static [&'static str] {
-        &[include_str!("moveit/procedures/arm-cannot-reach.md")]
+    async fn arm_poses(&self) -> BTreeMap<String, String> {
+        let (Ok(srdf), Ok(joints)) = (self.arms.srdf().await, self.arms.joints().await) else {
+            return BTreeMap::new();
+        };
+        status::arms_at(&srdf, &joints)
+            .into_iter()
+            .filter_map(|(arm, pose)| Some((arm, pose?)))
+            .collect()
     }
 
     async fn stop(&self) {

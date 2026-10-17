@@ -146,6 +146,14 @@ impl Motions {
             .map_err(|e| format!("MoveIt's straight-line planner did not answer: {e}"))?;
         let share = path["fraction"].as_f64().unwrap_or(0.0);
         if share < CLEAR_SHARE {
+            if share <= 0.0
+                && let Some(touching) = self.starts_in_collision(group).await
+            {
+                return Err(format!(
+                    "the arm starts in a collision ({touching}): move it clear first, as to one \
+                     of its named poses"
+                ));
+            }
             return Err(format!(
                 "only {:.0}% of the way is clear of collisions or within reach",
                 share * 100.0
@@ -165,6 +173,45 @@ impl Motions {
             )
             .await?,
         )
+    }
+
+    /// What `group` touches where it stands now, if it is in a collision.
+    async fn starts_in_collision(&self, group: &str) -> Option<String> {
+        let joints = self.arms.joints().await.ok()?;
+        let request = json!({"robot_state": Arms::robot_state(&joints), "group_name": group});
+        let service = self.arms.config.name("check_state_validity");
+        let r = self
+            .arms
+            .robot
+            .call(
+                &service,
+                "moveit_msgs/srv/GetStateValidity",
+                request,
+                CALL_WAIT,
+            )
+            .await
+            .ok()?;
+        if r["valid"].as_bool() != Some(false) {
+            return None;
+        }
+        let pairs: Vec<String> = r["contacts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(2)
+            .map(|c| {
+                format!(
+                    "{} and {}",
+                    c["contact_body_1"].as_str().unwrap_or("?"),
+                    c["contact_body_2"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        Some(if pairs.is_empty() {
+            "it touches something".to_owned()
+        } else {
+            pairs.join("; ")
+        })
     }
 
     /// What the hand of `group` holds, by the executor's state; empty when nothing or not known.
@@ -252,6 +299,10 @@ impl Drop for GiveBack {
             tokio::spawn(async move { give_back(robot.as_ref(), &service, request).await });
         }
     }
+}
+
+fn full_hand(held: &str) -> String {
+    format!("the hand holds {held}: put it down with a place, not by opening the hand")
 }
 
 /// A finished MoveIt goal, or what went wrong in words.
@@ -360,9 +411,7 @@ impl Native {
         // An open hand drops what it holds: that is a place, not a grip.
         let held = m.holding(&group).await;
         if state.contains("open") && !held.is_empty() {
-            return Err(format!(
-                "the hand holds {held}: put it down with a place, not by opening the hand"
-            ));
+            return Err(full_hand(&held));
         }
         m.lent(
             ARM_S,
@@ -411,11 +460,26 @@ impl NativeSkill for Native {
                              "description": "The hand's state, as arm_status lists them."}]),
             ),
         };
+        let effects = if self.kind == Kind::ArmTo {
+            json!(["arm_at(arm, pose)"])
+        } else {
+            json!([])
+        };
         json!({
             "name": name, "description": description, "args": args, "outputs": [],
-            "requires": [], "effects": [], "resources": ["left_arm", "right_arm"],
+            "requires": [], "effects": effects, "resources": ["left_arm", "right_arm"],
             "risk": "motion", "idempotent": true, "max_duration_s": ARM_S, "template": name,
+            "native": "MoveIt",
         })
+    }
+
+    async fn check(&self, args: &BTreeMap<String, String>) -> Option<String> {
+        if self.kind != Kind::Grip {
+            return None;
+        }
+        let state = args.get("state")?;
+        let held = self.shared.holding(args.get("arm")?).await;
+        (state.contains("open") && !held.is_empty()).then(|| full_hand(&held))
     }
 
     fn needs(&self) -> Vec<String> {

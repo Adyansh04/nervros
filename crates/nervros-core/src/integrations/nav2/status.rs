@@ -73,9 +73,9 @@ impl Seen {
     }
 
     /// One line for each turn.
-    pub(super) fn line(&self) -> String {
+    pub(super) fn parts(&self) -> Vec<String> {
         if !self.heard {
-            return "Nav2: not heard from".to_owned();
+            return vec!["Nav2: not heard from".to_owned()];
         }
         let mut parts = Vec::new();
         parts.push(match self.active {
@@ -112,7 +112,7 @@ impl Seen {
         if let Some(limit) = &self.limit {
             parts.push(format!("speed limit {limit}"));
         }
-        parts.join("; ")
+        parts
     }
 
     /// The same, for `nav_status`.
@@ -381,7 +381,10 @@ mod tests {
             heard: true,
             ..Seen::default()
         };
-        assert_eq!(idle.line(), "Nav2: up; localized to ±0.05 m; idle");
+        assert_eq!(
+            idle.parts().join("; "),
+            "Nav2: up; localized to ±0.05 m; idle"
+        );
         let walking = Seen {
             running: vec!["navigate_to_pose".into()],
             walk: Some(Walk {
@@ -394,12 +397,12 @@ mod tests {
             ..idle
         };
         assert_eq!(
-            walking.line(),
+            walking.parts().join("; "),
             "Nav2: up; localized to ±0.05 m; moving the base (navigate_to_pose): 3.2 m to go, \
              about 9 s, 1 recovery; collision monitor slowing the robot (PolygonSlow); speed \
              limit 30%"
         );
-        assert_eq!(Seen::default().line(), "Nav2: not heard from");
+        assert_eq!(Seen::default().parts().join("; "), "Nav2: not heard from");
     }
 
     #[test]

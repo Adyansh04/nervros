@@ -658,10 +658,17 @@ impl Missions {
                 .await
                 .unwrap_or(Value::Null)
         };
-        let (rooms, objects, state) = tokio::join!(
+        let arms = async {
+            match self.arm_poses.get() {
+                Some(poses) => poses.arm_poses().await,
+                None => std::collections::BTreeMap::new(),
+            }
+        };
+        let (rooms, objects, state, arms) = tokio::join!(
             self.latest(world.and_then(|w| w.rooms.as_ref())),
             self.latest(world.and_then(|w| w.objects.as_ref())),
-            state
+            state,
+            arms
         );
         let (map, base) = (&self.profile.ros.map_frame, &self.profile.ros.base_frame);
         let pose = self
@@ -675,6 +682,7 @@ impl Missions {
             rooms,
             objects,
             state,
+            arms,
         }
     }
 }
