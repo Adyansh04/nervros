@@ -149,6 +149,13 @@ enum Command {
     /// NervROS carries, and keep it as an incident.
     #[cfg(feature = "ros")]
     Why,
+    /// What the robot did over the last hours: missions by how they ended, skills' records,
+    /// incidents and goals, from its files. The world model's changes need the agent's `digest`.
+    Digest {
+        /// How far back.
+        #[arg(long, default_value_t = 24.0)]
+        hours: f64,
+    },
     /// The incidents kept for the robot, newest first, or one in full by its id.
     Incidents {
         /// An incident's id, such as i3.
@@ -296,6 +303,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Command::Replay { log } => records::replay(&log),
         Command::Missions { id, limit } => records::missions(&cli.profile, id.as_deref(), limit),
+        Command::Digest { hours } => records::digest(&cli.profile, hours),
         Command::Gaps { limit } => records::gaps(&cli.profile, limit),
         Command::Case { log, id, append } => records::case(&log, &id, append.as_deref()),
         Command::Mcp {

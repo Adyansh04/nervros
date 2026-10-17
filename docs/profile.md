@@ -239,6 +239,20 @@ image = "/camera/color/image_raw"
 about = "It points down at the floor in front of the robot."
 ```
 
+### `[keyframes]`
+
+Each camera's frames kept on disk as its view changes, for `when`. It needs `[look]`. Every
+`period_s` each camera's newest frame is compared with that camera's last kept one, by a small grey
+thumbnail, and kept when it differs: a still robot in a still room keeps almost nothing. Frames go
+under the state directory, `keyframes/<robot>/<camera>/<milliseconds>.jpg`.
+
+| Key | Default | |
+|---|---|---|
+| `period_s` | `2.0` | How often each camera is looked at. |
+| `keep_h` | `24.0` | How long frames are kept, and how far back `when` looks at most. |
+| `max_mb` | `2000` | The most disk they take together; the oldest go first. |
+| `edge_px` | `640` | The longest side of a kept frame. |
+
 ### `[segment]`
 
 The `segment` tool: masks for whatever a prompt names in a camera's newest frame ("the floor",
@@ -583,7 +597,10 @@ The rest are the checks you would run yourself before blaming the model:
 | `health_check` | The connection check, plus each camera's frame rate, whether the robot knows where it is on the map, the executor's state, and the known problems the playbooks check for. Returns what is wrong and what is fine. |
 | `why` | Explains the newest incident (within ten minutes), one by its id or its mission's, or checks the robot now; `list` lists the incidents. See [`[incidents]`](#incidents). |
 | `remember_finding` | Keeps a playbook the agent writes from a debugging session, checked as the profile's are; an `annotate` call. |
-| `watch` | Watches a topic in the background and posts to the chat when a condition holds: its rate drops below a floor, a field crosses a value, or a text field matches. Once, or each time it comes back; at most 8 at a time, all ended with the session. |
+| `watch` | Watches a topic in the background and posts to the chat when a condition holds: its rate drops below a floor, a field crosses a value, or a text field matches. With `[look]`, `sees` watches what a camera shows instead ("a person at the door"), asking the `watch` model every 15 s and posting on two yes in a row; at most 2 of those. Once, or each time it comes back; at most 8 at a time, all ended with the session. |
+| `when` | With `[keyframes]`: finds when something happened ("when did the mug leave the table?") from the frames kept, sampled to a dozen, narrowed to the moments the world model saw the thing change when it did, and asked of the `moment` model; a second look between the chosen frame and the one before closes a wide gap. Returns the time and the frame as a snapshot. |
+| `digest` | With `[mission]`: what the robot did over the last hours, in sections code writes: missions by how they ended, the runs cut short by the robot apart, each skill's record on fair runs, what moved or went missing in the world model, incidents and goals. `nervros-cli digest` prints the same from the robot's files, without the world model. |
+| `patrol` | With `[mission]`: walks a round of places as a job, standing a moment at each so the world model sees it, then reports what moved or went missing meanwhile. Approved once with its round and time limit. |
 | `watches` | Lists the running watches, or cancels one or all. |
 | `plot` | Draws a number from a topic's messages over time in the app's Plots tab, as `rqt_plot` does, for two minutes unless told longer. |
 | `memory` | Keeps what the operator asks it to remember across sessions ("the kitchen door sticks"), in the state directory, one file per robot; lists and forgets notes. The notes join the system prompt on every turn, and the Agent tab lists them. Remembering and forgetting are approved like an edit. |

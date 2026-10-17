@@ -85,7 +85,8 @@ pub struct Goal {
 
 impl Goal {
     /// One line for the model and the operator.
-    fn line(&self) -> String {
+    #[must_use]
+    pub fn line(&self) -> String {
         let mut line = format!("goal {} ({}): {}", self.id, self.text, self.state.name());
         match self.state {
             State::Active | State::Paused => {
@@ -100,7 +101,7 @@ impl Goal {
                 );
             }
             State::Impossible | State::Exhausted => {
-                let _ = write!(line, ": {}", self.why);
+                let _ = write!(line, ": {}", self.why.trim_end_matches('.'));
             }
             State::Met => {}
         }

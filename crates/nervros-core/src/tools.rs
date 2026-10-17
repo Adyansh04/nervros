@@ -16,6 +16,7 @@ pub mod segment;
 pub mod skills;
 pub mod vision;
 pub mod watch;
+pub(crate) mod when;
 pub mod zones;
 
 use std::borrow::Cow;

@@ -209,6 +209,40 @@ pub fn gaps(profile: &Path, limit: usize) -> Result<()> {
     Ok(())
 }
 
+/// What the robot did over the last `hours`, from its ledger, incidents and goals.
+pub fn digest(profile: &Path, hours: f64) -> Result<()> {
+    if !(hours.is_finite() && hours > 0.0) {
+        bail!("--hours is more than 0");
+    }
+    let since = nervros_core::now_s() - hours * 3600.0;
+    let missions = match open_ledger(profile)? {
+        Some(ledger) => ledger.since(since)?,
+        None => Vec::new(),
+    };
+    let profile = Profile::load(profile).context("loading the profile")?;
+    let state = nervros_core::app::state_dir();
+    let (file, _) = nervros_core::app::incident_files(&profile, &state);
+    let incidents: Vec<_> = nervros_core::incident::read(&file)
+        .into_iter()
+        .filter(|i| i.opened_s >= since)
+        .collect();
+    let goals = nervros_core::mission::goals::Goals::new(Some(nervros_core::app::goals_file(
+        &profile, &state,
+    )))
+    .all();
+    println!(
+        "{}",
+        nervros_core::mission::digest::compose(&nervros_core::mission::digest::Period {
+            hours,
+            missions: &missions,
+            world: &[],
+            incidents: &incidents,
+            goals: &goals,
+        })
+    );
+    Ok(())
+}
+
 /// The robot's incidents, newest first, or one in full by its id.
 pub fn incidents(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
     let profile = Profile::load(profile).context("loading the profile")?;

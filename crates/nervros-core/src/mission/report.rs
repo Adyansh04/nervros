@@ -207,12 +207,23 @@ impl Missions {
             .iter()
             .flat_map(|s| s.args.iter().map(|a| a.value.as_str()))
             .collect();
+        self.changes(since_s, &named).await
+    }
+
+    /// Every object that moved or went missing since `since_s`, a line each.
+    pub(crate) async fn changes_since(&self, since_s: f64) -> Vec<String> {
+        self.changes(since_s, &[]).await
+    }
+
+    /// Objects but `leave_out` that moved or went missing since `since_s`, at most
+    /// [`MOST_CHANGES`] lines and the rest counted.
+    async fn changes(&self, since_s: f64, leave_out: &[&str]) -> Vec<String> {
         let events: Vec<Value> = self
             .object_events("", since_s)
             .await
             .into_iter()
             .filter(|e| matches!(e["kind"].as_str(), Some("moved" | "missing")))
-            .filter(|e| !named.contains(&e["id"].as_str().unwrap_or_default()))
+            .filter(|e| !leave_out.contains(&e["id"].as_str().unwrap_or_default()))
             .collect();
         let mut lines = check::story(&events, crate::now_s());
         if lines.len() > MOST_CHANGES {

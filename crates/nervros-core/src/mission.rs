@@ -11,6 +11,7 @@ pub mod advice;
 pub mod camera;
 pub mod catalog;
 pub mod check;
+pub mod digest;
 pub mod goals;
 pub mod history;
 pub mod learn;

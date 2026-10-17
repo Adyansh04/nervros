@@ -380,6 +380,23 @@ impl Ledger {
         Ok(marked)
     }
 
+    /// The missions that started at `since_s` or later, oldest first, with their steps.
+    ///
+    /// # Errors
+    ///
+    /// The read failed.
+    pub fn since(&self, since_s: f64) -> rusqlite::Result<Vec<MissionRecord>> {
+        let db = self.db();
+        let mut found: Vec<MissionRecord> = db
+            .prepare_cached("SELECT * FROM missions WHERE started >= ?1 ORDER BY started")?
+            .query_map([since_s], mission_of)?
+            .collect::<rusqlite::Result<_>>()?;
+        for m in &mut found {
+            m.steps = steps_of(&db, &m.id)?;
+        }
+        Ok(found)
+    }
+
     /// The latest missions, newest first, with their steps.
     ///
     /// # Errors

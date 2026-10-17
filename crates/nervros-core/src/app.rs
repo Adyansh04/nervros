@@ -195,13 +195,17 @@ fn orphan_notice(state: &serde_json::Value) -> Option<String> {
 struct Seeing {
     editor: Option<Arc<crate::editor::EditorClient>>,
     vision: Option<crate::mission::camera::Vision>,
+    /// The cameras, for the watches on what they show.
+    cameras: Option<Arc<Cameras>>,
+    /// Their frames kept as the view changes, for `when`.
+    keyframes: Option<Arc<crate::vision::Keyframes>>,
 }
 
 /// `look`, `point`, `segment` and the world editor's tools, as the profile has them.
 fn seeing_tools(
     profile: &Profile,
     robot: &Arc<dyn RobotPort>,
-    llm: &Arc<Llm>,
+    (llm, ledger): (&Arc<Llm>, &Path),
     snapshots: &Arc<SnapshotStore>,
     registry: &mut Registry,
 ) -> Result<Seeing, StartError> {
@@ -256,6 +260,14 @@ fn seeing_tools(
             registry.add(tool)?;
         }
     }
+    let keyframes = seen_by
+        .as_ref()
+        .zip(profile.keyframes.clone())
+        .and_then(|(c, config)| {
+            let dir = robot_file(profile, ledger, "keyframes")?.with_extension("");
+            Some(crate::vision::Keyframes::start(config, Arc::clone(c), dir))
+        });
+    let cameras = seen_by.clone();
     let vision = seen_by
         .zip(looked_by)
         .map(|(cameras, look)| crate::mission::camera::Vision {
@@ -264,7 +276,60 @@ fn seeing_tools(
             seer: Arc::clone(&llm) as Arc<dyn crate::look::Seer>,
             scene_check: !llm.router().config().roles.scene_check.is_empty(),
         });
-    Ok(Seeing { editor, vision })
+    Ok(Seeing {
+        editor,
+        vision,
+        cameras,
+        keyframes,
+    })
+}
+
+/// `robot_state`, and the generic ROS tools the profile lists.
+fn robot_tools(
+    profile: &Profile,
+    robot: &Arc<dyn RobotPort>,
+    (schemas, guard): (&Arc<dyn SchemaSource>, &Arc<Guard>),
+    registry: &mut Registry,
+) -> Result<(), StartError> {
+    registry.add(Arc::new(RobotState::new(
+        profile,
+        Arc::clone(robot),
+        Arc::clone(guard),
+    )))?;
+    if let Some(config) = &profile.ros_tools {
+        for tool in crate::ros_tools::tools(config, robot, schemas, guard) {
+            registry.add(tool)?;
+        }
+    }
+    Ok(())
+}
+
+/// What the cameras give beyond `look`: watches on what they show, and `when` over the frames
+/// they kept, which the world model's history narrows when the robot has missions.
+fn camera_memory(
+    (profile, cameras, keyframes): (
+        &Profile,
+        Option<&Arc<Cameras>>,
+        Option<&Arc<crate::vision::Keyframes>>,
+    ),
+    (llm, snapshots): (&Arc<Llm>, &Arc<SnapshotStore>),
+    (watches, missions): (&crate::watch::Watches, Option<&Arc<Missions>>),
+    registry: &mut Registry,
+) -> Result<(), StartError> {
+    let seer = Arc::clone(llm) as Arc<dyn crate::look::Seer>;
+    if let Some(cameras) = cameras {
+        watches.see_through(Arc::clone(cameras), Arc::clone(&seer));
+    }
+    if let Some((keyframes, config)) = keyframes.zip(profile.keyframes.as_ref()) {
+        registry.add(Arc::new(crate::tools::when::WhenTool::new(
+            Arc::clone(keyframes),
+            seer,
+            Arc::clone(snapshots),
+            missions.cloned(),
+            config.keep_h,
+        )))?;
+    }
+    Ok(())
 }
 
 /// `list_places`, `tag_place` and `forget_place`, over the profile's places and the ones remembered
@@ -324,6 +389,13 @@ fn robot_file(profile: &Profile, ledger: &Path, kind: &str) -> Option<PathBuf> {
             .unwrap_or_else(|| "robot".into());
         dir.join(kind).join(format!("{name}.json"))
     })
+}
+
+/// Where a robot's goals live under the state folder `state`.
+#[must_use]
+pub fn goals_file(profile: &Profile, state: &Path) -> PathBuf {
+    robot_file(profile, &state.join("quota.json"), "goals")
+        .unwrap_or_else(|| state.join("goals").join("robot.json"))
 }
 
 /// Where a robot's mission ledger lives under the state folder `state`.
@@ -606,7 +678,7 @@ fn waiting_requests(history: Option<&Path>) -> (Option<PathBuf>, Vec<crate::sess
 /// The missions' tools, their history's and the schedules', and the schedules themselves.
 fn mission_tools(
     missions: Option<&Arc<Missions>>,
-    guard: &Arc<Guard>,
+    (guard, incidents): (&Arc<Guard>, &Arc<crate::incident::Investigator>),
     registry: &mut Registry,
 ) -> Result<Option<Arc<crate::schedule::Schedules>>, StartError> {
     let Some(missions) = missions else {
@@ -628,6 +700,10 @@ fn mission_tools(
             Arc::clone(missions),
         )))?;
     }
+    registry.add(Arc::new(crate::mission::digest::DigestTool::new(
+        Arc::clone(missions),
+        Arc::clone(incidents),
+    )))?;
     Ok(Some(schedules))
 }
 
@@ -659,6 +735,10 @@ fn job_tools(
         Arc::clone(jobs),
         frames,
     )))?;
+    registry.add(Arc::new(crate::search::PatrolTool::new(
+        Arc::clone(missions),
+        Arc::clone(jobs),
+    )))?;
     Ok(Some(store))
 }
 
@@ -684,20 +764,11 @@ pub fn start_with(
     let schemas: Arc<dyn SchemaSource> = Arc::new(RosidlSchemas::load(&profile)?);
     let mut registry = Registry::from_config(&profile.tools, &robot, &schemas, &guard)?;
     let snapshots = Arc::new(SnapshotStore::default());
-    let seeing = seeing_tools(&profile, &robot, &llm, &snapshots, &mut registry)?;
+    let seeing = seeing_tools(&profile, &robot, (&llm, ledger), &snapshots, &mut registry)?;
     let places = place_tools(&profile, &robot, ledger, &mut registry)?;
     let zones_file = robot_file(&profile, ledger, "zones");
     let zones = zone_tools(&profile, &robot, zones_file, &places, &guard, &mut registry)?;
-    registry.add(Arc::new(RobotState::new(
-        &profile,
-        Arc::clone(&robot),
-        Arc::clone(&guard),
-    )))?;
-    if let Some(config) = &profile.ros_tools {
-        for tool in crate::ros_tools::tools(config, &robot, &schemas, &guard) {
-            registry.add(tool)?;
-        }
-    }
+    robot_tools(&profile, &robot, (&schemas, &guard), &mut registry)?;
     let (watches, incidents) = debug_tools(&profile, &robot, ledger, &mut registry)?;
     let mcp = mcp_tools(&profile, models.privacy, &mut registry)?;
     let skills = skill_tools(&profile, &mut registry)?;
@@ -717,7 +788,13 @@ pub fn start_with(
         models.advisor,
         seeing.vision,
     );
-    let schedules = mission_tools(missions.as_ref(), &guard, &mut registry)?;
+    let schedules = mission_tools(missions.as_ref(), (&guard, &incidents), &mut registry)?;
+    camera_memory(
+        (&profile, seeing.cameras.as_ref(), seeing.keyframes.as_ref()),
+        (&llm, &snapshots),
+        (&watches, missions.as_ref()),
+        &mut registry,
+    )?;
     let jobs = crate::job::Jobs::new(Arc::clone(&guard));
     let programs = job_tools(&profile, missions.as_ref(), &jobs, ledger, &mut registry)?;
     check_rules(&profile, &registry)?;

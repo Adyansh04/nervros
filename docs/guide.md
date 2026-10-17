@@ -499,6 +499,28 @@ tells you: "Tell me when a mug appears in the bedroom" needs no approval.
 "Check the robot's health" runs the same connection check as the Doctor tab. You can ask it even
 while a mission runs.
 
+> **You:** Tell me when someone puts a box on the sofa.
+
+A watch can also wait for what a camera shows. A vision model looks every 15 seconds, and the
+watch posts once it says yes twice in a row, so one glimpse it mistook does not count.
+
+> **You:** When did the red mug leave the dining table?
+
+With `[keyframes]`, the cameras keep a frame each time their view changes. `when` shows a vision
+model a dozen of them in time order, those around the moments the world model saw the mug move
+when it did, and answers with the time and the frame.
+
+> **You:** How did today go?
+
+The digest counts the missions by how they ended, sets the runs the robot itself cut short apart,
+gives each skill's record, and lists what moved in the world model, the incidents and the goals.
+`nervros-cli digest --hours 24` prints the same in a terminal.
+
+> **You:** Check on the apartment: the living room, the bedroom and the office.
+
+A patrol walks the round as a job, stands a moment in each place so the world model sees it, and
+then reports what moved or went missing meanwhile.
+
 ### Debugging the ROS side
 
 With a `[ros_tools]` table in the profile, the agent reads the graph as `ros2` does: "what is
