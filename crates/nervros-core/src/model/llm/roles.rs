@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::client::{Llm, prompt_once_more, prompt_setback};
 use super::turn::{AgentSource, without_provider_body};
-use super::{Ask, ImageInput};
+use super::{Ask, ImageInput, Shot};
 use crate::providers::Role;
 use crate::providers::router::Need;
 
@@ -58,7 +58,7 @@ impl crate::look::Eyes for Llm {
             role: Role::VisionCheck,
             preamble: EYES_PREAMBLE,
             prompt,
-            image: Some(image),
+            images: vec![Shot::bare(image)],
         })
         .await
         .map(|a| (a.text, a.model))
@@ -77,7 +77,7 @@ impl crate::segment::Outliner for Llm {
             role: Role::Segment,
             preamble: OUTLINE_PREAMBLE,
             prompt,
-            image: Some(image),
+            images: vec![Shot::bare(image)],
         })
         .await
         .map(|a| (a.text, a.model))
@@ -93,7 +93,7 @@ impl crate::mission::advice::Advisor for Llm {
                 role: Role::Plan,
                 preamble: crate::mission::advice::ADVISOR_PREAMBLE,
                 prompt,
-                image: None,
+                images: Vec::new(),
             })
             .await;
         match asked {
@@ -113,10 +113,31 @@ impl crate::mission::sanity::Critic for Llm {
             role: Role::PlanCheck,
             preamble: crate::mission::sanity::CRITIC_PREAMBLE,
             prompt,
-            image: None,
+            images: Vec::new(),
         })
         .await
         .map(|a| a.text)
+        .map_err(|e| e.to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::look::Seer for Llm {
+    async fn ask_shots(
+        &self,
+        role: Role,
+        preamble: &str,
+        prompt: &str,
+        shots: Vec<Shot>,
+    ) -> Result<(String, String), String> {
+        self.ask(Ask {
+            role,
+            preamble,
+            prompt,
+            images: shots,
+        })
+        .await
+        .map(|a| (a.text, a.model))
         .map_err(|e| e.to_string())
     }
 }

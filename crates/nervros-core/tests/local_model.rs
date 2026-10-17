@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use nervros_core::llm::{Ask, DynamicTool, ImageFormat, ImageInput, Llm};
+use nervros_core::llm::{Ask, DynamicTool, ImageFormat, ImageInput, Llm, Shot};
 use nervros_core::providers::ledger::Ledger;
 use nervros_core::providers::router::{PrivacyMode, Router};
 use nervros_core::providers::{ModelsConfig, Role};
@@ -51,7 +51,7 @@ async fn describes_an_image() {
             role: Role::Routine,
             preamble: "Answer in one word.",
             prompt: "What colour fills this image?",
-            image: Some(image),
+            images: vec![Shot::bare(image)],
         })
         .await
         .unwrap();

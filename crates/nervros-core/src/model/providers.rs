@@ -162,17 +162,30 @@ pub enum Role {
     Segment,
     /// A second opinion on a plan before the operator approves it; off while its chain is empty.
     PlanCheck,
+    /// Whether frames from before and after a mission show its goals met.
+    Witness,
+    /// Which of a run of timestamped frames shows a moment the operator asks about.
+    Moment,
+    /// Whether a camera frame shows what a watch waits for, asked every few seconds.
+    Watch,
+    /// A plan the checks flagged, against what the cameras show; off while its chain is empty.
+    /// Apart from `plan_check`, which never sees a frame, so text in the scene cannot reach it.
+    SceneCheck,
 }
 
 impl Role {
     /// Every role.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 10] = [
         Self::Routine,
         Self::Plan,
         Self::VisionCheck,
         Self::Summarise,
         Self::Segment,
         Self::PlanCheck,
+        Self::Witness,
+        Self::Moment,
+        Self::Watch,
+        Self::SceneCheck,
     ];
 
     /// Its key in `models.toml`'s `[roles]`, such as `vision_check`.
@@ -185,6 +198,10 @@ impl Role {
             Self::Summarise => "summarise",
             Self::Segment => "segment",
             Self::PlanCheck => "plan_check",
+            Self::Witness => "witness",
+            Self::Moment => "moment",
+            Self::Watch => "watch",
+            Self::SceneCheck => "scene_check",
         }
     }
 }
@@ -222,6 +239,18 @@ pub struct RolesConfig {
     /// See [`Role::PlanCheck`].
     #[serde(default)]
     pub plan_check: Vec<String>,
+    /// See [`Role::Witness`]; empty, the `vision_check` chain.
+    #[serde(default)]
+    pub witness: Vec<String>,
+    /// See [`Role::Moment`]; empty, the `vision_check` chain.
+    #[serde(default)]
+    pub moment: Vec<String>,
+    /// See [`Role::Watch`]; empty, the `vision_check` chain.
+    #[serde(default)]
+    pub watch: Vec<String>,
+    /// See [`Role::SceneCheck`].
+    #[serde(default)]
+    pub scene_check: Vec<String>,
     /// Only the routine models listed answer, with no local model after them: set for an eval's
     /// arm, whose answers must be that model's.
     #[serde(skip)]
@@ -229,7 +258,8 @@ pub struct RolesConfig {
 }
 
 impl RolesConfig {
-    /// The chain for a role.
+    /// The chain for a role. The vision roles a profile leaves out look through `vision_check`,
+    /// so a profile names them only to spend a scarcer model on them alone.
     #[must_use]
     pub fn chain(&self, role: Role) -> &[String] {
         match role {
@@ -239,8 +269,17 @@ impl RolesConfig {
             Role::Summarise => &self.summarise,
             Role::Segment => &self.segment,
             Role::PlanCheck => &self.plan_check,
+            Role::Witness => or(&self.witness, &self.vision_check),
+            Role::Moment => or(&self.moment, &self.vision_check),
+            Role::Watch => or(&self.watch, &self.vision_check),
+            Role::SceneCheck => &self.scene_check,
         }
     }
+}
+
+/// `own`, or `fallback` when `own` is empty.
+fn or<'a>(own: &'a [String], fallback: &'a [String]) -> &'a [String] {
+    if own.is_empty() { fallback } else { own }
 }
 
 /// A `models.toml` that cannot be used.
@@ -393,6 +432,18 @@ pub(crate) mod tests {
         assert!(!config.roles.routine.is_empty());
         let local = config.model("qwen3.5-9b-local").unwrap();
         assert!(local.privacy.local && local.vision && local.tools);
+    }
+
+    #[test]
+    fn a_vision_role_left_out_looks_through_vision_check() {
+        let mut roles = RolesConfig {
+            vision_check: vec!["v".to_owned()],
+            ..RolesConfig::default()
+        };
+        assert_eq!(roles.chain(Role::Witness), ["v"]);
+        roles.witness = vec!["w".to_owned()];
+        assert_eq!(roles.chain(Role::Witness), ["w"]);
+        assert!(roles.chain(Role::PlanCheck).is_empty());
     }
 
     #[test]

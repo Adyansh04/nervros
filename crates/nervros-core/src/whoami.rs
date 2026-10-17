@@ -189,7 +189,7 @@ pub async fn draft(llm: &Llm, profile: &Profile, facts: &Value) -> Result<String
             role: Role::Routine,
             preamble: PREAMBLE,
             prompt: &prompt,
-            image: None,
+            images: Vec::new(),
         })
         .await?;
     Ok(answer.text)

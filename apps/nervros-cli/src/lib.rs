@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use anyhow::{Context as _, Result, bail};
 use clap::builder::PossibleValuesParser;
 use clap::{Parser, Subcommand};
-use nervros_core::llm::{Ask, ImageFormat, ImageInput, Llm};
+use nervros_core::llm::{Ask, ImageFormat, ImageInput, Llm, Shot};
 use nervros_core::profile::Profile;
 use nervros_core::providers::router::Router;
 use nervros_core::providers::{Role, free_only, openrouter};
@@ -40,16 +40,16 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Send one prompt, optionally with an image, and print the reply.
+    /// Send one prompt, optionally with images, and print the reply.
     Ask {
         /// The prompt.
         prompt: String,
         /// Which role's chain to use.
         #[arg(long, default_value = "routine", value_parser = PossibleValuesParser::new(Role::ALL.map(Role::name)))]
         role: String,
-        /// A JPEG or PNG to attach.
+        /// A JPEG or PNG to attach; repeated, several in order, each labelled with its file name.
         #[arg(long)]
-        image: Option<PathBuf>,
+        image: Vec<PathBuf>,
     },
     /// Chat with the robot. Lines starting with `/` are commands: `/arm`, `/disarm`, `/stop`,
     /// `/pause`, `/resume`, `/yes N`, `/allow N` (yes, and no more asking for that tool this
@@ -420,10 +420,11 @@ async fn models(profile: &Path, check: bool) -> Result<()> {
     Ok(())
 }
 
-async fn ask(profile: &Path, prompt: &str, role: Role, image: Option<PathBuf>) -> Result<()> {
-    let image = match image {
-        None => None,
-        Some(file) => {
+async fn ask(profile: &Path, prompt: &str, role: Role, images: Vec<PathBuf>) -> Result<()> {
+    let one = images.len() == 1;
+    let images = images
+        .iter()
+        .map(|file| {
             let format = match file
                 .extension()
                 .and_then(|e| e.to_str())
@@ -435,17 +436,27 @@ async fn ask(profile: &Path, prompt: &str, role: Role, image: Option<PathBuf>) -
                 _ => bail!("{} is not a .png or .jpg file", file.display()),
             };
             let bytes =
-                std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
-            Some(ImageInput { bytes, format })
-        }
-    };
+                std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+            let image = ImageInput { bytes, format };
+            // A lone image needs no name; several are told apart by theirs.
+            Ok(if one {
+                Shot::bare(image)
+            } else {
+                let name = file.file_name().unwrap_or_default().to_string_lossy();
+                Shot {
+                    label: format!("{name}:"),
+                    image,
+                }
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let llm = Llm::new(router(profile)?);
     let answer = llm
         .ask(Ask {
             role,
             preamble: "You are NervROS, a robot's assistant. Be brief.",
             prompt,
-            image,
+            images,
         })
         .await?;
     println!("{}", answer.text);

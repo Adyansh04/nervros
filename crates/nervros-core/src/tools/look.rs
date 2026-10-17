@@ -35,6 +35,24 @@ pub trait Eyes: Send + Sync {
     async fn see(&self, prompt: &str, image: ImageInput) -> Result<(String, String), String>;
 }
 
+/// A vision model asked about several labelled frames at once, through a role's chain: a start
+/// and an end to compare, or a clip to search.
+#[async_trait]
+pub trait Seer: Send + Sync {
+    /// The answer and the id of the model that gave it.
+    ///
+    /// # Errors
+    ///
+    /// Why no model answered.
+    async fn ask_shots(
+        &self,
+        role: crate::providers::Role,
+        preamble: &str,
+        prompt: &str,
+        shots: Vec<crate::llm::Shot>,
+    ) -> Result<(String, String), String>;
+}
+
 /// What one look found: the marked frame as kept, and what the vision model said of it.
 pub(crate) struct Looked {
     pub(crate) snapshot: Arc<crate::vision::Snapshot>,
