@@ -222,6 +222,12 @@ and `detection_image` (without detections `look` shows that camera's frame unmar
 then take a `camera` argument, `[look]`'s own by default, and the chat model sees each camera's
 `about` to choose one.
 
+With `[look]` and `[mission]`, a mission that succeeds is checked through the cameras too, for
+each goal that puts one thing in or on another, up to four. The detector's marks on the newest
+frame come first. Goals they do not settle go to the `witness` model in one request, with every
+camera's frame from the mission's start and from its end. Its "no" flags a success the world model
+believed; its "yes" never clears a goal the world model found unmet.
+
 ```toml
 [look]
 name = "chest"
@@ -374,9 +380,20 @@ arm = "arm"                                            # the argument valued lef
 - With a `plan_check` model in the models file, a second model also judges the plan from the
   operator's words. With a `plan` model other than the routine one, it advises the planner once a
   request's plans have failed twice.
+- With `[look]` and a `scene_check` model, a plan with a step that failed in at least half of its
+  last runs is also checked against what the cameras show now, with the steps' track records. Its
+  doubts are added to the card; they never send the plan back.
 
 Missions are kept in a ledger beside the quota file. The card shows how each step went before, and
 `recall`, the Mission tab and `nervros-cli missions` read the ledger.
+
+A run the robot or the executor ended, rather than the plan, is kept with its fault: the robot could
+not move, the deadman stopped it, the executor shut down or restarted, a skill's server was not up,
+someone drove the base by hand, or another mission ran. It counts in no track record, judges no
+taught skill and uses none of the request's replans, and its report says what the fault needs
+instead of asking for a new plan. A program that meets one stops there. A mission still kept as
+running when NervROS starts was cut short by NervROS stopping: it is kept as interrupted, and the
+window says so.
 
 ### `[[place]]`
 

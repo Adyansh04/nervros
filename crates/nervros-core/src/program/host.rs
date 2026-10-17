@@ -124,6 +124,14 @@ impl Host for RobotHost {
         let end = self
             .runtime
             .block_on(self.missions.run_for_job(&self.ctx, &intent, steps))?;
+        // A fault is the robot's or the executor's: a program that retried would only meet it again.
+        if let Some(fault) = end.fault {
+            return Err(format!(
+                "{skill} was cut short: {}. {}",
+                end.reason,
+                fault.next()
+            ));
+        }
         self.ctx.log(match end.outcome {
             Outcome::Success => format!("{skill} succeeded"),
             other => format!("{skill} ended {other}: {}", end.reason),

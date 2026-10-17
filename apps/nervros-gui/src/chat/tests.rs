@@ -679,6 +679,7 @@ fn snapshot_mission() {
         elapsed_s: 94.0,
         outputs: serde_json::Map::new(),
         by_job: false,
+        fault: None,
     });
     chat.apply(&Event::Report {
         turn: 2,

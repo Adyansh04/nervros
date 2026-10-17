@@ -780,7 +780,7 @@ $ nervros-cli --profile nervros.toml missions --limit 3
     asked: Every ten minutes, walk to the bedroom, room R3, three times.
 01a0fe10-ae04 34 min ago: Walk to the bedroom, room R3 (canceled, 9 s)
     asked: Walk to the bedroom, room R3.
-    s1 GoToPlace R3 failure: stopped: operator
+    s1 GoToPlace R3 stopped: stopped: operator
 ```
 
 ### Evals

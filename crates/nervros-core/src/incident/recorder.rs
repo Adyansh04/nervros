@@ -448,6 +448,7 @@ mod tests {
             elapsed_s: 30.0,
             outputs: serde_json::Map::new(),
             by_job,
+            fault: None,
         };
         events.send(finished("m9", "nothing seen", true)).unwrap();
         events

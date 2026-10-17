@@ -40,8 +40,8 @@ pub trait Host: Send + Sync {
     ///
     /// # Errors
     ///
-    /// The skill is not one the program was approved for, the plan failed its checks, or the
-    /// robot cannot run a mission now.
+    /// The skill is not one the program was approved for, the plan failed its checks, the robot
+    /// cannot run a mission now, or the robot or its executor cut the mission short.
     fn run(&self, skill: &str, args: Value) -> Result<Value, String>;
     /// The newest message on a topic, as JSON.
     ///

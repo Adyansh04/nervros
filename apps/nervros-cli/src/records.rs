@@ -142,8 +142,14 @@ pub fn missions(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
         None => ledger.recent(limit)?,
     };
     for m in &list {
+        // A faulted run says nothing about its plan; it is told apart from the plan's failures.
+        let fault = if m.fault.is_empty() {
+            String::new()
+        } else {
+            format!(", fault: {}", m.fault)
+        };
         println!(
-            "{} {} ago: {} ({}, {:.0} s)",
+            "{} {} ago: {} ({}{fault}, {:.0} s)",
             // A version 7 id begins with its millisecond: this much tells missions apart.
             &m.id[..m.id.len().min(13)],
             nervros_core::how_long(now - m.started),

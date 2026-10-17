@@ -139,7 +139,12 @@ async fn a_mission_is_kept_recalled_saved_by_name_and_run_again_and_gaps_are_log
         text: "is it done yet?".to_owned(),
     });
     eventually(|| missions.request().contains("done yet")).await;
-    eventually(|| ledger.recent(1).is_ok_and(|r| !r.is_empty())).await;
+    let ended = || {
+        ledger
+            .recent(1)
+            .is_ok_and(|r| r.first().is_some_and(|m| m.outcome != "running"))
+    };
+    eventually(ended).await;
     let kept = &ledger.recent(1).unwrap()[0];
     assert_eq!(
         (kept.outcome.as_str(), kept.request.as_str()),
@@ -690,6 +695,156 @@ async fn problems_go_back_to_the_model_and_attempts_are_capped() {
 }
 
 #[tokio::test]
+async fn a_mission_the_robot_cut_short_is_no_failure_of_the_plan() {
+    let fell = ScriptedRun {
+        result: Ok(GoalResult {
+            status: GoalStatus::Canceled,
+            result: json!({"outcome": 2, "failed_step_id": "s1", "cause": 1,
+                           "failure_reason": "stopped: the robot can no longer walk: fallen"}),
+        }),
+        ..ScriptedRun::default()
+    };
+    let robot: Arc<dyn RobotPort> = Arc::new(robot(fell));
+    let ledger = Ledger::in_memory().unwrap();
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot)
+        .unwrap()
+        .with_ledger(Arc::clone(&ledger));
+    let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+    let (events, _rx) = tokio::sync::broadcast::channel(64);
+    missions.attach(SessionHandle::for_tests(&tx, events));
+    let hash = missions.plan(steps(), By::Model).await.data["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        missions.run(&json!({"hash": hash})).await.status,
+        Status::Accepted
+    );
+
+    let text = report_from(&mut commands).await;
+    assert!(
+        text.contains("It was cut short during s1") && text.contains(Fault::Robot.next()),
+        "{text}"
+    );
+    assert_eq!(missions.run_failures.load(Ordering::SeqCst), 0);
+    let kept = &ledger.recent(1).unwrap()[0];
+    assert_eq!(
+        (kept.outcome.as_str(), kept.fault.as_str()),
+        ("canceled", "robot")
+    );
+    assert_eq!(kept.steps[0].outcome, "stopped");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_mission_is_given_up_once_the_executor_restarts() {
+    let forever = ScriptedRun {
+        step: Duration::from_hours(1),
+        ..ended(0, "", "")
+    };
+    let fake = Arc::new(robot(forever).with_topic("/x/state", json!({"boot_id": "a"})));
+    let robot: Arc<dyn RobotPort> = Arc::clone(&fake) as Arc<dyn RobotPort>;
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+    let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+    let (events, _rx) = tokio::sync::broadcast::channel(64);
+    missions.attach(SessionHandle::for_tests(&tx, events));
+    let hash = missions.plan(steps(), By::Model).await.data["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id = missions.run(&json!({"hash": hash})).await.data["mission_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fake.set_topic("/x/state", json!({"boot_id": "a", "mission_id": id}));
+    tokio::time::sleep(LIVENESS * 2).await;
+    fake.set_topic("/x/state", json!({"boot_id": "b", "mission_id": ""}));
+
+    let text = report_from(&mut commands).await;
+    assert!(text.contains("the executor restarted"), "{text}");
+    assert!(text.contains(Fault::ExecutorLost.next()), "{text}");
+}
+
+#[tokio::test]
+async fn a_mission_left_running_by_an_earlier_nervros_is_settled_at_start() {
+    let ledger = Ledger::in_memory().unwrap();
+    ledger
+        .record(&MissionRecord {
+            id: "m0".to_owned(),
+            intent: "fetch the mug".to_owned(),
+            outcome: "running".to_owned(),
+            ..MissionRecord::default()
+        })
+        .unwrap();
+    let robot: Arc<dyn RobotPort> = Arc::new(robot(ScriptedRun::default()));
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot)
+        .unwrap()
+        .with_ledger(Arc::clone(&ledger));
+    let (tx, _commands) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut seen) = tokio::sync::broadcast::channel(64);
+    missions.attach(SessionHandle::for_tests(&tx, events));
+
+    let notice = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(Event::Notice { text }) = seen.recv().await {
+                return text;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        notice.contains("\"fetch the mug\" (m0) was cut short"),
+        "{notice}"
+    );
+    let kept = &ledger.mission("m0").unwrap()[0];
+    assert_eq!(
+        (kept.outcome.as_str(), kept.fault.as_str()),
+        ("canceled", "interrupted")
+    );
+}
+
+#[tokio::test]
+async fn an_unmet_goal_names_the_step_that_should_have_met_it_and_what_else_changed() {
+    let now = crate::now_s();
+    let history = move |req: &Value| {
+        let moved = |id: &str, label: &str| {
+            json!({"id": id, "label": label, "kind": "moved", "room_id": "R2", "other_id": "",
+                   "detail": "", "stamp": {"sec": now.floor(), "nanosec": 0}})
+        };
+        let events = if req["query"] == "" {
+            json!([moved("O99", "chair"), moved("O18", "blue cup")])
+        } else {
+            json!([])
+        };
+        Ok(json!({ "events": events }))
+    };
+    let robot: Arc<dyn RobotPort> =
+        Arc::new(robot(ended(0, "", "")).with_service("/x/history", history));
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+    let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+    let (events, _rx) = tokio::sync::broadcast::channel(64);
+    missions.attach(SessionHandle::for_tests(&tx, events));
+    let hash = missions.plan(steps(), By::Model).await.data["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        missions.run(&json!({"hash": hash})).await.status,
+        Status::Accepted
+    );
+
+    let text = report_from(&mut commands).await;
+    assert!(
+        text.contains("holding(left, O18) DOES NOT hold") && text.contains("which s2 PickObject("),
+        "{text}"
+    );
+    assert!(
+        text.contains("O99 chair: moved") && !text.contains("O18 blue cup: moved"),
+        "the plan's own objects are its goal checks': {text}"
+    );
+}
+
+#[tokio::test]
 async fn a_failure_reports_the_step_and_limits_replans() {
     let failing = || ScriptedRun {
         result: Ok(GoalResult {
@@ -700,6 +855,9 @@ async fn a_failure_reports_the_step_and_limits_replans() {
     };
     let now = crate::now_s();
     let history = move |req: &Value| {
+        if req["query"] == "" {
+            return Ok(json!({"events": []}));
+        }
         assert_eq!(req["query"], "O18", "the failed step's object");
         let at = |ago: f64| json!({"sec": (now - ago).floor(), "nanosec": 0});
         Ok(json!({"events": [

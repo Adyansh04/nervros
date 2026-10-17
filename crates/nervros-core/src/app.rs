@@ -258,7 +258,12 @@ fn seeing_tools(
     }
     let vision = seen_by
         .zip(looked_by)
-        .map(|(cameras, look)| crate::mission::camera::Vision { look, cameras });
+        .map(|(cameras, look)| crate::mission::camera::Vision {
+            look,
+            cameras,
+            seer: Arc::clone(&llm) as Arc<dyn crate::look::Seer>,
+            scene_check: !llm.router().config().roles.scene_check.is_empty(),
+        });
     Ok(Seeing { editor, vision })
 }
 

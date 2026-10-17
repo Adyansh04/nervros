@@ -29,7 +29,8 @@ const SCHEMA: &str = "
         outcome TEXT NOT NULL,
         failed_step TEXT NOT NULL,
         reason TEXT NOT NULL,
-        plan TEXT NOT NULL DEFAULT ''
+        plan TEXT NOT NULL DEFAULT '',
+        fault TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS missions_by_time ON missions (started);
     CREATE TABLE IF NOT EXISTS steps (
@@ -74,7 +75,8 @@ pub struct MissionRecord {
     pub started: f64,
     /// Unix seconds.
     pub ended: f64,
-    /// `success`, `failure`, `canceled`, `timeout`, `rejected` or `error`.
+    /// `success`, `failure`, `canceled`, `timeout`, `rejected` or `error`; `running` until it
+    /// ends.
     pub outcome: String,
     /// The step it failed at, if it did.
     pub failed_step: String,
@@ -85,6 +87,9 @@ pub struct MissionRecord {
     /// The plan's steps, as `run_mission` takes them, to run it again; null in a ledger from
     /// before they were kept.
     pub plan: Value,
+    /// What made the run no test of the plan, as [`Fault::as_str`](super::Fault::as_str); empty
+    /// for none.
+    pub fault: String,
 }
 
 /// One step of a mission as it ended.
@@ -100,7 +105,8 @@ pub struct StepRecord {
     pub args: Value,
     /// How long it ran, when it ran.
     pub seconds: Option<f64>,
-    /// `success`, `failure`, or `skipped` when the mission never got to it.
+    /// `success`, `failure`, `stopped` when a stop cut it short, or `skipped` when the mission
+    /// never got to it.
     pub outcome: String,
     /// Why it failed.
     pub reason: String,
@@ -209,6 +215,21 @@ impl Ledger {
         if !kept_plans {
             db.execute_batch("ALTER TABLE missions ADD COLUMN plan TEXT NOT NULL DEFAULT ''")?;
         }
+        let kept_faults: bool = db.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('missions') WHERE name = 'fault'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !kept_faults {
+            // The step a stop cut short was kept as failed, and counted against its skill.
+            db.execute_batch(
+                "ALTER TABLE missions ADD COLUMN fault TEXT NOT NULL DEFAULT '';
+                 UPDATE steps SET outcome = 'stopped'
+                 WHERE outcome = 'failure' AND seconds IS NULL AND EXISTS (
+                     SELECT 1 FROM missions WHERE missions.id = steps.mission
+                       AND missions.outcome = 'canceled' AND missions.failed_step = steps.id);",
+            )?;
+        }
         Ok(Arc::new(Self { db: Mutex::new(db) }))
     }
 
@@ -216,7 +237,8 @@ impl Ledger {
         crate::lock(&self.db)
     }
 
-    /// Records a mission and its steps, replacing any record with its id.
+    /// Records a mission and its steps, replacing any record with its id: at its launch, as
+    /// `running` with no steps, then as it ended.
     ///
     /// # Errors
     ///
@@ -225,7 +247,7 @@ impl Ledger {
         let mut db = self.db();
         let tx = db.transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO missions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT OR REPLACE INTO missions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 m.id,
                 m.hash,
@@ -236,7 +258,8 @@ impl Ledger {
                 m.outcome,
                 m.failed_step,
                 m.reason,
-                m.plan.to_string()
+                m.plan.to_string(),
+                m.fault
             ],
         )?;
         {
@@ -259,7 +282,8 @@ impl Ledger {
         tx.commit()
     }
 
-    /// How `skill` on `target` has gone in its latest runs; none before its first.
+    /// How `skill` on `target` has gone in its latest runs; none before its first. A run that
+    /// ended in a fault, or still runs, is no test of the step.
     ///
     /// # Errors
     ///
@@ -271,6 +295,7 @@ impl Ledger {
              JOIN missions ON missions.id = steps.mission
              WHERE steps.skill = ?1 AND steps.target = ?2
                AND steps.outcome IN ('success', 'failure')
+               AND missions.fault = '' AND missions.outcome <> 'running'
              ORDER BY missions.started DESC LIMIT ?3",
         )?;
         let mut track = Track {
@@ -305,7 +330,8 @@ impl Ledger {
         Ok(Some(track))
     }
 
-    /// How `skill` went in its latest runs, on whatever it acted on: runs and successes.
+    /// How `skill` went in its latest runs, on whatever it acted on: runs and successes, counted
+    /// as [`Self::track`] counts them.
     ///
     /// # Errors
     ///
@@ -315,7 +341,7 @@ impl Ledger {
         let mut runs = db.prepare_cached(
             "SELECT steps.outcome FROM steps JOIN missions ON missions.id = steps.mission
              WHERE steps.skill = ?1 AND steps.outcome IN ('success', 'failure')
-               AND missions.outcome <> 'canceled'
+               AND missions.fault = '' AND missions.outcome <> 'running'
              ORDER BY missions.started DESC LIMIT ?2",
         )?;
         let outcomes: Vec<String> = runs
@@ -326,6 +352,32 @@ impl Ledger {
             u32::try_from(outcomes.len()).unwrap_or(u32::MAX),
             u32::try_from(succeeded).unwrap_or(u32::MAX),
         ))
+    }
+
+    /// Marks the missions still kept as running, other than `still`, as cut short when NervROS
+    /// stopped; the ones marked.
+    ///
+    /// # Errors
+    ///
+    /// The read or the write failed.
+    pub fn interrupted(&self, still: Option<&str>) -> rusqlite::Result<Vec<MissionRecord>> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let marked: Vec<MissionRecord> = tx
+            .prepare("SELECT * FROM missions WHERE outcome = 'running' AND id <> ?1")?
+            .query_map([still.unwrap_or_default()], mission_of)?
+            .collect::<rusqlite::Result<_>>()?;
+        tx.execute(
+            "UPDATE missions SET outcome = 'canceled', fault = ?2,
+                 reason = 'NervROS stopped while it ran'
+             WHERE outcome = 'running' AND id <> ?1",
+            params![
+                still.unwrap_or_default(),
+                super::Fault::Interrupted.as_str()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(marked)
     }
 
     /// The latest missions, newest first, with their steps.
@@ -488,6 +540,7 @@ fn mission_of(r: &Row<'_>) -> rusqlite::Result<MissionRecord> {
         reason: r.get(8)?,
         steps: Vec::new(),
         plan: serde_json::from_str(&plan).unwrap_or(Value::Null),
+        fault: r.get(10)?,
     })
 }
 
@@ -559,6 +612,7 @@ mod tests {
                 {"skill": "GoToPlace", "args": {"place": "dining_table_side"}},
                 {"id": "pick", "skill": "PickObject", "args": {"object_id": "mug_4"}, "retries": 1}
             ]),
+            fault: String::new(),
         }
     }
 
@@ -599,19 +653,53 @@ mod tests {
     }
 
     #[test]
-    fn a_skills_runs_leave_out_the_ones_the_operator_stopped() {
+    fn runs_that_were_no_test_of_a_step_are_left_out() {
         let ledger = Ledger::in_memory().unwrap();
         ledger
             .record(&mission("m1", 100.0, ("success", 40.0, "")))
             .unwrap();
-        // A cancel marks the step it stopped as failed.
-        let mut stopped = mission("m2", 200.0, ("failure", 5.0, "cancelled"));
+        let mut stopped = mission("m2", 200.0, ("stopped", 5.0, "stopped: user"));
         stopped.outcome = "canceled".to_owned();
         ledger.record(&stopped).unwrap();
+        let mut fell = mission("m3", 300.0, ("failure", 25.0, "fallen"));
+        fell.fault = "robot".to_owned();
+        ledger.record(&fell).unwrap();
+        let mut running = mission("m4", 400.0, ("failure", 5.0, "slipped"));
+        running.outcome = "running".to_owned();
+        ledger.record(&running).unwrap();
         ledger
-            .record(&mission("m3", 300.0, ("failure", 25.0, "slipped")))
+            .record(&mission("m5", 500.0, ("failure", 25.0, "slipped")))
             .unwrap();
+
         assert_eq!(ledger.skill_runs("PickObject").unwrap(), (2, 1));
+        let walks = ledger.track("GoToPlace", "dining_table_side").unwrap();
+        assert_eq!(
+            walks.unwrap().runs,
+            3,
+            "the stopped mission walked before its stop"
+        );
+    }
+
+    #[test]
+    fn missions_left_running_are_marked_interrupted_but_the_one_still_running() {
+        let ledger = Ledger::in_memory().unwrap();
+        for id in ["m1", "m2"] {
+            let mut m = mission(id, 100.0, ("success", 40.0, ""));
+            m.outcome = "running".to_owned();
+            m.steps.clear();
+            ledger.record(&m).unwrap();
+        }
+
+        let marked = ledger.interrupted(Some("m2")).unwrap();
+
+        assert_eq!(marked.len(), 1);
+        assert_eq!(marked[0].id, "m1");
+        let m1 = &ledger.mission("m1").unwrap()[0];
+        assert_eq!(
+            (m1.outcome.as_str(), m1.fault.as_str()),
+            ("canceled", "interrupted")
+        );
+        assert_eq!(ledger.mission("m2").unwrap()[0].outcome, "running");
     }
 
     #[test]
@@ -650,13 +738,20 @@ mod tests {
     }
 
     #[test]
-    fn a_ledger_from_before_plans_were_kept_gains_them() {
+    fn an_older_ledger_gains_plans_and_faults_and_stops_blaming_stopped_steps() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE missions (id TEXT PRIMARY KEY, hash TEXT NOT NULL, intent TEXT NOT NULL,
                  request TEXT NOT NULL, started REAL NOT NULL, ended REAL NOT NULL,
                  outcome TEXT NOT NULL, failed_step TEXT NOT NULL, reason TEXT NOT NULL);
-             INSERT INTO missions VALUES ('0190a', 'h', 'walk', 'walk', 1.0, 2.0, 'success', '', '');",
+             CREATE TABLE steps (mission TEXT NOT NULL, id TEXT NOT NULL, skill TEXT NOT NULL,
+                 target TEXT NOT NULL, args TEXT NOT NULL, seconds REAL, outcome TEXT NOT NULL,
+                 reason TEXT NOT NULL, PRIMARY KEY (mission, id));
+             INSERT INTO missions VALUES ('0190a', 'h', 'walk', 'walk', 1.0, 2.0, 'success', '', '');
+             INSERT INTO missions VALUES ('c', 'h', 'pick', 'pick', 3.0, 4.0, 'canceled', 's1', '');
+             INSERT INTO missions VALUES ('f', 'h', 'pick', 'pick', 5.0, 6.0, 'failure', 's1', '');
+             INSERT INTO steps VALUES ('c', 's1', 'PickObject', 'mug', '{}', NULL, 'failure', '');
+             INSERT INTO steps VALUES ('f', 's1', 'PickObject', 'mug', '{}', NULL, 'failure', '');",
         )
         .unwrap();
 
@@ -667,6 +762,8 @@ mod tests {
 
         assert_eq!(ledger.mission("0190a").unwrap()[0].plan, Value::Null);
         assert!(ledger.mission("0190b").unwrap()[0].plan.is_array());
+        assert_eq!(ledger.mission("c").unwrap()[0].steps[0].outcome, "stopped");
+        assert_eq!(ledger.mission("f").unwrap()[0].steps[0].outcome, "failure");
     }
 
     #[test]

@@ -40,6 +40,22 @@ string failed_step_id
 string failure_reason
 # For REJECTED: a JSON array of {code, line, node, message}.
 string diagnostics_json
+# Set when the robot or the executor, not the plan, ended the mission: a client then counts the
+# run as no test of the plan or its skills. NONE also for a stop or cancel a client asked for.
+uint8 CAUSE_NONE=0
+# The robot could not move: refused at the start, or it stopped being able to walk mid-mission.
+uint8 CAUSE_ROBOT=1
+# The agent's heartbeat stopped reaching the executor.
+uint8 CAUSE_DEADMAN=2
+# The executor shut down.
+uint8 CAUSE_SHUTDOWN=3
+# A skill's action server was not up.
+uint8 CAUSE_NO_SERVER=4
+# The base was being driven by hand.
+uint8 CAUSE_TELEOP=5
+# Another mission was running.
+uint8 CAUSE_BUSY=6
+uint8 cause
 # Wall time from goal acceptance to the result.
 float32 elapsed_s
 # What the steps handed on, a JSON object by key, such as {"s2_object_id": "mug"}; {} when none.

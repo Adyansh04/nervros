@@ -28,6 +28,8 @@ pub struct MissionEnd {
     pub reason: String,
     /// What its steps handed on, by key (`s2_object_id`), when the executor says.
     pub outputs: Map<String, Value>,
+    /// What made the run no test of its plan, when something did: worth no retry.
+    pub fault: Option<super::Fault>,
 }
 
 /// What a job hears when it was stopped, or ran out of time, before its mission ended.
@@ -123,6 +125,7 @@ impl Missions {
                     failed_step,
                     reason,
                     outputs,
+                    fault,
                     ..
                 }) if ended == id => {
                     return Ok(MissionEnd {
@@ -131,6 +134,7 @@ impl Missions {
                         failed_step,
                         reason,
                         outputs,
+                        fault,
                     });
                 }
                 // Behind on events, its end may have gone by unheard.

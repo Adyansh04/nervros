@@ -362,6 +362,9 @@ pub enum Event {
         /// Run by a job: a failed step is the job's to weigh, such as a look that saw nothing.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         by_job: bool,
+        /// What made the run no test of its plan, when something did.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fault: Option<crate::mission::Fault>,
     },
     /// A job the operator approved started, such as a robot program or a search.
     JobStarted {
