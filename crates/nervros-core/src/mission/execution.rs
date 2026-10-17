@@ -14,7 +14,7 @@ use super::plan::{Author as By, Compiled, PlannedStep, arg};
 use super::report::Evidence;
 use super::{
     Claim, EXECUTE, Fault, LIVENESS, LOST_AFTER, Missions, Outcome, Running, SERVICE_TIMEOUT,
-    STATE, STATE_FRESH, STATUSES, camera, check, goals, history, ledger,
+    STATE, STATE_FRESH, STATUSES, camera, check, goals, history, inbox, ledger,
 };
 use crate::lock;
 use crate::session::{Command, Event};
@@ -313,7 +313,7 @@ impl Missions {
 
     /// Finds out what the model needs to know of a mission that ended, and sends it the report.
     async fn tell_model(
-        &self,
+        self: &Arc<Self>,
         id: &str,
         compiled: &Compiled,
         ended: &Ended,
@@ -370,6 +370,72 @@ impl Missions {
         if let Some(s) = self.session.get() {
             s.send(Command::Report(report));
         }
+        self.propose_fix(id, compiled, ended, &seen);
+    }
+
+    /// After a step failed again on a fair run, asks the inbox for a fix, off the report's way:
+    /// one failure may be bad luck, and a fault is no failure of the step.
+    fn propose_fix(
+        self: &Arc<Self>,
+        id: &str,
+        compiled: &Compiled,
+        ended: &Ended,
+        seen: &Observed,
+    ) {
+        let (Some(inbox), Some(ledger)) = (self.inbox.get().cloned(), self.ledger.get().cloned())
+        else {
+            return;
+        };
+        if ended.fault.is_some() || !matches!(ended.outcome, Outcome::Failure | Outcome::Timeout) {
+            return;
+        }
+        let Some(step) = compiled.steps.iter().find(|s| s.id == ended.step) else {
+            return;
+        };
+        let target = ledger::target_of(&step.args);
+        if !inbox.wanted(&step.skill, &target) {
+            return;
+        }
+        let failure = inbox::Failure {
+            mission: id.to_owned(),
+            intent: compiled.plan.intent.clone(),
+            skill: step.skill.clone(),
+            target,
+            step: format!("{} {}", step.id, step.summary),
+            reason: ended.reason.clone(),
+            track: ledger::Track {
+                runs: 0,
+                succeeded: 0,
+                typical_s: None,
+                last_failure: None,
+            },
+            world: check::last_seen(step, seen, crate::now_s()),
+        };
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let key = (failure.skill.clone(), failure.target.clone());
+            let track = tokio::task::spawn_blocking(move || ledger.track(&key.0, &key.1))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten();
+            // Twice, and a third of its runs at least: a pattern, not bad luck.
+            let failing = |t: &ledger::Track| t.runs - t.succeeded;
+            let Some(track) = track.filter(|t| failing(t) >= 2 && failing(t) * 3 >= t.runs) else {
+                return;
+            };
+            let Some(proposal) = inbox.propose(&inbox::Failure { track, ..failure }).await else {
+                return;
+            };
+            let text = format!(
+                "the inbox has a proposed fix, for the operator to accept or dismiss: {}",
+                proposal.line()
+            );
+            if let Some(s) = me.session.get() {
+                s.send(Command::Note(text.clone()));
+            }
+            me.emit(Event::Notice { text });
+        });
     }
 
     /// Counts mission `id` for the goal it worked toward, judges every goal, and says where the

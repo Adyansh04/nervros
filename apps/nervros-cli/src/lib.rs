@@ -156,6 +156,13 @@ enum Command {
         #[arg(long, default_value_t = 24.0)]
         hours: f64,
     },
+    /// The fixes proposed after a step failed again: each with its step's record before and
+    /// since, once accepted. Accepting runs a tool, so it is the app's or the chat's to do.
+    Inbox {
+        /// Turn down this proposal, by its number.
+        #[arg(long)]
+        dismiss: Option<u32>,
+    },
     /// The incidents kept for the robot, newest first, or one in full by its id.
     Incidents {
         /// An incident's id, such as i3.
@@ -304,6 +311,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Replay { log } => records::replay(&log),
         Command::Missions { id, limit } => records::missions(&cli.profile, id.as_deref(), limit),
         Command::Digest { hours } => records::digest(&cli.profile, hours),
+        Command::Inbox { dismiss } => records::inbox(&cli.profile, dismiss),
         Command::Gaps { limit } => records::gaps(&cli.profile, limit),
         Command::Case { log, id, append } => records::case(&log, &id, append.as_deref()),
         Command::Mcp {

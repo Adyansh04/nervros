@@ -122,6 +122,21 @@ impl crate::mission::sanity::Critic for Llm {
 }
 
 #[async_trait::async_trait]
+impl crate::mission::inbox::Drafter for Llm {
+    async fn draft(&self, prompt: &str) -> Result<String, String> {
+        self.ask(Ask {
+            role: Role::Plan,
+            preamble: crate::mission::inbox::DRAFTER_PREAMBLE,
+            prompt,
+            images: Vec::new(),
+        })
+        .await
+        .map(|a| a.text)
+        .map_err(|e| e.to_string())
+    }
+}
+
+#[async_trait::async_trait]
 impl crate::look::Seer for Llm {
     async fn ask_shots(
         &self,

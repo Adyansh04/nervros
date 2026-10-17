@@ -521,6 +521,12 @@ gives each skill's record, and lists what moved in the world model, the incident
 A patrol walks the round as a job, stands a moment in each place so the world model sees it, and
 then reports what moved or went missing meanwhile.
 
+When a step keeps failing, NervROS may propose a lasting fix: a note the planner reads, a
+keep-out zone, or a parameter of a skill's server. It never applies one itself. The Agent tab's
+**Proposed fixes** list each with **Accept**, which runs it as yours, and **Dismiss**; once
+accepted, the step's record before and since shows whether it helped. The Agent tab also lists
+the goals, each with **Drop**.
+
 ### Debugging the ROS side
 
 With a `[ros_tools]` table in the profile, the agent reads the graph as `ros2` does: "what is

@@ -1,4 +1,5 @@
-//! The Agent tab: earlier sessions, the operator's notes, and the models with their quotas.
+//! The Agent tab: earlier sessions, the operator's notes and goals, the fixes proposed after a
+//! step failed again, and the models with their quotas.
 
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
@@ -109,8 +110,144 @@ impl Gui {
         }
         ui.add_space(12.0);
         self.memory_list(ui);
+        self.goals_list(ui);
+        self.inbox_list(ui);
         ui.add_space(12.0);
         self.models_list(ui);
+    }
+
+    /// The goals and where each stands, each with a way to drop it.
+    fn goals_list(&mut self, ui: &mut egui::Ui) {
+        let Some(goals) = self.agent.missions.as_ref().and_then(|m| m.goals()) else {
+            return;
+        };
+        let all = goals.all();
+        if all.is_empty() {
+            return;
+        }
+        ui.add_space(16.0);
+        theme::section(ui, "Goals");
+        let mut drop = None;
+        for g in all.iter().rev() {
+            theme::row(
+                ui,
+                |ui| {
+                    if ui.add(ReButton::new("Drop").small().secondary()).clicked() {
+                        drop = Some(g.id);
+                    }
+                },
+                |ui| {
+                    ui.label(
+                        RichText::new(g.id.to_string())
+                            .monospace()
+                            .color(theme::FAINT),
+                    );
+                    let line = g.line();
+                    ui.label(RichText::new(&line).size(13.0))
+                        .on_hover_text(&line);
+                },
+            );
+        }
+        if let Some(id) = drop
+            && let Err(e) = goals.drop_goal(id)
+        {
+            self.chat.items.push(crate::chat::Item::error(e));
+        }
+    }
+
+    /// The proposed fixes: an open one to accept, which runs its call as the operator's, or to
+    /// dismiss; an accepted one with its step's record before and since.
+    fn inbox_list(&mut self, ui: &mut egui::Ui) {
+        let Some(inbox) = self.agent.inbox.clone() else {
+            return;
+        };
+        let proposals = inbox.all();
+        if proposals.is_empty() {
+            return;
+        }
+        ui.add_space(16.0);
+        theme::section(ui, "Proposed fixes");
+        let ledger = self
+            .agent
+            .missions
+            .as_ref()
+            .and_then(|m| m.ledger())
+            .cloned();
+        let (mut accept, mut dismiss) = (None, None);
+        for p in proposals.iter().rev() {
+            let open = p.state == nervros_core::mission::inbox::State::Open;
+            theme::row(
+                ui,
+                |ui| {
+                    if open {
+                        if ui
+                            .add(ReButton::new("Dismiss").small().secondary())
+                            .on_hover_text("No fix like it is proposed for this step again")
+                            .clicked()
+                        {
+                            dismiss = Some(p.id);
+                        }
+                        if ui
+                            .add(ReButton::new("Accept").small())
+                            .on_hover_text(format!("Runs {} {} as yours", p.tool, p.args))
+                            .clicked()
+                        {
+                            accept = Some(p.clone());
+                        }
+                    }
+                },
+                |ui| {
+                    ui.label(
+                        RichText::new(p.id.to_string())
+                            .monospace()
+                            .color(theme::FAINT),
+                    );
+                    let line = format!("{} on {}: {}", p.skill, p.target, p.why);
+                    let more = format!("{}\n{} {}", p.failure, p.tool, p.args);
+                    ui.label(RichText::new(&line).size(13.0))
+                        .on_hover_text(more);
+                },
+            );
+            if let (Some(at), Some(ledger)) = (p.accepted_at, &ledger) {
+                #[expect(clippy::cast_precision_loss, reason = "seconds since 1970")]
+                let since = ledger
+                    .track_since(&p.skill, &p.target, at as f64)
+                    .ok()
+                    .flatten();
+                let record = |t: Option<&nervros_core::mission::ledger::Track>| {
+                    t.map_or_else(
+                        || "no runs".to_owned(),
+                        |t| format!("{} of {}", t.succeeded, t.runs),
+                    )
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "accepted; before {}, since {}",
+                        record(p.before.as_ref()),
+                        record(since.as_ref())
+                    ))
+                    .small()
+                    .color(theme::DIM),
+                );
+            }
+        }
+        if let Some(p) = accept {
+            let before = ledger
+                .as_ref()
+                .and_then(|l| l.track(&p.skill, &p.target).ok().flatten());
+            match inbox.accept(p.id, before) {
+                Ok(_) => self.agent.session.send(Command::Run {
+                    tool: p.tool,
+                    args: p.args,
+                }),
+                Err(e) => self.chat.items.push(crate::chat::Item::error(e)),
+            }
+        }
+        if let Some(id) = dismiss
+            && let Err(e) = inbox.dismiss(id)
+        {
+            self.chat.items.push(crate::chat::Item::error(e));
+        }
     }
 
     /// What the operator asked the agent to remember, each with a way to forget it.

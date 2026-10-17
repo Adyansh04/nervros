@@ -113,7 +113,7 @@ pub struct StepRecord {
 }
 
 /// How a step has gone before, from its latest runs.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct Track {
     /// Runs counted.
     pub runs: u32,
@@ -289,6 +289,21 @@ impl Ledger {
     ///
     /// The read failed.
     pub fn track(&self, skill: &str, target: &str) -> rusqlite::Result<Option<Track>> {
+        self.track_since(skill, target, 0.0)
+    }
+
+    /// As [`Self::track`], of the runs of missions that started at `since_s` or later: how a step
+    /// has gone since a fix.
+    ///
+    /// # Errors
+    ///
+    /// The read failed.
+    pub fn track_since(
+        &self,
+        skill: &str,
+        target: &str,
+        since_s: f64,
+    ) -> rusqlite::Result<Option<Track>> {
         let db = self.db();
         let mut runs = db.prepare_cached(
             "SELECT steps.outcome, steps.seconds, steps.reason FROM steps
@@ -296,6 +311,7 @@ impl Ledger {
              WHERE steps.skill = ?1 AND steps.target = ?2
                AND steps.outcome IN ('success', 'failure')
                AND missions.fault = '' AND missions.outcome <> 'running'
+               AND missions.started >= ?4
              ORDER BY missions.started DESC LIMIT ?3",
         )?;
         let mut track = Track {
@@ -305,7 +321,7 @@ impl Ledger {
             last_failure: None,
         };
         let mut times = Vec::new();
-        let rows = runs.query_map(params![skill, target, TRACK_RUNS], |r| {
+        let rows = runs.query_map(params![skill, target, TRACK_RUNS, since_s], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<f64>>(1)?,

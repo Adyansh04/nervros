@@ -60,6 +60,8 @@ pub struct Agent {
     pub programs: Option<Arc<crate::program::Store>>,
     /// What went wrong, investigated, for the Doctor tab.
     pub incidents: Arc<crate::incident::Investigator>,
+    /// Fixes proposed after a step failed again, for the Inbox tab.
+    pub inbox: Option<Arc<crate::mission::inbox::Inbox>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -284,6 +286,30 @@ fn seeing_tools(
     })
 }
 
+/// The improvement inbox, when the robot has missions and the `plan` role models to draft fixes;
+/// a fix calls one of the agent's own tools, so it is made once they are all known.
+fn improvement_inbox(
+    profile: &Profile,
+    ledger: &Path,
+    llm: &Arc<Llm>,
+    registry: &Registry,
+    missions: Option<&Arc<Missions>>,
+) -> Option<Arc<crate::mission::inbox::Inbox>> {
+    let missions = missions?;
+    if llm.router().config().roles.plan.is_empty() {
+        return None;
+    }
+    let fixes = crate::mission::inbox::FIXES
+        .iter()
+        .filter_map(|fix| registry.get(fix.tool).map(|t| t.spec().into_owned()))
+        .collect();
+    let drafter = Arc::clone(llm) as Arc<dyn crate::mission::inbox::Drafter>;
+    let inbox =
+        crate::mission::inbox::Inbox::new(robot_file(profile, ledger, "inbox"), fixes, drafter);
+    missions.use_inbox(Arc::clone(&inbox));
+    Some(inbox)
+}
+
 /// `robot_state`, and the generic ROS tools the profile lists.
 fn robot_tools(
     profile: &Profile,
@@ -389,6 +415,13 @@ fn robot_file(profile: &Profile, ledger: &Path, kind: &str) -> Option<PathBuf> {
             .unwrap_or_else(|| "robot".into());
         dir.join(kind).join(format!("{name}.json"))
     })
+}
+
+/// Where a robot's proposed fixes live under the state folder `state`.
+#[must_use]
+pub fn inbox_file(profile: &Profile, state: &Path) -> PathBuf {
+    robot_file(profile, &state.join("quota.json"), "inbox")
+        .unwrap_or_else(|| state.join("inbox").join("robot.json"))
 }
 
 /// Where a robot's goals live under the state folder `state`.
@@ -798,6 +831,7 @@ pub fn start_with(
     let jobs = crate::job::Jobs::new(Arc::clone(&guard));
     let programs = job_tools(&profile, missions.as_ref(), &jobs, ledger, &mut registry)?;
     check_rules(&profile, &registry)?;
+    let inbox = improvement_inbox(&profile, ledger, &llm, &registry, missions.as_ref());
     let tools = registry.iter().map(|t| t.spec().name.clone()).collect();
     let config = SessionConfig {
         pending_file,
@@ -849,6 +883,7 @@ pub fn start_with(
         jobs,
         programs,
         incidents,
+        inbox,
     })
 }
 

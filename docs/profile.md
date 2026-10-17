@@ -409,6 +409,14 @@ instead of asking for a new plan. A program that meets one stops there. A missio
 running when NervROS starts was cut short by NervROS stopping: it is kept as interrupted, and the
 window says so.
 
+With a `plan` model, a step that fails again on fair runs (twice, and a third of its latest runs
+at least) gets a proposed fix, one at a time per step: a call of `memory` (remember), `geofence`
+(add) or `param_set`, drafted by the `plan` model and checked against the tool's own arguments.
+The Agent tab lists it to accept, which runs the call as the operator's through its own approval,
+or to dismiss, which keeps that step from getting another. An accepted fix shows the step's record
+before and since. `nervros-cli inbox` lists them and `--dismiss N` turns one down. Proposals live
+in the state directory, `inbox/<robot>.json`.
+
 ### `[[place]]`
 
 Named places, beyond the world model's rooms. The operator can add more from where the robot

@@ -209,6 +209,41 @@ pub fn gaps(profile: &Path, limit: usize) -> Result<()> {
     Ok(())
 }
 
+/// The proposed fixes, each accepted one with its step's record before and since; with
+/// `dismiss`, that one turned down first.
+pub fn inbox(profile_path: &Path, dismiss: Option<u32>) -> Result<()> {
+    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let file = nervros_core::app::inbox_file(&profile, &nervros_core::app::state_dir());
+    if let Some(id) = dismiss {
+        nervros_core::mission::inbox::dismiss_in(&file, id).map_err(anyhow::Error::msg)?;
+        println!("dismissed {id}");
+    }
+    let proposals = nervros_core::mission::inbox::Inbox::read(&file);
+    let ledger = open_ledger(profile_path)?;
+    for p in &proposals {
+        println!("{} [{:?}]", p.line(), p.state);
+        if let (Some(at), Some(ledger)) = (p.accepted_at, &ledger) {
+            #[expect(clippy::cast_precision_loss, reason = "seconds since 1970")]
+            let since = ledger.track_since(&p.skill, &p.target, at as f64)?;
+            let record = |t: Option<&nervros_core::mission::ledger::Track>| {
+                t.map_or_else(
+                    || "no runs".to_owned(),
+                    |t| format!("{} of {}", t.succeeded, t.runs),
+                )
+            };
+            println!(
+                "    before: {}; since: {}",
+                record(p.before.as_ref()),
+                record(since.as_ref())
+            );
+        }
+    }
+    if proposals.is_empty() {
+        println!("no proposals");
+    }
+    Ok(())
+}
+
 /// What the robot did over the last `hours`, from its ledger, incidents and goals.
 pub fn digest(profile: &Path, hours: f64) -> Result<()> {
     if !(hours.is_finite() && hours > 0.0) {
