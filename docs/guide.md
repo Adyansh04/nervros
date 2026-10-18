@@ -30,7 +30,7 @@ Setup is in the [README](../README.md). Every setting is in the [profile](profil
   [When something goes wrong](#when-something-goes-wrong) ·
   [Runs the robot cut short](#runs-the-robot-cut-short)
 - **Memory and limits:** [Remembering](#remembering) · [Keeping a goal](#keeping-a-goal) ·
-  [Keeping it out of places](#keeping-it-out-of-places) ·
+  [Keeping it out of places](#keeping-it-out-of-places) · [Nav2 and MoveIt](#nav2-and-moveit) ·
   [The robot's self-description](#the-robots-self-description)
 - **Maps:** [Mapping a new building](#mapping-a-new-building) ·
   [Finishing the map](#finishing-the-map)
@@ -735,6 +735,63 @@ the composer, and **Remove** asks the agent to remove one, which you approve.
   the profile changes.
 - A plan made before a zone was added is checked again when it runs, from a schedule or by its
   hash.
+
+</details>
+
+## Nav2 and MoveIt
+
+<!-- video: 29-nav2.mp4 -->
+
+<!-- video: 30-moveit.mp4 -->
+
+With [`[nav2]`](profile.md#nav2) and [`[moveit]`](profile.md#moveit) in the profile, the agent
+works the robot's navigation and arm stacks directly: it reads them, changes how they behave, and
+runs their standard motions itself where the robot's executor has no skill for them.
+
+> **You:** Is navigation up, and how well does the robot know where it is?
+>
+> **You:** Could you walk to the office desk tray from here? Don't move.
+>
+> **You:** Shape the collision monitor's slow polygon as a box from 0.3 to 1.2 metres ahead.
+>
+> **You:** Can the right hand reach the red mug from here?
+>
+> **You:** Walk through the hallway to the office desk tray without stopping on the way.
+>
+> **You:** Raise your right hand 5 centimetres.
+
+| Ask about | Tool | What changes, and what asks you first |
+|---|---|---|
+| Navigation's state, a path's length and the zones it crosses, the cost at a spot | `nav_status`, `nav_check` | Nothing. A path check waits while Nav2 walks, since it would cut into Nav2's own planning |
+| The collision monitor: on or off, each polygon, a polygon's shape | `collision_monitor` | Turning on and growing are free; turning off and shrinking ask |
+| Costmaps, localization, the navigation servers, maps | `nav_admin` | Each asks, and none runs during a mission |
+| The arms: where each is, its named poses, the planners | `arm_status` | Nothing |
+| Whether a hand reaches something, whether a pose is clear, the path an arm would take | `arm_check` | Nothing; the path is drawn in the 3D view |
+| The obstacles the arms plan around, attaching an object to a hand, the octomap | `scene` | Adding is free; the rest asks |
+| How fast the arm moves NervROS runs go, the planner, poses remembered by name | `arm_settings` | Slower is free; faster and another planner ask |
+
+Plans may hold motions NervROS runs itself beside the executor's skills: a route through places
+without stopping at each (`WalkRoute`), a wait, a short straight hand move (`HandLine`), and, on a
+robot whose executor lacks them, walks, turns, arm poses and grips. The plan card marks such a
+step **NervROS runs it through Nav2** (or MoveIt), its preview shows where a walk or a route goes,
+and the 3D view draws the way while it runs. Stop and Pause work as for any step: a stopped step
+ends as stopped, a paused walk stands and goes on with what was left when you resume, and an arm
+move finishes first. If NervROS goes quiet with one of its motions running, a watchdog on the
+robot cancels it within two seconds. Where the robot's executor holds the arms, it lends them for
+the step and takes them back after it.
+
+The Robot tab shows a card for each stack: whether it is up, how well the robot is localized,
+what Nav2 is doing and the speed limit in force, and where each arm is.
+
+<details>
+<summary>What to watch for</summary>
+
+- On the G1, a speed below about 0.15 m/s does not move the legs at all. A slow zone at 30% and
+  the collision monitor's slow polygon together come below it, and the robot stands still until
+  one of them lets go.
+- A route's places are its waypoints: one inside furniture fails the whole route, so name places
+  or rooms with room to stand.
+- Grip never opens a hand that holds something: put the object down with a place.
 
 </details>
 

@@ -42,6 +42,8 @@ a Unitree G1 stack on ROS 2 Jazzy. It is in early development.
 | "Point at the red mug", with no pointing skill | Teaches the robot a new skill from the pieces its executor allows. The skill is kept once its first mission succeeds. | [Teaching it a skill](docs/guide.md#teaching-it-a-skill) |
 | "Stop", the Stop button or Ctrl+Shift+S | Halts the robot without waiting for a model. "Pause" holds a mission and "resume" lets it go on. | [Stopping](docs/guide.md#stopping) |
 | "Keep the robot out of the kitchen" | Adds a keep-out zone, drawn in red. Plans and navigation goals into it are refused. | [Keeping it out of places](docs/guide.md#keeping-it-out-of-places) |
+| "Make the corridor a slow zone at 30%", "Shape the collision monitor's slow polygon", "Can you get to the kitchen from here?" | Works the robot's Nav2 directly: slow zones through its speed filter, the collision monitor, costmaps, localization and maps, path checks. Loosening a limit asks you first. | [Nav2 and MoveIt](docs/guide.md#nav2-and-moveit) |
+| "Can the right hand reach the mug?", "Walk through the hallway to the kitchen without stopping", "Raise your right hand 5 cm" | Works MoveIt directly, and runs Nav2's and MoveIt's standard motions itself in a mission where the robot's executor has no skill for them, with Stop, Pause and a watchdog on the robot. | [Nav2 and MoveIt](docs/guide.md#nav2-and-moveit) |
 | "Keep the red mug on the tray" | Keeps a goal across missions and sessions: checks it itself after every mission, plans the next one toward it, and says when it is met. | [Keeping a goal](docs/guide.md#keeping-a-goal) |
 | "Tell me if the camera drops below 5 Hz" | Runs watches, live plots and schedules in the background. It also reads topics, TF, parameters and logs, as `ros2` does. | [Keeping an eye on it](docs/guide.md#keeping-an-eye-on-it) |
 | "Tell me when the camera shows a red mug", "When did the mug leave the table?" | Watches a camera with a vision model, and finds the moment in the frames the cameras kept. | [Waiting for what a camera shows](docs/guide.md#waiting-for-what-a-camera-shows) |
@@ -68,6 +70,28 @@ camera sees, with the detector's numbered marks, after the mug went into the tra
 *Left: a new building mapped room by room, with how much of each room the camera has seen. Right:
 the world editor, where you fix a room's type or an object's label by hand.*
 
+## Nav2 and MoveIt, from chat
+
+NervROS controls a robot's Nav2 and MoveIt fully from chat: it reads them, changes how they
+behave and runs their motions, on any robot whose profile names them
+([`[nav2]`](docs/profile.md#nav2), [`[moveit]`](docs/profile.md#moveit)).
+
+- **Nav2:** keep-out and slow zones through its costmap filters; the collision monitor, each
+  polygon and its shape; costmaps, localization, the navigation servers and maps; path checks.
+  Routes, poses, turns, straight walks, waits and docking run as mission steps.
+- **MoveIt:** where each arm is, reach and collision checks, and the path an arm would take, drawn
+  in the 3D view; the planning scene, objects held, the octomap; arm speed, planner and named
+  poses. Moves to a pose or a point, straight hand moves and grips run as mission steps.
+
+These steps mix with the robot's own skills in one mission, with Stop, Pause, previews and a
+watchdog on the robot, and anything that loosens a limit asks you first. More in
+[integrations](docs/integrations.md) and in the guide's
+[Nav2 and MoveIt](docs/guide.md#nav2-and-moveit).
+
+<!-- video: 29-nav2.mp4 -->
+
+<!-- video: 30-moveit.mp4 -->
+
 ## How it works
 
 <p align="center">
@@ -80,8 +104,9 @@ the world editor, where you fix a room's type or an object's label by hand.*
 3. **Anything that moves the robot is a mission.** The agent plans with the robot's own skills,
    NervROS compiles the plan to a behaviour tree, the robot's executor checks it, and you approve
    it.
-4. **The executor runs it** and reports each step. The agent then tells you how it went, checked
-   against the world model and the camera.
+4. **The executor runs it** and reports each step; standard Nav2 and MoveIt motions the executor
+   has no skill for, NervROS runs itself in the same mission. The agent then tells you how it went,
+   checked against the world model and the camera.
 
 Nothing in NervROS is robot-specific. One [profile](docs/profile.md) names the robot's topics,
 services, cameras, skills and limits, and the robot runs missions through a short
@@ -103,7 +128,8 @@ Also included:
 - **Plans are checked before you see them.** The robot's executor validates every behaviour tree,
   and NervROS checks the plan against what you asked.
 - **Stop always works.** "Stop", the Stop button or Ctrl+Shift+S halts the robot without a model.
-  A mission whose window closed or hung stops by itself.
+  A mission whose window closed or hung stops by itself, and a watchdog on the robot cancels the
+  motions NervROS runs itself.
 - **Keep-out zones hold.** A plan that ends its walk in a zone, or a navigation goal into one, is
   refused before the robot sees it. Removing a zone always asks you first.
 - **The robot's data stays data.** What the cameras, topics and world model report reaches the
@@ -166,3 +192,5 @@ The core needs neither ROS nor the viewer: `cargo build` builds it, and
 - **[Models](docs/models.md):** local and cloud models, roles, fallbacks and quotas.
 - **[Mission executor contract](docs/executor.md):** what the robot side provides, and how a
   mission runs.
+- **[Integrations](docs/integrations.md):** Nav2 and MoveIt, the motions NervROS runs itself, and
+  adding another stack.
