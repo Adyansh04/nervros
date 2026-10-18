@@ -161,6 +161,18 @@ pub enum Event {
         /// When the frame was taken, seconds since 1970: a `when` answer's is long past.
         stamp_s: f64,
     },
+    /// A line a stack draws in the 3D view, such as the path an arm's hand would take; it
+    /// replaces the layer's last, and no points clear it.
+    Drawn {
+        /// Which drawing it replaces, such as `arm_preview`.
+        layer: String,
+        /// The frame its points are in.
+        frame: String,
+        /// The points, in order, metres.
+        points: Vec<[f64; 3]>,
+        /// What it is, written at its end.
+        label: String,
+    },
     /// A number in a topic's messages to draw over time, in the viewer's Plots tab.
     Plot {
         /// The series' name.

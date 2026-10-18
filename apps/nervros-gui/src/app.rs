@@ -2,7 +2,7 @@
 //! right and a status bar. The viewer draws last, into whatever space the panels leave.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -33,12 +33,12 @@ mod agent_tab;
 mod bars;
 mod composer;
 mod dock;
+mod events;
 mod live;
 mod world;
 
 use live::watch;
 
-const EVENT_LOG: usize = 300;
 const COMPOSER: &str = "nervros_composer";
 /// The top bar's height in points: its 30-point buttons and the frame's margins.
 const TOP_BAR_HEIGHT: f32 = 48.0;
@@ -115,25 +115,31 @@ type SharedLive = Arc<Mutex<Live>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
     Mission,
-    World,
-    Layers,
+    Tree,
     Approvals,
+    World,
+    Robot,
+    Layers,
+    Library,
     Events,
     Agent,
     Doctor,
-    Robot,
 }
 
 impl Tab {
-    const ALL: [(Self, &'static str); 8] = [
+    /// In the order the tab bar shows them: what runs now first, the robot's world next, the
+    /// records and the agent's own state last.
+    const ALL: [(Self, &'static str); 10] = [
         (Self::Mission, "Mission"),
-        (Self::World, "World"),
-        (Self::Layers, "Layers"),
+        (Self::Tree, "Tree"),
         (Self::Approvals, "Approvals"),
+        (Self::World, "World"),
+        (Self::Robot, "Robot"),
+        (Self::Layers, "Layers"),
+        (Self::Library, "Library"),
         (Self::Events, "Events"),
         (Self::Agent, "Agent"),
         (Self::Doctor, "Doctor"),
-        (Self::Robot, "Robot"),
     ];
 }
 
@@ -263,7 +269,7 @@ pub struct Gui {
     /// What the listing has read of them.
     listing: crate::sessions::Listing,
     chat: Chat,
-    event_log: VecDeque<String>,
+    timeline: events::Events,
     input: String,
     history: Vec<String>,
     history_pos: Option<usize>,
@@ -394,7 +400,7 @@ impl Gui {
             sessions: None,
             listing: crate::sessions::Listing::default(),
             chat,
-            event_log: VecDeque::new(),
+            timeline: events::Events::default(),
             input: String::new(),
             history: Vec::new(),
             history_pos: None,
@@ -421,13 +427,18 @@ impl Gui {
         })
     }
 
-    /// Whether the executor says a mission runs.
+    /// Whether a mission runs: by the session's events, which cover the steps NervROS runs
+    /// itself, or by the executor, which also knows one another session started.
     fn mission_running(&self) -> bool {
-        self.live()
-            .executor
-            .as_ref()
-            .and_then(|s| s["mission_id"].as_str())
-            .is_some_and(|id| !id.is_empty())
+        self.chat
+            .latest_plan()
+            .is_some_and(crate::chat::PlanCard::running)
+            || self
+                .live()
+                .executor
+                .as_ref()
+                .and_then(|s| s["mission_id"].as_str())
+                .is_some_and(|id| !id.is_empty())
     }
 
     /// Whether a program or a search runs.
@@ -441,13 +452,16 @@ impl Gui {
 
     /// Whether the running mission is paused, or waits to pause once a pick or place ends.
     fn mission_paused(&self) -> bool {
-        self.mission_running()
-            && self
-                .live()
-                .executor
-                .as_ref()
-                .and_then(|s| s["paused"].as_bool())
-                .unwrap_or(false)
+        self.chat
+            .latest_plan()
+            .is_some_and(crate::chat::PlanCard::paused)
+            || (self.mission_running()
+                && self
+                    .live()
+                    .executor
+                    .as_ref()
+                    .and_then(|s| s["paused"].as_bool())
+                    .unwrap_or(false))
     }
 
     /// Pauses the running mission, or lets it go on; the executor's answer comes back as a
@@ -514,11 +528,7 @@ impl Gui {
                             Closing::StopFailed
                         };
                     }
-                    if self.event_log.len() == EVENT_LOG {
-                        self.event_log.pop_back();
-                    }
-                    let line = serde_json::to_string(&e).unwrap_or_default();
-                    self.event_log.push_front(line);
+                    self.timeline.push(&e);
                     if matches!(e, Event::ApprovalRequested { .. }) && self.tab != Tab::Approvals {
                         self.tab_before_approval = Some(self.tab);
                         self.tab = Tab::Approvals;
@@ -750,6 +760,7 @@ impl Gui {
         let (esc, stop, tab) = ctx.input_mut(|i| {
             let esc = working && !elsewhere && i.consume_key(Modifiers::NONE, Key::Escape);
             let stop = i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::S);
+            // Ctrl+1 to Ctrl+0, a key a tab in the bar's order.
             let keys = [
                 Key::Num1,
                 Key::Num2,
@@ -759,6 +770,8 @@ impl Gui {
                 Key::Num6,
                 Key::Num7,
                 Key::Num8,
+                Key::Num9,
+                Key::Num0,
             ];
             let tab = keys.iter().position(|k| i.consume_key(Modifiers::CTRL, *k));
             (esc, stop, tab)
@@ -888,7 +901,7 @@ mod live_eval;
 #[cfg(test)]
 mod tests {
     use super::composer::{walk_to_point, walk_to_target};
-    use super::world::{layers_view, world_view};
+    use super::world::{layers_view, places_view, world_view};
     use super::*;
     use egui_kittest::kittest::Queryable as _;
     use egui_kittest::{Harness, SnapshotOptions};
@@ -1015,6 +1028,7 @@ mod tests {
         let zone = |name: &str, polygon: Vec<[f64; 2]>, fixed| nervros_core::zones::Zone {
             name: name.into(),
             polygon,
+            rule: nervros_core::zones::Rule::KeepOut,
             fixed,
         };
         let zones = [
@@ -1028,10 +1042,27 @@ mod tests {
                 vec![[1.0, 1.0], [2.2, 1.0], [2.2, 2.0], [1.0, 2.0]],
                 false,
             ),
+            nervros_core::zones::Zone {
+                rule: nervros_core::zones::Rule::Slow(nervros_core::zones::SpeedLimit::Percent(
+                    30.0,
+                )),
+                ..zone(
+                    "corridor",
+                    vec![[0.0, 3.0], [6.0, 3.0], [6.0, 4.2], [0.0, 4.2]],
+                    false,
+                )
+            },
         ];
+        let places: Vec<nervros_core::profile::PlaceConfig> =
+            serde_json::from_value(serde_json::json!([
+                {"name": "start", "aliases": ["home"], "pose": {"x": 0.0, "y": 0.0}},
+                {"name": "office_desk_tray", "pose": {"x": 5.139, "y": -4.385, "yaw": -1.577},
+                 "near": ["tray_1"]},
+            ]))
+            .unwrap();
         let mut harness = Harness::builder()
             .wgpu()
-            .with_size(egui::vec2(420.0, 420.0))
+            .with_size(egui::vec2(360.0, 420.0))
             .build_ui(move |ui| {
                 theme::apply(ui);
                 Frame::new()
@@ -1039,6 +1070,7 @@ mod tests {
                     .inner_margin(Margin::same(14))
                     .show(ui, |ui| {
                         let _ = world_view(ui, &rooms, Some(13), &zones);
+                        let _ = places_view(ui, &places);
                     });
             });
         crate::testkit::style_for_tests(&harness.ctx);
@@ -1056,19 +1088,32 @@ mod tests {
             ("Map", true),
             ("Camera coverage", false),
             ("Rooms", true),
+            ("Plan", true),
+            ("Zones", true),
             ("Scan", true),
+            ("Collision: slow", true),
+            ("Global costmap", false),
         ] {
             layers.add(name, shown);
         }
+        let config: Vec<nervros_core::profile::LayerConfig> =
+            serde_json::from_value(serde_json::json!([
+                {"name": "Scan", "topic": "/scan", "type": "sensor_msgs/msg/LaserScan"},
+                {"name": "Collision: slow", "topic": "/collision_monitor_nervros_slow",
+                 "type": "geometry_msgs/msg/PolygonStamped", "color": [243, 166, 43]},
+                {"name": "Global costmap", "topic": "/global_costmap/costmap",
+                 "type": "nav_msgs/msg/OccupancyGrid", "style": "costmap"},
+            ]))
+            .unwrap();
         let mut harness = Harness::builder()
             .wgpu()
-            .with_size(egui::vec2(340.0, 300.0))
+            .with_size(egui::vec2(340.0, 520.0))
             .build_ui(move |ui| {
                 theme::apply(ui);
                 Frame::new()
                     .fill(theme::BG)
                     .inner_margin(Margin::same(14))
-                    .show(ui, |ui| layers_view(ui, &layers));
+                    .show(ui, |ui| layers_view(ui, &layers, &config));
             });
         crate::testkit::style_for_tests(&harness.ctx);
         harness.run();

@@ -12,7 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::catalog::{Arg, Catalog, GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, Skill};
+use super::catalog::{Arg, Catalog, GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, Skill, WALK_ROUTE};
 use crate::profile::PlaceConfig;
 
 /// Plans longer than this are split by the model into several missions.
@@ -249,6 +249,8 @@ struct Sim {
     holding: BTreeMap<String, String>,
     /// What went into what, object first.
     inside: Vec<(String, String)>,
+    /// The named pose each arm was sent to.
+    arms: BTreeMap<String, String>,
 }
 
 impl Sim {
@@ -371,6 +373,11 @@ impl Sim {
                         self.holding.insert(arm, String::new());
                     }
                 }
+                ("arm_at", [a, at]) => {
+                    if let (Some(arm), Some(pose)) = (value(a), value(at)) {
+                        self.arms.insert(arm, pose);
+                    }
+                }
                 // `X`, a capital, is what the hand the skill needs holding holds: its effects
                 // come before `hand_empty` empties it.
                 ("inside", [x, c]) => {
@@ -414,6 +421,7 @@ impl Sim {
                 .map(|(arm, held)| format!("holding({arm}, {held})")),
         );
         out.extend(self.inside.iter().map(|(o, c)| format!("inside({o}, {c})")));
+        out.extend(self.arms.iter().map(|(a, p)| format!("arm_at({a}, {p})")));
         // What a step finds is known only once it runs, so nothing can be checked against it.
         out.retain(|p| !p.contains('{'));
         out
@@ -510,6 +518,9 @@ pub struct PlannedStep {
     /// For a skill an agent taught: `draft` on its first try, else `kept`; empty for the rest.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub learned: String,
+    /// The stack NervROS runs it through itself, such as Nav2; empty for the executor's skills.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub native: String,
     /// What its arguments may turn out to be when they are known only as it runs, for the
     /// profile's rules: each object a walk to a label may reach, and what a step it takes an
     /// output from went for.
@@ -638,6 +649,7 @@ pub fn compile(
         xy: world.robot,
         holding: world.holding.clone(),
         inside: Vec::new(),
+        arms: BTreeMap::new(),
     };
     let mut links = links(plan, &mut problems);
     let mut n = 0;
@@ -691,6 +703,7 @@ pub fn compile(
                             .skill(&step.skill)
                             .map(|s| s.learned.clone())
                             .unwrap_or_default(),
+                        native: skill.native.clone(),
                         may_take,
                         expect,
                     });
@@ -770,6 +783,30 @@ type CompiledStep<'c> = (String, f64, Option<Spot>, &'c Skill);
 
 /// The step's `SubTree` element, with the outputs later steps take, its timeout in seconds and,
 /// for `GoToPlace`, where it leaves the robot.
+/// Where a route ends: its last place, or the centre of its last room.
+fn route_end(step: &Step, world: &World) -> Option<Spot> {
+    let last = arg(&step.args, "places")?
+        .split([',', ';'])
+        .map(str::trim)
+        .rfind(|n| !n.is_empty())?;
+    let same = |a: &str| crate::places::same_words(a, last);
+    if let Some(p) = world
+        .places
+        .iter()
+        .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)))
+    {
+        return Some(Spot {
+            id: p.name.clone(),
+            xy: Some((p.pose.x, p.pose.y)),
+        });
+    }
+    let room = world.rooms.iter().find(|r| r.id == last || same(&r.name))?;
+    Some(Spot {
+        id: room.id.clone(),
+        xy: room.xy,
+    })
+}
+
 fn compile_step<'c>(
     id: &str,
     step: &Step,
@@ -827,6 +864,9 @@ fn compile_step<'c>(
         ));
         return Err(problems);
     } else if let Some(skill) = catalog.skill(&step.skill) {
+        if step.skill == WALK_ROUTE {
+            spot = route_end(step, world);
+        }
         match ports_for(id, step, skill, world, links) {
             Ok(ports) => (skill, ports),
             Err(mut p) => {
@@ -1202,6 +1242,43 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_route_ends_at_its_last_place_or_room() {
+        let place = crate::profile::PlaceConfig {
+            name: "dock".into(),
+            aliases: vec!["the dock".into()],
+            frame: "map".into(),
+            pose: crate::profile::PlacePose {
+                x: 1.0,
+                y: 2.0,
+                yaw: 0.0,
+            },
+            near: Vec::new(),
+        };
+        let world = World {
+            places: vec![place],
+            rooms: vec![Thing {
+                id: "R8".into(),
+                name: "hallway".into(),
+                xy: Some((8.0, 0.0)),
+            }],
+            ..World::default()
+        };
+        let route = |places: &str| -> Step {
+            serde_json::from_value(serde_json::json!({
+                "skill": WALK_ROUTE, "args": [{"name": "places", "value": places}],
+            }))
+            .unwrap()
+        };
+        let end = |places: &str| route_end(&route(places), &world).map(|s| (s.id, s.xy));
+        assert_eq!(
+            end("hallway, the dock"),
+            Some(("dock".into(), Some((1.0, 2.0))))
+        );
+        assert_eq!(end("dock; hallway "), Some(("R8".into(), Some((8.0, 0.0)))));
+        assert_eq!(end("nowhere"), None);
+    }
     use crate::mission::catalog::tests::CATALOG;
     use crate::profile::PlacePose;
     use serde_json::json;

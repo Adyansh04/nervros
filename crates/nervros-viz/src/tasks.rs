@@ -1,5 +1,6 @@
 //! The sampling tasks: the robot and its model, the scan, the cameras and detections, and plots.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,14 +9,14 @@ use nervros_core::profile::TopicRef;
 use nervros_ros::image::encode_jpeg;
 use nervros_ros::{RobotPort, Transform};
 use rerun::RecordingStream;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::objects::object_colour;
 use crate::spawner::Layer;
 use crate::{
-    CAMERA_PERIOD, CAMERA_QUALITY, FOLLOW_PATH, MODEL_PATH, POSE_PERIOD, ROBOT_FRAME, ROBOT_MARK,
-    SCAN_PERIOD, TOPIC_WAIT, f32s, layers, put, put_static,
+    CAMERA_PERIOD, CAMERA_QUALITY, FOLLOW_PATH, MODEL_PATH, OBJECTS_PERIOD, POSE_PERIOD,
+    ROBOT_FRAME, ROBOT_MARK, SCAN_PERIOD, TOPIC_WAIT, f32s, layers, put, put_static,
 };
 
 /// A laser scan as points in the map, redrawn as scans arrive.
@@ -61,6 +62,51 @@ pub(super) async fn scan(
                 .with_colors([rerun::Color::from_rgb(r, g, b)]),
         );
         (last, drawn) = (stamp, true);
+    }
+}
+
+/// MoveIt's planning scene while its layer shows: the obstacles the arms plan around.
+pub(super) async fn arm_scene(
+    rec: RecordingStream,
+    robot: Arc<dyn RobotPort>,
+    (service, map): (String, String),
+    layer: Layer,
+) {
+    // `PlanningSceneComponents`: the world's object names and geometry.
+    const WORLD_OBJECTS: u64 = 8 | 16;
+    let mut tick = interval(OBJECTS_PERIOD);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut drawn = BTreeSet::new();
+    loop {
+        tick.tick().await;
+        if !layer.shown() {
+            if !drawn.is_empty() {
+                layer.clear(&rec);
+                drawn.clear();
+            }
+            continue;
+        }
+        let Ok(scene) = robot
+            .call(
+                &service,
+                "moveit_msgs/srv/GetPlanningScene",
+                json!({"components": {"components": WORLD_OBJECTS}}),
+                TOPIC_WAIT,
+            )
+            .await
+        else {
+            continue;
+        };
+        let objects = scene["scene"]["world"]["collision_objects"]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice);
+        layers::draw_scene(
+            &rec,
+            &layer.path,
+            objects,
+            |frame| robot.transform(&map, frame).ok(),
+            &mut drawn,
+        );
     }
 }
 

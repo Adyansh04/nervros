@@ -96,6 +96,7 @@ that never came up.
 | `remap` | none | Path prefixes to rewrite, for an install tree whose links point at another machine's paths. |
 | `map_frame` | `map` | The frame of places and poses. |
 | `base_frame` | `base_footprint` | The robot's base. |
+| `open_goals` | none | Where NervROS keeps the action goals of the motions it runs itself, as `nervros_interfaces/msg/OpenGoals`, latched and sent twice a second while any is open, for [`nervros_watchdog`](../ros/nervros_watchdog/README.md) on the robot to cancel if NervROS goes quiet. |
 
 ### `[privacy]`
 
@@ -337,22 +338,29 @@ topic = "/canopy/markers"
 type = "visualization_msgs/msg/MarkerArray"
 namespaces = ["viewpoint", "visited"]     # a marker array's namespaces to draw; all when left out
 hidden = false                            # starts hidden
+group = "World model"                     # its heading in the Layers tab; one by its type otherwise
 ```
 
 | Type | Drawn as |
 |---|---|
-| `nav_msgs/msg/OccupancyGrid` | Its occupied cells, over the map in the layer's colour. |
+| `nav_msgs/msg/OccupancyGrid` | Its occupied cells, over the map in the layer's colour. With `style = "costmap"`, a Nav2 costmap's costs: inflation from faint blue to indigo, the inscribed radius in violet, obstacles in coral, free cells clear. A grid in another frame, as a local costmap in `odom`, is placed by TF. |
 | `visualization_msgs/msg/MarkerArray` | Each marker by its type: arrows, cubes, spheres, cylinders, lines, point lists, triangle lists and text. Mesh markers are left out. |
 | `sensor_msgs/msg/LaserScan` | Points in the map, by TF from the scan's frame. |
+| `geometry_msgs/msg/PolygonStamped` | A closed outline on the map, by TF from its frame: a collision monitor's polygon as it shows it (`visualize: true`). The Layers tab names it beside its colour. |
 
-The Layers tab also switches the viewer's own drawings: the map, coverage, rooms, objects, trail,
-plan, keep-out zones, the robot model and the detector's boxes. Object names start hidden, since a
+`color = [r, g, b]` gives a layer its colour; the viewer picks one otherwise.
+
+The Layers tab lists the layers under headings (Robot, Navigation, Arms, World model, Sensors), each
+with its colour, and also switches the viewer's own drawings: the map, coverage, rooms, objects,
+trail, plan, zones (keep-out and slow), MoveIt's obstacles, the robot model and the detector's
+boxes. Object names start hidden, since a
 furnished room buries the map in them; hovering a box names it either way.
 
 ### `[mission]`
 
 The robot's mission executor, which runs behaviour trees; see
-[the executor contract](executor.md). With this section the agent gets `run_mission`. It checks a
+[the executor contract](executor.md). A robot with `[nav2]` or `[moveit]` and no executor still
+gets missions, of the motions NervROS runs itself ([integrations](integrations.md#native-steps)). With this section the agent gets `run_mission`. It checks a
 plan, shows it, and runs it once the operator approves, so the operator approves once, in the app,
 and the agent never asks first in the chat. `check_only` only checks a plan.
 
@@ -373,6 +381,7 @@ and the agent never asks first in the chat. `check_only` only checks a plan.
 | `teleop_speed` | `[0.5, 0.3, 0.8]` | Full hand-driving speed forward and sideways (m/s) and turning (rad/s); Slow in the Robot tab halves it. |
 | `define_skill`, `forget_skill` | none | The `DefineSkill` and `ForgetSkill` services: with both, the agent gets `teach_skill` and teaches the robot skills from the executor's learnable leaves; see [the executor contract](executor.md#taught-skills). |
 | `checks` | none | The skills the plan checks know; see below. |
+| `lend` | none | The `LendResources` service: an executor that holds the arms lends them for an arm move NervROS runs itself through MoveIt, and takes them back after; see [integrations](integrations.md#native-steps). |
 
 Before a plan reaches the operator, it is checked against their words: a left turn planned as a
 right one, a walk the wrong way or of another length, the other hand. Such a plan goes back to the
@@ -399,7 +408,7 @@ arm = "arm"                                            # the argument valued lef
   doubts are added to the card; they never send the plan back.
 
 Missions are kept in a ledger beside the quota file. The card shows how each step went before, and
-`recall`, the Mission tab and `nervros-cli missions` read the ledger.
+`recall`, the Library tab and `nervros-cli missions` read the ledger.
 
 A run the robot or the executor ended, rather than the plan, is kept with its fault: the robot could
 not move, the deadman stopped it, the executor shut down or restarted, a skill's server was not up,
@@ -438,25 +447,36 @@ place first, as it walks to any object the world model knows.
 
 ### `[geofence]`
 
-Keep-out zones: polygons on the map the robot may not be sent into.
+Zones: polygons on the map. A keep-out zone the robot may not be sent into; a slow zone it may
+enter no faster than a speed.
 
 - The profile's zones are fixed. The operator adds more in chat with `geofence` ("keep the robot
-  out of the kitchen", "keep it a metre from the vase"), around a room, an object, a place or
-  corners on the map. These are kept per robot in the state directory, beside the remembered
-  places.
-- Adding a zone only narrows where the robot goes, so it is free.
-- Removing one asks the operator every time, supervised or autonomous, and is never allowed for
-  the session. An `observe` profile refuses it. Only an edit of this file removes the profile's
-  zones.
+  out of the kitchen", "keep it a metre from the vase", "make the corridor a slow zone at 30%"),
+  around a room, an object, a place or corners on the map. These are kept per robot in the state
+  directory, beside the remembered places.
+- Adding a zone, or slowing a slow zone down, only makes the robot more careful, so it is free.
+- Removing a keep-out zone asks the operator every time, supervised or autonomous, and is never
+  allowed for the session. Removing a slow zone or letting the robot go faster in one asks too,
+  but may be allowed for the session. An `observe` profile refuses them. Only an edit of this
+  file changes the profile's zones.
 
 ```toml
 [geofence]
-mask = "/keepout_filter_mask"   # optional; needs [world] map
+slowest_percent = 30   # the slowest a slow zone may make the robot; default 5
+top_speed_mps = 0.6    # optional: then a slow zone may give its speed in m/s
 
 [[geofence.zone]]
 name = "stairs"
 polygon = [[4.0, 0.0], [5.0, 0.0], [5.0, 2.5], [4.0, 2.5]]   # map frame, metres, in order
+
+[[geofence.zone]]
+name = "corridor"
+polygon = [[0.0, 3.0], [6.0, 3.0], [6.0, 4.2], [0.0, 4.2]]
+slow = { percent = 50 }   # or { mps = 0.3 }
 ```
+
+A slow zone's speed is a share of the robot's top speed, as Nav2's speed filter takes it. Where
+slow zones overlap, the slowest holds.
 
 What the guard refuses:
 
@@ -475,15 +495,13 @@ What the plan check refuses:
   `[mission.checks] walk` names.
 - A plan run later, by its hash or a schedule, is checked again as it starts.
 
-Nav2 keeps its own paths out through `mask`. NervROS publishes an `OccupancyGrid` the size of
-`[world] map`, with the zones' cells at 100, latched (transient local), for Nav2's `KeepoutFilter`
-behind a `costmap_filter_info_server`. It publishes again whenever the zones or the map's grid
-change, and `nervros-cli doctor` says whether anything reads it. Without `mask`, Nav2 knows nothing
-of the zones and only the agent's own checks hold them: a walk whose route crosses a zone, driving
-by hand, and skills that move the base themselves are not held back.
+Nav2 learns the zones through [`[nav2]`](#nav2): keep-out zones through `keepout_mask`, slow
+zones through `speed_zones`. Without them, Nav2 knows nothing of the zones and only the agent's own
+checks hold the keep-out zones: a walk whose route crosses one, driving by hand, and skills that
+move the base themselves are not held back, and nothing slows the robot in a slow zone.
 
-The viewer draws the zones in red, the World tab lists them, and its buttons add and remove them
-through the agent.
+The viewer draws keep-out zones in red and slow zones in amber with their speed; the World tab
+lists them, and its buttons add and remove them through the agent.
 
 - A zone needs a name, at least three corners and an area of 0.05 m² or more. Names are unique,
   whatever their case, across the profile's zones and the chat's. A bad zone in the profile stops
@@ -492,6 +510,80 @@ through the agent.
   refused until one is named by id.
 - An object or a place gets a margin of 0.3 m unless the operator says otherwise. A place is a
   square reaching half a metre out from it, plus the margin.
+
+### `[nav2]`
+
+Nav2, when the robot runs it. The section gives the agent `nav_status`, `nav_check`,
+`collision_monitor` and `nav_admin` (see [Builtin tools](#builtin-tools)), a line on what Nav2 is
+doing in every turn, and the zones in Nav2's costmaps. Names without a leading `/` are under
+`namespace`.
+
+```toml
+[nav2]
+keepout_mask = "/keepout_filter_mask"   # optional; needs [world] map
+
+[nav2.speed_zones]                      # optional; needs [world] map
+mask = "/speed_filter_mask"
+info = "/speed_filter_info"             # optional: NervROS publishes the filter info itself
+```
+
+| Key | Default | |
+|---|---|---|
+| `namespace` | none | Where Nav2's nodes and servers run, such as `/robot1`. |
+| `keepout_mask` | none | Where the keep-out zones go out for Nav2's `KeepoutFilter`: an `OccupancyGrid` the size of `[world] map`, the zones' cells at 100, latched (transient local), published again whenever the zones or the map's grid change. A `costmap_filter_info_server` names it to the filter. |
+| `speed_zones.mask` | none | Where the slow zones go out for Nav2's `SpeedFilter`: the same grid, each cell the per cent of the top speed the slowest zone over it allows, 0 (no limit) elsewhere. |
+| `speed_zones.info` | none | Where NervROS publishes the speed filter's `CostmapFilterInfo` (in per cent, base 0, multiplier 1), latched, so the robot needs no filter info server for it. Leave it out when the robot runs its own. |
+| `lifecycle_manager` | `lifecycle_manager_navigation` | The lifecycle manager of the navigation servers: `is_active` for the status, `manage_nodes` for `nav_admin`. |
+| `collision_monitor` | `collision_monitor` | The collision monitor node. |
+| `costmaps` | `["global_costmap/global_costmap", "local_costmap/local_costmap"]` | The costmap nodes, whose clear and cost services `nav_admin` and `nav_check` call. |
+| `drive_speed_mps` | `0.25` | How fast a straight walk NervROS runs itself goes. |
+| `docking` | `false` | Whether the robot runs Nav2's docking server: then missions may dock and undock. |
+
+Missions also get Nav2's motions as steps NervROS runs itself, where the robot's executor has no
+skill of the name: `GoToPose`, `GoToTarget` (with a world model), `WalkRoute`, `TurnInPlace`,
+`WalkStraight`, `Wait`, and `Dock` and `Undock` with `docking`; see
+[integrations](integrations.md#native-steps).
+
+`nervros-cli doctor` says whether Nav2's navigation server is up and whether a costmap filter reads
+each mask.
+
+What Nav2 1.3 lets NervROS change while it runs, and so what `collision_monitor` offers: the whole
+monitor on or off, each polygon on or off, and the shape of a polygon that takes its shape from a
+topic (`polygon_sub_topic`, with no `points`; set `polygon_subscribe_transient_local: true` so the
+shape NervROS keeps reaches it after a restart). A polygon's action, slowdown ratio, limits and
+timing are read when the node starts. Keep the robot's own stop polygon fixed: a polygon that takes
+its shape from a topic stops nothing until a shape arrives.
+
+### `[moveit]`
+
+MoveIt, when the robot runs it. The section gives the agent `arm_status`, `arm_check`, `scene` and
+`arm_settings` (see [Builtin tools](#builtin-tools)), a line on where each arm is and what MoveIt's
+planning scene holds in every turn, and an arm preview drawn in the 3D view, beside the planning
+scene's boxes, spheres and cylinders (the Layers tab's "Arm obstacles"). Stop also tells MoveIt
+to stop any trajectory it runs; the hands keep their grip. NervROS reads the groups, end effectors
+and named poses from `move_group`'s `robot_description_semantic`. Its tools ask MoveIt's services,
+never its move action, so nothing they ask disturbs a motion the robot's executor runs; only a
+mission step moves an arm.
+
+Missions also get MoveIt's motions as steps NervROS runs itself, where the robot's executor has no
+skill of the name: `ArmTo` (a named or remembered pose), `HandTo` (just above an object, or a
+point), `HandLine` (a short straight hand move) and `Grip` (a hand's named state; never opening a
+hand that holds something). See [integrations](integrations.md#native-steps).
+
+| Key | Default | |
+|---|---|---|
+| `move_group` | `/move_group` | The `move_group` node; its services sit beside it, as MoveIt names them. |
+| `planning_frame` | the SRDF's virtual joint | The frame MoveIt plans in, its robot model's root, such as `pelvis`. |
+| `joint_states` | `/joint_states` | The `sensor_msgs/msg/JointState` topic with the arms' joints. |
+| `scaling` | `0.2` | The share of the arms' top speed NervROS's own arm moves start at; `arm_settings` changes it. |
+| `max_scaling` | `0.5` | The most `arm_settings` may raise it to. |
+
+`nervros-cli doctor` says whether it runs. The host needs `ros-jazzy-moveit-msgs` to build NervROS
+with MoveIt's messages.
+
+The obstacles NervROS adds are kept on the map, per robot in the state directory, and sent again
+in the planning frame whenever it moves on the map: a robot whose model is rooted at its body
+would otherwise carry them along as it walks.
 
 ### `[incidents]`
 
@@ -595,7 +687,8 @@ Doctor tab show a server that did not connect.
 ## Builtin tools
 
 Every robot gets `list_places`, `robot_state`, `geofence` and `stop`. `stop` is always allowed,
-armed or not, because it only makes the robot do less. `look` comes with `[look]`, `segment` with
+armed or not, because it only makes the robot do less; it cancels the goals NervROS sent itself
+too. `look` comes with `[look]`, `segment` with
 `[segment]`, and `run_mission` with `[mission]`.
 
 The rest are the checks you would run yourself before blaming the model:
@@ -610,20 +703,28 @@ The rest are the checks you would run yourself before blaming the model:
 | `digest` | With `[mission]`: what the robot did over the last hours, in sections code writes: missions by how they ended, the runs cut short by the robot apart, each skill's record on fair runs, what moved or went missing in the world model, incidents and goals. `nervros-cli digest` prints the same from the robot's files, without the world model. |
 | `patrol` | With `[mission]`: walks a round of places as a job, looking around at each with a full turn on the spot (the `[mission.checks]` `turn` skill), then reports what it saw in each room and what moved or went missing meanwhile. Approved once with its round and time limit. |
 | `watches` | Lists the running watches, or cancels one or all. |
-| `plot` | Draws a number from a topic's messages over time in the app's Plots tab, as `rqt_plot` does, for two minutes unless told longer. |
+| `plot` | Draws a number from a topic's messages over time in the app's Plots tab, as `rqt_plot` does, for two minutes unless told longer. A joint state's joint is named, as `position.right_elbow_joint`; a topic quiet now, as a velocity command between walks, is checked against its type and drawn once it publishes. |
 | `memory` | Keeps what the operator asks it to remember across sessions ("the kitchen door sticks"), in the state directory, one file per robot; lists and forgets notes. The notes join the system prompt on every turn, and the Agent tab lists them. Remembering and forgetting are approved like an edit. |
 | `goal` | With `[mission]`: keeps a goal the operator wants to hold across missions and sessions ("keep the mug on the tray"), with the predicates that hold once it is met (`at`, `holding`, `inside`, `on`), a budget of missions and an optional time limit, in the state directory, one file per robot. NervROS judges it after every mission the agent runs and reports, and at start, and the agent works toward it with missions that name it in `run_mission`'s `goal`. It ends met, exhausted, or impossible when the agent gives it up with the reason. Setting, pausing and giving up are approved like an edit. |
 | `schedule` | With `[mission]`: runs a plan again and again, such as a patrol every 30 minutes, a set number of times, or each time something happens: an object of a kind appears, in a room or anywhere, or a condition on a topic as `watch` takes it becomes true. The operator approves it once for all its runs; a run is skipped while the robot is disarmed or busy, and stopping the robot cancels every schedule. The Mission tab lists them. |
 | `recall` | With `[mission]`: what the robot did lately, from the mission ledger, what happened to an object, from `[world] history` and the robot's own missions with it, and the operator's notes. |
 | `plans` | With `[mission]`: saves a plan that worked by name ("evening check"), lists them, and runs one again. |
-| `skill_gap` | With `[mission]`: logs a request no skill can do, and why; planning that gives up logs one itself. The Mission tab and `nervros-cli gaps` list them. |
-| `program` | With `[mission]`: runs a short [Rhai](https://rhai.rs) program for what takes loops, counting or measuring, sandboxed (no files, network or `eval`, bounded in operations and size), on the robot's functions: the world model, topic reads and rates, TF, waits, and skills, each run as a mission. One that moves is approved once, with the skills its text names and its time limit, and runs as a job with Stop; one that only reads runs at once. Programs are kept by name per robot in the state directory, and the Mission tab lists them. |
+| `skill_gap` | With `[mission]`: logs a request no skill can do, and why; planning that gives up logs one itself. The Library tab and `nervros-cli gaps` list them. |
+| `program` | With `[mission]`: runs a short [Rhai](https://rhai.rs) program for what takes loops, counting or measuring, sandboxed (no files, network or `eval`, bounded in operations and size), on the robot's functions: the world model, topic reads and rates, TF, waits, and skills, each run as a mission. One that moves is approved once, with the skills its text names and its time limit, and runs as a job with Stop; one that only reads runs at once. Programs are kept by name per robot in the state directory, and the Library tab lists them. |
 | `search` | With `[mission]`: finds something, ranking where to look from the world model's sightings and history and where such things usually are, then walking to each place and looking until the detector sees it; approved once, with the places it will look in order. `plan` lists the places without moving. |
 | `teach_skill` | With `[mission]`'s `define_skill` and `forget_skill`: teaches the robot a skill from the executor's learnable leaves, as a draft kept once a mission with it succeeds; lists and forgets taught skills. |
 | `point` | With a `segment` model in the models file: points at what the operator names in the frame a camera's detector marks, found as `look` finds it, or the newest frame when there are no marks, including things no detector marks, and says which mark a point lands on. |
 | `skill` | With `skills`: reads one skill's procedure. |
 | `tag_place`, `forget_place` | Remembers where the robot stands, and which way it faces, as a named place; forgets one. Each is an `annotate` call: approval when supervised, no arming. |
-| `geofence` | Lists, adds and removes keep-out zones (see `[geofence]`): around a room, an object (its size and a margin), a place, or corners on the map. Adding is free, and refused while the robot stands inside the new zone or when a type names several rooms; removing always asks the operator. |
+| `geofence` | Lists, adds, slows and removes zones (see `[geofence]`): keep-out zones and slow zones, around a room, an object (its size and a margin), a place, or corners on the map. Adding is free, and a keep-out zone is refused while the robot stands inside it or when a type names several rooms; removing a keep-out zone always asks the operator, removing or speeding up a slow zone asks too. |
+| `nav_status` | With `[nav2]`: whether Nav2's servers are up, how sure localization is, what moves the base and how far it has to go, what the collision monitor is doing, the speed limit in force, and the zones. |
+| `nav_check` | With `[nav2]`: whether the robot can walk to a place, a room, an object or a point, how far and about how long, and through which zones, from Nav2's planner without moving (refused while Nav2 walks, since a request would cut into its own planning); and what Nav2's costmap holds at a spot. |
+| `collision_monitor` | With `[nav2]`: the collision monitor's polygons and what each does; the monitor on or off, a polygon on or off, and a polygon's shape where Nav2 allows it. Turning on and growing are free; turning off and shrinking ask the operator. |
+| `nav_admin` | With `[nav2]`: clears costmaps, sets localization's pose or makes it search the map, pauses, resumes or resets the navigation servers, saves and loads maps. Each asks the operator when supervised, and none runs during a mission. |
+| `arm_status` | With `[moveit]`: each arm group, its named poses and the one it is at, each hand and its poses, MoveIt's planners, and the obstacles in its planning scene and what each hand holds. |
+| `arm_check` | With `[moveit]`: whether an arm's hand reaches an object or a point, held as it is now (IK); whether a named pose is clear of collisions now; and the path an arm would take to a named pose, an object or a point, and how long it takes, drawn in the 3D view. Nothing moves. |
+| `scene` | With `[moveit]`: lists MoveIt's planning scene; adds an obstacle (a box, a cylinder or a sphere on the map, or an object of the world model by its box), free; removes one NervROS added, attaches an object to a hand or detaches it, and clears the octomap, each asking the operator. |
+| `arm_settings` | With `[moveit]`: how the arm moves NervROS runs itself go: their speed (slower is free, faster asks, up to `max_scaling`), the planning pipeline, planner and time (asks), and arm poses remembered by name from where an arm is now, for `ArmTo` and `arm_check`. |
 
 `look` can also answer about an earlier snapshot, and look closer at one mark: it crops the mark
 from the full frame at a higher resolution for the vision model, for a label or a small part.

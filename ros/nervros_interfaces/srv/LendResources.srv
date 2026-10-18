@@ -1,0 +1,18 @@
+# Lends the resources the executor holds to an agent that moves them itself, such as NervROS
+# running an arm move through MoveIt, or takes them back. The executor takes them as it would for
+# a mission, refuses missions and driving by hand while they are lent, and takes them back when
+# asked, when the client's heartbeat stops, on StopAll, or after max_s. A hand that holds
+# something keeps its arm held.
+
+# Who borrows, as its heartbeat names it.
+string client
+# base, left_arm, right_arm.
+string[] resources
+# True to borrow, false to give back.
+bool lend
+# The longest the client may keep them, s; 0 for the executor's own limit.
+float64 max_s
+---
+bool granted
+# Why not, in words, when it is not.
+string reason

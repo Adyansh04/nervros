@@ -235,8 +235,11 @@ fn walks(asked: &Asked, skill: &WalkSkill, steps: &[PlannedStep], out: &mut Vec<
 
 fn hands(side: Side, name: &str, steps: &[PlannedStep], out: &mut Vec<Concern>) {
     for s in steps {
+        // `right` or a group named for its side, such as `right_arm`.
         if let Some(arm) = arg(s, name)
-            && arm != side.name()
+            && !arm
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| w == side.name())
         {
             out.push(Concern::new(
                 &s.id,
@@ -890,6 +893,12 @@ mod tests {
         );
         assert_eq!(fixes(&wrong), [("s2".into(), "arm".into(), "left".into())]);
         assert!(check("Pick up the mug with your left hand", &[pick("left")]).is_empty());
+        // An arm group named for its side is that side.
+        assert!(check("Open your left hand", &[pick("left_arm")]).is_empty());
+        assert_eq!(
+            fixes(&check("Open your left hand", &[pick("right_arm")])).len(),
+            1
+        );
         assert_eq!(
             read("Turn right and pick up the mug with your left hand").turn,
             Some(Side::Right),

@@ -1,0 +1,8 @@
+nervros_watchdog:
+  ros__parameters:
+    # Where NervROS sends its open goals: the profile's [ros] open_goals.
+    open_goals_topic: /nervros/open_goals
+    # How long NervROS may go quiet with goals open; it sends them twice a second.
+    timeout_s: 2.0
+    # MoveIt's trajectory_execution_event, told "stop" when goals are cancelled; empty for none.
+    moveit_stop_topic: ""

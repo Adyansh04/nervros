@@ -1,9 +1,10 @@
-//! Keep-out zones: outlined and hatched in red on the floor, and named at a corner.
+//! Zones on the floor: keep-out zones outlined and hatched in red, slow zones in amber with their
+//! speed, each named at a corner.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use nervros_core::zones::{Zone, Zones};
+use nervros_core::zones::{Rule, Zone, Zones};
 use rerun::RecordingStream;
 use tokio::time::{MissedTickBehavior, interval};
 
@@ -11,9 +12,13 @@ use crate::spawner::Layer;
 use crate::{OBJECTS_PERIOD, f32s, layers, put_static};
 
 const ZONE_RED: [u8; 3] = [230, 60, 60];
+/// The window's warning amber: a slow zone is a caution, not a wall.
+const ZONE_AMBER: [u8; 3] = [243, 166, 43];
 /// Between the hatch's lines, in metres: lines rather than a fill, so the map shows through, and
-/// no transparency for the viewer to sort against the map's own layers.
+/// no transparency for the viewer to sort against the map's own layers. A slow zone's are sparser,
+/// so the two read apart at a glance.
 const HATCH_M: f64 = 0.25;
+const SLOW_HATCH_M: f64 = 0.5;
 /// Over the map, the coverage and the rooms' outlines.
 const ZONE_Z: f32 = 0.03;
 
@@ -47,9 +52,13 @@ fn on_floor(corner: [f64; 2]) -> [f32; 3] {
 
 /// One entity per zone, so a click names it; zones removed since the last draw are cleared.
 fn draw_zones(rec: &RecordingStream, path: &str, zones: &[Zone], drawn: &mut BTreeSet<String>) {
-    let red = rerun::Color::from_rgb(ZONE_RED[0], ZONE_RED[1], ZONE_RED[2]);
     let mut now = BTreeSet::new();
     for zone in zones {
+        let ([r, g, b], spacing, says) = match zone.rule {
+            Rule::KeepOut => (ZONE_RED, HATCH_M, "keep out".to_owned()),
+            Rule::Slow(limit) => (ZONE_AMBER, SLOW_HATCH_M, format!("slow, {}", limit.words())),
+        };
+        let colour = rerun::Color::from_rgb(r, g, b);
         let mut outline: Vec<[f32; 3]> = zone.polygon.iter().copied().map(on_floor).collect();
         outline.extend(outline.first().copied());
         // Names that differ only in what a slug drops would share an entity, and one go undrawn.
@@ -61,10 +70,10 @@ fn draw_zones(rec: &RecordingStream, path: &str, zones: &[Zone], drawn: &mut BTr
             rec,
             &entity,
             &rerun::LineStrips3D::new([outline])
-                .with_colors([red])
+                .with_colors([colour])
                 .with_radii([0.04]),
         );
-        let strokes: Vec<[[f32; 3]; 2]> = hatch(&zone.polygon, HATCH_M)
+        let strokes: Vec<[[f32; 3]; 2]> = hatch(&zone.polygon, spacing)
             .into_iter()
             .map(|stroke| stroke.map(on_floor))
             .collect();
@@ -72,7 +81,7 @@ fn draw_zones(rec: &RecordingStream, path: &str, zones: &[Zone], drawn: &mut BTr
             rec,
             &format!("{entity}/hatch"),
             &rerun::LineStrips3D::new(strokes)
-                .with_colors([red])
+                .with_colors([colour])
                 .with_radii([0.012]),
         );
         // At its northernmost corner: a room's own name sits at its middle.
@@ -86,8 +95,8 @@ fn draw_zones(rec: &RecordingStream, path: &str, zones: &[Zone], drawn: &mut BTr
                 rec,
                 &format!("{entity}/name"),
                 &rerun::Points3D::new([on_floor(corner)])
-                    .with_labels([format!("{}: keep out{set_in}", zone.name)])
-                    .with_colors([red])
+                    .with_labels([format!("{}: {says}{set_in}", zone.name)])
+                    .with_colors([colour])
                     .with_radii([0.06]),
             );
         }

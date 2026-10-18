@@ -11,6 +11,7 @@ pub mod advice;
 pub mod camera;
 pub mod catalog;
 pub mod check;
+pub(crate) mod composite;
 pub mod digest;
 pub mod goals;
 pub mod history;
@@ -300,6 +301,8 @@ pub struct Missions {
     advisor: OnceLock<Arc<dyn advice::Advisor>>,
     /// The camera's view of a mission's end, when the robot has a camera and a vision model.
     vision: OnceLock<camera::Vision>,
+    /// Where the arms are among their named poses, when the robot has an arm stack.
+    arm_poses: OnceLock<Arc<dyn ArmPoses>>,
     /// Whose resource locks a running mission holds, so no other act overlaps it.
     guard: OnceLock<Arc<crate::guard::Guard>>,
     /// Whether a plan for this request already went back for not matching the operator's words:
@@ -313,6 +316,18 @@ pub struct Missions {
     goals: OnceLock<Arc<goals::Goals>>,
     /// Fixes proposed after a step failed again, when a model drafts them.
     inbox: OnceLock<Arc<inbox::Inbox>>,
+}
+
+/// Where the robot's arms are among their named poses, for the goal checks after a mission.
+#[async_trait::async_trait]
+pub trait ArmPoses: Send + Sync {
+    /// The named pose each arm group is at; an arm between poses is left out.
+    async fn arm_poses(&self) -> std::collections::BTreeMap<String, String>;
+}
+
+/// Who this agent is to the robot, in its heartbeat and when it borrows the arms.
+pub(crate) fn client_id() -> String {
+    format!("nervros {}", std::process::id())
 }
 
 impl crate::session::Pulse for Missions {
@@ -345,8 +360,30 @@ impl Missions {
         places: Arc<crate::places::Places>,
         robot: Arc<dyn RobotPort>,
     ) -> Option<Arc<Self>> {
-        let config = profile.mission.clone()?;
-        Some(Arc::new(Self {
+        Some(Self::with_config(
+            profile,
+            profile.mission.clone()?,
+            places,
+            robot,
+        ))
+    }
+
+    /// The executor's names: the composite executor's when the robot's stacks run motions.
+    #[must_use]
+    pub fn config(&self) -> &MissionConfig {
+        &self.config
+    }
+
+    /// Over the executor `config` names, reached through `robot`: the composite executor when the
+    /// robot's stacks run motions of their own.
+    #[must_use]
+    pub fn with_config(
+        profile: &Profile,
+        config: MissionConfig,
+        places: Arc<crate::places::Places>,
+        robot: Arc<dyn RobotPort>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             robot,
             places,
             profile: profile.clone(),
@@ -361,19 +398,20 @@ impl Missions {
             last: Mutex::default(),
             session: OnceLock::new(),
             heartbeat: Mutex::default(),
-            client: format!("nervros {}", std::process::id()),
+            client: client_id(),
             ledger: OnceLock::new(),
             request: Mutex::default(),
             critic: OnceLock::new(),
             advisor: OnceLock::new(),
             vision: OnceLock::new(),
+            arm_poses: OnceLock::new(),
             guard: OnceLock::new(),
             questioned: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             drafts: learn::Drafts::default(),
             goals: OnceLock::new(),
             inbox: OnceLock::new(),
-        }))
+        })
     }
 
     /// Keeps finished missions in `ledger` from now on.
@@ -415,6 +453,12 @@ impl Missions {
         // Set once, at start-up.
         let _ = self.goals.set(goals);
         self
+    }
+
+    /// Checks where the arms ended against their named poses too.
+    pub fn set_arm_poses(&self, poses: Arc<dyn ArmPoses>) {
+        // Set once, at start-up.
+        let _ = self.arm_poses.set(poses);
     }
 
     /// Checks each successful mission's goals through the camera too.

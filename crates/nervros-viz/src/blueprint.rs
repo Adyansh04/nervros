@@ -4,6 +4,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use rerun::blueprint::components::{
     ActiveTab, AutoLayout, AutoViews, BackgroundKind, ColumnShare, ContainerKind, Eye3DKind,
@@ -14,9 +15,10 @@ use rerun::blueprint::encodings::{self, TextLogColumnKind};
 use rerun::external::re_log_types::{BlueprintActivationCommand, RecordingId};
 use rerun::external::re_sdk_types::SerializedComponentBatch;
 use rerun::external::re_sdk_types::blueprint::archetypes::{
-    Background, ContainerBlueprint, EyeControls3D, LineGrid3D, TextLogColumns, ViewBlueprint,
-    ViewContents, ViewportBlueprint,
+    Background, ContainerBlueprint, EyeControls3D, LineGrid3D, TextLogColumns, TimeAxis,
+    ViewBlueprint, ViewContents, ViewportBlueprint,
 };
+use rerun::external::re_sdk_types::encodings::{TimeInt, TimeRange, TimeRangeBoundary};
 use rerun::{AsComponents, RecordingStream, RecordingStreamBuilder, RecordingStreamResult};
 
 use crate::{CAMERA_PATH, FOLLOW_PATH};
@@ -161,6 +163,9 @@ pub(super) struct Layout {
     /// The strip's tab on show: the agent's log at first, as the mission lanes are empty until
     /// one runs; a mission or a plot the agent starts is brought forward.
     strip: AtomicUsize,
+    /// Until when a plot the operator asked for keeps the strip: a mission it was asked to watch
+    /// would take it over.
+    plots_until: Mutex<Option<Instant>>,
 }
 
 impl Layout {
@@ -172,6 +177,7 @@ impl Layout {
             framed: Mutex::new(None),
             follow: AtomicBool::new(false),
             strip: AtomicUsize::new(AGENT_TAB),
+            plots_until: Mutex::new(None),
         }
     }
 
@@ -197,13 +203,26 @@ impl Layout {
     }
 
     /// Shows the strip's Plots tab, where a plot the agent just started draws.
-    pub(super) fn show_plots(&self) {
+    pub(super) fn show_plots(&self, for_s: u64) {
+        *self
+            .plots_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some(Instant::now() + Duration::from_secs(for_s));
         self.show_strip(PLOTS_TAB);
     }
 
-    /// Shows the strip's Mission tab, where a mission's steps draw as it runs.
+    /// Shows the strip's Mission tab, where a mission's steps draw as it runs, unless a plot
+    /// still draws there.
     pub(super) fn show_mission(&self) {
-        self.show_strip(MISSION_TAB);
+        let plotting = self
+            .plots_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|until| Instant::now() < until);
+        if !plotting {
+            self.show_strip(MISSION_TAB);
+        }
     }
 
     fn show_strip(&self, tab: usize) {
@@ -227,6 +246,8 @@ impl Layout {
 const MISSION_TAB: usize = 0;
 const AGENT_TAB: usize = 1;
 const PLOTS_TAB: usize = 3;
+/// How much of a plot stays in view, nanoseconds of `log_time`.
+const PLOT_WINDOW_NS: i64 = 120_000_000_000;
 
 /// The map has grown past the extent the view was framed on by more than a margin on some side,
 /// as while a building is mapped.
@@ -304,12 +325,19 @@ fn panes(
                 })
             }),
         );
+    // A plot shows its last two minutes up to now: the viewer's own window is centred on the time
+    // cursor, so half of it stayed empty and a walk's start scrolled away.
+    let last_two_minutes =
+        TimeAxis::new().with_view_range(rerun::blueprint::components::TimeRange(TimeRange {
+            start: TimeRangeBoundary::CursorRelative(TimeInt(-PLOT_WINDOW_NS)),
+            end: TimeRangeBoundary::CursorRelative(TimeInt(0)),
+        }));
     let strip = Pane::tabs(
         vec![
             Pane::view("StateTimeline", "Mission", "/mission"),
             Pane::view("TextLog", "Agent", "/agent/log").with("TextLogColumns", &log_columns),
             Pane::view("TimeSeries", "Exploring", "/mapping"),
-            Pane::view("TimeSeries", "Plots", "/plots"),
+            Pane::view("TimeSeries", "Plots", "/plots").with("TimeAxis", &last_two_minutes),
         ],
         strip,
     );

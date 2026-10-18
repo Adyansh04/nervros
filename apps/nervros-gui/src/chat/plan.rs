@@ -20,11 +20,11 @@ use crate::theme;
 fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
     for s in &p.steps {
         let (status, node) = p.progress.get(&s.id).cloned().unwrap_or_default();
-        let failed = p.finished.as_ref().is_some_and(|f| f.1 == s.id);
-        let (color, mark) = if failed {
-            (theme::ERROR, "✗")
-        } else {
-            node_look(&status)
+        // The step a stop landed in was stopped, not failed.
+        let (color, mark) = match &p.finished {
+            Some((Outcome::Canceled, step, ..)) if *step == s.id => (theme::WARN, "■"),
+            Some((_, step, ..)) if *step == s.id => (theme::ERROR, "✗"),
+            _ => node_look(&status),
         };
         // The plan's own id names the step later steps take what it found from.
         let named = s
@@ -56,6 +56,10 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
                     summary.on_hover_text(note);
                 }
                 track_label(ui, s);
+                if !s.native.is_empty() {
+                    let text = format!("NervROS runs it through {}", s.native);
+                    ui.label(RichText::new(text).size(12.5).color(theme::DIM));
+                }
                 match s.learned.as_str() {
                     "draft" => {
                         let text = "a skill the agent taught: its first try";
@@ -99,39 +103,6 @@ fn node_look(status: &str) -> (Color32, &'static str) {
     }
 }
 
-/// The mission's behaviour tree as it has run so far, as the executor reports its nodes: each
-/// under the subtrees it is in, marked with its latest status.
-pub fn tree_panel(ui: &mut egui::Ui, p: &PlanCard) {
-    if p.nodes.is_empty() {
-        return;
-    }
-    ui.add_space(12.0);
-    egui::CollapsingHeader::new(RichText::new("Behaviour tree").strong())
-        .id_salt(("tree", &p.hash))
-        .default_open(true)
-        .show(ui, |ui| {
-            for (path, status) in &p.nodes {
-                // A node still running when the mission ended was stopped with it.
-                let status = if p.finished.is_some() && status == "running" {
-                    "stopped"
-                } else {
-                    status.as_str()
-                };
-                let depth = u16::try_from(path.matches('/').count()).unwrap_or(u16::MAX);
-                let name = path.rsplit('/').next().unwrap_or(path);
-                // BehaviorTree.CPP names an unnamed node by its type and uid, as "Sequence::3".
-                let name = name.split_once("::").map_or(name, |(n, _)| n);
-                let (colour, mark) = node_look(status);
-                ui.horizontal(|ui| {
-                    ui.add_space(14.0 * f32::from(depth));
-                    ui.label(RichText::new(mark).color(colour));
-                    ui.label(RichText::new(name).monospace())
-                        .on_hover_text(format!("{path}: {status}"));
-                });
-            }
-        });
-}
-
 /// How a step has gone before, small and quiet, with the details in its hover.
 fn track_label(ui: &mut egui::Ui, s: &PlannedStep) {
     let Some(track) = &s.track else {
@@ -170,6 +141,7 @@ pub(super) fn minutes(seconds: f64) -> String {
 pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut Vec<Action>) {
     let colour = match &p.finished {
         Some((Outcome::Success, ..)) => theme::SUCCESS,
+        Some((Outcome::Canceled, ..)) => theme::WARN,
         Some(_) => theme::ERROR,
         None if p.mission.is_some() => theme::INFO,
         None => theme::FAINT,
@@ -207,8 +179,13 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut
                     } else {
                         format!(" at {step}")
                     };
-                    RichText::new(format!("{}{at}: {reason}", capitalise(outcome.as_str())))
-                        .color(theme::ERROR)
+                    RichText::new(format!("{}{at}: {reason}", capitalise(outcome.as_str()))).color(
+                        if *outcome == Outcome::Canceled {
+                            theme::WARN
+                        } else {
+                            theme::ERROR
+                        },
+                    )
                 }
                 (None, Some(since)) => {
                     ui.ctx().request_repaint_after(Duration::from_secs(1));

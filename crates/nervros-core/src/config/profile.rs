@@ -41,9 +41,13 @@ pub struct Profile {
     /// Named places beyond the world model's rooms.
     #[serde(rename = "place", default)]
     pub places: Vec<PlaceConfig>,
-    /// Keep-out zones, and where Nav2 reads them.
+    /// Keep-out zones.
     #[serde(default)]
     pub geofence: GeofenceConfig,
+    /// Nav2, when the robot runs it.
+    pub nav2: Option<crate::integrations::nav2::Nav2Config>,
+    /// MoveIt, when the robot runs it.
+    pub moveit: Option<crate::integrations::moveit::MoveItConfig>,
     /// The incident investigator: what it watches and the robot's playbooks.
     pub incidents: Option<IncidentConfig>,
     /// Tools declared by ROS name and type.
@@ -68,17 +72,33 @@ pub struct Profile {
     dir: PathBuf,
 }
 
-/// Keep-out zones the robot may not be sent into (more are added in chat), and the topic their
-/// keep-out mask goes out on for Nav2's keepout filter.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Zones that keep the robot out or slow it down; more are added in chat.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GeofenceConfig {
-    /// A `nav_msgs/msg/OccupancyGrid` on the map's grid, latched, every cell in a zone occupied;
-    /// needs `[world] map`. Without it only the agent's own checks keep the robot out.
-    pub mask: Option<String>,
     /// The fixed zones.
     #[serde(rename = "zone", default)]
     pub zones: Vec<ZoneConfig>,
+    /// The slowest a slow zone may make the robot, in per cent of its top speed: a robot that
+    /// cannot walk slower than a fifth of its top speed sets 20.
+    #[serde(default = "default_slowest")]
+    pub slowest_percent: f64,
+    /// The robot's top speed, m/s: a slow zone may then give its speed in m/s too.
+    pub top_speed_mps: Option<f64>,
+}
+
+impl Default for GeofenceConfig {
+    fn default() -> Self {
+        Self {
+            zones: Vec::new(),
+            slowest_percent: default_slowest(),
+            top_speed_mps: None,
+        }
+    }
+}
+
+fn default_slowest() -> f64 {
+    5.0
 }
 
 /// How keyframes are kept: a camera's frame is kept when it differs from that camera's last kept
@@ -165,7 +185,7 @@ pub struct WatchedTopic {
     pub name: String,
 }
 
-/// A keep-out zone the profile sets.
+/// A zone the profile sets: a keep-out zone, or a slow one with `slow`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZoneConfig {
@@ -173,6 +193,9 @@ pub struct ZoneConfig {
     pub name: String,
     /// Its corners in the map frame, metres, in order around it.
     pub polygon: Vec<[f64; 2]>,
+    /// How fast the robot may go in it, `{ percent = 30 }` or `{ mps = 0.2 }`; a keep-out zone
+    /// without it.
+    pub slow: Option<crate::zones::SpeedLimit>,
 }
 
 /// An MCP server: how to reach it, and which of its tools the agent may use.
@@ -283,6 +306,11 @@ pub struct RosConfig {
     /// The fixed frame places and poses are in.
     #[serde(default = "default_map_frame")]
     pub map_frame: String,
+    /// Where NervROS keeps the action goals its own motions have open, as
+    /// `nervros_interfaces/msg/OpenGoals`, latched and sent twice a second while any is open: a
+    /// watchdog on the robot cancels them when it goes quiet.
+    #[serde(default)]
+    pub open_goals: Option<String>,
     /// The robot's base frame.
     #[serde(default = "default_base_frame")]
     pub base_frame: String,
@@ -306,6 +334,7 @@ impl Default for RosConfig {
             interfaces: Vec::new(),
             remap: std::collections::BTreeMap::new(),
             map_frame: default_map_frame(),
+            open_goals: None,
             base_frame: default_base_frame(),
         }
     }
@@ -514,6 +543,9 @@ pub struct MissionConfig {
     /// The skills whose arguments a plan is checked against the operator's words with.
     #[serde(default)]
     pub checks: PlanChecks,
+    /// `LendResources` service: the executor lends the arms it holds to the arm moves NervROS
+    /// runs itself, and takes them back after.
+    pub lend: Option<String>,
 }
 
 /// The executor's skills the plan checks know: names, units and signs are the robot's own, so
@@ -627,13 +659,22 @@ pub struct LayerConfig {
     /// Starts hidden.
     #[serde(default)]
     pub hidden: bool,
+    /// Its colour, `[r, g, b]`; one of the viewer's own otherwise.
+    pub color: Option<[u8; 3]>,
+    /// The heading the Layers tab lists it under, such as `Navigation`; one chosen by its type
+    /// otherwise.
+    pub group: Option<String>,
+    /// How an occupancy grid is drawn: `costmap` for Nav2's costs, a gradient from the inflation
+    /// out to the obstacles; its occupied cells in its colour otherwise.
+    pub style: Option<String>,
 }
 
 /// The message types a `[[viz.layer]]` can draw.
-pub const LAYER_TYPES: [&str; 3] = [
+pub const LAYER_TYPES: [&str; 4] = [
     "nav_msgs/msg/OccupancyGrid",
     "visualization_msgs/msg/MarkerArray",
     "sensor_msgs/msg/LaserScan",
+    "geometry_msgs/msg/PolygonStamped",
 ];
 
 /// A named place.
@@ -744,6 +785,41 @@ impl Profile {
         Ok(profile)
     }
 
+    /// The zones' names are unique and each zone and speed usable, within the speeds allowed.
+    fn check_zones(&self) -> Result<(), ProfileError> {
+        let g = &self.geofence;
+        let top_ok = g.top_speed_mps.is_none_or(|t| t.is_finite() && t > 0.0);
+        if !(1.0..=99.0).contains(&g.slowest_percent) || !top_ok {
+            return Err(ProfileError::Invalid(
+                "[geofence] slowest_percent is 1 to 99, top_speed_mps above 0".to_owned(),
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for z in &self.geofence.zones {
+            if !seen.insert(z.name.to_lowercase()) {
+                return Err(ProfileError::Duplicate {
+                    kind: "zone",
+                    name: z.name.clone(),
+                });
+            }
+            let zone = crate::zones::Zone {
+                name: z.name.clone(),
+                polygon: z.polygon.clone(),
+                rule: z
+                    .slow
+                    .map_or(crate::zones::Rule::KeepOut, crate::zones::Rule::Slow),
+                fixed: true,
+            };
+            let speed = z.slow.map_or(Ok(()), |limit| {
+                limit.check(self.geofence.slowest_percent, self.geofence.top_speed_mps)
+            });
+            zone.check().and(speed).map_err(|why| {
+                ProfileError::Invalid(format!("[[geofence.zone]] `{}`: {why}", z.name))
+            })?;
+        }
+        Ok(())
+    }
+
     fn check(&self) -> Result<(), ProfileError> {
         let mut seen = std::collections::BTreeSet::new();
         for t in &self.tools {
@@ -763,23 +839,7 @@ impl Profile {
                 });
             }
         }
-        let mut seen = std::collections::BTreeSet::new();
-        for z in &self.geofence.zones {
-            if !seen.insert(z.name.to_lowercase()) {
-                return Err(ProfileError::Duplicate {
-                    kind: "zone",
-                    name: z.name.clone(),
-                });
-            }
-            let zone = crate::zones::Zone {
-                name: z.name.clone(),
-                polygon: z.polygon.clone(),
-                fixed: true,
-            };
-            zone.check().map_err(|why| {
-                ProfileError::Invalid(format!("[[geofence.zone]] `{}`: {why}", z.name))
-            })?;
-        }
+        self.check_zones()?;
         if let Some(k) = &self.keyframes {
             let sane = |v: f64, most: f64| v.is_finite() && v > 0.0 && v <= most;
             if !sane(k.period_s, 3600.0) || !sane(k.keep_h, 24.0 * 30.0) || k.edge_px < 64 {
@@ -795,9 +855,15 @@ impl Profile {
                 ));
             }
         }
-        if self.geofence.mask.is_some() && self.world.as_ref().is_none_or(|w| w.map.is_none()) {
+        let masks = self
+            .nav2
+            .as_ref()
+            .is_some_and(|n| n.keepout_mask.is_some() || n.speed_zones.is_some());
+        if masks && self.world.as_ref().is_none_or(|w| w.map.is_none()) {
             return Err(ProfileError::Invalid(
-                "[geofence] mask needs [world] map: the mask is drawn on the map's grid".to_owned(),
+                "[nav2] keepout_mask and speed_zones need [world] map: a mask is drawn on the \
+                 map's grid"
+                    .to_owned(),
             ));
         }
         for layer in self.viz.iter().flat_map(|v| &v.layers) {

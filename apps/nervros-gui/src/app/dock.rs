@@ -18,6 +18,8 @@ impl Gui {
             .show(ui, |ui| {
                 match self.tab {
                     Tab::Mission => self.mission_tab(ui),
+                    Tab::Tree => self.tree_tab(ui),
+                    Tab::Library => self.library_tab(ui),
                     Tab::World => self.world_tab(ui),
                     Tab::Layers => self.layers_tab(ui),
                     Tab::Approvals => self.approvals_tab(ui),
@@ -30,10 +32,20 @@ impl Gui {
             });
     }
 
-    /// The tabs as two rows of four equal segments: eight names never fit one row of a dock,
-    /// and a row that wraps wherever the width runs out reads as a mistake.
+    /// The tabs as two rows of five equal segments: ten names never fit one row of a dock, and a
+    /// row that wraps wherever the width runs out reads as a mistake.
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let pending = self.chat.pending().count();
+        let running = self
+            .chat
+            .latest_plan()
+            .is_some_and(crate::chat::PlanCard::running);
+        let unwell = self
+            .live()
+            .checks
+            .as_ref()
+            .is_some_and(|c| c.iter().any(|c| !c.ok))
+            || self.agent.mcp.iter().any(|c| !c.ok);
         Frame::new()
             .fill(theme::SURFACE)
             .stroke(egui::Stroke::new(1.0, theme::BORDER))
@@ -42,8 +54,8 @@ impl Gui {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
                 ui.spacing_mut().button_padding = egui::vec2(4.0, 4.0);
-                let width = ((ui.available_width() - 9.0) / 4.0).floor();
-                for row in Tab::ALL.chunks(4) {
+                let width = ((ui.available_width() - 12.0) / 5.0).floor();
+                for row in Tab::ALL.chunks(5) {
                     ui.horizontal(|ui| {
                         for &(tab, name) in row {
                             let selected = self.tab == tab;
@@ -54,7 +66,7 @@ impl Gui {
                                 (false, true) => theme::TEXT,
                                 (false, false) => theme::DIM,
                             };
-                            let label = RichText::new(name).size(13.0).color(colour);
+                            let label = RichText::new(name).size(12.5).color(colour);
                             let button = egui::Button::new(label)
                                 .fill(if selected {
                                     theme::RAISED
@@ -65,10 +77,30 @@ impl Gui {
                                 .corner_radius(CornerRadius::same(7))
                                 .min_size(egui::vec2(width, 28.0));
                             let response = ui.add(button);
-                            let response = if waiting {
-                                response.on_hover_text(format!("{pending} waiting for you"))
-                            } else {
-                                response
+                            // A dot says what wants a look, from any tab.
+                            let badge = match tab {
+                                Tab::Approvals if waiting => {
+                                    Some((theme::WARN, format!("{pending} waiting for you")))
+                                }
+                                Tab::Tree if running => {
+                                    Some((theme::SUCCESS, "A mission is running".to_owned()))
+                                }
+                                Tab::Doctor if unwell => {
+                                    Some((theme::ERROR, "A check failed".to_owned()))
+                                }
+                                _ => None,
+                            };
+                            let response = match badge {
+                                Some((colour, why)) => {
+                                    let r = response.rect;
+                                    ui.painter().circle_filled(
+                                        egui::pos2(r.right() - 7.0, r.top() + 7.0),
+                                        3.0,
+                                        colour,
+                                    );
+                                    response.on_hover_text(why)
+                                }
+                                None => response,
                             };
                             if response.clicked() {
                                 self.tab = tab;
@@ -84,14 +116,38 @@ impl Gui {
         match self.chat.latest_plan() {
             Some(p) => {
                 crate::chat::plan_card(ui, p, self.chat.can_pause, &mut actions);
-                crate::chat::tree_panel(ui, p);
+                ui.add_space(8.0);
+                if ui
+                    .add(ReButton::new("Open its behaviour tree").small().secondary())
+                    .clicked()
+                {
+                    self.tab = Tab::Tree;
+                }
             }
             None => empty(
                 ui,
-                "No plan yet. Ask the robot to do something; its plan appears here.",
+                "No plan yet. Ask the robot to do something; its plan appears here, and its \
+                 behaviour tree in the Tree tab.",
             ),
         }
         self.schedules_list(ui);
+        self.act(ui.ctx(), actions);
+    }
+
+    fn tree_tab(&mut self, ui: &mut egui::Ui) {
+        let mut actions = Vec::new();
+        crate::chat::tree_tab(
+            ui,
+            self.chat.latest_plan(),
+            self.chat.can_pause,
+            &mut actions,
+        );
+        self.act(ui.ctx(), actions);
+    }
+
+    /// What the robot keeps from before: programs, taught skills, its missions and saved plans.
+    fn library_tab(&mut self, ui: &mut egui::Ui) {
+        let mut actions = Vec::new();
         if let Some(store) = &self.agent.programs {
             crate::programs::show(ui, store, &self.agent.jobs, &mut actions);
         }
@@ -169,6 +225,13 @@ impl Gui {
                 battery: l.battery.clone(),
                 motors: l.motors.clone(),
                 armed: self.agent.guard.armed(),
+                stacks: self
+                    .agent
+                    .integrations
+                    .iter()
+                    .map(|i| i.status())
+                    .filter(|parts| !parts.is_empty())
+                    .collect(),
             }
         };
         crate::robot::tab(ui, &status, self.drive.as_mut());
@@ -206,13 +269,8 @@ impl Gui {
         }
     }
 
-    fn events_tab(&self, ui: &mut egui::Ui) {
-        if self.event_log.is_empty() {
-            empty(ui, "Session events appear here, newest first.");
-        }
-        for line in &self.event_log {
-            ui.label(RichText::new(line).monospace().size(11.5).color(theme::DIM));
-        }
+    fn events_tab(&mut self, ui: &mut egui::Ui) {
+        self.timeline.show(ui);
     }
 
     fn doctor_tab(&mut self, ui: &mut egui::Ui) {

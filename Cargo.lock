@@ -7478,6 +7478,7 @@ dependencies = [
  "rig",
  "rmcp 3.5.0",
  "rosidl-schema",
+ "roxmltree",
  "rusqlite",
  "schemars 1.2.2",
  "secrecy",

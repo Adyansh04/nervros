@@ -1251,6 +1251,7 @@ async fn a_plan_checked_before_a_zone_was_added_is_refused_when_it_runs() {
         .add(crate::zones::Zone {
             name: "dock".into(),
             polygon: vec![[0.5, 1.5], [1.5, 1.5], [1.5, 2.5], [0.5, 2.5]],
+            rule: crate::zones::Rule::KeepOut,
             fixed: false,
         })
         .unwrap();

@@ -20,7 +20,7 @@ use crate::llm::{ImageInput, Shot};
 use crate::look::Seer;
 use crate::providers::Role;
 use crate::session::{Command, Event, SessionHandle};
-use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
+use crate::tools::{Risk, SchemaPart, SchemaSource, Tool, ToolOutcome, ToolSpec};
 use crate::vision::Cameras;
 
 /// How often a value or a message is looked at.
@@ -117,14 +117,54 @@ impl Condition {
     }
 }
 
-/// A field by dotted path (`pose.pose.position.x`, `status.0.level`).
+/// A field by dotted path (`pose.pose.position.x`, `status.0.level`); an array's item may be
+/// named by the message's `name` list it lines up with, as a joint state's
+/// `position.right_elbow_joint`.
 #[must_use]
 pub fn field<'a>(msg: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.')
-        .try_fold(msg, |v, part| match part.parse::<usize>() {
-            Ok(i) if v.is_array() => v.get(i),
-            _ => v.get(part),
-        })
+    let mut owner = &Value::Null;
+    let mut at = msg;
+    for part in path.split('.') {
+        at = match (at, part.parse::<usize>()) {
+            (Value::Array(items), Ok(i)) => items.get(i)?,
+            (Value::Array(items), Err(_)) => {
+                let names = owner["name"].as_array()?;
+                items.get(names.iter().position(|n| n.as_str() == Some(part))?)?
+            }
+            _ => {
+                owner = at;
+                at.get(part)?
+            }
+        };
+    }
+    Some(at)
+}
+
+/// Why `path` is no number in messages of this JSON Schema, if it is not.
+fn number_in(schema: &Value, path: &str) -> Result<(), String> {
+    let mut node = schema;
+    for part in path.split('.') {
+        // An item by index or by name: a name cannot be checked before a message comes.
+        node = if node["type"] == "array" {
+            &node["items"]
+        } else if let Some(next) = node["properties"].get(part) {
+            next
+        } else {
+            let fields: Vec<&str> = node["properties"]
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            return Err(format!(
+                "there is no `{part}`; the fields there are {}",
+                fields.join(", ")
+            ));
+        };
+    }
+    match node["type"].as_str() {
+        Some("number" | "integer") => Ok(()),
+        Some(other) => Err(format!("it is {other}")),
+        None => Err("it is no number".to_owned()),
+    }
 }
 
 /// What a value is, in a few words: a list is never quoted whole.
@@ -398,6 +438,8 @@ pub struct Watches {
     /// The cameras and the model a watch on what they show looks through, when the robot has
     /// cameras.
     sight: OnceLock<(Arc<Cameras>, Arc<dyn Seer>)>,
+    /// The robot's interfaces, to check a plot's field on a topic that is quiet now.
+    schemas: OnceLock<Arc<dyn SchemaSource>>,
 }
 
 impl Watches {
@@ -412,7 +454,14 @@ impl Watches {
             running: Mutex::new(Vec::new()),
             next: AtomicU64::new(1),
             sight: OnceLock::new(),
+            schemas: OnceLock::new(),
         })
+    }
+
+    /// Checks a plot's field against the robot's interfaces while its topic is quiet.
+    pub fn read_types(&self, schemas: Arc<dyn SchemaSource>) {
+        // Set once, at start-up.
+        let _ = self.schemas.set(schemas);
     }
 
     /// Lets a watch wait for what `cameras` show, each look asked of `seer`'s `watch` role.
@@ -640,20 +689,24 @@ impl Watches {
             .ok_or("`field` is a dotted path to a number, such as twist.twist.linear.x")?
             .to_owned();
         let (topic, ty) = self.topic(args, true).await?;
-        let msg = self
-            .robot
-            .latest(&topic, &ty, Duration::from_secs(2))
-            .await
-            .map_err(|e| format!("nothing arrived on {topic} to plot ({e})"))?;
-        let now = match field(&msg, &path) {
-            Some(v) => v.as_f64().ok_or_else(|| {
+        // A topic quiet now, as a velocity command between walks, is plotted once it publishes.
+        let now = if let Ok(msg) = self.robot.latest(&topic, &ty, Duration::from_secs(2)).await {
+            let v = field(&msg, &path)
+                .ok_or_else(|| format!("{topic} has no `{path}`; topic_sample shows its fields"))?;
+            Some(v.as_f64().ok_or_else(|| {
                 format!("`{path}` in {topic} is {}, not a number", kind(v, &path))
-            })?,
-            None => {
-                return Err(format!(
-                    "{topic} has no `{path}`; topic_sample shows its fields"
-                ));
+            })?)
+        } else {
+            if let Some(schema) = self
+                .schemas
+                .get()
+                .and_then(|s| s.schema(&ty, SchemaPart::Message, &[]).ok())
+            {
+                number_in(&schema, &path).map_err(|why| {
+                    format!("{topic} is a {ty} with no number at `{path}`: {why}")
+                })?;
             }
+            None
         };
         let for_s = args["for_s"]
             .as_u64()
@@ -670,7 +723,13 @@ impl Watches {
             });
         }
         let mut out = ToolOutcome::ok(json!({"plot": name, "now": now, "for_s": for_s}));
-        out.message = format!("plotting {name} in the viewer's Plots tab for {for_s} s");
+        out.message = match now {
+            Some(_) => format!("plotting {name} in the viewer's Plots tab for {for_s} s"),
+            None => format!(
+                "plotting {name} in the viewer's Plots tab for {for_s} s: the topic is quiet now, \
+                 so the line starts when it publishes"
+            ),
+        };
         Ok(out)
     }
 
@@ -860,7 +919,7 @@ fn plot_spec() -> ToolSpec {
          something changes; watch reports a condition instead.",
         json!({"type": "object", "properties": {
             "topic": {"type": "string", "description": "The topic, such as /odom."},
-            "field": {"type": "string", "description": "A dotted path to a number, such as twist.twist.linear.x or position.3."},
+            "field": {"type": "string", "description": "A dotted path to a number in the topic's own message: linear.x for a Twist, twist.twist.linear.x for an Odometry, position.right_elbow_joint (a joint by its name) for a JointState."},
             "for_s": {"type": "integer", "minimum": 1, "maximum": MAX_PLOT_S, "description": "How long to draw it (120)."}
         }, "required": ["topic", "field"], "additionalProperties": false}),
         Risk::Observe,
@@ -1238,6 +1297,54 @@ mod tests {
             .plot(&json!({"topic": "/odom", "field": "pose.x"}))
             .await;
         assert!(missing.unwrap_err().contains("no `pose.x`"));
+    }
+
+    #[test]
+    fn a_fields_path_is_checked_against_its_type() {
+        let twist = json!({"type": "object", "properties": {
+            "linear": {"type": "object", "properties": {"x": {"type": "number"}}},
+            "angular": {"type": "object", "properties": {"z": {"type": "number"}}}}});
+        assert!(number_in(&twist, "linear.x").is_ok());
+        let wrong = number_in(&twist, "twist.twist.linear.x").unwrap_err();
+        assert!(
+            wrong.contains("no `twist`") && wrong.contains("linear"),
+            "{wrong}"
+        );
+        let joints = json!({"type": "object", "properties": {
+            "position": {"type": "array", "items": {"type": "number"}},
+            "name": {"type": "array", "items": {"type": "string"}}}});
+        assert!(number_in(&joints, "position.3").is_ok());
+        let state = json!({"name": ["a", "right_elbow_joint"], "position": [0.1, 1.2]});
+        assert_eq!(
+            field(&state, "position.right_elbow_joint"),
+            Some(&json!(1.2))
+        );
+        assert_eq!(field(&state, "position.1"), Some(&json!(1.2)));
+        assert_eq!(field(&state, "position.left_elbow_joint"), None);
+        assert!(number_in(&joints, "name.0").unwrap_err().contains("string"));
+    }
+
+    #[tokio::test]
+    async fn a_quiet_topic_is_plotted_once_it_publishes() {
+        let graph = nervros_ros::GraphDetail {
+            topics: vec![(
+                "/cmd_vel".to_owned(),
+                vec!["geometry_msgs/msg/Twist".to_owned()],
+            )],
+            ..nervros_ros::GraphDetail::default()
+        };
+        let robot: Arc<dyn RobotPort> = Arc::new(FakeRobot::new().with_graph(graph));
+        let watches = Watches::new(robot, Vec::new());
+        let out = watches
+            .plot(&json!({"topic": "/cmd_vel", "field": "linear.x"}))
+            .await
+            .unwrap();
+        assert!(out.data["now"].is_null());
+        assert!(
+            out.message.contains("starts when it publishes"),
+            "{}",
+            out.message
+        );
     }
 
     #[tokio::test]

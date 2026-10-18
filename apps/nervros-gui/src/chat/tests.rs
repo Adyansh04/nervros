@@ -15,7 +15,6 @@ use rerun::external::egui;
 use rerun::external::egui::{Frame, Margin};
 
 use super::approval::time_left;
-use super::plan::tree_panel;
 use super::report::report_text;
 use super::*;
 use crate::plan_edit;
@@ -270,35 +269,38 @@ fn snapshot_plan_edit() {
 }
 
 #[test]
-fn snapshot_tree_panel() {
+fn snapshot_tree_tab() {
     let mut chat = doubtful_plan();
     chat.apply(&Event::MissionStarted {
         id: "m2".to_owned(),
         hash: "5be0c1d9f2a4".to_owned(),
     });
-    for (step, node, path, status) in [
-        ("s1", "", "s1_TurnInPlace::2", "running"),
-        ("s1", "Turn", "s1_TurnInPlace::2/Turn", "running"),
-        ("s1", "Turn", "s1_TurnInPlace::2/Turn", "success"),
-        ("s1", "", "s1_TurnInPlace::2", "success"),
-        ("s2", "", "s2_WalkStraight::5", "running"),
+    for (step, node, path, status, at) in [
+        ("s1", "", "s1_TurnInPlace::2", "running", 0.0),
+        ("s1", "Turn", "s1_TurnInPlace::2/Turn", "running", 0.1),
+        ("s1", "Turn", "s1_TurnInPlace::2/Turn", "success", 4.2),
+        ("s1", "", "s1_TurnInPlace::2", "success", 4.3),
+        ("s2", "", "s2_WalkStraight::5", "running", 4.4),
         (
             "s2",
             "Sequence",
             "s2_WalkStraight::5/Sequence::6",
             "running",
+            4.4,
         ),
         (
             "s2",
             "CheckClear",
             "s2_WalkStraight::5/Sequence::6/CheckClear",
             "success",
+            4.9,
         ),
         (
             "s2",
             "Walk",
             "s2_WalkStraight::5/Sequence::6/Walk",
             "running",
+            5.0,
         ),
     ] {
         chat.apply(&Event::MissionProgress {
@@ -307,10 +309,12 @@ fn snapshot_tree_panel() {
             node: node.to_owned(),
             path: path.to_owned(),
             status: status.to_owned(),
-            elapsed_s: 3.0,
+            elapsed_s: at,
         });
     }
-    let plan = chat.latest_plan().cloned().unwrap();
+    let mut plan = chat.latest_plan().cloned().unwrap();
+    // A start still to come reads as 0 s: the clock would differ on every run.
+    plan.started = Some(std::time::Instant::now() + std::time::Duration::from_hours(1));
     let mut harness = Harness::builder()
         .wgpu()
         .with_size(egui::vec2(440.0, 600.0))
@@ -318,12 +322,14 @@ fn snapshot_tree_panel() {
             Frame::new()
                 .fill(theme::BG)
                 .inner_margin(Margin::same(16))
-                .show(ui, |ui| tree_panel(ui, &plan));
+                .show(ui, |ui| {
+                    super::tree_tab(ui, Some(&plan), true, &mut Vec::new());
+                });
         });
     style_for_tests(&harness.ctx);
-    harness.run();
+    harness.run_steps(3);
     harness.fit_contents();
-    compare(&mut harness, "tree_panel", &SnapshotOptions::new());
+    compare(&mut harness, "tree_tab", &SnapshotOptions::new());
 }
 
 #[test]
@@ -824,6 +830,49 @@ fn snapshot_plan_with_records_and_a_preview_warning() {
         can_allow: false,
     });
     render(chat, "chat_plan_records");
+}
+
+#[test]
+fn snapshot_plan_with_native_steps() {
+    let mut chat = Chat::default();
+    chat.apply(&Event::User {
+        turn: 1,
+        text: "Walk through the hallway to the kitchen, pick up the mug and lift it a little"
+            .to_owned(),
+    });
+    let step = |id: &str, summary: &str, native: &str| PlannedStep {
+        id: id.to_owned(),
+        skill: summary.split('(').next().unwrap_or_default().to_owned(),
+        summary: summary.to_owned(),
+        timeout_s: 240.0,
+        native: native.to_owned(),
+        ..PlannedStep::default()
+    };
+    chat.apply(&Event::MissionPlanned {
+        hash: "5e2b90c1d4a7".to_owned(),
+        intent: "walk to the kitchen, pick up the mug and lift it".to_owned(),
+        steps: vec![
+            step("s1", "WalkRoute(places=hallway, kitchen)", "Nav2"),
+            step("s2", "PickObject(object_id=O17, arm=right)", ""),
+            step(
+                "s3",
+                "HandLine(arm=right_arm, direction=up, distance_m=0.1)",
+                "MoveIt",
+            ),
+            step("s4", "Wait(seconds=10)", "Nav2"),
+        ],
+        worst_case_s: 1380.0,
+        concerns: Vec::new(),
+        by_job: false,
+    });
+    chat.apply(&Event::ApprovalRequested {
+        id: 5,
+        tool: "run_mission".to_owned(),
+        args: serde_json::json!({"hash": "5e2b90c1d4a7"}),
+        reason: "`run_mission` acts on the robot".to_owned(),
+        can_allow: false,
+    });
+    render(chat, "chat_plan_native");
 }
 
 #[test]

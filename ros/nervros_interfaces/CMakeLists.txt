@@ -6,22 +6,25 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(unique_identifier_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/ExecuteMission.action"
   "msg/Heartbeat.msg"
   "msg/NodeEvent.msg"
+  "msg/OpenGoals.msg"
   "msg/RobotState.msg"
   "msg/StepPreview.msg"
   "srv/DefineSkill.srv"
   "srv/ForgetSkill.srv"
   "srv/GetCatalog.srv"
+  "srv/LendResources.srv"
   "srv/PauseMission.srv"
   "srv/PreviewMission.srv"
   "srv/StopAll.srv"
   "srv/Teleop.srv"
   "srv/ValidateMission.srv"
-  DEPENDENCIES builtin_interfaces geometry_msgs nav_msgs
+  DEPENDENCIES builtin_interfaces geometry_msgs nav_msgs unique_identifier_msgs
 )
 
 ament_package()

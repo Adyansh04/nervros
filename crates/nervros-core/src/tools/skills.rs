@@ -67,7 +67,7 @@ fn read(file: &Path) -> Result<Skill, String> {
 }
 
 /// A `SKILL.md`: its front matter's `name` and `description`, then the procedure.
-fn parse(text: &str) -> Result<Skill, String> {
+pub(crate) fn parse(text: &str) -> Result<Skill, String> {
     let rest = text
         .strip_prefix("---")
         .ok_or("it starts without its front matter (---)")?;
@@ -91,6 +91,22 @@ fn parse(text: &str) -> Result<Skill, String> {
         description,
         body: body.trim().to_owned(),
     })
+}
+
+/// The profile's skills, then the procedures its stacks bring that it has none of the same name
+/// for; and what could not be read.
+#[must_use]
+pub fn load_for(profile: &crate::profile::Profile) -> (Vec<Skill>, Vec<String>) {
+    let dirs: Vec<PathBuf> = profile.skills.iter().map(|d| profile.resolve(d)).collect();
+    let (mut skills, mut problems) = load(&dirs);
+    for text in crate::integrations::procedures(profile) {
+        match parse(text) {
+            Ok(s) if skills.iter().all(|k| k.name != s.name) => skills.push(s),
+            Ok(_) => {}
+            Err(e) => problems.push(format!("a stack's procedure: {e}")),
+        }
+    }
+    (skills, problems)
 }
 
 /// The index the system prompt carries: a line per skill.

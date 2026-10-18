@@ -336,8 +336,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 fn skills(profile: &Path) -> Result<()> {
     let profile = nervros_core::profile::Profile::load(profile).context("loading the profile")?;
-    let dirs: Vec<PathBuf> = profile.skills.iter().map(|d| profile.resolve(d)).collect();
-    let (skills, problems) = nervros_core::skills::load(&dirs);
+    let (skills, problems) = nervros_core::skills::load_for(&profile);
     match nervros_core::skills::index(&skills) {
         Some(index) => println!("{index}"),
         None => println!("no skills"),

@@ -30,7 +30,7 @@ Setup is in the [README](../README.md). Every setting is in the [profile](profil
   [When something goes wrong](#when-something-goes-wrong) ·
   [Runs the robot cut short](#runs-the-robot-cut-short)
 - **Memory and limits:** [Remembering](#remembering) · [Keeping a goal](#keeping-a-goal) ·
-  [Keeping it out of places](#keeping-it-out-of-places) ·
+  [Keeping it out of places](#keeping-it-out-of-places) · [Nav2 and MoveIt](#nav2-and-moveit) ·
   [The robot's self-description](#the-robots-self-description)
 - **Maps:** [Mapping a new building](#mapping-a-new-building) ·
   [Finishing the map](#finishing-the-map)
@@ -56,9 +56,10 @@ cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 - **Viewer, middle:** the 3D world (map, rooms, objects, the robot, where it walked and where it
   is about to walk), the cameras with the detector's marks, and below them the mission's steps
   over time, the agent's log and plots. It is one timeline you can scrub back.
-- **Dock, right:** Mission, World, Layers, Approvals, Events, Agent, Doctor and Robot (Ctrl+1 to
-  Ctrl+8). A waiting approval turns its tab amber. Doctor also drafts the robot's
-  self-description.
+- **Dock, right:** Mission, Tree, Approvals, World, Robot, Layers, Library, Events, Agent and
+  Doctor (Ctrl+1 to Ctrl+0). A dot marks a tab that wants a look: amber on Approvals while a
+  request waits, green on Tree while a mission runs, red on Doctor when a check failed. Doctor
+  also drafts the robot's self-description.
 - **Status bar:** whether the agent is working, how full the model's context is, and how much of
   it came from the model server's cache.
 
@@ -119,8 +120,8 @@ https://github.com/user-attachments/assets/7cf1cd95-a8dc-4519-a4cf-155976221887
 
 The plan card lists each step with its track record on this robot ("13 of 15 · 24 s"), and the
 viewer draws the planned path. While the mission runs, each step on the card shows its live state,
-the Mission tab shows the behaviour tree node by node, and the timeline strip shows the steps over
-time. When it ends, the agent gets a report with its goal checks:
+the Tree tab draws the behaviour tree step by step with the nodes running inside each, and the
+timeline strip shows the steps over time. When it ends, the agent gets a report with its goal checks:
 
 ```text
 report> Mission 01a0feba (Walk to the bedroom, room R3) ended: success after 24 s.
@@ -183,8 +184,9 @@ report> Mission 01a0ff3c (Bring the small white mug from the dining table to the
 > **NervROS:** The mission was successful! The small white mug has been brought from the dining
 > table to the tray on the office desk.
 
-The Mission tab shows the behaviour tree as it runs, node by node, beside each step's track record
-and the missions before it.
+The Tree tab draws the behaviour tree as it runs: each step a card on a spine with its wrappers
+(time limit, retries, optional), its live state and the nodes inside it with their times. The
+Library tab lists the missions before it and each step's track record.
 
 A failed mission comes back with the step that failed, why it failed, and what the world model saw
 of the object involved. The agent then proposes a changed plan for you to approve. You can keep
@@ -282,7 +284,7 @@ kind the argument takes.
 ### Doing it again
 
 - "Save that as the evening check" keeps a plan that worked, and "Run the evening check" runs it
-  again. The Mission tab lists saved plans.
+  again. The Library tab lists saved plans.
 - A schedule runs a plan on a clock or when something happens, approved once for every run (see
   [Keeping an eye on it](#keeping-an-eye-on-it)). Stopping the robot cancels every schedule.
 - Requests that no skill can do are logged as skill gaps, for whoever writes the next skill.
@@ -336,7 +338,7 @@ The program's functions are the robot's: `objects(words, room)`, `rooms()`, `pla
 (`PickObject(#{object_id: id, arm: "right"})`) or `run("Skill", #{...})`, `read(topic)`,
 `rate(topic, seconds)`, `tf(parent, child)`, `wait(seconds)` and `say(text)`.
 
-"Keep that program as count chairs" keeps it by name. The Mission tab lists kept programs to run
+"Keep that program as count chairs" keeps it by name. The Library tab lists kept programs to run
 again, and each run is approved again.
 
 <details>
@@ -412,7 +414,7 @@ A body can also nest `sequence`, `fallback`, `retry`, `timeout_s` and `force_suc
 You approve the teaching first. The executor checks the skill, which is then a draft. The plan
 that uses it comes to you like any plan, with its new step marked as a taught skill on its first
 try. Once that mission succeeds, the skill is kept on the robot, and the next "point at the tray"
-uses it. The Mission tab lists the taught skills, each with what it was taught for and a
+uses it. The Library tab lists the taught skills, each with what it was taught for and a
 **Forget** button. Gemini 3.5 Flash-Lite answered in this clip.
 
 <details>
@@ -462,9 +464,9 @@ robot. `/look`, `/places` and `/explore` send their request to the agent. In the
 | `/layout` | Puts the viewer's panes back |
 | `/edit` | Opens the world editor |
 | `/live` | Goes back to the live view after **Show in 3D** |
-| `/robot`, `/world`, `/approvals`, `/events`, `/layers` | Opens that tab of the dock |
+| `/robot`, `/world`, `/tree`, `/approvals`, `/events`, `/layers` | Opens that tab of the dock |
 | `/doctor` | Checks the setup again and opens Doctor |
-| `/models`, `/missions` | Opens Agent, or Mission |
+| `/models`, `/missions` | Opens Agent, or Library |
 | `/dock` | Shows or hides the dock |
 
 ## Driving by hand
@@ -709,24 +711,87 @@ unless you say otherwise), a place, or corners you give on the map. It names the
 it surrounds. From then on the agent refuses a walk that would end in a zone, a straight walk that
 would enter one, and a navigation goal inside one.
 
-The 3D view draws the zones in red (the Layers tab can hide them), and the World tab lists them.
-**Add** starts the request in the composer, and **Remove** asks the agent to remove one, which you
-approve every time.
+A slow zone lets the robot in, no faster than a share of its top speed:
+
+> **You:** Make the corridor a slow zone at 30%.
+
+Slowing a zone down is free; removing one or letting the robot go faster in it asks you first.
+
+The 3D view draws keep-out zones in red and slow zones in amber with their speed (the Layers tab
+can hide them), and the World tab lists them. **Keep out** and **Slow zone** start the request in
+the composer, and **Remove** asks the agent to remove one, which you approve.
 
 <details>
 <summary>Nav2, and what a zone does not hold back</summary>
 
-- When the profile names a `mask` topic ([`[geofence]`](profile.md#geofence)), NervROS publishes
-  the zones there for Nav2's keepout filter, so Nav2 plans around them too, and `doctor` says
-  whether anything reads it. Without it, a few things are not held back at a zone: a walk whose
-  route crosses one, driving by hand, and skills that move the base themselves (exploring, a pick
-  backing off).
+- With [`[nav2]`](profile.md#nav2), NervROS publishes the keep-out zones for Nav2's keepout
+  filter, so Nav2 plans around them too, and the slow zones for its speed filter, which slows the
+  robot inside them; `doctor` says whether anything reads them. Without it, a few things are not
+  held back at a keep-out zone: a walk whose route crosses one, driving by hand, and skills that
+  move the base themselves (exploring, a pick backing off).
 - Adding a zone is refused while the robot stands inside it, and for a room type that several
   rooms share until you name one by its id.
 - Zones added in chat are kept for the robot across sessions. Zones set in the profile stay until
   the profile changes.
 - A plan made before a zone was added is checked again when it runs, from a schedule or by its
   hash.
+
+</details>
+
+## Nav2 and MoveIt
+
+https://github.com/user-attachments/assets/43ac126e-f920-4fce-8a64-9ac0baea3062
+
+https://github.com/user-attachments/assets/3091295f-aee5-4a00-8305-f9cb5ecc8e03
+
+With [`[nav2]`](profile.md#nav2) and [`[moveit]`](profile.md#moveit) in the profile, the agent
+works the robot's navigation and arm stacks directly: it reads them, changes how they behave, and
+runs their standard motions itself where the robot's executor has no skill for them.
+
+> **You:** Is navigation up, and how well does the robot know where it is?
+>
+> **You:** Could you walk to the office desk tray from here? Don't move.
+>
+> **You:** Shape the collision monitor's slow polygon as a box from 0.3 to 1.2 metres ahead.
+>
+> **You:** Can the right hand reach the red mug from here?
+>
+> **You:** Walk through the hallway to the office desk tray without stopping on the way.
+>
+> **You:** Raise your right hand 5 centimetres.
+
+| Ask about | Tool | What changes, and what asks you first |
+|---|---|---|
+| Navigation's state, a path's length and the zones it crosses, the cost at a spot | `nav_status`, `nav_check` | Nothing. A path check waits while Nav2 walks, since it would cut into Nav2's own planning |
+| The collision monitor: on or off, each polygon, a polygon's shape | `collision_monitor` | Turning on and growing are free; turning off and shrinking ask |
+| Costmaps, localization, the navigation servers, maps | `nav_admin` | Each asks, and none runs during a mission |
+| The arms: where each is, its named poses, the planners | `arm_status` | Nothing |
+| Whether a hand reaches something, whether a pose is clear, the path an arm would take | `arm_check` | Nothing; the path is drawn in the 3D view |
+| The obstacles the arms plan around, attaching an object to a hand, the octomap | `scene` | Adding is free; the rest asks |
+| How fast the arm moves NervROS runs go, the planner, poses remembered by name | `arm_settings` | Slower is free; faster and another planner ask |
+
+Plans may hold motions NervROS runs itself beside the executor's skills: a route through places
+without stopping at each (`WalkRoute`), a wait, a short straight hand move (`HandLine`), and, on a
+robot whose executor lacks them, walks, turns, arm poses and grips. The plan card marks such a
+step **NervROS runs it through Nav2** (or MoveIt), its preview shows where a walk or a route goes,
+and the 3D view draws the way while it runs. Stop and Pause work as for any step: a stopped step
+ends as stopped, a paused walk stands and goes on with what was left when you resume, and an arm
+move finishes first. If NervROS goes quiet with one of its motions running, a watchdog on the
+robot cancels it within two seconds. Where the robot's executor holds the arms, it lends them for
+the step and takes them back after it.
+
+The Robot tab shows a card for each stack: whether it is up, how well the robot is localized,
+what Nav2 is doing and the speed limit in force, and where each arm is.
+
+<details>
+<summary>What to watch for</summary>
+
+- On the G1, a speed below about 0.15 m/s does not move the legs at all. A slow zone at 30% and
+  the collision monitor's slow polygon together come below it, and the robot stands still until
+  one of them lets go.
+- A route's places are its waypoints: one inside furniture fails the whole route, so name places
+  or rooms with room to stand.
+- Grip never opens a hand that holds something: put the object down with a place.
 
 </details>
 
@@ -986,5 +1051,5 @@ $ nervros-cli --profile scenarios/bench/nervros.toml eval scenarios/bench/suite.
 | Esc | Stops the reply |
 | Ctrl+Shift+S | Stops the mission |
 | Ctrl+K | Opens the command palette |
-| Ctrl+1 to Ctrl+8 | Opens the dock's tabs |
+| Ctrl+1 to Ctrl+0 | Opens the dock's tabs, in the bar's order |
 | W S, A D, Q E | Drives by hand: walk, turn, step sideways (Robot tab, Drive on) |

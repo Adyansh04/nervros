@@ -39,6 +39,9 @@ pub struct Status {
     pub motors: Option<Value>,
     /// Whether the robot is armed: driving by hand is motion, which Observe only keeps off.
     pub armed: bool,
+    /// What NervROS last saw of each of the robot's stacks (Nav2, MoveIt): a headline such as
+    /// "Nav2: up", then details.
+    pub stacks: Vec<Vec<String>>,
 }
 
 /// The room whose outline holds `(x, y)`.
@@ -223,6 +226,7 @@ fn keys_held(ctx: &egui::Context) -> [f64; 3] {
 /// The tab.
 pub fn tab(ui: &mut egui::Ui, status: &Status, drive: Option<&mut Drive>) {
     state_section(ui, status);
+    stacks_section(ui, &status.stacks);
     ui.add_space(18.0);
     if let Some(drive) = drive {
         drive_section(ui, status, drive);
@@ -313,19 +317,56 @@ fn state_section(ui: &mut egui::Ui, status: &Status) {
             facts.push(("Battery", text));
         }
     }
-    egui::Grid::new("robot_facts")
-        .num_columns(2)
-        .spacing([14.0, 6.0])
-        .show(ui, |ui| {
-            for (key, value) in facts {
-                // The keys stay whole; the values wrap in what is left.
-                ui.add(
-                    egui::Label::new(RichText::new(key).size(13.0).color(theme::FAINT)).extend(),
-                );
-                ui.label(RichText::new(value).size(13.5));
-                ui.end_row();
+    // Rows, not a grid: a grid lays its rows over each other on the frame it first shows.
+    for (key, value) in facts {
+        ui.horizontal_top(|ui| {
+            // The keys a column of their own; the values wrap in what is left.
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(84.0, 18.0), egui::Sense::hover());
+            ui.painter().text(
+                rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                key,
+                egui::FontId::proportional(13.0),
+                theme::FAINT,
+            );
+            ui.add(egui::Label::new(RichText::new(value).size(13.5)).wrap());
+        });
+        ui.add_space(2.0);
+    }
+}
+
+/// A card per stack: its name and state on the strip, the details below.
+fn stacks_section(ui: &mut egui::Ui, stacks: &[Vec<String>]) {
+    if stacks.is_empty() {
+        return;
+    }
+    ui.add_space(18.0);
+    theme::section(ui, "Navigation and arms");
+    for parts in stacks {
+        let Some((head, details)) = parts.split_first() else {
+            continue;
+        };
+        let (name, state) = head.split_once(": ").unwrap_or((head.as_str(), ""));
+        let colour = if state.starts_with("not heard") || state.contains("not active") {
+            theme::WARN
+        } else {
+            theme::SUCCESS
+        };
+        theme::status_card(ui, colour, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(name).strong().color(colour));
+                ui.label(RichText::new(state.replace('`', "")).size(13.5));
+            });
+            for detail in details {
+                let text = RichText::new(detail.replace('`', ""))
+                    .size(13.0)
+                    .color(theme::DIM);
+                ui.add(egui::Label::new(text).wrap());
             }
         });
+        ui.add_space(6.0);
+    }
 }
 
 fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
@@ -452,6 +493,20 @@ mod tests {
             motors: Some(json!({"status": [{"name": "left_knee",
                 "values": [{"key": "winding_temperature_C", "value": "48"}]}]})),
             armed: true,
+            stacks: vec![
+                vec![
+                    "Nav2: up".to_owned(),
+                    "localized to ±0.05 m".to_owned(),
+                    "moving the base (navigate_through_poses): 3.2 m to go, about 14 s".to_owned(),
+                    "speed limit 40%".to_owned(),
+                ],
+                vec![
+                    "MoveIt: up".to_owned(),
+                    "right_arm at `tucked`".to_owned(),
+                    "left_arm between named poses".to_owned(),
+                    "1 obstacle in its planning scene".to_owned(),
+                ],
+            ],
         }
     }
 
@@ -497,6 +552,7 @@ mod tests {
             "mission_step": "", "teleop": false}));
         fallen.battery = None;
         fallen.motors = None;
+        fallen.stacks = vec![vec!["Nav2: not heard from".to_owned()]];
         render("robot_fallen", fallen, false);
     }
 }

@@ -263,17 +263,24 @@ impl Tool for RobotState {
     }
 }
 
-/// `stop`: stops every motion through the robot's `StopAll`; always allowed.
+/// `stop`: cancels the goals NervROS sent itself and stops every motion through the robot's
+/// `StopAll`; always allowed.
 pub struct Stop {
     spec: ToolSpec,
     robot: Arc<dyn RobotPort>,
     mission: Option<MissionConfig>,
+    integrations: Arc<crate::integrations::Integrations>,
 }
 
 impl Stop {
-    /// From the profile.
+    /// Through `robot` to the executor `mission` names, if any, over the integrations whose goals
+    /// it cancels too.
     #[must_use]
-    pub fn new(profile: &Profile, robot: Arc<dyn RobotPort>) -> Self {
+    pub fn new(
+        robot: Arc<dyn RobotPort>,
+        mission: Option<MissionConfig>,
+        integrations: Arc<crate::integrations::Integrations>,
+    ) -> Self {
         let spec = ToolSpec::new(
             "stop",
             "Stops the robot now: halts the running mission and cancels its goals. Hands keep their grip.",
@@ -287,7 +294,8 @@ impl Stop {
         Self {
             spec,
             robot,
-            mission: profile.mission.clone(),
+            mission,
+            integrations,
         }
     }
 }
@@ -300,12 +308,15 @@ impl Tool for Stop {
 
     async fn call(&self, args: Value) -> ToolOutcome {
         let Some(m) = &self.mission else {
+            self.integrations.stop().await;
             return ToolOutcome::ok(
-                json!({"stopped": true, "note": "this robot has no mission executor; nothing was running"}),
+                json!({"stopped": true, "note": "this robot has no mission executor; NervROS cancelled its own goals"}),
             );
         };
         let reason = args["reason"].as_str().unwrap_or("stop tool").to_owned();
-        match self
+        // The mission hears of the stop before its goals are cancelled under it, so a step
+        // NervROS runs itself ends as stopped, not as failed.
+        let stopped = self
             .robot
             .call(
                 &m.stop,
@@ -313,8 +324,9 @@ impl Tool for Stop {
                 json!({"reason": reason}),
                 Duration::from_secs(5),
             )
-            .await
-        {
+            .await;
+        self.integrations.stop().await;
+        match stopped {
             Ok(r) if r["ok"].as_bool() == Some(true) => {
                 ToolOutcome::ok(json!({"stopped": true, "state": r["state_after"]}))
             }
@@ -438,7 +450,7 @@ mod tests {
             Ok(json!({"ok": true, "state_after": "holding posture"}))
         }));
         let port: Arc<dyn RobotPort> = Arc::clone(&robot) as Arc<dyn RobotPort>;
-        let out = Stop::new(&profile(), port)
+        let out = Stop::new(port, profile().mission, Arc::default())
             .call(json!({"reason": "user"}))
             .await;
         assert_eq!(out.data["stopped"], true);

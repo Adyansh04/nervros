@@ -1,5 +1,6 @@
 //! Occupancy grids drawn as images on the floor: the map, and what the camera has covered.
 
+use nervros_ros::Transform;
 use rerun::RecordingStream;
 use serde_json::Value;
 
@@ -12,6 +13,19 @@ pub(super) struct Grid {
     pub(super) cell_m: f32,
     /// The lower-left corner in the map frame.
     pub(super) corner: [f32; 3],
+    /// Its turn on the map about that corner, `[x, y, z, w]`.
+    pub(super) rotation: [f32; 4],
+}
+
+impl Grid {
+    /// The grid placed on the map by `to_map`, from the frame it came in, as a local costmap in
+    /// odom.
+    pub(super) fn placed(mut self, to_map: &Transform) -> Self {
+        let [x, y, z] = self.corner;
+        self.corner = f32s(to_map.apply([f64::from(x), f64::from(y), f64::from(z)]));
+        self.rotation = f32s(to_map.rotation);
+        self
+    }
 }
 
 /// A `nav_msgs/msg/OccupancyGrid` as a [`Grid`], each cell's value mapped by `cell`.
@@ -40,6 +54,7 @@ pub(super) fn grid<const N: usize>(msg: &Value, cell: impl Fn(i64) -> [u8; N]) -
         size: [u32::try_from(width).ok()?, u32::try_from(height).ok()?],
         cell_m,
         corner: [x, y, 0.0],
+        rotation: [0.0, 0.0, 0.0, 1.0],
     })
 }
 
@@ -60,6 +75,7 @@ pub(super) fn put_grid(
     // draws them black and hides whatever lies under them.
     let layer = rerun::GridMap::new(grid.bytes, format, grid.cell_m)
         .with_translation([x, y, lift])
+        .with_quaternion(rerun::Quaternion::from_xyzw(grid.rotation))
         .with_opacity(0.999);
     // Static: only the newest grid is kept, where a new one a second would pile up.
     put_static(rec, path, &layer);
