@@ -7,6 +7,7 @@
 pub mod moveit;
 pub mod nav2;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -460,8 +461,28 @@ pub(crate) async fn get_params(
     node: &str,
     names: &[String],
 ) -> Result<Vec<(Value, u64)>, String> {
+    // rclcpp refuses a whole read when one name is not declared, and logs a warning each time:
+    // the declared names are asked for, the rest come back unset.
+    if let Ok(declared) = declared(robot, node).await {
+        let asked: Vec<String> = names
+            .iter()
+            .filter(|n| declared.contains(*n))
+            .cloned()
+            .collect();
+        let values = if asked.is_empty() {
+            Vec::new()
+        } else {
+            get_values(robot, node, &asked).await?
+        };
+        let found: HashMap<&String, (Value, u64)> =
+            asked.iter().zip(values.iter().map(typed)).collect();
+        return Ok(names
+            .iter()
+            .map(|n| found.get(n).cloned().unwrap_or((Value::Null, 0)))
+            .collect());
+    }
+    // A node that cannot list them is asked for them all, then one by one.
     let values = get_values(robot, node, names).await?;
-    // rclcpp answers no values at all when one name is not declared: then each is asked alone.
     if values.len() == names.len() {
         return Ok(values.iter().map(typed).collect());
     }
@@ -471,6 +492,25 @@ pub(crate) async fn get_params(
         out.push(one.first().map_or((Value::Null, 0), typed));
     }
     Ok(out)
+}
+
+/// Every parameter `node` declares.
+async fn declared(robot: &dyn RobotPort, node: &str) -> Result<HashSet<String>, String> {
+    let out = robot
+        .call(
+            &format!("{node}/list_parameters"),
+            "rcl_interfaces/srv/ListParameters",
+            json!({"prefixes": [], "depth": 0}),
+            READ_WAIT,
+        )
+        .await
+        .map_err(|e| format!("{node} did not list its parameters: {e}"))?;
+    Ok(out["result"]["names"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n.as_str().map(str::to_owned))
+        .collect())
 }
 
 async fn get_values(
