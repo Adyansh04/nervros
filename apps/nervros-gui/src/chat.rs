@@ -23,15 +23,17 @@ mod plan;
 mod report;
 #[cfg(test)]
 pub(crate) mod tests;
+mod tree;
 mod view;
 
 pub(crate) use job::readable;
-pub(crate) use plan::{plan_card, tree_panel};
+pub(crate) use plan::plan_card;
 pub(crate) use view::{decode, spinner, thousands};
 
 use approval::approval_card;
 use approval::unanswered_card;
 use report::report;
+pub use tree::tree_tab;
 use view::agent_header;
 use view::empty_state;
 use view::error_card;
@@ -188,10 +190,22 @@ pub struct PlanCard {
     replaced: bool,
     /// Why it never ran: its approval was denied or ran out, or its call was refused.
     not_run: Option<String>,
-    /// Each tree node seen so far, by path, with its latest status, in the order they started.
-    nodes: Vec<(String, String)>,
+    /// Each tree node seen so far, in the order they started: the steps and what ran in them.
+    nodes: Vec<Node>,
     /// Paused, or waiting to pause once a pick or place ends.
     paused: bool,
+}
+
+/// A node of a running mission's tree, as its events report it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Node {
+    /// Its path in the tree, the step's name first: `s2_GoToPlace/walk_there`.
+    pub path: String,
+    /// Its latest status: `running`, `success`, `failure`, or `idle` once halted.
+    pub status: String,
+    /// Seconds into the mission it started, and ended once it has.
+    pub started_s: f64,
+    pub ended_s: Option<f64>,
 }
 
 /// What a session's model calls cost, summed.
@@ -650,13 +664,26 @@ impl Chat {
                 node,
                 path,
                 status,
-                ..
+                elapsed_s,
             } => {
                 if let Some(p) = self.plan_mut(|p| p.mission.as_ref() == Some(id)) {
                     if !path.is_empty() {
-                        match p.nodes.iter_mut().find(|(n, _)| n == path) {
-                            Some((_, s)) => s.clone_from(status),
-                            None => p.nodes.push((path.clone(), status.clone())),
+                        let done = (status != "running").then_some(*elapsed_s);
+                        match p.nodes.iter_mut().find(|n| n.path == *path) {
+                            Some(n) => {
+                                // A retried node starts again.
+                                if status == "running" && n.ended_s.is_some() {
+                                    n.started_s = *elapsed_s;
+                                }
+                                n.status.clone_from(status);
+                                n.ended_s = done;
+                            }
+                            None => p.nodes.push(Node {
+                                path: path.clone(),
+                                status: status.clone(),
+                                started_s: *elapsed_s,
+                                ended_s: done,
+                            }),
                         }
                     }
                     let entry = p.progress.entry(step.clone()).or_default();

@@ -103,39 +103,6 @@ fn node_look(status: &str) -> (Color32, &'static str) {
     }
 }
 
-/// The mission's behaviour tree as it has run so far, as the executor reports its nodes: each
-/// under the subtrees it is in, marked with its latest status.
-pub fn tree_panel(ui: &mut egui::Ui, p: &PlanCard) {
-    if p.nodes.is_empty() {
-        return;
-    }
-    ui.add_space(12.0);
-    egui::CollapsingHeader::new(RichText::new("Behaviour tree").strong())
-        .id_salt(("tree", &p.hash))
-        .default_open(true)
-        .show(ui, |ui| {
-            for (path, status) in &p.nodes {
-                // A node still running when the mission ended was stopped with it.
-                let status = if p.finished.is_some() && status == "running" {
-                    "stopped"
-                } else {
-                    status.as_str()
-                };
-                let depth = u16::try_from(path.matches('/').count()).unwrap_or(u16::MAX);
-                let name = path.rsplit('/').next().unwrap_or(path);
-                // BehaviorTree.CPP names an unnamed node by its type and uid, as "Sequence::3".
-                let name = name.split_once("::").map_or(name, |(n, _)| n);
-                let (colour, mark) = node_look(status);
-                ui.horizontal(|ui| {
-                    ui.add_space(14.0 * f32::from(depth));
-                    ui.label(RichText::new(mark).color(colour));
-                    ui.label(RichText::new(name).monospace())
-                        .on_hover_text(format!("{path}: {status}"));
-                });
-            }
-        });
-}
-
 /// How a step has gone before, small and quiet, with the details in its hover.
 fn track_label(ui: &mut egui::Ui, s: &PlannedStep) {
     let Some(track) = &s.track else {

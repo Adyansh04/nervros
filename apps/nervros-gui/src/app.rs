@@ -115,25 +115,31 @@ type SharedLive = Arc<Mutex<Live>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
     Mission,
-    World,
-    Layers,
+    Tree,
     Approvals,
+    World,
+    Robot,
+    Layers,
+    Library,
     Events,
     Agent,
     Doctor,
-    Robot,
 }
 
 impl Tab {
-    const ALL: [(Self, &'static str); 8] = [
+    /// In the order the tab bar shows them: what runs now first, the robot's world next, the
+    /// records and the agent's own state last.
+    const ALL: [(Self, &'static str); 10] = [
         (Self::Mission, "Mission"),
-        (Self::World, "World"),
-        (Self::Layers, "Layers"),
+        (Self::Tree, "Tree"),
         (Self::Approvals, "Approvals"),
+        (Self::World, "World"),
+        (Self::Robot, "Robot"),
+        (Self::Layers, "Layers"),
+        (Self::Library, "Library"),
         (Self::Events, "Events"),
         (Self::Agent, "Agent"),
         (Self::Doctor, "Doctor"),
-        (Self::Robot, "Robot"),
     ];
 }
 

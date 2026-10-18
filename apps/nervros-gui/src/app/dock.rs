@@ -18,6 +18,8 @@ impl Gui {
             .show(ui, |ui| {
                 match self.tab {
                     Tab::Mission => self.mission_tab(ui),
+                    Tab::Tree => self.tree_tab(ui),
+                    Tab::Library => self.library_tab(ui),
                     Tab::World => self.world_tab(ui),
                     Tab::Layers => self.layers_tab(ui),
                     Tab::Approvals => self.approvals_tab(ui),
@@ -30,8 +32,8 @@ impl Gui {
             });
     }
 
-    /// The tabs as two rows of four equal segments: eight names never fit one row of a dock,
-    /// and a row that wraps wherever the width runs out reads as a mistake.
+    /// The tabs as two rows of five equal segments: ten names never fit one row of a dock, and a
+    /// row that wraps wherever the width runs out reads as a mistake.
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let pending = self.chat.pending().count();
         Frame::new()
@@ -42,8 +44,8 @@ impl Gui {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
                 ui.spacing_mut().button_padding = egui::vec2(4.0, 4.0);
-                let width = ((ui.available_width() - 9.0) / 4.0).floor();
-                for row in Tab::ALL.chunks(4) {
+                let width = ((ui.available_width() - 12.0) / 5.0).floor();
+                for row in Tab::ALL.chunks(5) {
                     ui.horizontal(|ui| {
                         for &(tab, name) in row {
                             let selected = self.tab == tab;
@@ -54,7 +56,7 @@ impl Gui {
                                 (false, true) => theme::TEXT,
                                 (false, false) => theme::DIM,
                             };
-                            let label = RichText::new(name).size(13.0).color(colour);
+                            let label = RichText::new(name).size(12.5).color(colour);
                             let button = egui::Button::new(label)
                                 .fill(if selected {
                                     theme::RAISED
@@ -84,14 +86,38 @@ impl Gui {
         match self.chat.latest_plan() {
             Some(p) => {
                 crate::chat::plan_card(ui, p, self.chat.can_pause, &mut actions);
-                crate::chat::tree_panel(ui, p);
+                ui.add_space(8.0);
+                if ui
+                    .add(ReButton::new("Open its behaviour tree").small().secondary())
+                    .clicked()
+                {
+                    self.tab = Tab::Tree;
+                }
             }
             None => empty(
                 ui,
-                "No plan yet. Ask the robot to do something; its plan appears here.",
+                "No plan yet. Ask the robot to do something; its plan appears here, and its \
+                 behaviour tree in the Tree tab.",
             ),
         }
         self.schedules_list(ui);
+        self.act(ui.ctx(), actions);
+    }
+
+    fn tree_tab(&mut self, ui: &mut egui::Ui) {
+        let mut actions = Vec::new();
+        crate::chat::tree_tab(
+            ui,
+            self.chat.latest_plan(),
+            self.chat.can_pause,
+            &mut actions,
+        );
+        self.act(ui.ctx(), actions);
+    }
+
+    /// What the robot keeps from before: programs, taught skills, its missions and saved plans.
+    fn library_tab(&mut self, ui: &mut egui::Ui) {
+        let mut actions = Vec::new();
         if let Some(store) = &self.agent.programs {
             crate::programs::show(ui, store, &self.agent.jobs, &mut actions);
         }

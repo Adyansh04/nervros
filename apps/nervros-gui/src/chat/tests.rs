@@ -15,7 +15,6 @@ use rerun::external::egui;
 use rerun::external::egui::{Frame, Margin};
 
 use super::approval::time_left;
-use super::plan::tree_panel;
 use super::report::report_text;
 use super::*;
 use crate::plan_edit;
@@ -270,35 +269,38 @@ fn snapshot_plan_edit() {
 }
 
 #[test]
-fn snapshot_tree_panel() {
+fn snapshot_tree_tab() {
     let mut chat = doubtful_plan();
     chat.apply(&Event::MissionStarted {
         id: "m2".to_owned(),
         hash: "5be0c1d9f2a4".to_owned(),
     });
-    for (step, node, path, status) in [
-        ("s1", "", "s1_TurnInPlace::2", "running"),
-        ("s1", "Turn", "s1_TurnInPlace::2/Turn", "running"),
-        ("s1", "Turn", "s1_TurnInPlace::2/Turn", "success"),
-        ("s1", "", "s1_TurnInPlace::2", "success"),
-        ("s2", "", "s2_WalkStraight::5", "running"),
+    for (step, node, path, status, at) in [
+        ("s1", "", "s1_TurnInPlace::2", "running", 0.0),
+        ("s1", "Turn", "s1_TurnInPlace::2/Turn", "running", 0.1),
+        ("s1", "Turn", "s1_TurnInPlace::2/Turn", "success", 4.2),
+        ("s1", "", "s1_TurnInPlace::2", "success", 4.3),
+        ("s2", "", "s2_WalkStraight::5", "running", 4.4),
         (
             "s2",
             "Sequence",
             "s2_WalkStraight::5/Sequence::6",
             "running",
+            4.4,
         ),
         (
             "s2",
             "CheckClear",
             "s2_WalkStraight::5/Sequence::6/CheckClear",
             "success",
+            4.9,
         ),
         (
             "s2",
             "Walk",
             "s2_WalkStraight::5/Sequence::6/Walk",
             "running",
+            5.0,
         ),
     ] {
         chat.apply(&Event::MissionProgress {
@@ -307,7 +309,7 @@ fn snapshot_tree_panel() {
             node: node.to_owned(),
             path: path.to_owned(),
             status: status.to_owned(),
-            elapsed_s: 3.0,
+            elapsed_s: at,
         });
     }
     let plan = chat.latest_plan().cloned().unwrap();
@@ -318,12 +320,14 @@ fn snapshot_tree_panel() {
             Frame::new()
                 .fill(theme::BG)
                 .inner_margin(Margin::same(16))
-                .show(ui, |ui| tree_panel(ui, &plan));
+                .show(ui, |ui| {
+                    super::tree_tab(ui, Some(&plan), true, &mut Vec::new());
+                });
         });
     style_for_tests(&harness.ctx);
-    harness.run();
+    harness.run_steps(3);
     harness.fit_contents();
-    compare(&mut harness, "tree_panel", &SnapshotOptions::new());
+    compare(&mut harness, "tree_tab", &SnapshotOptions::new());
 }
 
 #[test]

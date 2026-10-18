@@ -580,7 +580,7 @@ impl Missions {
             .map(|s| s.why.trim())
             .find(|w| !w.is_empty())
             .map(str::to_owned)
-            .or_else(|| (!asked.is_empty()).then(|| crate::tools::clip(&asked, 60)))
+            .or_else(|| (!asked.is_empty()).then(|| name_from(&asked)))
             .unwrap_or_else(|| "the plan".to_owned())
     }
 
@@ -694,4 +694,38 @@ fn room_name(room: &Value) -> &str {
 
 fn object_name(object: &Value) -> &str {
     object["label"].as_str().unwrap_or_default()
+}
+
+/// The operator's words as a plan's name: whole words up to 60 characters, "…" when cut.
+fn name_from(asked: &str) -> String {
+    const NAME_CHARS: usize = 60;
+    if asked.chars().count() <= NAME_CHARS {
+        return asked.to_owned();
+    }
+    let mut name = String::new();
+    for word in asked.split_whitespace() {
+        if name.chars().count() + word.chars().count() + 1 > NAME_CHARS {
+            break;
+        }
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push_str(word);
+    }
+    format!("{}…", name.trim_end_matches([',', ';', ':']))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_long_request_names_a_plan_by_whole_words() {
+        let asked = "Walk through the hallway to the office desk tray, then pick up the mug and bring it back";
+        assert_eq!(
+            name_from(asked),
+            "Walk through the hallway to the office desk tray, then pick…"
+        );
+        assert_eq!(name_from("Wave"), "Wave");
+    }
 }
