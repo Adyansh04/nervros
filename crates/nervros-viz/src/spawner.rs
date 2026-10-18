@@ -16,7 +16,7 @@ use crate::grid::{draw_coverage, draw_map, known_extent};
 use crate::objects::{Drawn, draw_object_names, draw_objects};
 use crate::plan::{draw_plan, draw_trail};
 use crate::rooms::draw_rooms;
-use crate::tasks::{Drawer, camera, draw_detections, robot_model, sample, scan};
+use crate::tasks::{Drawer, arm_scene, camera, draw_detections, robot_model, sample, scan};
 use crate::zones::zones;
 use crate::{
     CAMERA_PATH, CAMERA_PERIOD, Layers, MODEL_PATH, OBJECT_PALETTE, OBJECTS_PERIOD, POSE_PERIOD,
@@ -192,9 +192,25 @@ impl Spawner {
 
     /// The keep-out zones, redrawn as the operator adds or removes them.
     pub(super) fn zones(&mut self, all: &Arc<Zones>) {
-        let layer = self.layer("Keep-out zones", "world/zones", true);
+        let layer = self.layer("Zones", "world/zones", true);
         self.tasks
             .spawn(zones(self.rec.clone(), Arc::clone(all), layer));
+    }
+
+    /// What MoveIt plans the arms around, on a robot with MoveIt.
+    pub(super) fn arm_scene(&mut self, profile: &Profile) {
+        if let Some(moveit) = &profile.moveit {
+            let layer = self.layer("Arm obstacles", "world/arm_scene", true);
+            self.tasks.spawn(arm_scene(
+                self.rec.clone(),
+                Arc::clone(&self.robot),
+                (
+                    moveit.name("get_planning_scene"),
+                    profile.ros.map_frame.clone(),
+                ),
+                layer,
+            ));
+        }
     }
 
     pub(super) fn profile_layers(&mut self, profile: &Profile) {
@@ -250,7 +266,7 @@ fn profile_layer(
     #[expect(clippy::cast_precision_loss, reason = "a handful of layers")]
     let lift = 0.02 + 0.005 * index as f32;
     if config.msg_type == "geometry_msgs/msg/PolygonStamped" {
-        let (robot, map, name) = (Arc::clone(robot), map.to_owned(), config.name.clone());
+        let (robot, map) = (Arc::clone(robot), map.to_owned());
         return Box::new(move |rec, path, msg| {
             let frame = msg["header"]["frame_id"].as_str().unwrap_or_default();
             let to_map = if frame.is_empty() || frame == map {
@@ -259,9 +275,24 @@ fn profile_layer(
                 robot.transform(&map, frame)
             };
             if let Ok(t) = to_map {
-                layers::draw_polygon(rec, path, msg, &t, (colour, &name, lift));
+                layers::draw_polygon(rec, path, msg, &t, (colour, lift));
             }
         });
     }
-    Box::new(move |rec, path, msg| layers::draw_occupied(rec, path, msg, colour, lift))
+    let (robot, map) = (Arc::clone(robot), map.to_owned());
+    let costmap = config.style.as_deref() == Some("costmap");
+    Box::new(move |rec, path, msg| {
+        // A grid in another frame, as a local costmap in odom, is placed on the map by TF.
+        let frame = msg["header"]["frame_id"].as_str().unwrap_or_default();
+        let to_map = if frame.is_empty() || frame == map {
+            Ok(Transform::IDENTITY)
+        } else {
+            robot.transform(&map, frame)
+        };
+        match to_map {
+            Ok(t) if costmap => layers::draw_costmap(rec, path, msg, &t, lift),
+            Ok(t) => layers::draw_occupied(rec, path, msg, &t, (colour, lift)),
+            Err(_) => {}
+        }
+    })
 }

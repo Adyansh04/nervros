@@ -6,7 +6,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use nervros_ros::Transform;
 use rerun::RecordingStream;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::grid::{grid, put_grid};
 use crate::{f32s, num, put, put_static, xyz};
@@ -70,8 +70,8 @@ pub(crate) fn draw_occupied(
     rec: &RecordingStream,
     path: &str,
     msg: &Value,
-    colour: [u8; 3],
-    lift: f32,
+    to_map: &Transform,
+    (colour, lift): ([u8; 3], f32),
 ) {
     let [r, g, b] = colour;
     let cell = |v: i64| {
@@ -82,19 +82,60 @@ pub(crate) fn draw_occupied(
         }
     };
     if let Some(grid) = grid(msg, cell) {
-        put_grid(rec, path, grid, rerun::ColorModel::RGBA, lift);
+        put_grid(
+            rec,
+            path,
+            grid.placed(to_map),
+            rerun::ColorModel::RGBA,
+            lift,
+        );
+    }
+}
+
+/// A Nav2 costmap as a gradient over the map: inflation from a faint blue to indigo as the cost
+/// rises, the robot's inscribed radius in violet and the obstacles in coral, free and unknown cells
+/// clear.
+pub(crate) fn draw_costmap(
+    rec: &RecordingStream,
+    path: &str,
+    msg: &Value,
+    to_map: &Transform,
+    lift: f32,
+) {
+    let shade =
+        |from: i64, to: i64, v: i64| u8::try_from(from + (to - from) * v / 98).unwrap_or(u8::MAX);
+    // Faint where the cost is low, so the map stays readable under a costmap.
+    let cell = |v: i64| match v {
+        100 => [235, 85, 95, 190],
+        99 => [150, 95, 235, 120],
+        1..=98 => [
+            shade(60, 130, v),
+            shade(140, 90, v),
+            shade(250, 235, v),
+            shade(10, 90, v),
+        ],
+        _ => [0, 0, 0, 0],
+    };
+    if let Some(grid) = grid(msg, cell) {
+        put_grid(
+            rec,
+            path,
+            grid.placed(to_map),
+            rerun::ColorModel::RGBA,
+            lift,
+        );
     }
 }
 
 /// A `geometry_msgs/msg/PolygonStamped` as a closed outline on the map, placed by its frame's
-/// transform, `lift` above the floor and named at its first corner; an empty one is cleared, as a
-/// collision monitor's polygon with no shape yet.
+/// transform, `lift` above the floor; an empty one is cleared, as a collision monitor's polygon
+/// with no shape yet. The Layers tab names it by its colour, so the map stays free of labels.
 pub(crate) fn draw_polygon(
     rec: &RecordingStream,
     path: &str,
     msg: &Value,
     to_map: &Transform,
-    (colour, name, lift): ([u8; 3], &str, f32),
+    (colour, lift): ([u8; 3], f32),
 ) {
     let mut corners: Vec<[f32; 3]> = msg["polygon"]["points"]
         .as_array()
@@ -118,16 +159,68 @@ pub(crate) fn draw_polygon(
         path,
         &rerun::LineStrips3D::new([corners])
             .with_colors([c])
-            .with_radii([0.015]),
-    );
-    put(
-        rec,
-        &format!("{path}/name"),
-        &rerun::Points3D::new([first])
-            .with_labels([name])
-            .with_colors([c])
             .with_radii([0.02]),
     );
+}
+
+/// MoveIt's world objects, as a `moveit_msgs/msg/PlanningScene` lists them: each box, sphere and
+/// cylinder translucent on the map, placed by `to_map` from its frame; hovering one names it, as
+/// a label would sit on the robot. Meshes are left out; objects gone since the last call are
+/// cleared.
+pub(crate) fn draw_scene(
+    rec: &RecordingStream,
+    path: &str,
+    objects: &[Value],
+    to_map: impl Fn(&str) -> Option<Transform>,
+    drawn: &mut BTreeSet<String>,
+) {
+    let colour = json!({"r": 0.6, "g": 0.48, "b": 1.0, "a": 0.4});
+    let mut now = BTreeSet::new();
+    for o in objects {
+        let (Some(id), Some(t)) = (
+            o["id"].as_str(),
+            o["header"]["frame_id"].as_str().and_then(&to_map),
+        ) else {
+            continue;
+        };
+        let at = t.compose(&pose(&o["pose"]));
+        let entity = format!("{path}/{}", slug(id));
+        let poses = o["primitive_poses"]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice);
+        let mut solid = false;
+        for (i, (p, place)) in o["primitives"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .zip(poses)
+            .enumerate()
+        {
+            let d = |k: usize| num(&p["dimensions"][k]);
+            // A solid primitive's type numbers are a marker's for the same shape.
+            let size = match p["type"].as_u64() {
+                Some(kind::CUBE) => [d(0), d(1), d(2)],
+                Some(kind::SPHERE) => [2.0 * d(0); 3],
+                Some(kind::CYLINDER) => [2.0 * d(1), 2.0 * d(1), d(0)],
+                _ => continue,
+            };
+            let placed = at.compose(&pose(place));
+            solid = true;
+            let marker = json!({
+                "type": p["type"],
+                "scale": {"x": size[0], "y": size[1], "z": size[2]},
+                "color": colour,
+            });
+            draw_marker(rec, &format!("{entity}/{i}"), &marker, &placed);
+        }
+        if solid {
+            now.insert(entity);
+        }
+    }
+    for gone in drawn.difference(&now) {
+        put_static(rec, gone, &rerun::Clear::recursive());
+    }
+    *drawn = now;
 }
 
 /// A `sensor_msgs/msg/LaserScan` as points in the map frame, by the scan frame's transform.
@@ -449,5 +542,28 @@ mod tests {
             1,
             "markers in a frame with no transform are not drawn"
         );
+    }
+
+    #[test]
+    fn scene_solids_are_drawn_and_cleared_once_gone() {
+        let rec = rerun::RecordingStreamBuilder::new("test")
+            .buffered()
+            .unwrap();
+        let identity = |_: &str| Some(Transform::IDENTITY);
+        let object = |id: &str, kind: u64| {
+            json!({"header": {"frame_id": "pelvis"}, "id": id,
+                "primitives": [{"type": kind, "dimensions": [0.3, 0.3, 0.3]}],
+                "primitive_poses": [{"position": {"x": 1.0, "y": 1.0, "z": 0.8}}]})
+        };
+        let mut drawn = BTreeSet::new();
+        let both = [object("Box 1", kind::CUBE), object("mesh", 7)];
+        draw_scene(&rec, "world/arm_scene", &both, identity, &mut drawn);
+        assert_eq!(
+            drawn.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["world/arm_scene/box_1"],
+            "a mesh, or any shape not a box, sphere or cylinder, is left out"
+        );
+        draw_scene(&rec, "world/arm_scene", &[], identity, &mut drawn);
+        assert!(drawn.is_empty());
     }
 }

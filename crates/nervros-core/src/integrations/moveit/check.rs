@@ -216,6 +216,15 @@ impl ArmCheck {
         let response = &planned["motion_plan_response"];
         let code = response["error_code"]["val"].as_i64().unwrap_or(0);
         if code != 1 {
+            // An earlier preview left standing would read as a path that still exists.
+            if let Some(session) = self.arms.session.get() {
+                session.emit(Event::Drawn {
+                    layer: "arm_preview".to_owned(),
+                    frame: planning.clone(),
+                    points: Vec::new(),
+                    label: String::new(),
+                });
+            }
             return ToolOutcome::ok(json!({
                 "planned": false,
                 "group": group,
@@ -239,7 +248,8 @@ impl ArmCheck {
                 &joints,
                 &names,
                 &points,
-                &format!("{group} to {to}"),
+                // The model reads the pose name in backticks; the map shows it plain.
+                &format!("{group} to {}", to.replace('`', "")),
             )
             .await;
         ToolOutcome::ok(json!({

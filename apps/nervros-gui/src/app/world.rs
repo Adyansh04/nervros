@@ -47,7 +47,13 @@ impl Gui {
     }
 
     pub(super) fn layers_tab(&self, ui: &mut egui::Ui) {
-        layers_view(ui, &self.bridge.layers);
+        let config = self
+            .agent
+            .profile
+            .viz
+            .as_ref()
+            .map_or(&[][..], |v| v.layers.as_slice());
+        layers_view(ui, &self.bridge.layers, config);
     }
 }
 
@@ -268,35 +274,109 @@ pub(super) fn zones_view(ui: &mut egui::Ui, zones: &[Zone]) -> Vec<Action> {
 }
 
 /// A switch per layer the viewer draws, as RViz's displays list has.
-pub(super) fn layers_view(ui: &mut egui::Ui, layers: &nervros_viz::Layers) {
+/// The headings of the Layers tab, in order.
+const GROUPS: [&str; 6] = [
+    "Robot",
+    "Navigation",
+    "Arms",
+    "World model",
+    "Sensors",
+    "Other",
+];
+
+/// The heading a layer goes under, and its colour when it has one of its own: the profile's word
+/// for one of its layers, else what its type or name says.
+fn group_of<'a>(
+    name: &str,
+    config: &'a [nervros_core::profile::LayerConfig],
+) -> (&'a str, Option<[u8; 3]>) {
+    if let Some(c) = config.iter().find(|c| c.name == name) {
+        let costmap = c.style.as_deref() == Some("costmap");
+        let by_type = match c.msg_type.as_str() {
+            _ if costmap => "Navigation",
+            "geometry_msgs/msg/PolygonStamped" | "nav_msgs/msg/Path" => "Navigation",
+            "sensor_msgs/msg/LaserScan" => "Sensors",
+            _ => "World model",
+        };
+        // A costmap is a gradient; its swatch is the inscribed radius's magenta.
+        let colour = c.color.or(costmap.then_some([210, 80, 210]));
+        return (c.group.as_deref().unwrap_or(by_type), colour);
+    }
+    let group = match name {
+        "Robot model" | "Trail" | "Plan" => "Robot",
+        "Zones" => "Navigation",
+        "Arm obstacles" => "Arms",
+        "Map" | "Rooms" | "Objects" | "Object names" | "Camera coverage" => "World model",
+        "Detections" => "Sensors",
+        _ => "Other",
+    };
+    let colour = match name {
+        "Zones" => Some([226, 76, 76]),
+        "Plan" => Some([255, 120, 200]),
+        "Arm obstacles" => Some([150, 120, 255]),
+        _ => None,
+    };
+    (group, colour)
+}
+
+/// The Layers tab: each layer under its heading with a switch, its colour beside its name.
+pub(super) fn layers_view(
+    ui: &mut egui::Ui,
+    layers: &nervros_viz::Layers,
+    config: &[nervros_core::profile::LayerConfig],
+) {
     let list = layers.list();
     if list.is_empty() {
         empty(ui, "The profile gives the viewer nothing to draw.");
         return;
     }
-    theme::section(ui, "Layers");
     ui.label(
         RichText::new("What the world and camera views draw. A hidden layer is cleared.")
             .color(theme::DIM),
     );
-    ui.add_space(8.0);
-    for (name, mut shown) in list {
-        ui.horizontal(|ui| {
-            let toggle = ui.toggle_switch(14.0, &mut shown);
-            // Named for a screen reader, and for a script that clicks it.
-            toggle.widget_info(|| {
-                egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, shown, &name)
+    for group in GROUPS {
+        let rows: Vec<&(String, bool)> = list
+            .iter()
+            .filter(|(name, _)| group_of(name, config).0 == group)
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        ui.add_space(14.0);
+        theme::section(ui, group);
+        for (name, shown) in rows {
+            let mut shown = *shown;
+            ui.horizontal(|ui| {
+                let toggle = ui.toggle_switch(14.0, &mut shown);
+                // Named for a screen reader, and for a script that clicks it.
+                toggle.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, shown, name)
+                });
+                if toggle.changed() {
+                    layers.set(name, shown);
+                }
+                if let (_, Some([r, g, b])) = group_of(name, config) {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    let colour = egui::Color32::from_rgb(r, g, b);
+                    ui.painter().rect_filled(
+                        rect,
+                        CornerRadius::same(3),
+                        if shown {
+                            colour
+                        } else {
+                            colour.gamma_multiply(0.35)
+                        },
+                    );
+                }
+                let text = RichText::new(name);
+                ui.label(if shown {
+                    text
+                } else {
+                    text.color(theme::FAINT)
+                });
             });
-            if toggle.changed() {
-                layers.set(&name, shown);
-            }
-            let text = RichText::new(&name);
-            ui.label(if shown {
-                text
-            } else {
-                text.color(theme::FAINT)
-            });
-        });
-        ui.add_space(2.0);
+            ui.add_space(2.0);
+        }
     }
 }

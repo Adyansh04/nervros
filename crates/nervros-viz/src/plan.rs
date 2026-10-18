@@ -50,7 +50,7 @@ pub(super) fn draw_preview(rec: &RecordingStream, steps: &[PreviewStep]) {
             rec,
             &format!("{PLAN_PATH}/paths"),
             &rerun::LineStrips3D::new(paths)
-                .with_radii([0.025])
+                .with_radii([0.04])
                 .with_colors([colour]),
         );
     }

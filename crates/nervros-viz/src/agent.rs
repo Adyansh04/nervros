@@ -66,8 +66,10 @@ pub(super) async fn agent(
                 continue;
             }
             Event::MissionStarted { .. } => {
-                // A new mission's steps start from empty lanes, on show.
+                // A new mission's steps start from empty lanes, on show; the stacks' drawings
+                // from before it, as an arm preview, would read as part of it.
                 put(&rec, "mission", &rerun::Clear::recursive());
+                put_static(&rec, "world/drawn", &rerun::Clear::recursive());
                 layout.show_mission();
                 continue;
             }
@@ -170,17 +172,18 @@ fn draw_line(
         &path,
         &rerun::LineStrips3D::new([on_map.clone()])
             .with_colors([colour])
-            .with_radii([0.012]),
+            .with_radii([0.02]),
     );
-    if let Some(end) = on_map.last() {
-        put_static(
-            rec,
-            &format!("{path}/end"),
-            &rerun::Points3D::new([*end])
-                .with_labels([label])
-                .with_colors([colour])
-                .with_radii([0.03]),
-        );
+    if let (Some(start), Some(end)) = (on_map.first(), on_map.last()) {
+        let mut dot = rerun::Points3D::new([*end])
+            .with_colors([colour])
+            .with_radii([0.03]);
+        // A short drawing, as an arm's path, lies on the robot, where a label would hide it.
+        let reach: f32 = start.iter().zip(end).map(|(a, b)| (a - b).powi(2)).sum();
+        if reach.sqrt() > 1.0 {
+            dot = dot.with_labels([label]);
+        }
+        put_static(rec, &format!("{path}/end"), &dot);
     }
 }
 

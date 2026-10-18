@@ -338,19 +338,22 @@ topic = "/canopy/markers"
 type = "visualization_msgs/msg/MarkerArray"
 namespaces = ["viewpoint", "visited"]     # a marker array's namespaces to draw; all when left out
 hidden = false                            # starts hidden
+group = "World model"                     # its heading in the Layers tab; one by its type otherwise
 ```
 
 | Type | Drawn as |
 |---|---|
-| `nav_msgs/msg/OccupancyGrid` | Its occupied cells, over the map in the layer's colour. |
+| `nav_msgs/msg/OccupancyGrid` | Its occupied cells, over the map in the layer's colour. With `style = "costmap"`, a Nav2 costmap's costs: inflation from faint blue to indigo, the inscribed radius in violet, obstacles in coral, free cells clear. A grid in another frame, as a local costmap in `odom`, is placed by TF. |
 | `visualization_msgs/msg/MarkerArray` | Each marker by its type: arrows, cubes, spheres, cylinders, lines, point lists, triangle lists and text. Mesh markers are left out. |
 | `sensor_msgs/msg/LaserScan` | Points in the map, by TF from the scan's frame. |
-| `geometry_msgs/msg/PolygonStamped` | A closed outline on the map, by TF from its frame, named at a corner: a collision monitor's polygon as it shows it (`visualize: true`). |
+| `geometry_msgs/msg/PolygonStamped` | A closed outline on the map, by TF from its frame: a collision monitor's polygon as it shows it (`visualize: true`). The Layers tab names it beside its colour. |
 
 `color = [r, g, b]` gives a layer its colour; the viewer picks one otherwise.
 
-The Layers tab also switches the viewer's own drawings: the map, coverage, rooms, objects, trail,
-plan, keep-out zones, the robot model and the detector's boxes. Object names start hidden, since a
+The Layers tab lists the layers under headings (Robot, Navigation, Arms, World model, Sensors), each
+with its colour, and also switches the viewer's own drawings: the map, coverage, rooms, objects,
+trail, plan, zones (keep-out and slow), MoveIt's obstacles, the robot model and the detector's
+boxes. Object names start hidden, since a
 furnished room buries the map in them; hovering a box names it either way.
 
 ### `[mission]`
@@ -405,7 +408,7 @@ arm = "arm"                                            # the argument valued lef
   doubts are added to the card; they never send the plan back.
 
 Missions are kept in a ledger beside the quota file. The card shows how each step went before, and
-`recall`, the Mission tab and `nervros-cli missions` read the ledger.
+`recall`, the Library tab and `nervros-cli missions` read the ledger.
 
 A run the robot or the executor ended, rather than the plan, is kept with its fault: the robot could
 not move, the deadman stopped it, the executor shut down or restarted, a skill's server was not up,
@@ -555,7 +558,8 @@ its shape from a topic stops nothing until a shape arrives.
 
 MoveIt, when the robot runs it. The section gives the agent `arm_status`, `arm_check`, `scene` and
 `arm_settings` (see [Builtin tools](#builtin-tools)), a line on where each arm is and what MoveIt's
-planning scene holds in every turn, and an arm preview drawn in the 3D view. Stop also tells MoveIt
+planning scene holds in every turn, and an arm preview drawn in the 3D view, beside the planning
+scene's boxes, spheres and cylinders (the Layers tab's "Arm obstacles"). Stop also tells MoveIt
 to stop any trajectory it runs; the hands keep their grip. NervROS reads the groups, end effectors
 and named poses from `move_group`'s `robot_description_semantic`. Its tools ask MoveIt's services,
 never its move action, so nothing they ask disturbs a motion the robot's executor runs; only a
@@ -705,8 +709,8 @@ The rest are the checks you would run yourself before blaming the model:
 | `schedule` | With `[mission]`: runs a plan again and again, such as a patrol every 30 minutes, a set number of times, or each time something happens: an object of a kind appears, in a room or anywhere, or a condition on a topic as `watch` takes it becomes true. The operator approves it once for all its runs; a run is skipped while the robot is disarmed or busy, and stopping the robot cancels every schedule. The Mission tab lists them. |
 | `recall` | With `[mission]`: what the robot did lately, from the mission ledger, what happened to an object, from `[world] history` and the robot's own missions with it, and the operator's notes. |
 | `plans` | With `[mission]`: saves a plan that worked by name ("evening check"), lists them, and runs one again. |
-| `skill_gap` | With `[mission]`: logs a request no skill can do, and why; planning that gives up logs one itself. The Mission tab and `nervros-cli gaps` list them. |
-| `program` | With `[mission]`: runs a short [Rhai](https://rhai.rs) program for what takes loops, counting or measuring, sandboxed (no files, network or `eval`, bounded in operations and size), on the robot's functions: the world model, topic reads and rates, TF, waits, and skills, each run as a mission. One that moves is approved once, with the skills its text names and its time limit, and runs as a job with Stop; one that only reads runs at once. Programs are kept by name per robot in the state directory, and the Mission tab lists them. |
+| `skill_gap` | With `[mission]`: logs a request no skill can do, and why; planning that gives up logs one itself. The Library tab and `nervros-cli gaps` list them. |
+| `program` | With `[mission]`: runs a short [Rhai](https://rhai.rs) program for what takes loops, counting or measuring, sandboxed (no files, network or `eval`, bounded in operations and size), on the robot's functions: the world model, topic reads and rates, TF, waits, and skills, each run as a mission. One that moves is approved once, with the skills its text names and its time limit, and runs as a job with Stop; one that only reads runs at once. Programs are kept by name per robot in the state directory, and the Library tab lists them. |
 | `search` | With `[mission]`: finds something, ranking where to look from the world model's sightings and history and where such things usually are, then walking to each place and looking until the detector sees it; approved once, with the places it will look in order. `plan` lists the places without moving. |
 | `teach_skill` | With `[mission]`'s `define_skill` and `forget_skill`: teaches the robot a skill from the executor's learnable leaves, as a draft kept once a mission with it succeeds; lists and forgets taught skills. |
 | `point` | With a `segment` model in the models file: points at what the operator names in the frame a camera's detector marks, found as `look` finds it, or the newest frame when there are no marks, including things no detector marks, and says which mark a point lands on. |

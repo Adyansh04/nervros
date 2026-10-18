@@ -1069,19 +1069,32 @@ mod tests {
             ("Map", true),
             ("Camera coverage", false),
             ("Rooms", true),
+            ("Plan", true),
+            ("Zones", true),
             ("Scan", true),
+            ("Collision: slow", true),
+            ("Global costmap", false),
         ] {
             layers.add(name, shown);
         }
+        let config: Vec<nervros_core::profile::LayerConfig> =
+            serde_json::from_value(serde_json::json!([
+                {"name": "Scan", "topic": "/scan", "type": "sensor_msgs/msg/LaserScan"},
+                {"name": "Collision: slow", "topic": "/collision_monitor_nervros_slow",
+                 "type": "geometry_msgs/msg/PolygonStamped", "color": [243, 166, 43]},
+                {"name": "Global costmap", "topic": "/global_costmap/costmap",
+                 "type": "nav_msgs/msg/OccupancyGrid", "style": "costmap"},
+            ]))
+            .unwrap();
         let mut harness = Harness::builder()
             .wgpu()
-            .with_size(egui::vec2(340.0, 300.0))
+            .with_size(egui::vec2(340.0, 520.0))
             .build_ui(move |ui| {
                 theme::apply(ui);
                 Frame::new()
                     .fill(theme::BG)
                     .inner_margin(Margin::same(14))
-                    .show(ui, |ui| layers_view(ui, &layers));
+                    .show(ui, |ui| layers_view(ui, &layers, &config));
             });
         crate::testkit::style_for_tests(&harness.ctx);
         harness.run();

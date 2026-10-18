@@ -661,6 +661,12 @@ pub struct LayerConfig {
     pub hidden: bool,
     /// Its colour, `[r, g, b]`; one of the viewer's own otherwise.
     pub color: Option<[u8; 3]>,
+    /// The heading the Layers tab lists it under, such as `Navigation`; one chosen by its type
+    /// otherwise.
+    pub group: Option<String>,
+    /// How an occupancy grid is drawn: `costmap` for Nav2's costs, a gradient from the inflation
+    /// out to the obstacles; its occupied cells in its colour otherwise.
+    pub style: Option<String>,
 }
 
 /// The message types a `[[viz.layer]]` can draw.

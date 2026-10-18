@@ -155,6 +155,7 @@ pub fn spawn(
     bridge.world(profile, &layout);
     bridge.zones(zones);
     bridge.profile_layers(profile);
+    bridge.arm_scene(profile);
     bridge.tasks.spawn(agent(
         rec.clone(),
         (Arc::clone(robot), profile.ros.map_frame.clone()),
