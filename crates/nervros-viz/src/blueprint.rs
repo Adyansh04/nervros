@@ -15,9 +15,10 @@ use rerun::blueprint::encodings::{self, TextLogColumnKind};
 use rerun::external::re_log_types::{BlueprintActivationCommand, RecordingId};
 use rerun::external::re_sdk_types::SerializedComponentBatch;
 use rerun::external::re_sdk_types::blueprint::archetypes::{
-    Background, ContainerBlueprint, EyeControls3D, LineGrid3D, TextLogColumns, ViewBlueprint,
-    ViewContents, ViewportBlueprint,
+    Background, ContainerBlueprint, EyeControls3D, LineGrid3D, TextLogColumns, TimeAxis,
+    ViewBlueprint, ViewContents, ViewportBlueprint,
 };
+use rerun::external::re_sdk_types::encodings::{TimeInt, TimeRange, TimeRangeBoundary};
 use rerun::{AsComponents, RecordingStream, RecordingStreamBuilder, RecordingStreamResult};
 
 use crate::{CAMERA_PATH, FOLLOW_PATH};
@@ -245,6 +246,8 @@ impl Layout {
 const MISSION_TAB: usize = 0;
 const AGENT_TAB: usize = 1;
 const PLOTS_TAB: usize = 3;
+/// How much of a plot stays in view, nanoseconds of `log_time`.
+const PLOT_WINDOW_NS: i64 = 120_000_000_000;
 
 /// The map has grown past the extent the view was framed on by more than a margin on some side,
 /// as while a building is mapped.
@@ -322,12 +325,19 @@ fn panes(
                 })
             }),
         );
+    // A plot shows its last two minutes up to now: the viewer's own window is centred on the time
+    // cursor, so half of it stayed empty and a walk's start scrolled away.
+    let last_two_minutes =
+        TimeAxis::new().with_view_range(rerun::blueprint::components::TimeRange(TimeRange {
+            start: TimeRangeBoundary::CursorRelative(TimeInt(-PLOT_WINDOW_NS)),
+            end: TimeRangeBoundary::CursorRelative(TimeInt(0)),
+        }));
     let strip = Pane::tabs(
         vec![
             Pane::view("StateTimeline", "Mission", "/mission"),
             Pane::view("TextLog", "Agent", "/agent/log").with("TextLogColumns", &log_columns),
             Pane::view("TimeSeries", "Exploring", "/mapping"),
-            Pane::view("TimeSeries", "Plots", "/plots"),
+            Pane::view("TimeSeries", "Plots", "/plots").with("TimeAxis", &last_two_minutes),
         ],
         strip,
     );
