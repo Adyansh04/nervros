@@ -13,6 +13,9 @@ use super::Arms;
 use super::srdf::Srdf;
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
+/// Where an arm or a hand is when it is at none of its named poses.
+const BETWEEN: &str = "between named poses";
+
 /// How often the watcher looks.
 const PERIOD: Duration = Duration::from_secs(5);
 const SCENE_WAIT: Duration = Duration::from_secs(3);
@@ -126,7 +129,7 @@ async fn look(arms: &Arms) -> Vec<String> {
                 .into_iter()
                 .map(|(arm, pose)| match pose {
                     Some(p) => format!("{arm} at `{p}`"),
-                    None => format!("{arm} between named poses"),
+                    None => format!("{arm} {BETWEEN}"),
                 }),
         );
     } else {
@@ -217,7 +220,8 @@ impl Tool for ArmStatus {
                     "group": g.name,
                     "tip": srdf.tip(&g.name),
                     "poses": srdf.poses_of(&g.name).map(|p| p.name.clone()).collect::<Vec<_>>(),
-                    "at": at.get(&g.name).cloned().flatten(),
+                    // Words, not null: a model read an arm out as "at null".
+                    "at": at.get(&g.name).cloned().flatten().unwrap_or_else(|| BETWEEN.to_owned()),
                 })
             })
             .collect();
@@ -232,7 +236,7 @@ impl Tool for ArmStatus {
                     "group": e.group,
                     "on": e.parent_group,
                     "poses": srdf.poses_of(&e.group).map(|p| p.name.clone()).collect::<Vec<_>>(),
-                    "at": at,
+                    "at": at.unwrap_or_else(|| BETWEEN.to_owned()),
                 })
             })
             .collect();
