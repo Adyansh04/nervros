@@ -555,13 +555,17 @@ pub(crate) async fn locate(
     clear_m: f64,
 ) -> Result<Spot, String> {
     let text = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty());
-    if let Some(place) = text("place") {
-        let same = |a: &str| crate::places::same_words(a, place);
-        let found = places
+    let known = |name: &str| {
+        let same = |a: &str| crate::places::same_words(a, name);
+        places
             .all()
             .into_iter()
-            .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)));
-        return found
+            .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)))
+    };
+    // A model gives a place's name as an object as often as not.
+    let place = text("place").or_else(|| text("object").filter(|o| known(o).is_some()));
+    if let Some(place) = place {
+        return known(place)
             .map(|p| Spot {
                 x: p.pose.x,
                 y: p.pose.y,
@@ -704,6 +708,24 @@ mod tests {
             vec![self.0.to_owned()]
         }
         async fn stop(&self) {}
+    }
+
+    #[tokio::test]
+    async fn a_place_named_as_an_object_is_the_place() {
+        let profile: Profile = toml::from_str(
+            "[robot]\nname = \"x\"\n[models]\nfile = \"m.toml\"\n[[place]]\nname = \"office_desk_tray\"\npose = { x = 5.0, y = -4.0, yaw = 0.5 }\n",
+        )
+        .unwrap();
+        let places = crate::places::Places::new(&profile, None);
+        let robot = nervros_ros::fake::FakeRobot::new();
+        let ctx = (&profile, places.as_ref(), &robot as &dyn RobotPort);
+        let spot = locate(&json!({"object": "office_desk_tray"}), ctx, None, 0.3)
+            .await
+            .unwrap();
+        assert_eq!(
+            (spot.x, spot.y, spot.what.as_str()),
+            (5.0, -4.0, "office_desk_tray")
+        );
     }
 
     #[test]
