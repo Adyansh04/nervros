@@ -42,7 +42,7 @@ pub(super) async fn agent(
             } => {
                 plots.spawn(plot(&rec, &robot, name, (topic, msg_type, field), *for_s));
                 // Asked for, so shown: the agent's reply says where to look.
-                layout.show_plots();
+                layout.show_plots(*for_s);
                 continue;
             }
             Event::Drawn {

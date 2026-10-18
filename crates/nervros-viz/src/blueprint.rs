@@ -4,6 +4,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use rerun::blueprint::components::{
     ActiveTab, AutoLayout, AutoViews, BackgroundKind, ColumnShare, ContainerKind, Eye3DKind,
@@ -161,6 +162,9 @@ pub(super) struct Layout {
     /// The strip's tab on show: the agent's log at first, as the mission lanes are empty until
     /// one runs; a mission or a plot the agent starts is brought forward.
     strip: AtomicUsize,
+    /// Until when a plot the operator asked for keeps the strip: a mission it was asked to watch
+    /// would take it over.
+    plots_until: Mutex<Option<Instant>>,
 }
 
 impl Layout {
@@ -172,6 +176,7 @@ impl Layout {
             framed: Mutex::new(None),
             follow: AtomicBool::new(false),
             strip: AtomicUsize::new(AGENT_TAB),
+            plots_until: Mutex::new(None),
         }
     }
 
@@ -197,13 +202,26 @@ impl Layout {
     }
 
     /// Shows the strip's Plots tab, where a plot the agent just started draws.
-    pub(super) fn show_plots(&self) {
+    pub(super) fn show_plots(&self, for_s: u64) {
+        *self
+            .plots_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some(Instant::now() + Duration::from_secs(for_s));
         self.show_strip(PLOTS_TAB);
     }
 
-    /// Shows the strip's Mission tab, where a mission's steps draw as it runs.
+    /// Shows the strip's Mission tab, where a mission's steps draw as it runs, unless a plot
+    /// still draws there.
     pub(super) fn show_mission(&self) {
-        self.show_strip(MISSION_TAB);
+        let plotting = self
+            .plots_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|until| Instant::now() < until);
+        if !plotting {
+            self.show_strip(MISSION_TAB);
+        }
     }
 
     fn show_strip(&self, tab: usize) {
