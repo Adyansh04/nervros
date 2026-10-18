@@ -461,27 +461,37 @@ pub(crate) async fn get_params(
     node: &str,
     names: &[String],
 ) -> Result<Vec<(Value, u64)>, String> {
-    // rclcpp refuses a whole read when one name is not declared, and logs a warning each time:
-    // the declared names are asked for, the rest come back unset.
-    if let Ok(declared) = declared(robot, node).await {
-        let asked: Vec<String> = names
-            .iter()
-            .filter(|n| declared.contains(*n))
-            .cloned()
-            .collect();
-        let values = if asked.is_empty() {
-            Vec::new()
-        } else {
-            get_values(robot, node, &asked).await?
-        };
-        let found: HashMap<&String, (Value, u64)> =
-            asked.iter().zip(values.iter().map(typed)).collect();
-        return Ok(names
-            .iter()
-            .map(|n| found.get(n).cloned().unwrap_or((Value::Null, 0)))
-            .collect());
+    // rclcpp warns for each undeclared name it is asked for: only the declared ones are asked,
+    // the rest come back unset.
+    let Ok(declared) = declared(robot, node).await else {
+        return get_each(robot, node, names).await;
+    };
+    let asked: Vec<String> = names
+        .iter()
+        .filter(|n| declared.contains(*n))
+        .cloned()
+        .collect();
+    let found: HashMap<String, (Value, u64)> = asked
+        .iter()
+        .cloned()
+        .zip(get_each(robot, node, &asked).await?)
+        .collect();
+    Ok(names
+        .iter()
+        .map(|n| found.get(n).cloned().unwrap_or((Value::Null, 0)))
+        .collect())
+}
+
+/// `names`' values in one read; one by one when a name declared without a value spoils it, as
+/// rclcpp then answers none.
+async fn get_each(
+    robot: &dyn RobotPort,
+    node: &str,
+    names: &[String],
+) -> Result<Vec<(Value, u64)>, String> {
+    if names.is_empty() {
+        return Ok(Vec::new());
     }
-    // A node that cannot list them is asked for them all, then one by one.
     let values = get_values(robot, node, names).await?;
     if values.len() == names.len() {
         return Ok(values.iter().map(typed).collect());

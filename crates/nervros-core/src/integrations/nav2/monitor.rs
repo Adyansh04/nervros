@@ -642,6 +642,10 @@ mod tests {
         FakeRobot::new()
             .with_service("/collision_monitor/get_parameters", move |req| {
                 let names = req["names"].as_array().cloned().unwrap_or_default();
+                // As rclcpp: a name declared without a value spoils the whole read.
+                if names.iter().any(|n| n == "PolygonSlow.points") {
+                    return Ok(json!({"values": []}));
+                }
                 let values: Vec<Value> = names
                     .iter()
                     .map(|n| match n.as_str().unwrap_or_default() {
@@ -666,7 +670,7 @@ mod tests {
                 Ok(json!({"result": {"names": [
                     "polygons", "base_frame_id", "PolygonStop.type", "PolygonSlow.type",
                     "PolygonStop.action_type", "PolygonSlow.action_type",
-                    "PolygonSlow.slowdown_ratio", "PolygonStop.points",
+                    "PolygonSlow.slowdown_ratio", "PolygonStop.points", "PolygonSlow.points",
                     "PolygonSlow.polygon_sub_topic"]}}))
             })
     }
