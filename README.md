@@ -88,9 +88,13 @@ watchdog on the robot, and anything that loosens a limit asks you first. More in
 [integrations](docs/integrations.md) and in the guide's
 [Nav2 and MoveIt](docs/guide.md#nav2-and-moveit).
 
-<!-- video: 29-nav2.mp4 -->
+https://github.com/user-attachments/assets/43ac126e-f920-4fce-8a64-9ac0baea3062
 
-<!-- video: 30-moveit.mp4 -->
+https://github.com/user-attachments/assets/3091295f-aee5-4a00-8305-f9cb5ecc8e03
+
+*Nav2: a slow zone holding /cmd_vel to 40% on a route NervROS runs, then the collision monitor's
+slow polygon. MoveIt: a previewed arm path, a box that blocks it, and arm moves with the elbow
+plotted. Waits and walks are sped up.*
 
 ## How it works
 

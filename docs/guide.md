@@ -740,9 +740,9 @@ the composer, and **Remove** asks the agent to remove one, which you approve.
 
 ## Nav2 and MoveIt
 
-<!-- video: 29-nav2.mp4 -->
+https://github.com/user-attachments/assets/43ac126e-f920-4fce-8a64-9ac0baea3062
 
-<!-- video: 30-moveit.mp4 -->
+https://github.com/user-attachments/assets/3091295f-aee5-4a00-8305-f9cb5ecc8e03
 
 With [`[nav2]`](profile.md#nav2) and [`[moveit]`](profile.md#moveit) in the profile, the agent
 works the robot's navigation and arm stacks directly: it reads them, changes how they behave, and
