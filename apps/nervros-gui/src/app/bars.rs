@@ -233,6 +233,9 @@ impl Gui {
                     let text = format!("Working {} s", since.elapsed().as_secs());
                     ui.label(RichText::new(text).small().color(theme::INFO));
                 }
+                None if self.mission_running() => {
+                    ui.label(RichText::new("Mission running").small().color(theme::INFO));
+                }
                 None => {
                     ui.label(item("Idle".to_owned()));
                 }

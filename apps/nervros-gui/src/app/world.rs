@@ -3,9 +3,10 @@
 
 use std::fmt::Write as _;
 
+use nervros_core::profile::PlaceConfig;
 use nervros_core::zones::{Rule, Zone};
 use rerun::external::egui;
-use rerun::external::egui::{Align, CornerRadius, Layout, RichText};
+use rerun::external::egui::{Align, CornerRadius, Frame, Layout, Margin, RichText, Stroke};
 use rerun::external::re_ui::{ReButton, UiExt as _};
 use serde_json::Value;
 
@@ -33,7 +34,7 @@ impl Gui {
             (l.rooms.clone(), l.objects)
         };
         let zones = self.agent.zones.all();
-        let actions = if let Some(rooms) = rooms {
+        let mut actions = if let Some(rooms) = rooms {
             world_view(ui, &rooms, objects, &zones)
         } else {
             empty(
@@ -43,6 +44,7 @@ impl Gui {
             );
             zones_view(ui, &zones)
         };
+        actions.extend(places_view(ui, &self.agent.places.all()));
         self.act(ui.ctx(), actions);
     }
 
@@ -55,6 +57,81 @@ impl Gui {
             .map_or(&[][..], |v| v.layers.as_slice());
         layers_view(ui, &self.bridge.layers, config);
     }
+}
+
+/// The named places, the profile's and the operator's, each with a button that puts a walk there
+/// in the composer.
+pub(super) fn places_view(ui: &mut egui::Ui, places: &[PlaceConfig]) -> Vec<Action> {
+    let mut actions = Vec::new();
+    ui.add_space(14.0);
+    theme::section(ui, "Places");
+    if places.is_empty() {
+        ui.label(
+            RichText::new("None yet: ask the agent to remember where the robot stands.")
+                .color(theme::DIM),
+        );
+        return actions;
+    }
+    ui.add_space(6.0);
+    for place in places {
+        let name = place.name.replace('_', " ");
+        let mut about = format!(
+            "{} at ({:.2}, {:.2})",
+            place.name, place.pose.x, place.pose.y
+        );
+        if !place.aliases.is_empty() {
+            let _ = write!(about, "\nAlso: {}", place.aliases.join(", "));
+        }
+        if !place.near.is_empty() {
+            let _ = write!(about, "\nNear: {}", place.near.join(", "));
+        }
+        card(ui, |ui| {
+            // In a row: a right-to-left layout on its own takes all the height there is.
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(ReButton::new("Go").small().secondary())
+                        .on_hover_text("Put a walk here in the composer")
+                        .clicked()
+                    {
+                        actions.push(Action::Prefill(format!("Walk to {name}.")));
+                    }
+                    ui.label(
+                        RichText::new(format!("{:.1}, {:.1}", place.pose.x, place.pose.y))
+                            .monospace()
+                            .size(11.0)
+                            .color(theme::FAINT),
+                    );
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        swatch(ui, theme::ACCENT);
+                        ui.add(egui::Label::new(RichText::new(&name).size(13.5)).truncate())
+                            .on_hover_text(about);
+                    });
+                });
+            });
+        });
+    }
+    actions
+}
+
+/// A row of the World tab's lists, on its own surface.
+fn card(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
+    Frame::new()
+        .fill(theme::SURFACE)
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            body(ui);
+        });
+    ui.add_space(4.0);
+}
+
+fn swatch(ui: &mut egui::Ui, colour: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(2), colour);
 }
 
 /// The world model's rooms by number, R2 before R10: canopy lists them in the order it segmented
@@ -113,7 +190,8 @@ pub(super) fn world_view(
         });
     });
     ui.add_space(8.0);
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    // The dock scrolls the tab; the scope keeps the grid's truncation to the grid.
+    ui.scope(|ui| {
         // Long room names are cut, whole in their hover: wrapped, a grid row grows ragged.
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         egui::Grid::new("world_rooms")
@@ -179,8 +257,8 @@ pub(super) fn world_view(
                     ui.end_row();
                 }
             });
-        actions.extend(zones_view(ui, zones));
     });
+    actions.extend(zones_view(ui, zones));
     actions
 }
 
@@ -230,45 +308,62 @@ pub(super) fn zones_view(ui: &mut egui::Ui, zones: &[Zone]) -> Vec<Action> {
             Rule::KeepOut => (theme::ERROR, "keep-out"),
             Rule::Slow(_) => (theme::WARN, "slow"),
         };
-        ui.horizontal(|ui| {
-            // The swatch is the 3D view's colour for a zone.
-            let (swatch, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(swatch, CornerRadius::same(2), colour);
-            let corners = zone
-                .polygon
-                .iter()
-                .map(|[x, y]| format!("({x:.2}, {y:.2})"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            ui.label(RichText::new(&zone.name).size(13.5))
-                .on_hover_text(format!("Corners on the map: {corners}"));
-            if let Rule::Slow(limit) = zone.rule {
-                ui.label(RichText::new(format!("at most {}", limit.words())).color(theme::WARN))
-                    .on_hover_text("Nav2 slows the robot to this inside the zone");
-            }
-            ui.label(RichText::new(format!("{:.1} m²", zone.area())).color(theme::DIM));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if zone.fixed {
+        let corners = zone
+            .polygon
+            .iter()
+            .map(|[x, y]| format!("({x:.2}, {y:.2})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        card(ui, |ui| {
+            // In a row: a right-to-left layout on its own takes all the height there is.
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if zone.fixed {
+                        ui.label(
+                            RichText::new("from the profile")
+                                .small()
+                                .color(theme::FAINT),
+                        )
+                        .on_hover_text("Only an edit of the robot's profile removes this zone");
+                    } else if ui
+                        .add(ReButton::new("Remove").small().secondary())
+                        .on_hover_text("Ask the agent to remove it; you approve")
+                        .clicked()
+                    {
+                        actions.push(Action::Say(format!(
+                            "Remove the {kind} zone \"{}\".",
+                            zone.name
+                        )));
+                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        // The swatch is the 3D view's colour for a zone.
+                        swatch(ui, colour);
+                        ui.add(
+                            egui::Label::new(RichText::new(&zone.name).strong().size(13.5))
+                                .truncate(),
+                        )
+                        .on_hover_text(format!("Corners on the map: {corners}"));
+                    });
+                });
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new(kind).size(12.0).color(colour));
+                if let Rule::Slow(limit) = zone.rule {
                     ui.label(
-                        RichText::new("from the profile")
-                            .small()
-                            .color(theme::FAINT),
+                        RichText::new(format!("· at most {}", limit.words()))
+                            .size(12.0)
+                            .color(theme::DIM),
                     )
-                    .on_hover_text("Only an edit of the robot's profile removes this zone");
-                } else if ui
-                    .add(ReButton::new("Remove").small().secondary())
-                    .on_hover_text("Ask the agent to remove it; you approve")
-                    .clicked()
-                {
-                    actions.push(Action::Say(format!(
-                        "Remove the {kind} zone \"{}\".",
-                        zone.name
-                    )));
+                    .on_hover_text("Nav2 slows the robot to this inside the zone");
                 }
+                ui.label(
+                    RichText::new(format!("· {:.1} m²", zone.area()))
+                        .size(12.0)
+                        .color(theme::DIM),
+                );
             });
         });
-        ui.add_space(2.0);
     }
     actions
 }
@@ -298,8 +393,8 @@ fn group_of<'a>(
             "sensor_msgs/msg/LaserScan" => "Sensors",
             _ => "World model",
         };
-        // A costmap is a gradient; its swatch is the inscribed radius's magenta.
-        let colour = c.color.or(costmap.then_some([210, 80, 210]));
+        // A costmap is a gradient; its swatch is the inscribed radius's violet.
+        let colour = c.color.or(costmap.then_some([150, 95, 235]));
         return (c.group.as_deref().unwrap_or(by_type), colour);
     }
     let group = match name {
@@ -356,12 +451,9 @@ pub(super) fn layers_view(
                     layers.set(name, shown);
                 }
                 if let (_, Some([r, g, b])) = group_of(name, config) {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                     let colour = egui::Color32::from_rgb(r, g, b);
-                    ui.painter().rect_filled(
-                        rect,
-                        CornerRadius::same(3),
+                    swatch(
+                        ui,
                         if shown {
                             colour
                         } else {

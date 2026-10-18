@@ -79,7 +79,7 @@ pub fn entries() -> Vec<Entry> {
         entry(
             "Robot: its state, and driving by hand",
             "/robot",
-            "Ctrl+8",
+            "Ctrl+5",
             Cmd::Tab(Tab::Robot),
         ),
         entry("Models and quotas", "/models", "", Cmd::Tab(Tab::Agent)),
@@ -87,7 +87,13 @@ pub fn entries() -> Vec<Entry> {
             "Missions, saved plans and skill gaps",
             "/missions",
             "",
-            Cmd::Tab(Tab::Mission),
+            Cmd::Tab(Tab::Library),
+        ),
+        entry(
+            "The mission's behaviour tree",
+            "/tree",
+            "Ctrl+2",
+            Cmd::Tab(Tab::Tree),
         ),
         entry("World model", "/world", "", Cmd::Tab(Tab::World)),
         entry(

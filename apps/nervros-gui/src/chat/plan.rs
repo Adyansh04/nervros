@@ -20,11 +20,11 @@ use crate::theme;
 fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
     for s in &p.steps {
         let (status, node) = p.progress.get(&s.id).cloned().unwrap_or_default();
-        let failed = p.finished.as_ref().is_some_and(|f| f.1 == s.id);
-        let (color, mark) = if failed {
-            (theme::ERROR, "✗")
-        } else {
-            node_look(&status)
+        // The step a stop landed in was stopped, not failed.
+        let (color, mark) = match &p.finished {
+            Some((Outcome::Canceled, step, ..)) if *step == s.id => (theme::WARN, "■"),
+            Some((_, step, ..)) if *step == s.id => (theme::ERROR, "✗"),
+            _ => node_look(&status),
         };
         // The plan's own id names the step later steps take what it found from.
         let named = s
@@ -141,6 +141,7 @@ pub(super) fn minutes(seconds: f64) -> String {
 pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut Vec<Action>) {
     let colour = match &p.finished {
         Some((Outcome::Success, ..)) => theme::SUCCESS,
+        Some((Outcome::Canceled, ..)) => theme::WARN,
         Some(_) => theme::ERROR,
         None if p.mission.is_some() => theme::INFO,
         None => theme::FAINT,
@@ -178,8 +179,13 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut
                     } else {
                         format!(" at {step}")
                     };
-                    RichText::new(format!("{}{at}: {reason}", capitalise(outcome.as_str())))
-                        .color(theme::ERROR)
+                    RichText::new(format!("{}{at}: {reason}", capitalise(outcome.as_str()))).color(
+                        if *outcome == Outcome::Canceled {
+                            theme::WARN
+                        } else {
+                            theme::ERROR
+                        },
+                    )
                 }
                 (None, Some(since)) => {
                     ui.ctx().request_repaint_after(Duration::from_secs(1));

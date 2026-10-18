@@ -432,6 +432,8 @@ impl Gui {
         }
     }
 
+    /// Each job's model, one row a job: the one it uses first and its quota, the ones it falls
+    /// back on in the hover.
     fn models_list(&self, ui: &mut egui::Ui) {
         ui.add_space(16.0);
         theme::section(ui, "Models");
@@ -449,31 +451,61 @@ impl Gui {
             (Role::Watch, "Watch"),
             (Role::SceneCheck, "Scene check"),
         ] {
-            ui.label(RichText::new(name).strong());
             let (take, skipped) = router.candidates(role, Need::default(), now);
-            if take.is_empty() && skipped.is_empty() {
-                ui.label(
-                    RichText::new("off: models.toml lists no model for it")
-                        .small()
-                        .color(theme::DIM),
-                );
-            }
-            for m in take {
-                ui.horizontal(|ui| {
-                    ui.bullet(theme::SUCCESS);
-                    ui.label(RichText::new(&m.id).monospace());
-                    let q = quota(router, m, now);
-                    ui.label(RichText::new(q).small().color(theme::DIM));
-                });
-            }
-            for (id, why) in skipped {
-                ui.horizontal(|ui| {
-                    ui.bullet(theme::DIM);
-                    ui.label(RichText::new(id).monospace().color(theme::DIM));
-                    ui.label(RichText::new(format!("{why:?}")).small().color(theme::DIM));
-                });
-            }
-            ui.add_space(8.0);
+            let chain: Vec<String> = take
+                .iter()
+                .map(|m| format!("{}  {}", m.id, quota(router, m, now)))
+                .chain(
+                    skipped
+                        .iter()
+                        .map(|(id, why)| format!("{id}  skipped: {why:?}")),
+                )
+                .collect();
+            let first = take.first();
+            theme::row(
+                ui,
+                |ui| {
+                    if let Some(m) = first {
+                        ui.label(
+                            RichText::new(quota(router, m, now))
+                                .small()
+                                .color(theme::DIM),
+                        );
+                    }
+                    if chain.len() > 1 {
+                        ui.label(
+                            RichText::new(format!("+{}", chain.len() - 1))
+                                .small()
+                                .color(theme::FAINT),
+                        );
+                    }
+                },
+                |ui| {
+                    // A column of its own, so the models line up.
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(88.0, 18.0), egui::Sense::hover());
+                    ui.painter().text(
+                        rect.left_center(),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        egui::FontId::proportional(12.5),
+                        theme::DIM,
+                    );
+                    let (dot, id) = match (first, skipped.first()) {
+                        (Some(m), _) => (theme::SUCCESS, m.id.as_str()),
+                        (None, Some((id, _))) => (theme::WARN, id.as_str()),
+                        (None, None) => (theme::FAINT, "off"),
+                    };
+                    ui.bullet(dot);
+                    let hover = if chain.is_empty() {
+                        "Off: models.toml lists no model for it".to_owned()
+                    } else {
+                        format!("In order:\n{}", chain.join("\n"))
+                    };
+                    ui.label(RichText::new(id).monospace().size(12.0))
+                        .on_hover_text(hover);
+                },
+            );
         }
     }
 }

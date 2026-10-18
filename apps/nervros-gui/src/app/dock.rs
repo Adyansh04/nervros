@@ -36,6 +36,16 @@ impl Gui {
     /// row that wraps wherever the width runs out reads as a mistake.
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let pending = self.chat.pending().count();
+        let running = self
+            .chat
+            .latest_plan()
+            .is_some_and(crate::chat::PlanCard::running);
+        let unwell = self
+            .live()
+            .checks
+            .as_ref()
+            .is_some_and(|c| c.iter().any(|c| !c.ok))
+            || self.agent.mcp.iter().any(|c| !c.ok);
         Frame::new()
             .fill(theme::SURFACE)
             .stroke(egui::Stroke::new(1.0, theme::BORDER))
@@ -67,10 +77,30 @@ impl Gui {
                                 .corner_radius(CornerRadius::same(7))
                                 .min_size(egui::vec2(width, 28.0));
                             let response = ui.add(button);
-                            let response = if waiting {
-                                response.on_hover_text(format!("{pending} waiting for you"))
-                            } else {
-                                response
+                            // A dot says what wants a look, from any tab.
+                            let badge = match tab {
+                                Tab::Approvals if waiting => {
+                                    Some((theme::WARN, format!("{pending} waiting for you")))
+                                }
+                                Tab::Tree if running => {
+                                    Some((theme::SUCCESS, "A mission is running".to_owned()))
+                                }
+                                Tab::Doctor if unwell => {
+                                    Some((theme::ERROR, "A check failed".to_owned()))
+                                }
+                                _ => None,
+                            };
+                            let response = match badge {
+                                Some((colour, why)) => {
+                                    let r = response.rect;
+                                    ui.painter().circle_filled(
+                                        egui::pos2(r.right() - 7.0, r.top() + 7.0),
+                                        3.0,
+                                        colour,
+                                    );
+                                    response.on_hover_text(why)
+                                }
+                                None => response,
                             };
                             if response.clicked() {
                                 self.tab = tab;

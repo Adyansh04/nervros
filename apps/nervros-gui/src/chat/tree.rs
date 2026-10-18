@@ -89,6 +89,8 @@ fn now_s(p: &PlanCard) -> f64 {
 fn step_state(p: &PlanCard, s: &PlannedStep) -> State {
     let status = p.progress.get(&s.id).map_or("", |(st, _)| st.as_str());
     match (&p.finished, State::of(status)) {
+        // A stop lands in a step; that step did not fail.
+        (Some((Outcome::Canceled, failed, ..)), _) if *failed == s.id => State::Stopped,
         (Some((_, failed, ..)), _) if *failed == s.id => State::Failed,
         (Some((Outcome::Canceled, ..)), State::Running) => State::Stopped,
         (Some(_), State::Running) => State::Failed,
@@ -309,15 +311,15 @@ fn step_card(ui: &mut egui::Ui, p: &PlanCard, s: &PlannedStep, state: State) {
                 && !reason.is_empty()
             {
                 ui.add_space(4.0);
+                let colour = state.colour();
                 Frame::new()
-                    .fill(theme::ERROR.gamma_multiply(0.12))
+                    .fill(colour.gamma_multiply(0.12))
                     .corner_radius(CornerRadius::same(6))
                     .inner_margin(Margin::symmetric(8, 6))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.add(
-                            egui::Label::new(RichText::new(reason).size(12.5).color(theme::ERROR))
-                                .wrap(),
+                            egui::Label::new(RichText::new(reason).size(12.5).color(colour)).wrap(),
                         );
                     });
             }
@@ -407,7 +409,7 @@ fn status_text(ui: &mut egui::Ui, p: &PlanCard, node: Option<&Node>, state: Stat
         State::Running => (format!("running {time}"), theme::INFO),
         State::Succeeded => (format!("✓ {time}"), theme::SUCCESS),
         State::Failed => (format!("✗ {time}"), theme::ERROR),
-        State::Stopped => ("stopped".to_owned(), theme::WARN),
+        State::Stopped => (format!("stopped {time}"), theme::WARN),
     };
     ui.label(RichText::new(text.trim()).size(12.0).color(colour));
 }

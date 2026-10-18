@@ -56,9 +56,10 @@ cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 - **Viewer, middle:** the 3D world (map, rooms, objects, the robot, where it walked and where it
   is about to walk), the cameras with the detector's marks, and below them the mission's steps
   over time, the agent's log and plots. It is one timeline you can scrub back.
-- **Dock, right:** Mission, World, Layers, Approvals, Events, Agent, Doctor and Robot (Ctrl+1 to
-  Ctrl+8). A waiting approval turns its tab amber. Doctor also drafts the robot's
-  self-description.
+- **Dock, right:** Mission, Tree, Approvals, World, Robot, Layers, Library, Events, Agent and
+  Doctor (Ctrl+1 to Ctrl+0). A dot marks a tab that wants a look: amber on Approvals while a
+  request waits, green on Tree while a mission runs, red on Doctor when a check failed. Doctor
+  also drafts the robot's self-description.
 - **Status bar:** whether the agent is working, how full the model's context is, and how much of
   it came from the model server's cache.
 
@@ -119,8 +120,8 @@ https://github.com/user-attachments/assets/7cf1cd95-a8dc-4519-a4cf-155976221887
 
 The plan card lists each step with its track record on this robot ("13 of 15 · 24 s"), and the
 viewer draws the planned path. While the mission runs, each step on the card shows its live state,
-the Mission tab shows the behaviour tree node by node, and the timeline strip shows the steps over
-time. When it ends, the agent gets a report with its goal checks:
+the Tree tab draws the behaviour tree step by step with the nodes running inside each, and the
+timeline strip shows the steps over time. When it ends, the agent gets a report with its goal checks:
 
 ```text
 report> Mission 01a0feba (Walk to the bedroom, room R3) ended: success after 24 s.
@@ -183,8 +184,9 @@ report> Mission 01a0ff3c (Bring the small white mug from the dining table to the
 > **NervROS:** The mission was successful! The small white mug has been brought from the dining
 > table to the tray on the office desk.
 
-The Mission tab shows the behaviour tree as it runs, node by node, beside each step's track record
-and the missions before it.
+The Tree tab draws the behaviour tree as it runs: each step a card on a spine with its wrappers
+(time limit, retries, optional), its live state and the nodes inside it with their times. The
+Library tab lists the missions before it and each step's track record.
 
 A failed mission comes back with the step that failed, why it failed, and what the world model saw
 of the object involved. The agent then proposes a changed plan for you to approve. You can keep
@@ -282,7 +284,7 @@ kind the argument takes.
 ### Doing it again
 
 - "Save that as the evening check" keeps a plan that worked, and "Run the evening check" runs it
-  again. The Mission tab lists saved plans.
+  again. The Library tab lists saved plans.
 - A schedule runs a plan on a clock or when something happens, approved once for every run (see
   [Keeping an eye on it](#keeping-an-eye-on-it)). Stopping the robot cancels every schedule.
 - Requests that no skill can do are logged as skill gaps, for whoever writes the next skill.
@@ -336,7 +338,7 @@ The program's functions are the robot's: `objects(words, room)`, `rooms()`, `pla
 (`PickObject(#{object_id: id, arm: "right"})`) or `run("Skill", #{...})`, `read(topic)`,
 `rate(topic, seconds)`, `tf(parent, child)`, `wait(seconds)` and `say(text)`.
 
-"Keep that program as count chairs" keeps it by name. The Mission tab lists kept programs to run
+"Keep that program as count chairs" keeps it by name. The Library tab lists kept programs to run
 again, and each run is approved again.
 
 <details>
@@ -412,7 +414,7 @@ A body can also nest `sequence`, `fallback`, `retry`, `timeout_s` and `force_suc
 You approve the teaching first. The executor checks the skill, which is then a draft. The plan
 that uses it comes to you like any plan, with its new step marked as a taught skill on its first
 try. Once that mission succeeds, the skill is kept on the robot, and the next "point at the tray"
-uses it. The Mission tab lists the taught skills, each with what it was taught for and a
+uses it. The Library tab lists the taught skills, each with what it was taught for and a
 **Forget** button. Gemini 3.5 Flash-Lite answered in this clip.
 
 <details>
@@ -462,9 +464,9 @@ robot. `/look`, `/places` and `/explore` send their request to the agent. In the
 | `/layout` | Puts the viewer's panes back |
 | `/edit` | Opens the world editor |
 | `/live` | Goes back to the live view after **Show in 3D** |
-| `/robot`, `/world`, `/approvals`, `/events`, `/layers` | Opens that tab of the dock |
+| `/robot`, `/world`, `/tree`, `/approvals`, `/events`, `/layers` | Opens that tab of the dock |
 | `/doctor` | Checks the setup again and opens Doctor |
-| `/models`, `/missions` | Opens Agent, or Mission |
+| `/models`, `/missions` | Opens Agent, or Library |
 | `/dock` | Shows or hides the dock |
 
 ## Driving by hand
@@ -992,5 +994,5 @@ $ nervros-cli --profile scenarios/bench/nervros.toml eval scenarios/bench/suite.
 | Esc | Stops the reply |
 | Ctrl+Shift+S | Stops the mission |
 | Ctrl+K | Opens the command palette |
-| Ctrl+1 to Ctrl+8 | Opens the dock's tabs |
+| Ctrl+1 to Ctrl+0 | Opens the dock's tabs, in the bar's order |
 | W S, A D, Q E | Drives by hand: walk, turn, step sideways (Robot tab, Drive on) |

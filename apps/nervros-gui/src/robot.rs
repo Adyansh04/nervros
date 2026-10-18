@@ -317,19 +317,22 @@ fn state_section(ui: &mut egui::Ui, status: &Status) {
             facts.push(("Battery", text));
         }
     }
-    egui::Grid::new("robot_facts")
-        .num_columns(2)
-        .spacing([14.0, 6.0])
-        .show(ui, |ui| {
-            for (key, value) in facts {
-                // The keys stay whole; the values wrap in what is left.
-                ui.add(
-                    egui::Label::new(RichText::new(key).size(13.0).color(theme::FAINT)).extend(),
-                );
-                ui.label(RichText::new(value).size(13.5));
-                ui.end_row();
-            }
+    // Rows, not a grid: a grid lays its rows over each other on the frame it first shows.
+    for (key, value) in facts {
+        ui.horizontal_top(|ui| {
+            // The keys a column of their own; the values wrap in what is left.
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(84.0, 18.0), egui::Sense::hover());
+            ui.painter().text(
+                rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                key,
+                egui::FontId::proportional(13.0),
+                theme::FAINT,
+            );
+            ui.add(egui::Label::new(RichText::new(value).size(13.5)).wrap());
         });
+        ui.add_space(2.0);
+    }
 }
 
 /// A card per stack: its name and state on the strip, the details below.

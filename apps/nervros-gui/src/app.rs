@@ -427,13 +427,18 @@ impl Gui {
         })
     }
 
-    /// Whether the executor says a mission runs.
+    /// Whether a mission runs: by the session's events, which cover the steps NervROS runs
+    /// itself, or by the executor, which also knows one another session started.
     fn mission_running(&self) -> bool {
-        self.live()
-            .executor
-            .as_ref()
-            .and_then(|s| s["mission_id"].as_str())
-            .is_some_and(|id| !id.is_empty())
+        self.chat
+            .latest_plan()
+            .is_some_and(crate::chat::PlanCard::running)
+            || self
+                .live()
+                .executor
+                .as_ref()
+                .and_then(|s| s["mission_id"].as_str())
+                .is_some_and(|id| !id.is_empty())
     }
 
     /// Whether a program or a search runs.
@@ -447,13 +452,16 @@ impl Gui {
 
     /// Whether the running mission is paused, or waits to pause once a pick or place ends.
     fn mission_paused(&self) -> bool {
-        self.mission_running()
-            && self
-                .live()
-                .executor
-                .as_ref()
-                .and_then(|s| s["paused"].as_bool())
-                .unwrap_or(false)
+        self.chat
+            .latest_plan()
+            .is_some_and(crate::chat::PlanCard::paused)
+            || (self.mission_running()
+                && self
+                    .live()
+                    .executor
+                    .as_ref()
+                    .and_then(|s| s["paused"].as_bool())
+                    .unwrap_or(false))
     }
 
     /// Pauses the running mission, or lets it go on; the executor's answer comes back as a
@@ -752,6 +760,7 @@ impl Gui {
         let (esc, stop, tab) = ctx.input_mut(|i| {
             let esc = working && !elsewhere && i.consume_key(Modifiers::NONE, Key::Escape);
             let stop = i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::S);
+            // Ctrl+1 to Ctrl+0, a key a tab in the bar's order.
             let keys = [
                 Key::Num1,
                 Key::Num2,
@@ -761,6 +770,8 @@ impl Gui {
                 Key::Num6,
                 Key::Num7,
                 Key::Num8,
+                Key::Num9,
+                Key::Num0,
             ];
             let tab = keys.iter().position(|k| i.consume_key(Modifiers::CTRL, *k));
             (esc, stop, tab)
@@ -890,7 +901,7 @@ mod live_eval;
 #[cfg(test)]
 mod tests {
     use super::composer::{walk_to_point, walk_to_target};
-    use super::world::{layers_view, world_view};
+    use super::world::{layers_view, places_view, world_view};
     use super::*;
     use egui_kittest::kittest::Queryable as _;
     use egui_kittest::{Harness, SnapshotOptions};
@@ -1042,9 +1053,16 @@ mod tests {
                 )
             },
         ];
+        let places: Vec<nervros_core::profile::PlaceConfig> =
+            serde_json::from_value(serde_json::json!([
+                {"name": "start", "aliases": ["home"], "pose": {"x": 0.0, "y": 0.0}},
+                {"name": "office_desk_tray", "pose": {"x": 5.139, "y": -4.385, "yaw": -1.577},
+                 "near": ["tray_1"]},
+            ]))
+            .unwrap();
         let mut harness = Harness::builder()
             .wgpu()
-            .with_size(egui::vec2(420.0, 420.0))
+            .with_size(egui::vec2(360.0, 420.0))
             .build_ui(move |ui| {
                 theme::apply(ui);
                 Frame::new()
@@ -1052,6 +1070,7 @@ mod tests {
                     .inner_margin(Margin::same(14))
                     .show(ui, |ui| {
                         let _ = world_view(ui, &rooms, Some(13), &zones);
+                        let _ = places_view(ui, &places);
                     });
             });
         crate::testkit::style_for_tests(&harness.ctx);

@@ -33,22 +33,36 @@ impl Group {
 /// How many events the tab keeps.
 const KEPT: usize = 500;
 
-/// The tab's state: the lines, newest first, and which of them show.
+/// The tab's state: the lines, newest first, which of them show, and each checked plan's name
+/// by its hash, for the line its mission starts.
 #[derive(Debug, Default)]
 pub struct Events {
     lines: std::collections::VecDeque<Logged>,
     filter: Group,
+    plans: std::collections::HashMap<String, String>,
 }
 
 impl Events {
     /// Keeps `event`'s line, if it has one.
     pub fn push(&mut self, event: &Event) {
-        if let Some(line) = Logged::of(event) {
-            if self.lines.len() == KEPT {
-                self.lines.pop_back();
+        let Some(mut line) = Logged::of(event) else {
+            return;
+        };
+        match event {
+            Event::MissionPlanned { hash, intent, .. } => {
+                self.plans.insert(hash.clone(), intent.clone());
             }
-            self.lines.push_front(line);
+            Event::MissionStarted { hash, .. } => {
+                if let Some(intent) = self.plans.get(hash) {
+                    line.summary = format!("started \"{intent}\"");
+                }
+            }
+            _ => {}
         }
+        if self.lines.len() == KEPT {
+            self.lines.pop_back();
+        }
+        self.lines.push_front(line);
     }
 
     /// The tab: the filter, then the events.
@@ -206,9 +220,9 @@ fn summarise(kind: &str, value: &Value) -> (String, Group, bool) {
         ),
         "armed" => (
             if value["armed"].as_bool() == Some(true) {
-                "armed".to_owned()
+                "the agent may act".to_owned()
             } else {
-                "disarmed".to_owned()
+                "observe only: the agent may not act".to_owned()
             },
             Group::All,
             false,
@@ -270,7 +284,8 @@ fn mission_words(kind: &str, value: &Value) -> Option<(String, Group, bool)> {
                     text("reason")
                 ),
                 Group::Missions,
-                outcome != "success",
+                // A stop is the operator's call, not a problem.
+                !matches!(outcome.as_str(), "success" | "canceled"),
             )
         }
         "job_started" | "job_finished" => {
@@ -307,7 +322,7 @@ fn problem_words(kind: &str, value: &Value) -> Option<(String, Group, bool)> {
                 true,
             )
         }
-        "halted" => (format!("halted: {}", text("reason")), Group::Problems, true),
+        "halted" => (format!("halted: {}", text("reason")), Group::All, false),
         "stopped" => {
             let ok = value["ok"].as_bool() == Some(true);
             (format!("stopped: {}", text("detail")), Group::All, !ok)
@@ -316,12 +331,15 @@ fn problem_words(kind: &str, value: &Value) -> Option<(String, Group, bool)> {
     })
 }
 
-/// A tool's arguments as words: `action: path · place: office_desk_tray`.
+/// A tool's arguments as words: `action: path · place: office_desk_tray`; a plan's hash by its
+/// first eight digits.
 fn arguments(args: &Value) -> String {
+    let hash = |t: &str| t.len() >= 32 && t.chars().all(|c| c.is_ascii_hexdigit());
     match args.as_object() {
         Some(map) => map
             .iter()
             .map(|(k, v)| match v.as_str() {
+                Some(text) if hash(text) => format!("{k}: {}…", &text[..8]),
                 Some(text) => format!("{k}: {text}"),
                 None => format!("{k}: {v}"),
             })

@@ -196,6 +196,20 @@ pub struct PlanCard {
     paused: bool,
 }
 
+impl PlanCard {
+    /// Whether its mission runs now.
+    #[must_use]
+    pub fn running(&self) -> bool {
+        self.mission.is_some() && self.finished.is_none()
+    }
+
+    /// Whether its mission is paused, or waits to pause once a pick or place ends.
+    #[must_use]
+    pub fn paused(&self) -> bool {
+        self.running() && self.paused
+    }
+}
+
 /// A node of a running mission's tree, as its events report it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {

@@ -55,6 +55,8 @@ pub struct Agent {
     pub unanswered: Vec<crate::session::Unanswered>,
     /// The keep-out zones, for what draws them.
     pub zones: Arc<crate::zones::Zones>,
+    /// The named places, the profile's and the operator's, for the window's list.
+    pub places: Arc<crate::places::Places>,
     /// Programs and searches the operator approved once, for the window's list and its Stop.
     pub jobs: Arc<crate::job::Jobs>,
     /// The programs kept by name, when the robot has an executor to run them.
@@ -850,7 +852,7 @@ pub fn start_with(
     let (memory, stop) = memory_and_stop(&profile, &port, (ledger, &integrations), &mut registry)?;
     let missions = missions(
         &profile,
-        places,
+        Arc::clone(&places),
         port,
         &guard,
         ledger,
@@ -920,6 +922,7 @@ pub fn start_with(
         mcp,
         unanswered,
         zones,
+        places,
         jobs,
         programs,
         incidents,
