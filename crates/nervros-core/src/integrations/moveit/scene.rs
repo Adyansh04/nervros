@@ -313,11 +313,21 @@ impl Scene {
             .as_str()
             .filter(|f| !f.is_empty())
             .unwrap_or(map);
-        let to_map = self
-            .arms
-            .robot
-            .transform(map, frame)
-            .map_err(|e| format!("cannot place {frame} on the map: {e}"))?;
+        let to_map = match self.arms.robot.transform(map, frame) {
+            Ok(t) => t,
+            Err(e) => {
+                // The frames to give instead: an obstacle by the arms sits best in MoveIt's own.
+                let planning = match self.arms.srdf().await {
+                    Ok(srdf) => self.arms.planning_frame(&srdf).ok(),
+                    Err(_) => None,
+                };
+                return Err(format!(
+                    "cannot place {frame} on the map: {e}; the robot's base frame is {}{}",
+                    self.arms.profile.ros.base_frame,
+                    planning.map_or_else(String::new, |p| format!(", and MoveIt plans in {p}"))
+                ));
+            }
+        };
         Ok((
             id.to_owned(),
             Obstacle {
