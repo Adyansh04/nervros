@@ -117,21 +117,35 @@ impl Condition {
     }
 }
 
-/// A field by dotted path (`pose.pose.position.x`, `status.0.level`).
+/// A field by dotted path (`pose.pose.position.x`, `status.0.level`); an array's item may be
+/// named by the message's `name` list it lines up with, as a joint state's
+/// `position.right_elbow_joint`.
 #[must_use]
 pub fn field<'a>(msg: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.')
-        .try_fold(msg, |v, part| match part.parse::<usize>() {
-            Ok(i) if v.is_array() => v.get(i),
-            _ => v.get(part),
-        })
+    let mut owner = &Value::Null;
+    let mut at = msg;
+    for part in path.split('.') {
+        at = match (at, part.parse::<usize>()) {
+            (Value::Array(items), Ok(i)) => items.get(i)?,
+            (Value::Array(items), Err(_)) => {
+                let names = owner["name"].as_array()?;
+                items.get(names.iter().position(|n| n.as_str() == Some(part))?)?
+            }
+            _ => {
+                owner = at;
+                at.get(part)?
+            }
+        };
+    }
+    Some(at)
 }
 
 /// Why `path` is no number in messages of this JSON Schema, if it is not.
 fn number_in(schema: &Value, path: &str) -> Result<(), String> {
     let mut node = schema;
     for part in path.split('.') {
-        node = if node["type"] == "array" && part.parse::<usize>().is_ok() {
+        // An item by index or by name: a name cannot be checked before a message comes.
+        node = if node["type"] == "array" {
             &node["items"]
         } else if let Some(next) = node["properties"].get(part) {
             next
@@ -905,7 +919,7 @@ fn plot_spec() -> ToolSpec {
          something changes; watch reports a condition instead.",
         json!({"type": "object", "properties": {
             "topic": {"type": "string", "description": "The topic, such as /odom."},
-            "field": {"type": "string", "description": "A dotted path to a number in the topic's own message: linear.x for a Twist, twist.twist.linear.x for an Odometry, position.3 for a JointState."},
+            "field": {"type": "string", "description": "A dotted path to a number in the topic's own message: linear.x for a Twist, twist.twist.linear.x for an Odometry, position.right_elbow_joint (a joint by its name) for a JointState."},
             "for_s": {"type": "integer", "minimum": 1, "maximum": MAX_PLOT_S, "description": "How long to draw it (120)."}
         }, "required": ["topic", "field"], "additionalProperties": false}),
         Risk::Observe,
@@ -1300,6 +1314,13 @@ mod tests {
             "position": {"type": "array", "items": {"type": "number"}},
             "name": {"type": "array", "items": {"type": "string"}}}});
         assert!(number_in(&joints, "position.3").is_ok());
+        let state = json!({"name": ["a", "right_elbow_joint"], "position": [0.1, 1.2]});
+        assert_eq!(
+            field(&state, "position.right_elbow_joint"),
+            Some(&json!(1.2))
+        );
+        assert_eq!(field(&state, "position.1"), Some(&json!(1.2)));
+        assert_eq!(field(&state, "position.left_elbow_joint"), None);
         assert!(number_in(&joints, "name.0").unwrap_err().contains("string"));
     }
 
