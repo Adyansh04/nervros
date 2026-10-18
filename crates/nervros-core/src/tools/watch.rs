@@ -640,20 +640,19 @@ impl Watches {
             .ok_or("`field` is a dotted path to a number, such as twist.twist.linear.x")?
             .to_owned();
         let (topic, ty) = self.topic(args, true).await?;
-        let msg = self
-            .robot
-            .latest(&topic, &ty, Duration::from_secs(2))
-            .await
-            .map_err(|e| format!("nothing arrived on {topic} to plot ({e})"))?;
-        let now = match field(&msg, &path) {
-            Some(v) => v.as_f64().ok_or_else(|| {
-                format!("`{path}` in {topic} is {}, not a number", kind(v, &path))
-            })?,
-            None => {
-                return Err(format!(
-                    "{topic} has no `{path}`; topic_sample shows its fields"
-                ));
-            }
+        // A topic quiet now, as a velocity command between walks, is plotted once it publishes.
+        let now = match self.robot.latest(&topic, &ty, Duration::from_secs(2)).await {
+            Ok(msg) => match field(&msg, &path) {
+                Some(v) => Some(v.as_f64().ok_or_else(|| {
+                    format!("`{path}` in {topic} is {}, not a number", kind(v, &path))
+                })?),
+                None => {
+                    return Err(format!(
+                        "{topic} has no `{path}`; topic_sample shows its fields"
+                    ));
+                }
+            },
+            Err(_) => None,
         };
         let for_s = args["for_s"]
             .as_u64()
@@ -670,7 +669,13 @@ impl Watches {
             });
         }
         let mut out = ToolOutcome::ok(json!({"plot": name, "now": now, "for_s": for_s}));
-        out.message = format!("plotting {name} in the viewer's Plots tab for {for_s} s");
+        out.message = match now {
+            Some(_) => format!("plotting {name} in the viewer's Plots tab for {for_s} s"),
+            None => format!(
+                "plotting {name} in the viewer's Plots tab for {for_s} s: the topic is quiet now, \
+                 so the line starts when it publishes"
+            ),
+        };
         Ok(out)
     }
 
@@ -1238,6 +1243,29 @@ mod tests {
             .plot(&json!({"topic": "/odom", "field": "pose.x"}))
             .await;
         assert!(missing.unwrap_err().contains("no `pose.x`"));
+    }
+
+    #[tokio::test]
+    async fn a_quiet_topic_is_plotted_once_it_publishes() {
+        let graph = nervros_ros::GraphDetail {
+            topics: vec![(
+                "/cmd_vel".to_owned(),
+                vec!["geometry_msgs/msg/Twist".to_owned()],
+            )],
+            ..nervros_ros::GraphDetail::default()
+        };
+        let robot: Arc<dyn RobotPort> = Arc::new(FakeRobot::new().with_graph(graph));
+        let watches = Watches::new(robot, Vec::new());
+        let out = watches
+            .plot(&json!({"topic": "/cmd_vel", "field": "linear.x"}))
+            .await
+            .unwrap();
+        assert!(out.data["now"].is_null());
+        assert!(
+            out.message.contains("starts when it publishes"),
+            "{}",
+            out.message
+        );
     }
 
     #[tokio::test]
