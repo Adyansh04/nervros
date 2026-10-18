@@ -154,7 +154,8 @@ impl Monitor {
             "collision_monitor",
             "Nav2's collision monitor, which stops or slows the robot when an obstacle comes \
              inside one of its polygons. status: each polygon, what it does and whether it is \
-             on. on, off: the whole monitor. enable, disable: one polygon. shape: a polygon's \
+             on. enable, disable: one polygon, by name (\"turn the slow polygon off\"). on, \
+             off: the whole monitor, every polygon at once. shape: a polygon's \
              corners in the robot's frame ([[x, y], ...], metres), a circle's radius, or `scale` \
              of its shape, for the polygons it lets NervROS shape. Turning on and growing are \
              free; turning off and shrinking need the operator's approval.",
@@ -528,7 +529,7 @@ impl Tool for Monitor {
     }
 
     async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
-        let reason = match args["action"].as_str() {
+        let reason = match action(args) {
             Some("off") => "turns Nav2's collision monitor off: nothing stops or slows the robot \
                             before an obstacle until it is on again"
                 .to_owned(),
@@ -582,7 +583,7 @@ impl Tool for Monitor {
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {
-        match args["action"].as_str().unwrap_or("status") {
+        match action(&args).unwrap_or("status") {
             "status" => self.status().await,
             "on" => self.toggle(true).await,
             "off" => self.toggle(false).await,
@@ -593,6 +594,19 @@ impl Tool for Monitor {
                 "action `{other}` is not one of status, on, off, enable, disable, shape"
             )),
         }
+    }
+}
+
+/// The action `args` ask for: on or off with a polygon named is that polygon's enable or disable,
+/// as "turn the slow polygon off" reads.
+fn action(args: &Value) -> Option<&str> {
+    let named = args["polygon"]
+        .as_str()
+        .is_some_and(|p| !p.trim().is_empty());
+    match args["action"].as_str() {
+        Some("on") if named => Some("enable"),
+        Some("off") if named => Some("disable"),
+        other => other,
     }
 }
 
@@ -648,6 +662,13 @@ mod tests {
                 Ok(json!({"results": [{"successful": true}]}))
             })
             .with_service("/collision_monitor/toggle", |_| Ok(json!({"success": true})))
+            .with_service("/collision_monitor/list_parameters", |_| {
+                Ok(json!({"result": {"names": [
+                    "polygons", "base_frame_id", "PolygonStop.type", "PolygonSlow.type",
+                    "PolygonStop.action_type", "PolygonSlow.action_type",
+                    "PolygonSlow.slowdown_ratio", "PolygonStop.points",
+                    "PolygonSlow.polygon_sub_topic"]}}))
+            })
     }
 
     fn monitor(robot: FakeRobot) -> Arc<Monitor> {
@@ -686,6 +707,13 @@ mod tests {
             "{}",
             disable.reason
         );
+        // "Turn the stop polygon off" is that polygon's, not the whole monitor's.
+        let named = m
+            .assess(&json!({"action": "off", "polygon": "PolygonStop"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(named.reason, disable.reason);
         // A fixed polygon cannot be shaped at all.
         let fixed = m
             .assess(&json!({"action": "shape", "polygon": "PolygonStop", "scale": 2.0}))
