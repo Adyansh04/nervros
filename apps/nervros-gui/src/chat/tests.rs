@@ -312,7 +312,9 @@ fn snapshot_tree_tab() {
             elapsed_s: at,
         });
     }
-    let plan = chat.latest_plan().cloned().unwrap();
+    let mut plan = chat.latest_plan().cloned().unwrap();
+    // A start still to come reads as 0 s: the clock would differ on every run.
+    plan.started = Some(std::time::Instant::now() + std::time::Duration::from_hours(1));
     let mut harness = Harness::builder()
         .wgpu()
         .with_size(egui::vec2(440.0, 600.0))

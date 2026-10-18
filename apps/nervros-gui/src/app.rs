@@ -2,7 +2,7 @@
 //! right and a status bar. The viewer draws last, into whatever space the panels leave.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -33,12 +33,12 @@ mod agent_tab;
 mod bars;
 mod composer;
 mod dock;
+mod events;
 mod live;
 mod world;
 
 use live::watch;
 
-const EVENT_LOG: usize = 300;
 const COMPOSER: &str = "nervros_composer";
 /// The top bar's height in points: its 30-point buttons and the frame's margins.
 const TOP_BAR_HEIGHT: f32 = 48.0;
@@ -269,7 +269,7 @@ pub struct Gui {
     /// What the listing has read of them.
     listing: crate::sessions::Listing,
     chat: Chat,
-    event_log: VecDeque<String>,
+    timeline: events::Events,
     input: String,
     history: Vec<String>,
     history_pos: Option<usize>,
@@ -400,7 +400,7 @@ impl Gui {
             sessions: None,
             listing: crate::sessions::Listing::default(),
             chat,
-            event_log: VecDeque::new(),
+            timeline: events::Events::default(),
             input: String::new(),
             history: Vec::new(),
             history_pos: None,
@@ -520,11 +520,7 @@ impl Gui {
                             Closing::StopFailed
                         };
                     }
-                    if self.event_log.len() == EVENT_LOG {
-                        self.event_log.pop_back();
-                    }
-                    let line = serde_json::to_string(&e).unwrap_or_default();
-                    self.event_log.push_front(line);
+                    self.timeline.push(&e);
                     if matches!(e, Event::ApprovalRequested { .. }) && self.tab != Tab::Approvals {
                         self.tab_before_approval = Some(self.tab);
                         self.tab = Tab::Approvals;

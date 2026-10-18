@@ -239,13 +239,8 @@ impl Gui {
         }
     }
 
-    fn events_tab(&self, ui: &mut egui::Ui) {
-        if self.event_log.is_empty() {
-            empty(ui, "Session events appear here, newest first.");
-        }
-        for line in &self.event_log {
-            ui.label(RichText::new(line).monospace().size(11.5).color(theme::DIM));
-        }
+    fn events_tab(&mut self, ui: &mut egui::Ui) {
+        self.timeline.show(ui);
     }
 
     fn doctor_tab(&mut self, ui: &mut egui::Ui) {
