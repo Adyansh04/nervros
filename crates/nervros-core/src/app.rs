@@ -505,7 +505,7 @@ fn mission_ledger(profile: &Profile, ledger: &Path) -> Option<Arc<crate::mission
 /// blaming the model. Incidents and remembered playbooks are kept per robot beside its memory.
 fn debug_tools(
     profile: &Profile,
-    robot: &Arc<dyn RobotPort>,
+    (robot, schemas): (&Arc<dyn RobotPort>, &Arc<dyn SchemaSource>),
     ledger: &Path,
     registry: &mut Registry,
 ) -> Result<
@@ -521,6 +521,7 @@ fn debug_tools(
         .map(|c| c.read_deny.clone())
         .unwrap_or_default();
     let watches = crate::watch::Watches::new(Arc::clone(robot), read_deny);
+    watches.read_types(Arc::clone(schemas));
     for tool in watches.tools() {
         registry.add(tool)?;
     }
@@ -846,7 +847,7 @@ pub fn start_with(
     let (zones, integrations, port) =
         zone_and_stack_tools(&profile, &robot, stack_parts, &mut registry)?;
     robot_tools(&profile, &robot, (&schemas, &guard), &mut registry)?;
-    let (watches, incidents) = debug_tools(&profile, &robot, ledger, &mut registry)?;
+    let (watches, incidents) = debug_tools(&profile, (&robot, &schemas), ledger, &mut registry)?;
     let mcp = mcp_tools(&profile, models.privacy, &mut registry)?;
     let skills = skill_tools(&profile, &mut registry)?;
     let (memory, stop) = memory_and_stop(&profile, &port, (ledger, &integrations), &mut registry)?;
