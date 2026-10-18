@@ -399,7 +399,8 @@ impl Scene {
         let id = args["id"].as_str().unwrap_or_default();
         if !crate::lock(&self.added).contains_key(id) {
             return ToolOutcome::failed(format!(
-                "NervROS added no obstacle `{id}`; the robot's own stay as it set them"
+                "there is no obstacle `{id}` NervROS added in the planning scene now (list shows \
+                 them); the robot's own stay as it set them"
             ));
         }
         let gone = json!({"id": id, "operation": REMOVE});
