@@ -33,9 +33,10 @@ impl ArmCheck {
             "arm_check",
             "Asks MoveIt about an arm without moving it. reach: whether the arm's hand reaches an \
              object (its id) or a point (x, y, z in frame, the map by default), held as it is now. \
-             valid: whether a named pose of the arm is clear of collisions now. preview: the path \
-             the arm would take to a named pose, an object or a point, how long it takes, drawn \
-             in the 3D view. group is the arm, as arm_status names it, or its side.",
+             valid: whether a named pose of the arm is clear of collisions now, the pose alone. \
+             preview: whether and how the arm gets to a named pose, an object or a point: the \
+             path MoveIt plans, how long it takes, drawn in the 3D view; use it for \"can the arm \
+             get there\". group is the arm, as arm_status names it, or its side.",
             json!({
                 "type": "object",
                 "properties": {
@@ -155,6 +156,9 @@ impl ArmCheck {
                     "pose": name,
                     "clear": r["valid"].as_bool() == Some(true),
                     "touching": contacts,
+                    // A clear pose is not one the arm can get to: a model answered "yes, it can
+                    // reach it" past an obstacle no plan gets round.
+                    "checked": "the pose alone, not the way there: preview plans the way",
                 }))
             }
             Err(e) => ToolOutcome::failed(format!("MoveIt's state check did not answer: {e}")),
