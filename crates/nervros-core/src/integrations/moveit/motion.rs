@@ -437,7 +437,8 @@ impl NativeSkill for Native {
             Kind::HandTo => (
                 "HandTo",
                 "Move a hand to just above an object, or to a point, keeping it turned as it is. \
-                 It stops above an object, not on it.",
+                 It stops above an object, not on it, and only within the arm's reach. To show \
+                 the operator where something is, use point instead.",
                 json!([arm, {"name": "target", "type": "string",
                              "description": "An object's id, such as O17, or a point x;y;z on the map in metres."}]),
             ),
