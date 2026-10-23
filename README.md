@@ -114,8 +114,9 @@ plotted. Waits and walks are sped up.*
 
 Nothing in NervROS is robot-specific. One [profile](docs/profile.md) names the robot's topics,
 services, cameras, skills and limits, and the robot runs missions through a short
-[executor contract](docs/executor.md). Models come from llama.cpp, Gemini, OpenRouter or any
-OpenAI-compatible server, and each role has its own chain of fallbacks ([models](docs/models.md)).
+[executor contract](docs/executor.md). Models come from llama.cpp, Gemini, OpenRouter, any
+OpenAI-compatible server or Claude, whose paid key runs against a budget no call passes, and each
+role has its own chain of fallbacks ([models](docs/models.md)).
 
 Also included:
 

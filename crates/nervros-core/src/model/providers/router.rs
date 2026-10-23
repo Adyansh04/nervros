@@ -4,10 +4,12 @@
 //! Local models that fit are appended at the end, so a working local server is always the last
 //! resort. The caller tries the candidates in order and reports what happened.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
+use super::budget::{Budget, Tokens};
 use super::ledger::{Ledger, Refused, ResetZone, until_next_day};
 use super::{ModelConfig, ModelsConfig, ProviderKind, Role};
 
@@ -50,16 +52,24 @@ pub struct Router {
     config: ModelsConfig,
     ledger: Mutex<Ledger>,
     privacy: PrivacyMode,
+    /// Per provider id, for the providers that have one.
+    budgets: HashMap<String, Budget>,
 }
 
 impl Router {
     /// A router over a validated config and a ledger.
     #[must_use]
     pub fn new(config: ModelsConfig, ledger: Ledger, privacy: PrivacyMode) -> Self {
+        let budgets = config
+            .providers
+            .iter()
+            .filter_map(|p| p.budget.as_ref().map(|b| (p.id.clone(), Budget::new(b))))
+            .collect();
         Self {
             config,
             ledger: Mutex::new(ledger),
             privacy,
+            budgets,
         }
     }
 
@@ -93,6 +103,14 @@ impl Router {
         }
     }
 
+    /// Refused when the model's provider has spent its budget.
+    fn within_budget(&self, model: &ModelConfig) -> Result<(), Refused> {
+        match self.budgets.get(&model.provider) {
+            Some(budget) if !budget.allows() => Err(Refused::Budget(model.provider.clone())),
+            _ => Ok(()),
+        }
+    }
+
     fn pool_of<'a>(&'a self, model: &'a ModelConfig) -> Option<(&'a str, u32)> {
         let name = model.limits.pool.as_deref()?;
         self.config.pools.get(name).map(|p| (name, p.rpd))
@@ -112,6 +130,9 @@ impl Router {
         };
         if !private {
             return Some(Skip::Privacy);
+        }
+        if let Err(refused) = self.within_budget(model) {
+            return Some(Skip::Refused(refused));
         }
         let ledger = self.ledger();
         ledger
@@ -174,6 +195,7 @@ impl Router {
         let Some(model) = self.config.model(model_id) else {
             return Ok(());
         };
+        self.within_budget(model)?;
         let zone = self.zone(model);
         let mut ledger = self.ledger();
         ledger.check(&model.id, &model.limits, self.pool_of(model), now, zone)?;
@@ -182,6 +204,44 @@ impl Router {
             tracing::warn!(model = %model.id, error = %e, "could not save the quota ledger");
         }
         Ok(())
+    }
+
+    /// Adds what a call's tokens cost to its provider's budget, for a provider that has one.
+    pub fn record_spend(&self, model_id: &str, tokens: Tokens) {
+        let Some(model) = self.config.model(model_id) else {
+            return;
+        };
+        let (Some(budget), Some(price)) = (self.budgets.get(&model.provider), &model.price) else {
+            return;
+        };
+        let usd = price.cost(tokens);
+        match budget.add(usd) {
+            Ok(spent) => tracing::info!(
+                model = %model.id,
+                call_usd = usd,
+                spent_usd = spent,
+                budget_usd = budget.usd(),
+                "spend"
+            ),
+            Err(e) => tracing::warn!(
+                model = %model.id,
+                file = %budget.path().display(),
+                error = %e,
+                "could not count the spend; the budget now reads as spent"
+            ),
+        }
+    }
+
+    /// US dollars spent and the budget, per provider that has one.
+    #[must_use]
+    pub fn spend(&self) -> Vec<(String, f64, f64)> {
+        let mut out: Vec<(String, f64, f64)> = self
+            .budgets
+            .iter()
+            .map(|(id, b)| (id.clone(), b.spent(), b.usd()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// Parks a model for `for_how_long`, at most until its provider's next daily reset; persists
@@ -314,6 +374,63 @@ mod tests {
 
     fn ids(models: &[&ModelConfig]) -> Vec<String> {
         models.iter().map(|m| m.id.clone()).collect()
+    }
+
+    #[test]
+    fn a_spent_budget_passes_its_models_over_and_each_call_adds_its_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("spend.json");
+        let text = format!(
+            r#"
+            [[provider]]
+            id = "anthropic"
+            kind = "anthropic"
+            key = {{ env = "NONE" }}
+            budget = {{ usd = 0.01, spent_file = "{}" }}
+
+            [[model]]
+            id = "haiku"
+            provider = "anthropic"
+            model = "claude-haiku-5-5"
+            tools = true
+            max_tokens = 16000
+            price = {{ input = 0.10, output = 0.50, cache_read = 0.01, cache_write = 0.125 }}
+
+            [roles]
+            routine = ["haiku"]
+            "#,
+            file.display()
+        );
+        let r = Router::new(
+            ModelsConfig::parse(&text).unwrap(),
+            Ledger::default(),
+            PrivacyMode::Sim,
+        );
+        let now = SystemTime::now();
+        assert!(r.take_request("haiku", now).is_ok());
+        // A million fresh prompt tokens at $0.10: past the cent the budget allows.
+        r.record_spend(
+            "haiku",
+            Tokens {
+                input: 1_000_000,
+                ..Tokens::default()
+            },
+        );
+        let (_, spent, usd) = r.spend()[0].clone();
+        assert!((spent - 0.10).abs() < 1e-9 && (usd - 0.01).abs() < 1e-12);
+        assert_eq!(
+            r.take_request("haiku", now),
+            Err(Refused::Budget("anthropic".to_owned()))
+        );
+        let (take, skipped) = r.candidates(Role::Routine, Need::default(), now);
+        assert!(take.is_empty());
+        assert_eq!(
+            skipped,
+            [(
+                "haiku".to_owned(),
+                Skip::Refused(Refused::Budget("anthropic".to_owned()))
+            )]
+        );
     }
 
     #[test]

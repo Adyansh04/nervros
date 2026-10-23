@@ -25,7 +25,8 @@ headers = { "X-Title" = "NervROS" }
 
 - `kind` is `openai_compat` for anything that speaks OpenAI's chat completions: llama.cpp, Ollama,
   vLLM, OpenRouter, Groq. `gemini_interactions` is Google's Gemini, whose key travels only in the
-  `x-goog-api-key` header, never in a URL.
+  `x-goog-api-key` header, never in a URL. `anthropic` is Claude's Messages API, with the key in
+  `x-api-key` and the prompt cached between calls.
 - An `openai_compat` provider needs `base_url`. Its `headers` go with each request, and
   `timeout_s` (60 by default) bounds each call.
 - `key` is `{ file = "..." }` or `{ env = "NAME" }`, and absent for a local server. Keys are never
@@ -40,6 +41,35 @@ Only free models run:
   requests today. `free_only = true` says so for OpenRouter, and `false` is refused.
 - Elsewhere a free tier is a property of the key, which nothing here can check, so `free_only` is
   refused there: use a free-tier key.
+
+The one exception is a paid provider with a budget, which NervROS stops calling before it is spent:
+
+```toml
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+key = { file = "~/.config/claude.key" }
+budget = { usd = 95.0, spent_file = "~/.config/nervros/claude-spend.json" }
+
+[[model]]
+id = "claude-haiku-5.5"
+provider = "anthropic"
+model = "claude-haiku-5-5"
+vision = true
+tools = true
+max_tokens = 16000
+context = 90000
+price = { input = 0.10, output = 0.50, cache_read = 0.01, cache_write = 0.125 }
+```
+
+- An `anthropic` provider needs a `budget`, and each model on a budgeted provider a `price` in US
+  dollars per million tokens; the file is refused without them. An `anthropic` model also needs
+  `max_tokens`, the longest reply, which the API requires.
+- Each call's fresh, cached, cache-written and reply tokens are priced and added to `spent_file`,
+  under a file lock that every NervROS process on the machine shares, so a new state directory or
+  a second process does not start the count again. No call starts once the spend reaches `usd`;
+  the role's chain goes on to the next model. A spend file that cannot be read counts as spent.
+- Set `usd` below the key's credit: a call in flight is counted when it returns.
 
 ## Models
 
@@ -64,6 +94,8 @@ privacy = { trains = true }                     # free endpoints may train on wh
 | `params` | none | Request fields passed to the provider as they are, such as Gemini's `{ generation_config = { thinking_level = "low" } }`. |
 | `context` | none | Its context window in tokens; see below. Unset, nothing is cut. |
 | `stream` | `false` | Its replies appear word by word in the window. |
+| `price` | none | US dollars per million tokens: `input`, `output`, `cache_read`, `cache_write`; needed on a budgeted provider. |
+| `max_tokens` | none | The longest reply, in tokens; needed on `anthropic`. |
 
 With `context` set, the conversation is condensed before a turn once it passes half the window.
 Tool results before the operator's newest message are cut to a line, and when that is not enough,

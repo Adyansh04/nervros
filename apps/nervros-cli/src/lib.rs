@@ -369,6 +369,9 @@ async fn models(profile: &Path, check: bool) -> Result<()> {
             router.used_today(&model.id, now)
         );
     }
+    for (provider, spent, usd) in router.spend() {
+        println!("{provider}: ${spent:.2} spent of a ${usd:.2} budget");
+    }
     if !check {
         return Ok(());
     }

@@ -17,6 +17,7 @@ use super::client::{Llm, prompt_setback, stream_setback};
 use super::history::{History, RESERVE_TOKENS, cut_old, fit, size, tokens_of};
 use super::{LlmError, Setback};
 use crate::providers::Role;
+use crate::providers::budget::Tokens;
 use crate::providers::router::Need;
 
 /// Model-facing JSON a tool returns.
@@ -65,6 +66,9 @@ pub trait AgentSource: Send + Sync {
 
     /// Sets a model aside for `for_how_long` after a 429.
     fn park(&self, model_id: &str, for_how_long: Duration);
+
+    /// Counts what one call cost against its provider's budget, if it has one.
+    fn spent(&self, _model_id: &str, _cost: CallCost) {}
 
     /// Tries a model whose server did not answer last, for `for_how_long`.
     fn set_aside(&self, model_id: &str, for_how_long: Duration) {
@@ -130,6 +134,18 @@ impl AgentSource for Llm {
         if let Err(e) = self.router.park(model_id, SystemTime::now(), for_how_long) {
             tracing::warn!(model = %model_id, error = %e, "could not save the quota ledger");
         }
+    }
+
+    fn spent(&self, model_id: &str, cost: CallCost) {
+        self.router.record_spend(
+            model_id,
+            Tokens {
+                input: cost.input_tokens,
+                cached: cost.cached_tokens,
+                cache_write: cost.cache_write_tokens,
+                output: cost.output_tokens,
+            },
+        );
     }
 
     fn set_aside(&self, model_id: &str, for_how_long: Duration) {
@@ -217,17 +233,16 @@ impl AgentHook for TurnHook {
         _ctx: &HookContext,
         event: ModelTurnFinished<'_>,
     ) -> ModelTurnAction {
+        let sent = self.sent.lock().ok().and_then(|mut s| s.take());
+        let cost = CallCost {
+            ms: sent.map_or(0, |t| {
+                u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }),
+            ..CallCost::of(&event.usage)
+        };
+        self.source.spent(&self.model, cost);
         if let Some(on_call) = &self.on_call {
-            let sent = self.sent.lock().ok().and_then(|mut s| s.take());
-            // A count the provider leaves out is zero tokens to the budget and the report.
-            on_call(CallCost {
-                input_tokens: event.usage.input_tokens.unwrap_or(0),
-                cached_tokens: event.usage.cached_input_tokens.unwrap_or(0),
-                output_tokens: event.usage.output_tokens.unwrap_or(0),
-                ms: sent.map_or(0, |t| {
-                    u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
-                }),
-            });
+            on_call(cost);
         }
         ModelTurnAction::Continue
     }
@@ -282,10 +297,26 @@ pub struct CallCost {
     pub input_tokens: u64,
     /// Of those, read from the provider's prompt cache.
     pub cached_tokens: u64,
+    /// Of those, written to the provider's prompt cache.
+    pub cache_write_tokens: u64,
     /// Reply tokens.
     pub output_tokens: u64,
     /// From sending the request to the whole reply.
     pub ms: u64,
+}
+
+impl CallCost {
+    /// A call's cost from rig's count, its time unknown; a count left out is zero tokens.
+    #[must_use]
+    pub fn of(usage: &rig::completion::Usage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens.unwrap_or(0),
+            cached_tokens: usage.cached_input_tokens.unwrap_or(0),
+            cache_write_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+            output_tokens: usage.output_tokens.unwrap_or(0),
+            ms: 0,
+        }
+    }
 }
 
 /// What is given each model call's cost.

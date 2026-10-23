@@ -7,13 +7,14 @@ use std::time::{Duration, SystemTime};
 use rig::agent::StreamingError;
 use rig::completion::{Message, PromptError};
 use rig::http_client::ReqwestClient;
+use rig::providers::anthropic::AnthropicConfig;
 use rig::providers::gemini::GeminiConfig;
 use rig::providers::openai::OpenAIConfig;
 use rig::run::PromptResponse;
 use rig::{Agent, AgentBuilder, ErrorKind};
 use secrecy::{ExposeSecret as _, SecretString};
 
-use super::turn::{AgentSource as _, without_provider_body};
+use super::turn::{AgentSource as _, CallCost, without_provider_body};
 use super::{Answer, Ask, BUSY_RETRY, LlmError, Setback, user_message};
 use crate::providers::router::{Need, Router, Skip};
 use crate::providers::{ModelConfig, ProviderConfig, ProviderKind, Role, free_only};
@@ -170,6 +171,22 @@ impl Llm {
                     GeminiConfig::new(key.expose_secret()).connect(ReqwestClient::from(http));
                 Ok(AgentBuilder::new(client.interactions(&model.model)))
             }
+            ProviderKind::Anthropic => {
+                let key = key.ok_or_else(|| LlmError::Client {
+                    provider: provider.id.clone(),
+                    message: "anthropic needs a key".to_owned(),
+                })?;
+                let client =
+                    AnthropicConfig::new(key.expose_secret()).connect(ReqwestClient::from(http));
+                let mut messages = client.completion(&model.model);
+                // The system prompt and tools are the same each call: read back from the cache,
+                // they cost a tenth of sending them again.
+                messages.wire = messages.wire.with_automatic_caching();
+                if let Some(max) = model.max_tokens {
+                    messages.wire = messages.wire.with_default_max_tokens(max);
+                }
+                Ok(AgentBuilder::new(messages))
+            }
         }
     }
 
@@ -209,6 +226,7 @@ impl Llm {
             };
             match prompt_once_more(&agent, message, again).await {
                 Ok(response) => {
+                    self.spent(&model.id, CallCost::of(&response.usage));
                     // A count the provider leaves out is zero tokens to the budget and the report.
                     return Ok(Answer {
                         text: response.output,

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::client::{Llm, prompt_once_more, prompt_setback};
-use super::turn::{AgentSource, without_provider_body};
+use super::turn::{AgentSource, CallCost, without_provider_body};
 use super::{Ask, ImageInput, Shot};
 use crate::providers::Role;
 use crate::providers::router::Need;
@@ -32,8 +32,12 @@ pub async fn summarise(source: &Arc<dyn AgentSource>, transcript: &str) -> Optio
         let agent = builder.preamble(SUMMARY_PREAMBLE).build();
         let again = || source.take_request(&model).is_ok();
         match prompt_once_more(&agent, transcript.to_owned(), again).await {
-            Ok(response) if !response.output.trim().is_empty() => return Some(response.output),
-            Ok(_) => {}
+            Ok(response) => {
+                source.spent(&model, CallCost::of(&response.usage));
+                if !response.output.trim().is_empty() {
+                    return Some(response.output);
+                }
+            }
             Err(e) => {
                 if let Some(setback) = prompt_setback(&e) {
                     source.set_back(&model, setback);
