@@ -554,20 +554,17 @@ impl Composite {
 
     async fn pause(&self, request: &Value) -> Result<Value, RosError> {
         let on = request["pause"].as_bool().unwrap_or(false);
-        let here = {
-            let running = crate::lock(&self.running);
-            match running.as_ref() {
-                Some(r) if r.executor.is_none() => {
-                    r.paused.send_replace(on);
-                    true
-                }
-                Some(_) => false,
-                None => {
-                    return Ok(json!({"ok": false, "message": "no mission is running"}));
-                }
+        // A step NervROS runs pauses here. The executor pauses its own stretch, and a mission of
+        // its skills alone, which goes to it straight and leaves nothing running here.
+        let here = match crate::lock(&self.running).as_ref() {
+            Some(r) if r.executor.is_none() => {
+                r.paused.send_replace(on);
+                Some(true)
             }
+            Some(_) => Some(false),
+            None => None,
         };
-        if here {
+        if here == Some(true) {
             return Ok(json!({"ok": true, "message": if on { "paused" } else { "resumed" }}));
         }
         match self.real.as_ref().and_then(|r| r.pause.clone()) {
@@ -581,6 +578,7 @@ impl Composite {
                     )
                     .await
             }
+            None if here.is_none() => Ok(json!({"ok": false, "message": "no mission is running"})),
             None => Ok(json!({"ok": false, "message": "the executor cannot pause"})),
         }
     }

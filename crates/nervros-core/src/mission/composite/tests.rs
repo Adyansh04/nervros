@@ -488,3 +488,32 @@ async fn pause_and_stop_in_an_executor_stretch_go_to_the_executor() {
         "the native step after the stop never ran"
     );
 }
+
+#[tokio::test]
+async fn a_mission_of_executor_skills_alone_is_paused_by_the_executor() {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&asked);
+    let robot = FakeRobot::new().with_service("/x/pause_mission", move |r| {
+        log.lock().unwrap().push(format!("pause {}", r["pause"]));
+        Ok(json!({"ok": true, "message": "paused"}))
+    });
+    let real: MissionConfig = serde_json::from_value(json!({
+        "execute": "/x/execute_mission", "validate": "/x/validate_mission",
+        "catalog": "/x/get_catalog", "stop": "/x/stop_all", "state": "/x/robot_state",
+        "pause": "/x/pause_mission",
+    }))
+    .unwrap();
+    // The executor runs such a mission without the composite, so nothing runs here.
+    let c = Composite::new(Arc::new(robot), Some(real), Vec::new());
+    let paused = c
+        .call(PAUSE, "", json!({"pause": true}), CALL_WAIT)
+        .await
+        .unwrap();
+    assert_eq!(paused["ok"], true, "{paused}");
+    assert_eq!(*asked.lock().unwrap(), ["pause true"]);
+    let none = composite(Vec::new())
+        .call(PAUSE, "", json!({"pause": true}), CALL_WAIT)
+        .await
+        .unwrap();
+    assert_eq!(none["message"], "no mission is running", "{none}");
+}
