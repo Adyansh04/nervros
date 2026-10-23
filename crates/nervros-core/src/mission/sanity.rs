@@ -413,10 +413,15 @@ const POINTING: [&str; 6] = ["it", "that", "this", "them", "those", "these"];
 /// said first in a session, nobody knows what it is.
 #[must_use]
 pub fn unnamed(request: &str) -> Option<String> {
-    words(request)
+    let words = words(request);
+    let at = words
         .windows(2)
-        .find(|p| HANDLING.contains(&p[0].as_str()) && POINTING.contains(&p[1].as_str()))
-        .map(|p| p[1].clone())
+        .position(|p| HANDLING.contains(&p[0].as_str()) && POINTING.contains(&p[1].as_str()))?;
+    // A thing the request names before it, as in "find the toy robot and pick it up", is what it is.
+    let named_before = words[..at]
+        .iter()
+        .any(|w| ["the", "a", "an"].contains(&w.as_str()));
+    (!named_before).then(|| words[at + 1].clone())
 }
 
 /// What a request asks to repeat on a clock, as "every 5 minutes, 3 times".
@@ -769,6 +774,11 @@ mod tests {
         );
         assert_eq!(unnamed("Pick up the small white mug"), None);
         assert_eq!(unnamed("Turn it around"), None, "not a thing to handle");
+        assert_eq!(
+            unnamed("Walk to the office desk, find the toy robot on it, and pick it up."),
+            None,
+            "named before it"
+        );
     }
 
     #[test]
