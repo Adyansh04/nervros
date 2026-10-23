@@ -247,8 +247,8 @@ struct Sim {
     at: Option<String>,
     xy: Option<(f64, f64)>,
     holding: BTreeMap<String, String>,
-    /// What went into what, object first.
-    inside: Vec<(String, String)>,
+    /// Where each placed object rests: the object, its host and `inside` or `on`.
+    placed: Vec<(String, String, &'static str)>,
     /// The named pose each arm was sent to.
     arms: BTreeMap<String, String>,
 }
@@ -353,7 +353,7 @@ impl Sim {
             match (name, args.as_slice()) {
                 ("holding", [a, x]) => {
                     if let (Some(arm), Some(obj)) = (value(a), value(x)) {
-                        self.inside.retain(|(o, _)| *o != obj);
+                        self.placed.retain(|(o, _, _)| *o != obj);
                         // A replan after a failed place tends to pick the object up again.
                         if let Some((hand, _)) = self.holding.iter().find(|(_, held)| **held == obj)
                         {
@@ -380,7 +380,8 @@ impl Sim {
                 }
                 // `X`, a capital, is what the hand the skill needs holding holds: its effects
                 // come before `hand_empty` empties it.
-                ("inside", [x, c]) => {
+                ("inside" | "on", [x, c]) => {
+                    let relation = if name == "on" { "on" } else { "inside" };
                     let obj = if x.starts_with(char::is_uppercase) {
                         skill
                             .requires
@@ -396,8 +397,8 @@ impl Sim {
                         value(x)
                     };
                     if let (Some(obj), Some(container)) = (obj, value(c)) {
-                        self.inside.retain(|(o, _)| *o != obj);
-                        self.inside.push((obj, container));
+                        self.placed.retain(|(o, _, _)| *o != obj);
+                        self.placed.push((obj, container, relation));
                     }
                 }
                 _ => {}
@@ -420,7 +421,7 @@ impl Sim {
                 .filter(|(_, held)| !held.is_empty())
                 .map(|(arm, held)| format!("holding({arm}, {held})")),
         );
-        out.extend(self.inside.iter().map(|(o, c)| format!("inside({o}, {c})")));
+        out.extend(self.placed.iter().map(|(o, c, r)| format!("{r}({o}, {c})")));
         out.extend(self.arms.iter().map(|(a, p)| format!("arm_at({a}, {p})")));
         // What a step finds is known only once it runs, so nothing can be checked against it.
         out.retain(|p| !p.contains('{'));
@@ -648,7 +649,7 @@ pub fn compile(
         at: None,
         xy: world.robot,
         holding: world.holding.clone(),
-        inside: Vec::new(),
+        placed: Vec::new(),
         arms: BTreeMap::new(),
     };
     let mut links = links(plan, &mut problems);
@@ -1320,6 +1321,31 @@ mod tests {
 
     fn catalog() -> Catalog {
         Catalog::parse(CATALOG).unwrap()
+    }
+
+    #[test]
+    fn a_place_on_a_surface_ends_with_the_object_on_it() {
+        let mut c: Value = serde_json::from_str(CATALOG).unwrap();
+        let skills = c["skills"].as_array_mut().unwrap();
+        let mut place_on = skills
+            .iter()
+            .find(|s| s["name"] == "PlaceInto")
+            .unwrap()
+            .clone();
+        place_on["name"] = json!("PlaceOn");
+        place_on["template"] = json!("PlaceOn");
+        place_on["args"][0]["name"] = json!("surface_id");
+        place_on["requires"] = json!(["near(surface_id)", "holding(arm, X)"]);
+        place_on["effects"] = json!(["on(X, surface_id)", "hand_empty(arm)"]);
+        skills.push(place_on);
+        let catalog = Catalog::parse(&c.to_string()).unwrap();
+        let p = plan(&json!([
+            {"skill": "GoToPlace", "args": {"place": "Basket"}},
+            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}},
+            {"skill": "PlaceOn", "args": {"surface_id": "O31", "phrase": "basket", "arm": "right"}}
+        ]));
+        let compiled = compile(&p, &catalog, &world(), Author::Model).unwrap();
+        assert_eq!(compiled.goal, ["on(O17, O31)"]);
     }
 
     #[test]
