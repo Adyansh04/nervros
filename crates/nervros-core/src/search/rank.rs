@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::priors::{room_type, rooms_for};
 use crate::mission::check::{how_long, named};
+use crate::profile::PlaceConfig;
 
 /// How fast what the world model saw goes stale: an hour old counts about 0.96 of new, a day 0.37.
 const DAY_S: f64 = 86_400.0;
@@ -46,6 +47,8 @@ pub struct Seen<'a> {
     pub robot: Option<(f64, f64)>,
     /// Unix seconds now.
     pub now_s: f64,
+    /// The named places, on the map: a room with some in it is looked at from them.
+    pub places: &'a [PlaceConfig],
 }
 
 /// The places to look, best first, one per target.
@@ -200,7 +203,8 @@ fn moves(seen: &Seen<'_>) -> Vec<Lookout> {
 }
 
 /// Every room: those such things are usually in first, each counting more the less of it the
-/// camera has seen, since a seen room would have shown the thing.
+/// camera has seen, since a seen room would have shown the thing. A room with named places in it
+/// is looked at from each of them: from its middle the cameras see little of what is on a table.
 fn rooms(seen: &Seen<'_>) -> Vec<Lookout> {
     let usual = rooms_for(seen.words);
     seen.rooms["rooms"]
@@ -208,7 +212,7 @@ fn rooms(seen: &Seen<'_>) -> Vec<Lookout> {
         .map_or(&[][..], Vec::as_slice)
         .iter()
         .filter(|r| !text(r, "id").is_empty())
-        .map(|r| {
+        .flat_map(|r| {
             let kind = room_type(text(r, "type"));
             let rank = usual.iter().position(|u| *u == kind);
             let seen_share = r["floor_coverage"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
@@ -235,16 +239,56 @@ fn rooms(seen: &Seen<'_>) -> Vec<Lookout> {
             } else {
                 why
             };
+            let room = text(r, "id").to_owned();
+            let inside: Vec<Lookout> = seen
+                .places
+                .iter()
+                .filter(|p| holds(&r["outline"], p.pose.x, p.pose.y))
+                .map(|p| Lookout {
+                    target: p.name.clone(),
+                    why: why.clone(),
+                    room: room.clone(),
+                    score: odds * unseen,
+                    xy: Some((p.pose.x, p.pose.y)),
+                })
+                .collect();
+            if !inside.is_empty() {
+                return inside;
+            }
             let c = &r["centroid"];
-            Lookout {
-                target: text(r, "id").to_owned(),
+            vec![Lookout {
+                target: room.clone(),
                 why,
-                room: text(r, "id").to_owned(),
+                room,
                 score: odds * unseen,
                 xy: c["x"].as_f64().zip(c["y"].as_f64()),
-            }
+            }]
         })
         .collect()
+}
+
+/// Whether a `geometry_msgs/Polygon` holds the point: a ray from it crosses an odd number of
+/// edges.
+pub(crate) fn holds(outline: &Value, x: f64, y: f64) -> bool {
+    let corners: Vec<(f64, f64)> = outline["points"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter_map(|p| p["x"].as_f64().zip(p["y"].as_f64()))
+        .collect();
+    if corners.len() < 3 {
+        return false;
+    }
+    let before = corners.iter().cycle().skip(corners.len() - 1);
+    corners
+        .iter()
+        .zip(before)
+        .filter(|((xa, ya), (xb, yb))| {
+            (*ya > y) != (*yb > y) && x < xa + (xb - xa) * (y - ya) / (yb - ya)
+        })
+        .count()
+        % 2
+        == 1
 }
 
 #[cfg(test)]
@@ -281,6 +325,7 @@ mod tests {
             events: &[],
             robot: Some((0.0, 0.0)),
             now_s: NOW,
+            places: &[],
         };
         let ranked = rank(&seen);
         assert_eq!(
@@ -307,6 +352,7 @@ mod tests {
             events: &[],
             robot: Some((0.0, 0.0)),
             now_s: NOW,
+            places: &[],
         };
         // The kitchen is one of the rooms keys are in; then the less seen of the others.
         assert_eq!(order(&seen), ["R1", "R2", "R3"]);
@@ -339,6 +385,7 @@ mod tests {
             events: &[],
             robot: None,
             now_s: NOW,
+            places: &[],
         };
         let ranked = rank(&seen);
         assert_eq!(
@@ -370,10 +417,48 @@ mod tests {
             events: &events,
             robot: None,
             now_s: NOW,
+            places: &[],
         };
         let ranked = rank(&seen);
         assert_eq!(ranked[0].target, "R3");
         assert_eq!(ranked[0].why, "mug was moved there 60 s ago");
         assert_eq!(ranked.iter().filter(|l| l.target == "R3").count(), 1);
+    }
+
+    #[test]
+    fn a_room_with_named_places_in_it_is_looked_at_from_them_the_nearest_first() {
+        let objects = json!({"objects": []});
+        let square = |x0: f64, x1: f64| {
+            json!({"points": [{"x": x0, "y": -1.0}, {"x": x1, "y": -1.0}, {"x": x1, "y": 1.0},
+                              {"x": x0, "y": 1.0}]})
+        };
+        let rooms = json!({"rooms": [
+            {"id": "R1", "type": "bedroom", "outline": square(0.0, 4.0),
+             "centroid": {"x": 2.0, "y": 0.0}, "floor_coverage": 0.5},
+            {"id": "R2", "type": "office", "outline": square(4.0, 8.0),
+             "centroid": {"x": 6.0, "y": 0.0}, "floor_coverage": 0.5}]});
+        let place = |name: &str, x: f64| PlaceConfig {
+            name: name.to_owned(),
+            aliases: Vec::new(),
+            frame: "map".to_owned(),
+            pose: crate::profile::PlacePose { x, y: 0.5, yaw: 0.0 },
+            near: Vec::new(),
+        };
+        let places = [place("far_nightstand", 3.5), place("near_nightstand", 0.5)];
+        let seen = Seen {
+            words: "toy",
+            objects: &objects,
+            rooms: &rooms,
+            events: &[],
+            robot: Some((0.0, 0.0)),
+            now_s: NOW,
+            places: &places,
+        };
+        assert_eq!(
+            order(&seen),
+            ["near_nightstand", "far_nightstand", "R2"],
+            "toys are bedroom things; the office has no place named in it"
+        );
+        assert!(!holds(&json!({"points": []}), 0.0, 0.0));
     }
 }

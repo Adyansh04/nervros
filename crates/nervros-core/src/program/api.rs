@@ -24,7 +24,7 @@ pub trait Host: Send + Sync {
     ///
     /// The world model did not answer.
     fn rooms(&self) -> Result<Value, String>;
-    /// The named places, as `[{name, x, y}]`.
+    /// The named places, as `[{name, x, y, room}]`, `room` the id of the room it is in or empty.
     ///
     /// # Errors
     ///
@@ -71,9 +71,9 @@ pub trait Host: Send + Sync {
 /// What the functions look like to the model, for the tool's description.
 pub const REFERENCE: &str = "objects(words) and objects(words, room) -> [#{id, label, name, \
      room, x, y, z, state, last_seen_s}]; rooms() -> [#{id, name, type, x, y, area, seen}]; \
-     places() -> [#{name, x, y}]; pose() -> #{x, y, yaw}; walk(place) -> true once there (a place, \
-     room or object id, or words); find(words) -> the id the detector reports, or () when it sees \
-     none; any skill by its name, such as PickObject(#{object_id: id, arm: \"right\"}), \
+     places() -> [#{name, x, y, room}] (room: the id of the room it is in); pose() -> \
+     #{x, y, yaw}; walk(place) -> true once there (a place, room or object id, or words); \
+     find(words) -> the id the detector reports, or () when it sees none; any skill by its name, such as PickObject(#{object_id: id, arm: \"right\"}), \
      PickObject(id) or TuckForTravel(), or run(\"Skill\", #{args}), -> #{ok, outcome, reason, \
      outputs}; read(topic) -> \
      the newest message; rate(topic, seconds) -> Hz; tf(parent, child) -> #{x, y, z, yaw}; \

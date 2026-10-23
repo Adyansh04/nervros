@@ -392,7 +392,12 @@ keys itself.
 
 1. where the world model saw the thing, and how long ago,
 2. where it went since,
-3. the rooms such things are usually in, the least seen first, nearer before farther.
+3. the rooms such things are usually in, the least seen first, nearer before farther; a room with
+   named places in it is looked at from each of them, since from a room's middle the cameras see
+   little of what stands on its tables.
+
+To look in an order you give ("on the office desk, then the nightstands"), the agent writes a
+program instead: it can pick the thing up and put it away once found, which a search cannot.
 
 The approval names the first places and why: "O783 (a mug was seen there 9 days ago), then O244
 (a mug was seen there 9 days ago), then O27 …", and so on. The search walks to each place and looks with the

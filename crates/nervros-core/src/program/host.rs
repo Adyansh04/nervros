@@ -96,10 +96,18 @@ impl Host for RobotHost {
 
     fn places(&self) -> Result<Value, String> {
         let seen = self.runtime.block_on(self.missions.observe());
+        let rooms = seen.rooms["rooms"].as_array().cloned().unwrap_or_default();
         Ok(Value::Array(
             seen.places
                 .iter()
-                .map(|p| json!({"name": p.name, "x": p.pose.x, "y": p.pose.y}))
+                .map(|p| {
+                    let room = rooms
+                        .iter()
+                        .find(|r| crate::search::holds(&r["outline"], p.pose.x, p.pose.y))
+                        .and_then(|r| r["id"].as_str())
+                        .unwrap_or_default();
+                    json!({"name": p.name, "x": p.pose.x, "y": p.pose.y, "room": room})
+                })
                 .collect(),
         ))
     }

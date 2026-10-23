@@ -9,4 +9,5 @@ mod tool;
 
 pub use patrol::PatrolTool;
 pub use rank::Lookout;
+pub(crate) use rank::holds;
 pub use tool::SearchTool;
