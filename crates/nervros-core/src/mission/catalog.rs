@@ -55,6 +55,10 @@ pub struct LearnableLeaf {
     /// argument may feed only these.
     #[serde(default)]
     pub world_ids: Option<Vec<String>>,
+    /// The only values an input takes, for the inputs the executor fixes, as an arm's `left` or
+    /// `right`: an argument fed to one takes only these too.
+    #[serde(default)]
+    pub values: BTreeMap<String, Vec<String>>,
 }
 
 /// One skill: a behaviour-tree macro in the executor's library.
