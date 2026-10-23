@@ -240,10 +240,13 @@ impl Catalog {
                 let _ = write!(text, " Needs {}.", s.requires.join(" and "));
             }
             for a in s.model_args() {
-                let what = if a.choices.is_empty() {
-                    a.description.clone()
-                } else {
-                    a.choices.join(" or ")
+                // A bare value reads like an example: say what it is and that only those go.
+                let what = match (a.choices.is_empty(), a.description.is_empty()) {
+                    (true, _) => a.description.clone(),
+                    (false, true) => format!("only {}", a.choices.join(" or ")),
+                    (false, false) => {
+                        format!("{}; only {}", a.description, a.choices.join(" or "))
+                    }
                 };
                 let _ = write!(text, "\n    {}: {what}", a.name);
             }
@@ -298,7 +301,7 @@ pub(crate) mod tests {
         assert!(text.contains(
             "- PickObject(object_id, phrase, arm): Pick an object up. Needs near(object_id) and hand_empty(arm)."
         ));
-        assert!(text.contains("\n    arm: left or right"));
+        assert!(text.contains("\n    arm: which arm; only left or right"));
         assert!(text.contains("\n    phrase: what the detector looks for"));
         assert!(!text.contains("GoToPose"));
     }
