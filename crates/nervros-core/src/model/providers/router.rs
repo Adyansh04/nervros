@@ -214,22 +214,7 @@ impl Router {
         let (Some(budget), Some(price)) = (self.budgets.get(&model.provider), &model.price) else {
             return;
         };
-        let usd = price.cost(tokens);
-        match budget.add(usd) {
-            Ok(spent) => tracing::info!(
-                model = %model.id,
-                call_usd = usd,
-                spent_usd = spent,
-                budget_usd = budget.usd(),
-                "spend"
-            ),
-            Err(e) => tracing::warn!(
-                model = %model.id,
-                file = %budget.path().display(),
-                error = %e,
-                "could not count the spend; the budget now reads as spent"
-            ),
-        }
+        budget.charge(price.cost(tokens), &model.id);
     }
 
     /// US dollars spent and the budget, per provider that has one.

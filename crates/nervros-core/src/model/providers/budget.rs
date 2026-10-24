@@ -2,11 +2,18 @@
 //! NervROS process on the machine shares, so no run starts again from nothing, and no call starts
 //! once the budget is spent.
 
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+/// How long a reading of the spend file stands: the window asks every frame, and another
+/// process's spend shows within this.
+const REREAD: Duration = Duration::from_secs(2);
 
 /// US dollars per million tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -74,11 +81,24 @@ struct Spent {
     usd: f64,
 }
 
+/// What this process knows of the spend.
+#[derive(Debug, Default)]
+struct Seen {
+    /// The file's spend as last read or written, and when.
+    usd: f64,
+    at: Option<Instant>,
+    /// Charged here and not yet in the file.
+    pending: f64,
+    /// A charge could not be written: the budget counts as spent from then on.
+    lost: bool,
+}
+
 /// A budget and its spend file.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Budget {
     usd: f64,
     path: PathBuf,
+    seen: Arc<Mutex<Seen>>,
 }
 
 impl Budget {
@@ -88,6 +108,7 @@ impl Budget {
         Self {
             usd: config.usd,
             path: crate::secret::expand_home(&config.spent_file),
+            seen: Arc::default(),
         }
     }
 
@@ -97,17 +118,23 @@ impl Budget {
         self.usd
     }
 
-    /// US dollars spent so far. An unreadable file counts as the whole budget spent: a budget
-    /// that cannot be read must not be spent past.
+    /// US dollars spent so far, this process's charges on their way to the file included. A file
+    /// that cannot be read, or a charge that could not be written, counts as the whole budget
+    /// spent: a budget that cannot be counted must not be spent past.
     #[must_use]
     pub fn spent(&self) -> f64 {
-        match self.read() {
-            Ok(usd) => usd,
-            Err(e) => {
+        let mut seen = crate::lock(&self.seen);
+        if seen.lost {
+            return self.usd;
+        }
+        if seen.at.is_none_or(|at| at.elapsed() >= REREAD) {
+            seen.usd = read(&self.path).unwrap_or_else(|e| {
                 tracing::warn!(file = %self.path.display(), error = %e, "the spend file is unreadable");
                 self.usd
-            }
+            });
+            seen.at = Some(Instant::now());
         }
+        seen.usd + seen.pending
     }
 
     /// Whether another call may start.
@@ -116,42 +143,37 @@ impl Budget {
         self.spent() < self.usd
     }
 
-    /// Adds `usd` to the spend, under an exclusive lock so two processes cannot lose a call.
-    ///
-    /// # Errors
-    ///
-    /// The file cannot be opened, locked, read or written.
-    pub fn add(&self, usd: f64) -> std::io::Result<f64> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path)?;
-        file.lock()?;
-        let spent = read_spent(&mut file)? + usd.max(0.0);
-        let text = serde_json::to_vec(&Spent { usd: spent }).map_err(std::io::Error::other)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.set_len(0)?;
-        file.write_all(&text)?;
-        file.sync_all()?;
-        file.unlock()?;
-        Ok(spent)
-    }
-
-    fn read(&self) -> std::io::Result<f64> {
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0.0),
-            Err(e) => return Err(e),
+    /// Charges `usd` for a call to `model`: counted here at once, and added to the file off the
+    /// async runtime when there is one, since the write waits on a lock and the disk.
+    pub fn charge(&self, usd: f64, model: &str) {
+        let usd = usd.max(0.0);
+        crate::lock(&self.seen).pending += usd;
+        let (path, seen, budget, model) = (
+            self.path.clone(),
+            Arc::clone(&self.seen),
+            self.usd,
+            model.to_owned(),
+        );
+        let write = move || {
+            let added = add(&path, usd);
+            let mut seen = crate::lock(&seen);
+            seen.pending = (seen.pending - usd).max(0.0);
+            match added {
+                Ok(spent) => {
+                    seen.usd = spent;
+                    seen.at = Some(Instant::now());
+                    tracing::info!(model = %model, call_usd = usd, spent_usd = spent, budget_usd = budget, "spend");
+                }
+                Err(e) => {
+                    seen.lost = true;
+                    tracing::warn!(model = %model, file = %path.display(), error = %e, "could not count the spend; the budget now reads as spent");
+                }
+            }
         };
-        file.lock_shared()?;
-        let spent = read_spent(&mut file);
-        file.unlock()?;
-        spent
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(write)),
+            Err(_) => write(),
+        }
     }
 
     /// The spend file's path.
@@ -161,13 +183,44 @@ impl Budget {
     }
 }
 
-/// The spend a file holds; an empty file is a new budget.
-fn read_spent(file: &mut File) -> std::io::Result<f64> {
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    if text.trim().is_empty() {
-        return Ok(0.0);
-    }
+/// `path` with `suffix` added to its name.
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = OsString::from(path.as_os_str());
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Adds `usd` to the spend in `path` under an exclusive lock on a file beside it, so two processes
+/// cannot lose a call, and replaces the file whole: a crash leaves the old spend or the new one.
+fn add(path: &Path, usd: f64) -> std::io::Result<f64> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(beside(path, ".lock"))?;
+    lock.lock()?;
+    let spent = read(path)? + usd;
+    let next = beside(path, ".next");
+    let mut file = File::create(&next)?;
+    file.write_all(&serde_json::to_vec(&Spent { usd: spent }).map_err(std::io::Error::other)?)?;
+    file.sync_all()?;
+    std::fs::rename(&next, path)?;
+    // The rename itself is on disk only once the directory is.
+    File::open(dir)?.sync_all()?;
+    lock.unlock()?;
+    Ok(spent)
+}
+
+/// The spend in `path`: none yet when there is no file. A file is only ever replaced whole, so an
+/// empty one was damaged, not started.
+fn read(path: &Path) -> std::io::Result<f64> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0.0),
+        Err(e) => return Err(e),
+    };
     let spent: Spent = serde_json::from_str(&text).map_err(std::io::Error::other)?;
     if spent.usd.is_finite() && spent.usd >= 0.0 {
         Ok(spent.usd)
@@ -212,15 +265,22 @@ mod tests {
         });
         assert!((budget.spent() - 0.0).abs() < f64::EPSILON);
         assert!(budget.allows());
-        budget.add(0.4).unwrap();
-        // Another process's view of the same file.
-        let other = Budget::new(&BudgetConfig {
-            usd: 1.0,
-            spent_file: dir.path().join("sub/spend.json"),
-        });
-        other.add(0.7).unwrap();
-        assert!((budget.spent() - 1.1).abs() < 1e-9);
-        assert!(!budget.allows());
+        budget.charge(0.4, "m");
+        // Other processes' views of the same file: one charges, one only reads.
+        let process = || {
+            Budget::new(&BudgetConfig {
+                usd: 1.0,
+                spent_file: dir.path().join("sub/spend.json"),
+            })
+        };
+        process().charge(0.7, "m");
+        let other = process();
+        assert!((other.spent() - 1.1).abs() < 1e-9);
+        assert!(!other.allows());
+        assert!(
+            (budget.spent() - 0.4).abs() < 1e-9,
+            "read again only once its reading is old"
+        );
     }
 
     #[test]
@@ -230,10 +290,30 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         let budget = Budget::new(&BudgetConfig {
             usd: 5.0,
+            spent_file: path.clone(),
+        });
+        assert!(!budget.allows());
+        // Written whole, so an empty file was damaged rather than started.
+        std::fs::write(&path, "").unwrap();
+        let budget = Budget::new(&BudgetConfig {
+            usd: 5.0,
             spent_file: path,
         });
         assert!(!budget.allows());
-        assert!(budget.add(0.1).is_err());
+    }
+
+    #[test]
+    fn a_charge_that_cannot_be_written_leaves_the_budget_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        // The lock file cannot be opened where a directory stands, whoever runs the test.
+        std::fs::create_dir(dir.path().join("spend.json.lock")).unwrap();
+        let budget = Budget::new(&BudgetConfig {
+            usd: 5.0,
+            spent_file: dir.path().join("spend.json"),
+        });
+        assert!(budget.allows());
+        budget.charge(0.1, "m");
+        assert!(!budget.allows());
     }
 
     #[test]

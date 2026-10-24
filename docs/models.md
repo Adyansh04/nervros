@@ -67,8 +67,10 @@ price = { input = 0.10, output = 0.50, cache_read = 0.01, cache_write = 0.125 }
   `max_tokens`, the longest reply, which the API requires.
 - Each call's fresh, cached, cache-written and reply tokens are priced and added to `spent_file`,
   under a file lock that every NervROS process on the machine shares, so a new state directory or
-  a second process does not start the count again. No call starts once the spend reaches `usd`;
-  the role's chain goes on to the next model. A spend file that cannot be read counts as spent.
+  a second process does not start the count again. The file is replaced whole, never rewritten in
+  place. No call starts once the spend reaches `usd`; the role's chain goes on to the next model.
+  A spend file that cannot be read counts as spent, and so does the budget of a process that
+  could not write one. Another process's spend shows within two seconds.
 - Set `usd` below the key's credit: a call in flight is counted when it returns.
 
 ## Models
