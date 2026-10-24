@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::priors::{room_type, rooms_for};
+use crate::builtins::holds;
 use crate::mission::check::{how_long, named};
 use crate::profile::PlaceConfig;
 
@@ -265,30 +266,6 @@ fn rooms(seen: &Seen<'_>) -> Vec<Lookout> {
             }]
         })
         .collect()
-}
-
-/// Whether a `geometry_msgs/Polygon` holds the point: a ray from it crosses an odd number of
-/// edges.
-pub(crate) fn holds(outline: &Value, x: f64, y: f64) -> bool {
-    let corners: Vec<(f64, f64)> = outline["points"]
-        .as_array()
-        .map_or(&[][..], Vec::as_slice)
-        .iter()
-        .filter_map(|p| p["x"].as_f64().zip(p["y"].as_f64()))
-        .collect();
-    if corners.len() < 3 {
-        return false;
-    }
-    let before = corners.iter().cycle().skip(corners.len() - 1);
-    corners
-        .iter()
-        .zip(before)
-        .filter(|((xa, ya), (xb, yb))| {
-            (*ya > y) != (*yb > y) && x < xa + (xb - xa) * (y - ya) / (yb - ya)
-        })
-        .count()
-        % 2
-        == 1
 }
 
 #[cfg(test)]

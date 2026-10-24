@@ -103,7 +103,7 @@ impl Host for RobotHost {
                 .map(|p| {
                     let room = rooms
                         .iter()
-                        .find(|r| crate::search::holds(&r["outline"], p.pose.x, p.pose.y))
+                        .find(|r| crate::builtins::holds(&r["outline"], p.pose.x, p.pose.y))
                         .and_then(|r| r["id"].as_str())
                         .unwrap_or_default();
                     json!({"name": p.name, "x": p.pose.x, "y": p.pose.y, "room": room})

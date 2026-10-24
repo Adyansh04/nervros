@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::plan::{PlannedStep, predicate as predicate_of};
-use crate::builtins::inside;
+use crate::builtins::holds;
 use crate::profile::PlaceConfig;
 
 /// How far from a place's pose still counts as there.
@@ -330,11 +330,7 @@ fn at(target: &str, seen: &Observed, out: impl Fn(Option<bool>, String) -> Verdi
         return out(Some(d <= AT_PLACE_M), format!("{d:.2} m from {}", p.name));
     }
     if let Some(room) = room(seen, target) {
-        let outline: Vec<(f64, f64)> = room["outline"]["points"]
-            .as_array()
-            .map(|pts| pts.iter().map(xy).collect())
-            .unwrap_or_default();
-        let ok = inside((x, y), &outline);
+        let ok = holds(&room["outline"], x, y);
         return out(
             Some(ok),
             format!("the robot is {}in {target}", if ok { "" } else { "not " }),
@@ -511,13 +507,11 @@ pub fn room_said(seen: &Observed, room_id: &str) -> String {
 #[must_use]
 pub fn room_of_robot(seen: &Observed) -> Option<&str> {
     let pose = seen.pose?;
-    seen.rooms["rooms"].as_array()?.iter().find_map(|r| {
-        let outline: Vec<(f64, f64)> = r["outline"]["points"]
-            .as_array()
-            .map(|pts| pts.iter().map(xy).collect())
-            .unwrap_or_default();
-        inside(pose, &outline).then(|| text(r, "id"))
-    })
+    let (x, y) = pose;
+    seen.rooms["rooms"]
+        .as_array()?
+        .iter()
+        .find_map(|r| holds(&r["outline"], x, y).then(|| text(r, "id")))
 }
 
 /// What `found` rests on: the world model's support, else the smallest object whose footprint holds
