@@ -344,8 +344,13 @@ impl Composite {
                 CALL_WAIT,
             )
             .await?;
-        let catalog: Value = serde_json::from_str(reply["catalog_json"].as_str().unwrap_or("{}"))
-            .unwrap_or_default();
+        let catalog: Value = serde_json::from_str(
+            reply["catalog_json"].as_str().unwrap_or_default(),
+        )
+        .map_err(|e| RosError::Conversion {
+            name: real.catalog.clone(),
+            message: format!("the catalog is not JSON: {e}"),
+        })?;
         Ok(catalog["skills"]
             .as_array()
             .into_iter()
@@ -354,17 +359,21 @@ impl Composite {
             .collect())
     }
 
-    /// Which steps run here.
-    async fn natives_in(&self, steps: &[TreeStep]) -> Vec<Option<Arc<dyn NativeSkill>>> {
-        let executor = self.catalog_of_executor().await.unwrap_or_default();
-        steps
+    /// Which steps run here. Without the executor's catalog nothing can tell, since a native
+    /// skill of the same name as the executor's must not stand in for it.
+    async fn natives_in(
+        &self,
+        steps: &[TreeStep],
+    ) -> Result<Vec<Option<Arc<dyn NativeSkill>>>, RosError> {
+        let executor = self.catalog_of_executor().await?;
+        Ok(steps
             .iter()
             .map(|s| {
                 (!executor.contains(&s.template))
                     .then(|| self.natives.get(&s.template).cloned())
                     .flatten()
             })
-            .collect()
+            .collect())
     }
 
     async fn validate(&self, request: &Value) -> Result<Value, RosError> {
@@ -377,7 +386,14 @@ impl Composite {
                 );
             }
         };
-        let natives = self.natives_in(&steps).await;
+        let natives = match self.natives_in(&steps).await {
+            Ok(n) => n,
+            Err(e) => {
+                return Ok(
+                    json!({"ok": false, "diagnostics_json": diagnostics(&format!("the executor's catalog could not be read: {e}")), "tree_sha256": sha(tree), "worst_case_duration_s": 0.0}),
+                );
+            }
+        };
         if natives.iter().all(Option::is_none) {
             return match &self.real {
                 Some(real) => {
@@ -397,7 +413,7 @@ impl Composite {
         }
         let mut problems = Vec::new();
         let mut worst = 0.0;
-        let mut run: Vec<String> = Vec::new();
+        let mut run: Vec<&TreeStep> = Vec::new();
         for (step, native) in steps.iter().zip(&natives) {
             match native {
                 Some(native) => {
@@ -434,7 +450,7 @@ impl Composite {
                         }
                     }
                 }
-                None => run.push(step.xml.clone()),
+                None => run.push(step),
             }
         }
         if !run.is_empty() {
@@ -449,13 +465,13 @@ impl Composite {
     }
 
     /// Validates a stretch of executor steps with the executor; its worst case. A reference to
-    /// what an earlier stretch hands on is checked as a literal.
-    async fn validate_stretch(&self, steps: &[String], problems: &mut Vec<Value>) -> f64 {
+    /// what a step outside the stretch hands on is checked as a literal.
+    async fn validate_stretch(&self, steps: &[&TreeStep], problems: &mut Vec<Value>) -> f64 {
         let Some(real) = &self.real else {
             problems.push(json!({"code": "UNKNOWN_MACRO", "line": 0, "node": "", "message": "this robot has no executor for these skills"}));
             return 0.0;
         };
-        let literal: Vec<String> = steps.iter().map(|s| unbind(s)).collect();
+        let literal = unbound(steps.iter().copied());
         let reply = self
             .inner
             .call(
@@ -492,7 +508,7 @@ impl Composite {
     ) -> Result<Value, RosError> {
         let tree = request["tree_xml"].as_str().unwrap_or_default();
         let steps = parse(tree).map_err(RosError::Rejected)?;
-        let natives = self.natives_in(&steps).await;
+        let natives = self.natives_in(&steps).await?;
         let real = self.real.as_ref().and_then(|r| r.preview.clone());
         if natives.iter().all(Option::is_none) {
             return match real {
@@ -507,8 +523,7 @@ impl Composite {
         let mut out = Vec::new();
         let lead = natives.iter().take_while(|n| n.is_none()).count();
         if let (true, Some(real)) = (lead > 0, &real) {
-            let first: Vec<String> = steps[..lead].iter().map(|s| unbind(&s.xml)).collect();
-            let ahead = json!({"tree_xml": tree_of(&first)});
+            let ahead = json!({"tree_xml": tree_of(&unbound(steps[..lead].iter()))});
             if let Ok(r) = self.inner.call(real, service_type, ahead, timeout).await
                 && r["ok"].as_bool() == Some(true)
             {
@@ -520,7 +535,7 @@ impl Composite {
                 continue;
             };
             if let Some(mut seen) = native.preview(&step.args).await {
-                let id = step.name.split('_').next().unwrap_or_default();
+                let id = step_id(&step.name);
                 seen["step_id"] = json!(id);
                 seen["name"] = json!(step.name);
                 out.push(seen);
@@ -554,20 +569,17 @@ impl Composite {
 
     async fn pause(&self, request: &Value) -> Result<Value, RosError> {
         let on = request["pause"].as_bool().unwrap_or(false);
-        let here = {
-            let running = crate::lock(&self.running);
-            match running.as_ref() {
-                Some(r) if r.executor.is_none() => {
-                    r.paused.send_replace(on);
-                    true
-                }
-                Some(_) => false,
-                None => {
-                    return Ok(json!({"ok": false, "message": "no mission is running"}));
-                }
+        // A step NervROS runs pauses here. The executor pauses its own stretch, and a mission of
+        // its skills alone, which goes to it straight and leaves nothing running here.
+        let here = match crate::lock(&self.running).as_ref() {
+            Some(r) if r.executor.is_none() => {
+                r.paused.send_replace(on);
+                Some(true)
             }
+            Some(_) => Some(false),
+            None => None,
         };
-        if here {
+        if here == Some(true) {
             return Ok(json!({"ok": true, "message": if on { "paused" } else { "resumed" }}));
         }
         match self.real.as_ref().and_then(|r| r.pause.clone()) {
@@ -581,6 +593,7 @@ impl Composite {
                     )
                     .await
             }
+            None if here.is_none() => Ok(json!({"ok": false, "message": "no mission is running"})),
             None => Ok(json!({"ok": false, "message": "the executor cannot pause"})),
         }
     }
@@ -622,7 +635,7 @@ impl Composite {
     async fn execute(&self, goal: Value, timeout: Duration) -> Result<Goal, RosError> {
         let tree = goal["tree_xml"].as_str().unwrap_or_default();
         let steps = parse(tree).map_err(RosError::Rejected)?;
-        let natives = self.natives_in(&steps).await;
+        let natives = self.natives_in(&steps).await?;
         if natives.iter().all(Option::is_none) {
             let Some(real) = &self.real else {
                 return Err(RosError::Unavailable(
@@ -692,20 +705,38 @@ impl Composite {
     }
 }
 
-/// A `{key}` reference to what another stretch handed on, as a literal the executor checks as any.
-fn unbind(xml: &str) -> String {
+/// The stretch's elements, each `{key}` a step outside it hands on made a literal: the executor
+/// checks only a reference to a step in the same mission, and an output port must stay one.
+fn unbound<'a>(stretch: impl Iterator<Item = &'a TreeStep> + Clone) -> Vec<String> {
+    let inside: BTreeSet<&str> = stretch.clone().map(|s| step_id(&s.name)).collect();
+    stretch.map(|s| unbind(&s.xml, &inside)).collect()
+}
+
+/// `sN` of `sN_Skill`, or of a key `sN_port` that step hands on.
+fn step_id(name: &str) -> &str {
+    name.split('_').next().unwrap_or_default()
+}
+
+/// `xml` with each `{key}` of a step not `inside` as a literal, which the executor checks as any.
+fn unbind(xml: &str, inside: &BTreeSet<&str>) -> String {
     let mut out = String::with_capacity(xml.len());
     let mut rest = xml;
     while let Some(at) = rest.find("=\"{") {
-        out.push_str(&rest[..at + 2]);
-        rest = &rest[at + 3..];
-        match rest.find("}\"") {
-            Some(end) => {
-                out.push_str(&rest[..end]);
-                rest = &rest[end + 1..];
-            }
-            None => out.push('{'),
+        let (head, tail) = rest.split_at(at + 3);
+        let Some(end) = tail.find("}\"") else {
+            out.push_str(head);
+            rest = tail;
+            continue;
+        };
+        let key = &tail[..end];
+        if inside.contains(step_id(key)) {
+            out.push_str(head);
+            out.push_str(&tail[..=end]);
+        } else {
+            out.push_str(&head[..head.len() - 1]);
+            out.push_str(key);
         }
+        rest = &tail[end + 1..];
     }
     out.push_str(rest);
     out
@@ -747,7 +778,7 @@ impl Run {
         json!({
             "outcome": outcome,
             "failed_node": step,
-            "failed_step_id": step.split('_').next().unwrap_or_default(),
+            "failed_step_id": step_id(step),
             "failure_reason": reason,
             "diagnostics_json": "[]",
             "cause": 0,
@@ -835,6 +866,7 @@ impl Run {
         } = goal;
         tokio::pin!(result);
         let mut stop = self.ctl.stop.clone();
+        let mut cancelled = false;
         let done = loop {
             tokio::select! {
                 Some(mut fb) = feedback.recv() => {
@@ -842,10 +874,10 @@ impl Run {
                     let _ = self.feedback.send(fb).await;
                 }
                 r = &mut result => break r,
-                changed = stop.changed(), if !*stop.borrow() => {
-                    if changed.is_ok() && *stop.borrow() {
-                        let _ = cancel().await;
-                    }
+                // At once for a stop that came while the goal was being sent.
+                true = crate::integrations::turns(&mut stop, true), if !cancelled => {
+                    cancelled = true;
+                    let _ = cancel().await;
                 }
             }
         };
@@ -951,16 +983,8 @@ impl Run {
                 break;
             }
             self.event(&step.name, 0, RUNNING).await;
-            let run = tokio::time::timeout(timeout, native.run(&args, &self.ctl));
-            tokio::pin!(run);
-            let mut tick = tokio::time::interval(TICK);
-            tick.tick().await;
-            let ran = loop {
-                tokio::select! {
-                    r = &mut run => break r,
-                    _ = tick.tick() => self.still(&step.name).await,
-                }
-            };
+            let ran = self.attempt(step, native, &args, timeout).await;
+            timed_out = ran.is_err();
             match ran {
                 Ok(Ok(handed)) => {
                     for (port, value) in handed {
@@ -972,10 +996,7 @@ impl Run {
                     return None;
                 }
                 Ok(Err(why)) => last = why,
-                Err(_) => {
-                    timed_out = true;
-                    last = format!("it ran past its {:.0} s", timeout.as_secs_f64());
-                }
+                Err(()) => last = format!("it ran past its {:.0} s", timeout.as_secs_f64()),
             }
             self.event(&step.name, RUNNING, FAILURE).await;
             tracing::info!(step = %step.name, attempt, %last, "a native step failed");
@@ -997,6 +1018,41 @@ impl Run {
             OUTCOME_FAILURE
         };
         Some(self.result(outcome, &step.name, &last, outputs))
+    }
+
+    /// One run of a native step within `timeout`, which a pause does not count against: the
+    /// deadline moves on by it. `Err` when it ran out.
+    async fn attempt(
+        &self,
+        step: &TreeStep,
+        native: &Arc<dyn NativeSkill>,
+        args: &BTreeMap<String, String>,
+        timeout: Duration,
+    ) -> Result<Result<BTreeMap<String, String>, String>, ()> {
+        let run = native.run(args, &self.ctl);
+        tokio::pin!(run);
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        let mut paused = self.ctl.paused.clone();
+        let mut paused_at: Option<tokio::time::Instant> = None;
+        let mut tick = tokio::time::interval(TICK);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                r = &mut run => return Ok(r),
+                () = &mut deadline, if paused_at.is_none() => return Err(()),
+                true = crate::integrations::turns(&mut paused, paused_at.is_none()) => {
+                    match paused_at.take() {
+                        Some(at) => {
+                            let moved = deadline.deadline() + at.elapsed();
+                            deadline.as_mut().reset(moved);
+                        }
+                        None => paused_at = Some(tokio::time::Instant::now()),
+                    }
+                }
+                _ = tick.tick() => self.still(&step.name).await,
+            }
+        }
     }
 
     /// Says a step still runs, so the window's timer and the pause state stay current.

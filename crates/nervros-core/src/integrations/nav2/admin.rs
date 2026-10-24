@@ -279,7 +279,13 @@ impl NavAdmin {
                 )
                 .await
             {
-                Ok(_) => ToolOutcome::ok(json!({"saved": name, "by": "slam_toolbox"})),
+                Ok(r) => match r["result"].as_u64() {
+                    Some(0) => ToolOutcome::ok(json!({"saved": name, "by": "slam_toolbox"})),
+                    Some(1) => ToolOutcome::failed(
+                        "SLAM Toolbox has no map to save yet: it has received no scan",
+                    ),
+                    _ => ToolOutcome::failed("SLAM Toolbox could not save the map"),
+                },
                 Err(why) => ToolOutcome::failed(why),
             };
         }
@@ -482,5 +488,31 @@ mod tests {
             .await;
         assert_eq!(out.data["at"], "dock", "{}", out.message);
         assert_eq!(lifecycle_code("pause"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn slam_toolboxs_answer_says_whether_the_map_was_saved() {
+        let saved = |code: u64| {
+            admin(
+                FakeRobot::new().with_service("/slam_toolbox/save_map", move |_| {
+                    Ok(json!({"result": code}))
+                }),
+            )
+        };
+        let ask = json!({"action": "save_map", "name": "ground_floor"});
+        assert_eq!(saved(0).call(ask.clone()).await.data["by"], "slam_toolbox");
+        let none = saved(1).call(ask.clone()).await;
+        assert!(
+            none.message.contains("no map to save yet"),
+            "{}",
+            none.message
+        );
+        assert!(
+            saved(255)
+                .call(ask)
+                .await
+                .message
+                .contains("could not save")
+        );
     }
 }

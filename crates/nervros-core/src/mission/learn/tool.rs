@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use super::body;
 use crate::lock;
-use crate::mission::catalog::{Catalog, Learnable};
+use crate::mission::catalog::{Catalog, Learnable, Skill};
 use crate::mission::{Missions, SERVICE_TIMEOUT};
 use crate::tools::{Assessment, Risk, Tool, ToolOutcome, ToolSpec};
 
@@ -147,10 +147,14 @@ impl TeachSkill {
                 self.0.drafts.put(name, request.clone());
                 let mut out = ToolOutcome::ok(json!({"draft": name, "body": request["body_xml"],
                                                      "max_s": request["max_duration_s"]}));
+                // The skill list this turn's plans read was built before the skill was.
+                let only = (self.0.catalog().await.ok())
+                    .and_then(|c| c.skill(name).map(pinned))
+                    .unwrap_or_default();
                 out.message = format!(
-                    "{name} is a draft skill now, with up to {:.0} s to run. Plan a mission with \
-                     it to try it: the operator approves that as usual, and it is kept once it \
-                     succeeds",
+                    "{name} is a draft skill now, with up to {:.0} s to run{only}. Plan a \
+                     mission with it to try it: the operator approves that as usual, and it is \
+                     kept once it succeeds",
                     request["max_duration_s"].as_f64().unwrap_or(DEFAULT_S)
                 );
                 out
@@ -169,6 +173,22 @@ impl TeachSkill {
             Err(why) => ToolOutcome::failed(why),
         }
     }
+}
+
+/// The values the executor pins on a skill's arguments, as `; its arm takes only left or right`.
+fn pinned(skill: &Skill) -> String {
+    skill
+        .model_args()
+        .filter(|a| !a.choices.is_empty())
+        .fold(String::new(), |mut text, a| {
+            let _ = write!(
+                text,
+                "; its {} takes only {}",
+                a.name,
+                a.choices.join(" or ")
+            );
+            text
+        })
 }
 
 /// Whether the world model's `objects` (a `WorldObjectArray`) holds something `value` names: an
@@ -381,5 +401,21 @@ impl Missions {
                 .unwrap_or("it was not forgotten")
                 .to_owned())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mission::catalog::tests::CATALOG;
+
+    #[test]
+    fn a_new_skill_s_pinned_values_are_named_for_its_first_plan() {
+        let catalog = Catalog::parse(CATALOG).unwrap();
+        assert_eq!(
+            pinned(catalog.skill("PickObject").unwrap()),
+            "; its arm takes only left or right"
+        );
+        assert_eq!(pinned(catalog.skill("TuckForTravel").unwrap()), "");
     }
 }

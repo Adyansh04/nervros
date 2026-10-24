@@ -115,6 +115,8 @@ pub enum Refused {
     Pool(String),
     /// Its per-minute limit is used up.
     Minute,
+    /// Its provider's budget is spent.
+    Budget(String),
 }
 
 impl std::fmt::Display for Refused {
@@ -124,6 +126,7 @@ impl std::fmt::Display for Refused {
             Self::Daily => f.write_str("its daily limit is used up"),
             Self::Pool(pool) => write!(f, "the {pool} pool's daily limit is used up"),
             Self::Minute => f.write_str("its per-minute limit is used up"),
+            Self::Budget(provider) => write!(f, "the {provider} budget is spent"),
         }
     }
 }

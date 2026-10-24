@@ -19,9 +19,13 @@
 //! script the window answers four prompts and saves each dock tab.
 //!
 //! `NERVROS_GUI_EVAL_VIDEO=<name>` records the script as `<name>.mkv`, every frame the window
-//! renders stamped with when it rendered, and `<name>.speed.json`, the playback speed the script
-//! asked for each stretch. An encoder makes the clip from the two: a slow frame then lasts longer
-//! instead of being written again.
+//! renders stamped with when it rendered, `<name>.speed.json`, the playback speed the script
+//! asked for each stretch, and `<name>.moments.json`, when the recording started and the stretches
+//! where the pointer travels and clicks, which play at normal speed. An encoder makes the clip from
+//! them: a slow frame then lasts longer instead of being written again.
+//!
+//! The pointer stays in the window as an operator's would: it waits in the message field, travels
+//! to what a step clicks, and comes back.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -53,6 +57,10 @@ const QUIET: Duration = Duration::from_secs(5);
 const TYPING: f64 = 24.0;
 /// How long an approval card shows before it is approved, as an operator would read it.
 const READING: Duration = Duration::from_millis(2500);
+/// How fast the pointer travels to what it clicks, in points a second, within the shortest and
+/// longest move a hand makes.
+const GLIDE: f32 = 1400.0;
+const GLIDE_SECONDS: (f32, f32) = (0.35, 0.95);
 
 /// The machine's GPU: kittest's own setup prefers a software rasterizer, for snapshots that match
 /// on every machine.
@@ -112,6 +120,11 @@ enum Step {
     Focus(String),
     /// `:limit 40`: minutes a prompt may take to settle, for a long mission such as exploring.
     Limit(Duration),
+    /// `:record`: the clip starts here; the steps before it set the scene, unrecorded.
+    Record,
+    /// `:scroll 600`: the dock scrolled down by that many points (up when negative), with the
+    /// wheel, as to reach a button below its fold.
+    Scroll(f32),
 }
 
 impl Step {
@@ -175,6 +188,13 @@ impl Step {
                 .map(|(k, secs)| Self::Hold(k, Duration::from_secs_f64(secs)))
                 .ok_or_else(|| bad("a key and seconds")),
             "focus" if !rest.is_empty() && rest != "0" => Ok(Self::Focus(rest.to_owned())),
+            "record" => Ok(Self::Record),
+            "scroll" => rest
+                .parse::<f32>()
+                .ok()
+                .filter(|d| d.is_finite())
+                .map(Self::Scroll)
+                .ok_or_else(|| bad("points to scroll")),
             _ => Err(bad("no such command")),
         }
     }
@@ -227,8 +247,12 @@ struct Capture {
     ffmpeg: Child,
     base: PathBuf,
     started: Instant,
+    /// When it started, in seconds since the Unix epoch, to line the session log up with it.
+    epoch: f64,
     /// Seconds into the recording, and the speed from then on.
     speeds: Vec<(f64, f64)>,
+    /// Seconds into the recording from and to which the pointer travels and clicks.
+    moments: Vec<(f64, f64)>,
     frames: u64,
     last: Instant,
     slowest: Duration,
@@ -258,11 +282,16 @@ impl Capture {
         match ffmpeg {
             Ok(ffmpeg) => {
                 let now = Instant::now();
+                let epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64());
                 Some(Self {
                     ffmpeg,
                     base: base.to_owned(),
                     started: now,
+                    epoch,
                     speeds: vec![(0.0, speed)],
+                    moments: Vec::new(),
                     frames: 0,
                     last: now,
                     slowest: Duration::ZERO,
@@ -303,10 +332,21 @@ impl Capture {
             .iter()
             .map(|(at, speed)| serde_json::json!({"at": at, "speed": speed}))
             .collect();
-        let path = self.base.with_extension("speed.json");
-        let json = serde_json::to_string_pretty(&speeds).unwrap_or_default();
-        if let Err(e) = std::fs::write(&path, json) {
-            eprintln!("{}: {e}", path.display());
+        let moments: Vec<_> = self
+            .moments
+            .iter()
+            .map(|(from, to)| serde_json::json!({"from": from, "to": to}))
+            .collect();
+        let moments = serde_json::json!({"started": self.epoch, "moments": moments});
+        for (extension, value) in [
+            ("speed.json", serde_json::json!(speeds)),
+            ("moments.json", moments),
+        ] {
+            let path = self.base.with_extension(extension);
+            let json = serde_json::to_string_pretty(&value).unwrap_or_default();
+            if let Err(e) = std::fs::write(&path, json) {
+                eprintln!("{}: {e}", path.display());
+            }
         }
         #[expect(clippy::cast_precision_loss, reason = "a frame count")]
         let fps = self.frames as f64 / seconds.max(1e-3);
@@ -336,6 +376,11 @@ struct Run<'a> {
     in_mission: bool,
     /// How long a prompt may take to settle.
     limit: Duration,
+    /// Where the pointer is.
+    pointer: egui::Pos2,
+    /// Steps move the pointer and click, as an operator would; the settings at the top of a
+    /// script, before the window is up, act directly.
+    moving: bool,
 }
 
 impl Run<'_> {
@@ -377,8 +422,15 @@ impl Run<'_> {
         }
     }
 
+    /// The window as a PNG, without the pointer, as a screenshot leaves the cursor out. The steps
+    /// that hide and bring back the pointer are not recorded, so the clip does not flicker.
     fn save(&mut self, name: &str) {
-        match self.harness.render() {
+        self.harness.event(egui::Event::PointerGone);
+        self.harness.run_steps(1);
+        let image = self.harness.render();
+        self.harness.event(egui::Event::PointerMoved(self.pointer));
+        self.harness.run_steps(1);
+        match image {
             Ok(image) => {
                 let path = self.out.join(format!("{name}.png"));
                 image
@@ -400,9 +452,15 @@ impl Run<'_> {
             Step::Wait(d) => self.wait(*d),
             Step::Follow(on) => self.harness.state().bridge.follow(*on),
             Step::Tab(tab) => {
-                let gui = self.harness.state_mut();
-                gui.tab = *tab;
-                gui.dock_open = true;
+                self.harness.state_mut().dock_open = true;
+                if self.moving {
+                    self.frame();
+                    if let Some(rect) = self.tab_button(*tab) {
+                        self.click_rect(rect);
+                    }
+                }
+                // Not clicked, or the click missed: the script still gets its tab.
+                self.harness.state_mut().tab = *tab;
             }
             Step::Edit(on) => {
                 let gui = self.harness.state_mut();
@@ -416,20 +474,7 @@ impl Run<'_> {
             }
             Step::Approve(on) => self.approve = *on,
             Step::Click(label) => {
-                // The widget called that, else the first whose label holds it: a card's title
-                // "Approve geofence?" comes before its Approve button.
-                let node = self
-                    .harness
-                    .query_all_by_label(label)
-                    .next()
-                    .or_else(|| self.harness.query_all_by_label_contains(label).next());
-                match node {
-                    Some(node) => {
-                        node.click();
-                        self.pointer_away();
-                    }
-                    None => eprintln!("nothing to click labelled {label:?}"),
-                }
+                self.click_label(label);
             }
             Step::Type(text) => self.type_text(text),
             Step::Key(modifiers, key) => self.harness.key_press_modifiers(*modifiers, *key),
@@ -476,12 +521,15 @@ impl Run<'_> {
                     Ok(n) => self.harness.query_all_by_role(role).nth(n - 1),
                     Err(_) => self.harness.query_all_by_role_and_label(role, which).next(),
                 };
-                match field {
-                    Some(field) => field.focus(),
+                match field.map(|f| f.rect()) {
+                    // A click focuses a field, and shows the operator doing it.
+                    Some(rect) => self.click_rect(rect),
                     None => eprintln!("no text field {which}"),
                 }
             }
             Step::Shot(name) => self.save(name),
+            Step::Record => {}
+            Step::Scroll(points) => self.scroll_dock(*points),
         }
         self.frame();
     }
@@ -521,16 +569,128 @@ impl Run<'_> {
             }
         }
         self.wait(Duration::from_millis(400));
-        self.harness.get_by_label("Send").click();
-        self.pointer_away();
+        self.click_label("Send");
     }
 
-    /// The pointer shows where a click landed for a moment, then leaves the window, so it does
-    /// not sit on the button for the rest of the clip.
-    fn pointer_away(&mut self) {
-        self.wait(Duration::from_millis(500));
-        self.harness.event(egui::Event::PointerGone);
+    /// Where the pointer waits between clicks: in the message field, where no tooltip opens.
+    fn rest_point(&self) -> egui::Pos2 {
+        self.harness
+            .ctx
+            .read_response(egui::Id::new(COMPOSER))
+            .map_or(egui::pos2(220.0, 900.0), |r| {
+                egui::pos2(r.rect.left() + r.rect.width() * 0.45, r.rect.center().y)
+            })
+    }
+
+    fn point(&mut self, at: egui::Pos2) {
+        self.pointer = at;
+        self.harness.event(egui::Event::PointerMoved(at));
         self.frame();
+    }
+
+    /// Moves the pointer to `to` as a hand does: easing in and out, on a slight bow.
+    fn glide(&mut self, to: egui::Pos2) {
+        let (from, path) = (self.pointer, to - self.pointer);
+        let length = path.length();
+        if length < 1.0 {
+            return;
+        }
+        let seconds = (length / GLIDE).clamp(GLIDE_SECONDS.0, GLIDE_SECONDS.1);
+        let bow = path.rot90().normalized() * (length * 0.06).min(28.0);
+        let began = Instant::now();
+        loop {
+            let t = (began.elapsed().as_secs_f32() / seconds).min(1.0);
+            let eased = t * t * (3.0 - 2.0 * t);
+            self.point(from + path * eased + bow * (std::f32::consts::PI * eased).sin());
+            if t >= 1.0 {
+                break;
+            }
+        }
+    }
+
+    /// The widget called `label`, else the first whose label holds it: a card's title
+    /// "Approve geofence?" comes before its Approve button.
+    fn rect_of(&self, label: &str) -> Option<egui::Rect> {
+        self.harness
+            .query_all_by_label(label)
+            .next()
+            .or_else(|| self.harness.query_all_by_label_contains(label).next())
+            .map(|node| node.rect())
+    }
+
+    /// A dock tab's button: the topmost widget of its name, as the viewer's own tabs below share
+    /// some names.
+    fn tab_button(&self, tab: Tab) -> Option<egui::Rect> {
+        let name = Tab::ALL.iter().find(|(t, _)| *t == tab)?.1;
+        self.harness
+            .query_all_by_label(name)
+            .map(|node| node.rect())
+            .min_by(|a, b| a.top().total_cmp(&b.top()))
+    }
+
+    fn click_label(&mut self, label: &str) {
+        if let Some(rect) = self.rect_of(label) {
+            self.click_rect(rect);
+        } else {
+            eprintln!("nothing to click labelled {label:?}");
+        }
+    }
+
+    /// Travels to `rect`, clicks it and comes back to rest. The moment plays at normal speed in
+    /// the clip, however fast the stretch around it.
+    fn click_rect(&mut self, rect: egui::Rect) {
+        let began = self.moment();
+        self.glide(rect.center());
+        self.wait(Duration::from_millis(120));
+        let pos = self.pointer;
+        for pressed in [true, false] {
+            self.harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            });
+            self.frame();
+        }
+        self.wait(Duration::from_millis(350));
+        self.glide(self.rest_point());
+        self.end_moment(began);
+    }
+
+    /// Scrolls the dock with the wheel, a few notches over a few frames, the pointer over it.
+    fn scroll_dock(&mut self, points: f32) {
+        let tab = self.harness.state().tab;
+        let Some(bar) = self.tab_button(tab) else {
+            eprintln!("no dock to scroll");
+            return;
+        };
+        let began = self.moment();
+        self.glide(bar.center() + egui::vec2(0.0, 320.0));
+        for _ in 0..6 {
+            self.harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -points / 6.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            });
+            self.wait(Duration::from_millis(60));
+        }
+        self.wait(Duration::from_millis(300));
+        self.end_moment(began);
+    }
+
+    /// Seconds into the recording now, while one records.
+    fn moment(&self) -> Option<f64> {
+        self.capture
+            .as_ref()
+            .map(|c| c.started.elapsed().as_secs_f64())
+    }
+
+    fn end_moment(&mut self, began: Option<f64>) {
+        if let (Some(began), Some(capture)) = (began, &mut self.capture) {
+            let ended = capture.started.elapsed().as_secs_f64();
+            capture.moments.push((began, ended));
+        }
     }
 
     /// Steps until no turn, mission or job runs, no approval waits (unless approving is left to
@@ -541,12 +701,18 @@ impl Run<'_> {
         while began.elapsed() < self.limit {
             self.frame();
             if self.approve && self.harness.state().chat.pending().count() > 0 {
+                // The card is read at normal speed too, before the pointer goes to it.
+                let began = self.moment();
                 self.wait(READING);
-                let button = self.harness.query_all_by_label("Approve").next();
-                if let Some(button) = button {
-                    button.click();
+                let button = self
+                    .harness
+                    .query_all_by_label("Approve")
+                    .next()
+                    .map(|b| b.rect());
+                if let Some(rect) = button {
+                    self.click_rect(rect);
                 }
-                self.pointer_away();
+                self.end_moment(began);
                 continue;
             }
             let gui = self.harness.state();
@@ -630,6 +796,9 @@ fn a_script_reads_prompts_commands_and_settings() {
         Step::parse(":limit 40"),
         Ok(Step::Limit(Duration::from_mins(40)))
     );
+    assert_eq!(Step::parse(":record"), Ok(Step::Record));
+    assert_eq!(Step::parse(":scroll 600"), Ok(Step::Scroll(600.0)));
+    assert!(Step::parse(":scroll far").is_err());
 }
 
 #[test]
@@ -696,6 +865,8 @@ fn live_eval() {
         mission_speed: None,
         in_mission: false,
         limit: PER_PROMPT,
+        pointer: egui::Pos2::ZERO,
+        moving: false,
     };
     let settings = steps.iter().take_while(|s| s.is_setting()).count();
     for step in &steps[..settings] {
@@ -703,11 +874,23 @@ fn live_eval() {
     }
     // The map, the camera and the world model need a moment to arrive.
     run.wait(Duration::from_secs(10));
+    run.moving = true;
+    let steps = &steps[settings..];
+    let scene = steps
+        .iter()
+        .position(|s| *s == Step::Record)
+        .map_or(0, |at| at + 1);
+    for step in &steps[..scene] {
+        run.step(step);
+    }
+    // From the first frame the pointer is there, waiting in the message field.
+    let rest = run.rest_point();
+    run.point(rest);
     if let Some(name) = &clip {
         let size = run.harness.render().map_or((1600, 960), |i| i.dimensions());
         run.capture = Capture::start(&run.out.join(name), size, run.speed);
     }
-    for step in &steps[settings..] {
+    for step in &steps[scene..] {
         run.step(step);
     }
     // The end holds a moment, so the last frame is the settled window.

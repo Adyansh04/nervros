@@ -1,4 +1,5 @@
-//! The free-only rule: NervROS never reaches a paid model.
+//! The free-only rule: NervROS never reaches a paid model, but for one whose provider has a budget
+//! (see [`super::budget`]), which no call passes.
 //!
 //! On OpenRouter, where a model id says whether it is free, every id must be an explicit `:free`
 //! variant (the random `openrouter/free` router and `stealth/*` models are refused), at config

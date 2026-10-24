@@ -203,22 +203,21 @@ impl ProgramTool {
     }
 }
 
-/// The skills a program may call by name, each with the argument a bare value fills.
+/// The skills a program may call by name, each with the arguments bare values fill.
 fn callable(catalog: &Catalog) -> Vec<SkillCall> {
     catalog
         .plan_skills()
         .into_iter()
         .map(|name| {
-            let first_arg = if name == GO_TO_PLACE {
-                "place".to_owned()
+            let args = if name == GO_TO_PLACE {
+                vec!["place".to_owned()]
             } else {
                 catalog
                     .skill(&name)
-                    .and_then(|s| s.model_args().next())
-                    .map(|a| a.name.clone())
+                    .map(|s| s.model_args().map(|a| a.name.clone()).collect())
                     .unwrap_or_default()
             };
-            SkillCall { name, first_arg }
+            SkillCall { name, args }
         })
         .collect()
 }

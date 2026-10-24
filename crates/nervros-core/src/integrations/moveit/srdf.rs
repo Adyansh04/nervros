@@ -116,6 +116,34 @@ impl Srdf {
         Ok(srdf)
     }
 
+    /// Adds to each group the links its joints move, from the robot's URDF: an SRDF may give a
+    /// hand by its joints alone. A URDF that does not parse adds nothing.
+    #[must_use]
+    pub(crate) fn with_urdf(mut self, urdf: &str) -> Self {
+        let Ok(doc) = roxmltree::Document::parse(urdf) else {
+            return self;
+        };
+        let moves: BTreeMap<&str, &str> = doc
+            .root_element()
+            .children()
+            .filter(|n| n.has_tag_name("joint"))
+            .filter_map(|j| {
+                let child = j.children().find(|c| c.has_tag_name("child"))?;
+                Some((j.attribute("name")?, child.attribute("link")?))
+            })
+            .collect();
+        for group in &mut self.groups {
+            for joint in &group.joints {
+                if let Some(&link) = moves.get(joint.as_str())
+                    && !group.links.iter().any(|l| l == link)
+                {
+                    group.links.push(link.to_owned());
+                }
+            }
+        }
+        self
+    }
+
     /// The group called `name`.
     pub(crate) fn group(&self, name: &str) -> Option<&Group> {
         self.groups.iter().find(|g| g.name == name)
@@ -214,5 +242,22 @@ mod tests {
         );
         assert!(srdf.pose_at("right_arm", &now, 0.001).is_none());
         assert!(Srdf::parse("<robot").is_err());
+    }
+
+    #[test]
+    fn a_hand_given_by_its_joints_touches_the_links_they_move() {
+        let urdf = r#"<robot name="arm">
+  <link name="right_palm"/><link name="right_finger"/><link name="right_finger_tip"/>
+  <joint name="right_finger_joint" type="revolute"><parent link="right_finger"/><child link="right_finger_tip"/></joint>
+</robot>"#;
+        let srdf = Srdf::parse(SRDF).unwrap().with_urdf(urdf);
+        assert_eq!(
+            srdf.hand_links("right_arm"),
+            ["right_palm", "right_finger", "right_finger_tip"]
+        );
+        assert_eq!(
+            Srdf::parse(SRDF).unwrap().with_urdf("not xml"),
+            Srdf::parse(SRDF).unwrap()
+        );
     }
 }

@@ -23,7 +23,8 @@ struct Room {
     pub(super) id: String,
     pub(super) name: String,
     pub(super) kind: String,
-    pub(super) outline: Vec<(f64, f64)>,
+    /// As the world model gives it, a `geometry_msgs/Polygon`.
+    pub(super) outline: Value,
     /// What the camera has seen of it, when the world model says (canopy does).
     seen: Value,
 }
@@ -51,25 +52,12 @@ async fn rooms(robot: &dyn RobotPort, topic: Option<&TopicRef>) -> Vec<Room> {
         .map(|list| {
             list.iter()
                 .map(|r| {
-                    let outline = r["outline"]["points"]
-                        .as_array()
-                        .map(|pts| {
-                            pts.iter()
-                                .map(|p| {
-                                    (
-                                        p["x"].as_f64().unwrap_or(0.0),
-                                        p["y"].as_f64().unwrap_or(0.0),
-                                    )
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
                     let text = |k: &str| r[k].as_str().unwrap_or_default().to_owned();
                     Room {
                         id: text("id"),
                         name: text("name"),
                         kind: text("type"),
-                        outline,
+                        outline: r["outline"].clone(),
                         seen: seen_of(r),
                     }
                 })
@@ -78,20 +66,32 @@ async fn rooms(robot: &dyn RobotPort, topic: Option<&TopicRef>) -> Vec<Room> {
         .unwrap_or_default()
 }
 
-/// Ray casting: whether a point lies inside a polygon.
+/// Ray casting: whether a point lies inside a polygon, its corners as `(x, y)` or `[x, y]`.
 #[must_use]
-pub fn inside(point: (f64, f64), polygon: &[(f64, f64)]) -> bool {
-    let (x, y) = point;
+pub fn inside<P: Copy + Into<[f64; 2]>>(point: impl Into<[f64; 2]>, polygon: &[P]) -> bool {
+    let [x, y] = point.into();
     let mut hit = false;
     let mut j = polygon.len().wrapping_sub(1);
-    for (i, &(xi, yi)) in polygon.iter().enumerate() {
-        let (xj, yj) = polygon[j];
+    for (i, &corner) in polygon.iter().enumerate() {
+        let ([xi, yi], [xj, yj]) = (corner.into(), polygon[j].into());
         if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
             hit = !hit;
         }
         j = i;
     }
     hit
+}
+
+/// Whether a `geometry_msgs/Polygon` as JSON, such as a room's outline, holds the point.
+#[must_use]
+pub fn holds(outline: &Value, x: f64, y: f64) -> bool {
+    let corners: Vec<[f64; 2]> = outline["points"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| Some([p["x"].as_f64()?, p["y"].as_f64()?]))
+        .collect();
+    corners.len() >= 3 && inside([x, y], &corners)
 }
 
 /// `list_places`: named places and the world model's rooms.
@@ -229,7 +229,7 @@ impl Tool for RobotState {
                 let [x, y, _] = t.translation;
                 let round = |v: f64| (v * 100.0).round() / 100.0;
                 out["pose"] = json!({"frame": self.frames.0, "x": round(x), "y": round(y), "yaw": round(t.yaw())});
-                if let Some(r) = rooms.into_iter().find(|r| inside((x, y), &r.outline)) {
+                if let Some(r) = rooms.into_iter().find(|r| holds(&r.outline, x, y)) {
                     out["room"] = json!({"id": r.id, "name": r.name, "type": r.kind});
                 }
             }

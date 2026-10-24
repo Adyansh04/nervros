@@ -213,12 +213,13 @@ whether the balance controller is active, with some hysteresis, and says why in 
   - `near(x)`: within about 0.6 m of object or room `x`, judged only for ids the world model
     knows;
   - `holding(arm, x)`: a hand holds `x`, where a capital letter means any object;
-  - `hand_empty(arm)`.
+  - `hand_empty(arm)`;
+  - `still()`, an effect: the skill holds the base only to keep it where it is, as a wait does.
 
   It follows the plan from the robot's current state. It adds a walk before a step that needs
-  the robot near a known object, forgets where the robot is after a skill that takes the base,
-  and rejects a step whose hand is wrong, with the fix spelled out. Other predicates are the
-  executor's to check.
+  the robot near a known object, forgets where the robot is after a skill that takes the base
+  unless it is `still()`, and rejects a step whose hand is wrong, with the fix spelled out. Other
+  predicates are the executor's to check.
 - **Navigation.** An executor that has `GoToPose(station)`, where the station is `x;y;yaw` in
   the map frame, or `GoToTarget(target)`, a room or object id, lets plans write
   `GoToPlace(place)`. The planner picks the macro from what the place is. The model never names

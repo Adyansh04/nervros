@@ -19,7 +19,7 @@ turns what you ask into missions. You check and approve each one before anything
 > **Start with the [guide](docs/guide.md).** It shows every feature in a short clip from a real run,
 > with the exact words typed and what came back.
 
-https://github.com/user-attachments/assets/0c9381e1-ae1e-4391-a63d-53ef5df6179c
+https://github.com/user-attachments/assets/9db9e88d-0e8f-4cfe-8ed9-3682b3a96143
 
 *A simulated Unitree G1 fetches a mug: the plan, the approval, then the walk, the pick and the
 place, sped up four times while the robot works.*
@@ -88,9 +88,9 @@ watchdog on the robot, and anything that loosens a limit asks you first. More in
 [integrations](docs/integrations.md) and in the guide's
 [Nav2 and MoveIt](docs/guide.md#nav2-and-moveit).
 
-https://github.com/user-attachments/assets/43ac126e-f920-4fce-8a64-9ac0baea3062
+https://github.com/user-attachments/assets/77410286-8fd9-4e43-91f9-bc31c3a2d0e4
 
-https://github.com/user-attachments/assets/3091295f-aee5-4a00-8305-f9cb5ecc8e03
+https://github.com/user-attachments/assets/f6234f46-2ef1-4e02-ab06-115bab6d5782
 
 *Nav2: a slow zone holding /cmd_vel to 40% on a route NervROS runs, then the collision monitor's
 slow polygon. MoveIt: a previewed arm path, a box that blocks it, and arm moves with the elbow
@@ -114,8 +114,9 @@ plotted. Waits and walks are sped up.*
 
 Nothing in NervROS is robot-specific. One [profile](docs/profile.md) names the robot's topics,
 services, cameras, skills and limits, and the robot runs missions through a short
-[executor contract](docs/executor.md). Models come from llama.cpp, Gemini, OpenRouter or any
-OpenAI-compatible server, and each role has its own chain of fallbacks ([models](docs/models.md)).
+[executor contract](docs/executor.md). Models come from llama.cpp, Gemini, OpenRouter, any
+OpenAI-compatible server or Claude, whose paid key runs against a budget no call passes, and each
+role has its own chain of fallbacks ([models](docs/models.md)).
 
 Also included:
 

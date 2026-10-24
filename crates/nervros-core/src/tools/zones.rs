@@ -113,20 +113,10 @@ impl Zone {
         self.rule == Rule::KeepOut
     }
 
-    /// Whether a point is inside, by ray casting.
+    /// Whether a point is inside.
     #[must_use]
     pub fn contains(&self, x: f64, y: f64) -> bool {
-        let p = &self.polygon;
-        let mut inside = false;
-        let mut j = p.len().wrapping_sub(1);
-        for i in 0..p.len() {
-            let ([xi, yi], [xj, yj]) = (p[i], p[j]);
-            if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
-                inside = !inside;
-            }
-            j = i;
-        }
-        inside
+        crate::builtins::inside([x, y], &self.polygon)
     }
 
     /// How far along a straight move from `from` to `to` it first enters this zone, none when it

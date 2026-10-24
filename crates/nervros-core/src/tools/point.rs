@@ -198,7 +198,8 @@ impl PointTool {
         out.message = if listed.is_empty() {
             format!(
                 "`{what}` is not in the {} camera's frame: nothing is marked, and nothing \
-                 moved; the user sees the frame",
+                 moved; the user sees the frame. Point at it with the other camera, or once a \
+                 walk has brought it into view: a hand need not reach it to point",
                 camera.name
             )
         } else {

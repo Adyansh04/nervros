@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rig::completion::Message;
 use rig::message::{AssistantContent, CallId, ToolName, UserContent};
 
@@ -321,4 +323,60 @@ fn earlier_reasoning_is_dropped_and_turns_left_empty_go_with_it() {
         Message::Assistant { content, .. } if content.len() == 1
             && matches!(&content[0], AssistantContent::Text(t) if t.text == "In the kitchen.")
     ));
+}
+
+#[tokio::test]
+async fn a_call_recovered_from_an_invalid_tool_call_is_charged_once_like_the_rest() {
+    use rig::test_utils::{MockCompletionModel, MockTurn};
+    #[derive(Default)]
+    struct Billed(std::sync::Mutex<Vec<CallCost>>);
+    impl AgentSource for Billed {
+        fn candidates(&self, _: Role, _: crate::providers::router::Need) -> Vec<String> {
+            Vec::new()
+        }
+        fn builder(&self, _: &str) -> Result<AgentBuilder, LlmError> {
+            let used = |input, output| rig::completion::Usage {
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                ..rig::completion::Usage::default()
+            };
+            Ok(AgentBuilder::new(MockCompletionModel::from_turns([
+                MockTurn::tool_call("c1", "no_such_tool", serde_json::json!({}))
+                    .with_usage(used(100, 10)),
+                MockTurn::text("Done.").with_usage(used(50, 5)),
+            ])))
+        }
+        fn take_request(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn park(&self, _: &str, _: Duration) {}
+        fn spent(&self, _: &str, cost: CallCost) {
+            crate::lock(&self.0).push(cost);
+        }
+    }
+    let billed = Arc::new(Billed::default());
+    let setup = TurnSetup {
+        preamble: "",
+        max_turns: 4,
+        tools: &[],
+        started: Arc::default(),
+        window: None,
+        on_call: None,
+        delta: None,
+    };
+    let mut history = History::default();
+    let source: Arc<dyn AgentSource> = billed.clone();
+    let reply = chat("m", source, setup, &mut history, "go").await.unwrap();
+    assert_eq!(reply, "Done.");
+    let costs = crate::lock(&billed.0).clone();
+    assert_eq!(
+        costs.iter().map(|c| c.input_tokens).sum::<u64>(),
+        150,
+        "{costs:?}"
+    );
+    assert_eq!(
+        costs.iter().map(|c| c.output_tokens).sum::<u64>(),
+        15,
+        "{costs:?}"
+    );
 }
