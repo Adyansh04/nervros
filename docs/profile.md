@@ -567,8 +567,8 @@ mission step moves an arm.
 
 Missions also get MoveIt's motions as steps NervROS runs itself, where the robot's executor has no
 skill of the name: `ArmTo` (a named or remembered pose), `HandTo` (just above an object, or a
-point), `HandLine` (a short straight hand move) and `Grip` (a hand's named state; never opening a
-hand that holds something). See [integrations](integrations.md#native-steps).
+point), `HandLine` (a short straight hand move) and `Grip` (a hand's named state; never moving a
+hand that holds something, or may). See [integrations](integrations.md#native-steps).
 
 | Key | Default | |
 |---|---|---|

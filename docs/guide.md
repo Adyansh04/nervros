@@ -834,7 +834,7 @@ what Nav2 is doing and the speed limit in force, and where each arm is.
   one of them lets go.
 - A route's places are its waypoints: one inside furniture fails the whole route, so name places
   or rooms with room to stand.
-- Grip never opens a hand that holds something: put the object down with a place.
+- Grip never moves a hand that holds something, or may: put the object down with a place.
 
 </details>
 

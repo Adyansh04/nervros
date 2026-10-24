@@ -214,17 +214,20 @@ impl Motions {
         })
     }
 
-    /// What the hand of `group` holds, by the executor's state; empty when nothing or not known.
-    async fn holding(&self, group: &str) -> String {
+    /// What the hand of `group` holds by the executor's state: an object id,
+    /// [`crate::mission::UNKNOWN_HELD`], or empty for nothing. Empty where no executor holds the
+    /// arms.
+    async fn holding(&self, group: &str) -> Result<String, String> {
         let Some(topic) = &self.state else {
-            return String::new();
+            return Ok(String::new());
         };
         let side = if group.contains("left") {
             "left"
         } else {
             "right"
         };
-        self.arms
+        let state = self
+            .arms
             .robot
             .latest(
                 topic,
@@ -232,9 +235,8 @@ impl Motions {
                 Duration::from_secs(1),
             )
             .await
-            .ok()
-            .and_then(|s| s[format!("holding_{side}")].as_str().map(str::to_owned))
-            .unwrap_or_default()
+            .map_err(|e| format!("what the {side} hand holds is not known: {e}"))?;
+        Ok(crate::mission::held_by(&state, side))
     }
 
     /// Runs `motion` with the arms the executor lends, given back however it ends.
@@ -302,7 +304,7 @@ impl Drop for GiveBack {
 }
 
 fn full_hand(held: &str) -> String {
-    format!("the hand holds {held}: put it down with a place, not by opening the hand")
+    format!("the hand holds {held}, and moving its fingers could drop it: a place puts it down")
 }
 
 /// A finished MoveIt goal, or what went wrong in words.
@@ -408,9 +410,9 @@ impl Native {
                 let names: Vec<&str> = srdf.poses_of(&hand).map(|p| p.name.as_str()).collect();
                 format!("{hand} has no state `{state}`; it has {}", names.join(", "))
             })?;
-        // An open hand drops what it holds: that is a place, not a grip.
-        let held = m.holding(&group).await;
-        if state.contains("open") && !held.is_empty() {
+        // Any state can loosen a grip, pinch_ready as much as open: putting down is a place's.
+        let held = m.holding(&group).await?;
+        if !held.is_empty() {
             return Err(full_hand(&held));
         }
         m.lent(
@@ -455,8 +457,8 @@ impl NativeSkill for Native {
             ),
             Kind::Grip => (
                 "Grip",
-                "Set a hand to one of its named states, such as open or closed. It never opens a \
-                 hand that holds something: a place puts it down.",
+                "Set a hand to one of its named states, such as open or closed. It never moves a \
+                 hand that holds something, or may: a place puts it down.",
                 json!([arm, {"name": "state", "type": "string", "format": "id",
                              "description": "The hand's state, as arm_status lists them."}]),
             ),
@@ -478,9 +480,11 @@ impl NativeSkill for Native {
         if self.kind != Kind::Grip {
             return None;
         }
-        let state = args.get("state")?;
-        let held = self.shared.holding(args.get("arm")?).await;
-        (state.contains("open") && !held.is_empty()).then(|| full_hand(&held))
+        match self.shared.holding(args.get("arm")?).await {
+            Ok(held) if held.is_empty() => None,
+            Ok(held) => Some(full_hand(&held)),
+            Err(e) => Some(e),
+        }
     }
 
     fn needs(&self) -> Vec<String> {
