@@ -117,19 +117,19 @@ fn to_json(value: &Dynamic) -> Result<Value, Box<EvalAltResult>> {
     rhai::serde::from_dynamic(value)
 }
 
-/// Values given without names, as the arguments they fill in order.
-fn positional(values: &[&str], names: &[String]) -> Value {
-    Value::Object(
-        names
-            .iter()
-            .zip(values)
-            .map(|(n, v)| (n.clone(), Value::from(*v)))
-            .collect(),
-    )
+/// Values given without names, as the arguments they fill in order: any value, as
+/// `TurnInPlace(90)` writes a number.
+fn positional(values: &[Dynamic], names: &[String]) -> Result<Value, Box<EvalAltResult>> {
+    names
+        .iter()
+        .zip(values)
+        .map(|(n, v)| Ok((n.clone(), to_json(v)?)))
+        .collect::<Result<serde_json::Map<_, _>, _>>()
+        .map(Value::Object)
 }
 
 /// A skill as functions of its name: its arguments in a map, values without names in the
-/// catalog's order, or none.
+/// catalog's order, or none. A map given alone is the arguments by name, not a first value.
 fn register_skill(engine: &mut Engine, host: &Arc<dyn Host>, skill: &SkillCall) {
     let (h, name) = (Arc::clone(host), skill.name.clone());
     engine.register_fn(&skill.name, move |args: Map| -> Fallible {
@@ -138,21 +138,24 @@ fn register_skill(engine: &mut Engine, host: &Arc<dyn Host>, skill: &SkillCall) 
     });
     if let Some(first) = skill.args.first() {
         let (h, name, names) = (Arc::clone(host), skill.name.clone(), vec![first.clone()]);
-        engine.register_fn(&skill.name, move |a: &str| -> Fallible {
-            to_dynamic(h.run(&name, positional(&[a], &names)))
+        engine.register_fn(&skill.name, move |a: Dynamic| -> Fallible {
+            to_dynamic(h.run(&name, positional(&[a], &names)?))
         });
     }
     if skill.args.len() >= 2 {
         let (h, name, names) = (Arc::clone(host), skill.name.clone(), skill.args.clone());
-        engine.register_fn(&skill.name, move |a: &str, b: &str| -> Fallible {
-            to_dynamic(h.run(&name, positional(&[a, b], &names)))
+        engine.register_fn(&skill.name, move |a: Dynamic, b: Dynamic| -> Fallible {
+            to_dynamic(h.run(&name, positional(&[a, b], &names)?))
         });
     }
     if skill.args.len() >= 3 {
         let (h, name, names) = (Arc::clone(host), skill.name.clone(), skill.args.clone());
-        engine.register_fn(&skill.name, move |a: &str, b: &str, c: &str| -> Fallible {
-            to_dynamic(h.run(&name, positional(&[a, b, c], &names)))
-        });
+        engine.register_fn(
+            &skill.name,
+            move |a: Dynamic, b: Dynamic, c: Dynamic| -> Fallible {
+                to_dynamic(h.run(&name, positional(&[a, b, c], &names)?))
+            },
+        );
     }
     // ExploreBuilding() takes nothing: approved as a skill it ran, it then failed as no function.
     let (h, name) = (Arc::clone(host), skill.name.clone());

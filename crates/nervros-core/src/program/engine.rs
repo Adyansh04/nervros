@@ -218,6 +218,8 @@ mod tests {
                 PickObject(id);
                 PickObject();
                 PickObject(id, "left");
+                PickObject(17);
+                PickObject(#{object_id: id, arm: "left"});
             }
             counts
         "#;
@@ -230,6 +232,8 @@ mod tests {
             [
                 "GoToPlace",
                 "FindInView",
+                "PickObject",
+                "PickObject",
                 "PickObject",
                 "PickObject",
                 "PickObject",
@@ -247,6 +251,16 @@ mod tests {
             ran[5].1,
             json!({"object_id": "mug_4", "arm": "left"}),
             "values without names fill the arguments in order"
+        );
+        assert_eq!(
+            ran[6].1,
+            json!({"object_id": 17}),
+            "a number as it is written"
+        );
+        assert_eq!(
+            ran[7].1,
+            json!({"object_id": "mug_4", "arm": "left"}),
+            "a map alone is the arguments by name"
         );
         assert_eq!(fake.said.lock().unwrap().as_slice(), ["kitchen has 1"]);
     }
