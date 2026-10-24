@@ -334,8 +334,12 @@ impl Sim {
         }
         problems.append(&mut self.apply(id, step, skill));
         // A skill that takes the base may move it, as a pick backs off the surface afterwards, so
-        // the robot's position is unknown until the next walk.
-        if skill.resources.iter().any(|r| r == "base") {
+        // the robot's position is unknown until the next walk; `still()` says it stays, as a wait.
+        let stays = skill
+            .effects
+            .iter()
+            .any(|e| predicate(e).is_some_and(|(name, _)| name == "still"));
+        if !stays && skill.resources.iter().any(|r| r == "base") {
             self.at = None;
             self.xy = None;
         }
@@ -1807,6 +1811,24 @@ mod tests {
         ]));
         assert_eq!(
             compile(&tuck, &catalog(), &world(), Author::Model)
+                .unwrap()
+                .steps
+                .len(),
+            3
+        );
+        // Nor does one that holds the base to stand still.
+        let mut c: Value = serde_json::from_str(CATALOG).unwrap();
+        c["skills"].as_array_mut().unwrap().push(json!({
+            "name": "Wait", "template": "Wait", "resources": ["base"], "effects": ["still()"],
+            "max_duration_s": 600, "args": [{"name": "seconds", "type": "string"}]}));
+        let wait = plan(&json!([
+            {"skill": "GoToPlace", "args": {"place": "O17"}},
+            {"skill": "Wait", "args": {"seconds": "5"}},
+            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}}
+        ]));
+        let catalog = Catalog::parse(&c.to_string()).unwrap();
+        assert_eq!(
+            compile(&wait, &catalog, &world(), Author::Model)
                 .unwrap()
                 .steps
                 .len(),

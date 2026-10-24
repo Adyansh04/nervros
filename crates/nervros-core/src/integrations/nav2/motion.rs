@@ -405,7 +405,7 @@ impl NativeSkill for Native {
                 json!([{"name": "seconds", "type": "string", "format": "number", "min": 1, "max": 600,
                         "description": "How long to wait, in seconds."}]),
                 json!([]),
-                json!([]),
+                json!(["still()"]),
                 // Standing still holds the base.
                 base,
                 600.0,
