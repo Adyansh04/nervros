@@ -121,13 +121,15 @@ impl Ctx {
     /// A goal or a message that would send the robot into a keep-out zone, refused with the
     /// zone's name: Nav2's pose goals and paths, and a pose published for Nav2 to go to. A move
     /// relative to where the robot stands is checked only as a mission step, so while there are
-    /// zones Nav2's own is refused.
+    /// keep-out zones Nav2's own is refused.
     fn zone_refusal(&self, ty: &str, payload: &Value) -> Option<ToolOutcome> {
         use crate::integrations::nav2::goals::{Destinations, destinations};
         let zones = self.guard.zones()?;
         let poses = match destinations(ty, payload) {
             Destinations::Poses(poses) => poses,
-            Destinations::Relative if !zones.all().is_empty() => {
+            // A mission step is checked for entering a keep-out zone, which a move from wherever the
+            // robot stands cannot be here; a slow zone refuses no move, there or here.
+            Destinations::Relative if !zones.keep_out().is_empty() => {
                 return Some(ToolOutcome::refused(
                     "with keep-out zones set, a straight move is checked against them only as a \
                      mission step: walk with run_mission",
