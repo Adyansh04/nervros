@@ -41,8 +41,9 @@ A mission may hold steps NervROS runs itself beside the robot executor's skills:
 
 They take the names an executor's skills would. A skill of the same name in the executor's catalog
 is used instead: on the G1 the executor walks, turns and moves the arms itself, and NervROS runs
-only routes, waits and straight hand moves. A robot with no executor at all plans with native
-steps only.
+only routes, waits and straight hand moves. While the executor's catalog cannot be read, no step
+runs as a native one, since none can be told from the executor's own. A robot with no executor at
+all plans with native steps only.
 
 A composite executor (`mission/composite.rs`) stands between the missions and the robot's
 executor, so planning, approval, the plan checks, the ledger, track records and goal checks work as
