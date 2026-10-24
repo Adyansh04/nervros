@@ -73,19 +73,21 @@ pub const REFERENCE: &str = "objects(words) and objects(words, room) -> [#{id, l
      room, x, y, z, state, last_seen_s}]; rooms() -> [#{id, name, type, x, y, area, seen}]; \
      places() -> [#{name, x, y, room}] (room: the id of the room it is in); pose() -> \
      #{x, y, yaw}; walk(place) -> true once there (a place, room or object id, or words); \
-     find(words) -> the id the detector reports, or () when it sees none; any skill by its name, such as PickObject(#{object_id: id, arm: \"right\"}), \
-     PickObject(id) or TuckForTravel(), or run(\"Skill\", #{args}), -> #{ok, outcome, reason, \
-     outputs}; read(topic) -> \
-     the newest message; rate(topic, seconds) -> Hz; tf(parent, child) -> #{x, y, z, yaw}; \
-     wait(seconds); say(text) tells the operator. The last value is the program's result.";
+     find(words) -> the id the detector reports, or () when it sees none; any skill by its name, \
+     its arguments in a map, PickObject(#{object_id: id, arm: \"right\"}), or in the catalog's \
+     order, PickObject(id, \"right\") or PlaceOn(id, \"left\"), or none, TuckForTravel(), or \
+     run(\"Skill\", #{args}), -> #{ok, outcome, reason, outputs}; read(topic) -> the newest \
+     message; rate(topic, seconds) -> Hz; tf(parent, child) -> #{x, y, z, yaw}; wait(seconds); \
+     say(text) tells the operator. The last value is the program's result.";
 
 /// A skill as a program may call it by name: the skill and the argument a bare value fills.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillCall {
     /// As plans name it, such as `PickObject`.
     pub name: String,
-    /// The argument `PickObject("O17")` sets: its first.
-    pub first_arg: String,
+    /// The arguments values without names fill, in order: `PickObject("O17", "left")` sets
+    /// `object_id` and `arm`.
+    pub args: Vec<String>,
 }
 
 type Fallible = Result<Dynamic, Box<EvalAltResult>>;
@@ -113,6 +115,50 @@ fn to_dynamic(value: Result<Value, String>) -> Fallible {
 
 fn to_json(value: &Dynamic) -> Result<Value, Box<EvalAltResult>> {
     rhai::serde::from_dynamic(value)
+}
+
+/// Values given without names, as the arguments they fill in order.
+fn positional(values: &[&str], names: &[String]) -> Value {
+    Value::Object(
+        names
+            .iter()
+            .zip(values)
+            .map(|(n, v)| (n.clone(), Value::from(*v)))
+            .collect(),
+    )
+}
+
+/// A skill as functions of its name: its arguments in a map, values without names in the
+/// catalog's order, or none.
+fn register_skill(engine: &mut Engine, host: &Arc<dyn Host>, skill: &SkillCall) {
+    let (h, name) = (Arc::clone(host), skill.name.clone());
+    engine.register_fn(&skill.name, move |args: Map| -> Fallible {
+        let args = to_json(&Dynamic::from_map(args))?;
+        to_dynamic(h.run(&name, args))
+    });
+    if let Some(first) = skill.args.first() {
+        let (h, name, names) = (Arc::clone(host), skill.name.clone(), vec![first.clone()]);
+        engine.register_fn(&skill.name, move |a: &str| -> Fallible {
+            to_dynamic(h.run(&name, positional(&[a], &names)))
+        });
+    }
+    if skill.args.len() >= 2 {
+        let (h, name, names) = (Arc::clone(host), skill.name.clone(), skill.args.clone());
+        engine.register_fn(&skill.name, move |a: &str, b: &str| -> Fallible {
+            to_dynamic(h.run(&name, positional(&[a, b], &names)))
+        });
+    }
+    if skill.args.len() >= 3 {
+        let (h, name, names) = (Arc::clone(host), skill.name.clone(), skill.args.clone());
+        engine.register_fn(&skill.name, move |a: &str, b: &str, c: &str| -> Fallible {
+            to_dynamic(h.run(&name, positional(&[a, b, c], &names)))
+        });
+    }
+    // ExploreBuilding() takes nothing: approved as a skill it ran, it then failed as no function.
+    let (h, name) = (Arc::clone(host), skill.name.clone());
+    engine.register_fn(&skill.name, move || -> Fallible {
+        to_dynamic(h.run(&name, json!({})))
+    });
 }
 
 /// Adds the robot's functions to `engine`, each answered by `host`.
@@ -167,24 +213,7 @@ pub fn register(engine: &mut Engine, host: &Arc<dyn Host>, skills: &[SkillCall])
         find(h.as_ref(), &words_of(&words))
     });
     for skill in skills {
-        let (h, name) = (Arc::clone(host), skill.name.clone());
-        engine.register_fn(&skill.name, move |args: Map| -> Fallible {
-            let args = to_json(&Dynamic::from_map(args))?;
-            to_dynamic(h.run(&name, args))
-        });
-        let (h, name, arg) = (
-            Arc::clone(host),
-            skill.name.clone(),
-            skill.first_arg.clone(),
-        );
-        engine.register_fn(&skill.name, move |value: &str| -> Fallible {
-            to_dynamic(h.run(&name, json!({ arg.as_str(): value })))
-        });
-        // ExploreBuilding() takes nothing: approved as a skill it ran, it then failed as no function.
-        let (h, name) = (Arc::clone(host), skill.name.clone());
-        engine.register_fn(&skill.name, move || -> Fallible {
-            to_dynamic(h.run(&name, json!({})))
-        });
+        register_skill(engine, host, skill);
     }
     let h = Arc::clone(host);
     engine.register_fn("read", move |topic: &str| to_dynamic(h.read(topic)));

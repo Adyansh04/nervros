@@ -441,7 +441,11 @@ mod tests {
             name: name.to_owned(),
             aliases: Vec::new(),
             frame: "map".to_owned(),
-            pose: crate::profile::PlacePose { x, y: 0.5, yaw: 0.0 },
+            pose: crate::profile::PlacePose {
+                x,
+                y: 0.5,
+                yaw: 0.0,
+            },
             near: Vec::new(),
         };
         let places = [place("far_nightstand", 3.5), place("near_nightstand", 0.5)];
