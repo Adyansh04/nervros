@@ -10,13 +10,15 @@ use rig::AgentBuilder;
 use rig::agent::tool::{DynamicTool, ToolOutput};
 use rig::agent::{
     AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, InvalidToolCallAction,
-    InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, RequestPatch,
+    InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, RequestPatch, RunSettled,
+    SettledOutcome,
 };
 
 use super::client::{Llm, prompt_setback, stream_setback};
 use super::history::{History, RESERVE_TOKENS, cut_old, fit, size, tokens_of};
 use super::{LlmError, Setback};
 use crate::providers::Role;
+use crate::providers::budget::Tokens;
 use crate::providers::router::Need;
 
 /// Model-facing JSON a tool returns.
@@ -65,6 +67,9 @@ pub trait AgentSource: Send + Sync {
 
     /// Sets a model aside for `for_how_long` after a 429.
     fn park(&self, model_id: &str, for_how_long: Duration);
+
+    /// Counts what one call cost against its provider's budget, if it has one.
+    fn spent(&self, _model_id: &str, _cost: CallCost) {}
 
     /// Tries a model whose server did not answer last, for `for_how_long`.
     fn set_aside(&self, model_id: &str, for_how_long: Duration) {
@@ -132,6 +137,18 @@ impl AgentSource for Llm {
         }
     }
 
+    fn spent(&self, model_id: &str, cost: CallCost) {
+        self.router.record_spend(
+            model_id,
+            Tokens {
+                input: cost.input_tokens,
+                cached: cost.cached_tokens,
+                cache_write: cost.cache_write_tokens,
+                output: cost.output_tokens,
+            },
+        );
+    }
+
     fn set_aside(&self, model_id: &str, for_how_long: Duration) {
         self.router
             .set_aside(model_id, SystemTime::now(), for_how_long);
@@ -165,8 +182,26 @@ struct TurnHook {
     on_call: Option<OnCall>,
     /// When the pending call was sent.
     sent: Mutex<Option<Instant>>,
+    /// What the turn's calls have been charged so far.
+    charged: Mutex<CallCost>,
     /// The system prompt for the last call, which says no tool can be called.
     last_word: String,
+}
+
+impl TurnHook {
+    /// Charges `cost` to the model's budget and reports it.
+    fn charge(&self, cost: CallCost) {
+        if let Ok(mut charged) = self.charged.lock() {
+            charged.input_tokens += cost.input_tokens;
+            charged.cached_tokens += cost.cached_tokens;
+            charged.cache_write_tokens += cost.cache_write_tokens;
+            charged.output_tokens += cost.output_tokens;
+        }
+        self.source.spent(&self.model, cost);
+        if let Some(on_call) = &self.on_call {
+            on_call(cost);
+        }
+    }
 }
 
 impl AgentHook for TurnHook {
@@ -217,19 +252,38 @@ impl AgentHook for TurnHook {
         _ctx: &HookContext,
         event: ModelTurnFinished<'_>,
     ) -> ModelTurnAction {
-        if let Some(on_call) = &self.on_call {
-            let sent = self.sent.lock().ok().and_then(|mut s| s.take());
-            // A count the provider leaves out is zero tokens to the budget and the report.
-            on_call(CallCost {
-                input_tokens: event.usage.input_tokens.unwrap_or(0),
-                cached_tokens: event.usage.cached_input_tokens.unwrap_or(0),
-                output_tokens: event.usage.output_tokens.unwrap_or(0),
-                ms: sent.map_or(0, |t| {
-                    u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
-                }),
-            });
-        }
+        let sent = self.sent.lock().ok().and_then(|mut s| s.take());
+        let cost = CallCost {
+            ms: sent.map_or(0, |t| {
+                u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }),
+            ..CallCost::of(&event.usage)
+        };
+        self.charge(cost);
         ModelTurnAction::Continue
+    }
+
+    /// A call whose turn was recovered from an invalid tool call fires no model-turn hook, though
+    /// it was billed: what the run's total holds beyond the calls charged one by one is charged
+    /// here. A run that fails keeps such a call uncharged; the run's error carries no counts.
+    async fn on_run_settled(&self, _ctx: &HookContext, event: RunSettled<'_>) {
+        let SettledOutcome::Response(response) = event.outcome else {
+            return;
+        };
+        let total = CallCost::of(&response.usage);
+        let charged = self.charged.lock().map(|c| *c).unwrap_or_default();
+        let rest = CallCost {
+            input_tokens: total.input_tokens.saturating_sub(charged.input_tokens),
+            cached_tokens: total.cached_tokens.saturating_sub(charged.cached_tokens),
+            cache_write_tokens: total
+                .cache_write_tokens
+                .saturating_sub(charged.cache_write_tokens),
+            output_tokens: total.output_tokens.saturating_sub(charged.output_tokens),
+            ms: 0,
+        };
+        if rest != CallCost::default() {
+            self.charge(rest);
+        }
     }
 
     /// Small models invent tool names; the model gets the real ones back as the call's result
@@ -282,10 +336,26 @@ pub struct CallCost {
     pub input_tokens: u64,
     /// Of those, read from the provider's prompt cache.
     pub cached_tokens: u64,
+    /// Of those, written to the provider's prompt cache.
+    pub cache_write_tokens: u64,
     /// Reply tokens.
     pub output_tokens: u64,
     /// From sending the request to the whole reply.
     pub ms: u64,
+}
+
+impl CallCost {
+    /// A call's cost from rig's count, its time unknown; a count left out is zero tokens.
+    #[must_use]
+    pub fn of(usage: &rig::completion::Usage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens.unwrap_or(0),
+            cached_tokens: usage.cached_input_tokens.unwrap_or(0),
+            cache_write_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+            output_tokens: usage.output_tokens.unwrap_or(0),
+            ms: 0,
+        }
+    }
 }
 
 /// What is given each model call's cost.
@@ -373,6 +443,7 @@ pub async fn chat(
             }),
             on_call: setup.on_call,
             sent: Mutex::new(None),
+            charged: Mutex::new(CallCost::default()),
             last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
         });
     let agent = builder.build();

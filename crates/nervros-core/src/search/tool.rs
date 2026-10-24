@@ -84,6 +84,7 @@ impl SearchTool {
             events: &events,
             robot,
             now_s: crate::now_s(),
+            places: &seen.places,
         });
         if ranked.is_empty() {
             return Err(
@@ -261,9 +262,11 @@ fn spec() -> ToolSpec {
              and looks with the detector, up to max_places ({DEFAULT_PLACES} by default) within \
              max_minutes ({DEFAULT_MINUTES}), until it sees it, and reports where. Places come best \
              first: where the world model saw it, where it went since, then the rooms such things \
-             are usually in, the least seen first. The operator approves a search once. Only when \
-             the operator asks where it could be without moving is it action=plan, which lists the \
-             places and moves nothing. For where something was last seen, recall answers at once."
+             are usually in, the least seen first, each from the named places in it. To look in \
+             an order the operator gives, write a program. The operator approves a search once. \
+             Only when the operator asks where it could be without moving is it action=plan, \
+             which lists the places and moves nothing. For where something was last seen, recall \
+             answers at once."
         ),
         json!({"type": "object", "properties": {
             "action": {"type": "string", "enum": ["plan", "go"]},

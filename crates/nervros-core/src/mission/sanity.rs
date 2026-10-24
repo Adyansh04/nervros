@@ -408,15 +408,26 @@ const HANDLING: [&str; 11] = [
 ];
 /// Words that stand for a thing said before.
 const POINTING: [&str; 6] = ["it", "that", "this", "them", "those", "these"];
+/// Words after which `the` or `a` names where to go or look, not what to handle.
+const WHERE: [&str; 11] = [
+    "to", "into", "in", "at", "on", "onto", "from", "near", "by", "toward", "towards",
+];
 
 /// The word a request uses for what to handle when it names nothing, as `it` in "pick it up":
 /// said first in a session, nobody knows what it is.
 #[must_use]
 pub fn unnamed(request: &str) -> Option<String> {
-    words(request)
+    let words = words(request);
+    let at = words
         .windows(2)
-        .find(|p| HANDLING.contains(&p[0].as_str()) && POINTING.contains(&p[1].as_str()))
-        .map(|p| p[1].clone())
+        .position(|p| HANDLING.contains(&p[0].as_str()) && POINTING.contains(&p[1].as_str()))?;
+    // A thing the request names before it, as in "find the toy robot and pick it up", is what it
+    // is; "go to the kitchen and pick it up" names a place.
+    let named_before = (0..at).any(|i| {
+        ["the", "a", "an"].contains(&words[i].as_str())
+            && (i == 0 || !WHERE.contains(&words[i - 1].as_str()))
+    });
+    (!named_before).then(|| words[at + 1].clone())
 }
 
 /// What a request asks to repeat on a clock, as "every 5 minutes, 3 times".
@@ -769,6 +780,16 @@ mod tests {
         );
         assert_eq!(unnamed("Pick up the small white mug"), None);
         assert_eq!(unnamed("Turn it around"), None, "not a thing to handle");
+        assert_eq!(
+            unnamed("Go to the kitchen and pick it up").as_deref(),
+            Some("it"),
+            "the kitchen is where, not what"
+        );
+        assert_eq!(
+            unnamed("Walk to the office desk, find the toy robot on it, and pick it up."),
+            None,
+            "named before it"
+        );
     }
 
     #[test]

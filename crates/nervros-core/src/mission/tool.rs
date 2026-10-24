@@ -59,7 +59,7 @@ impl Missions {
                             "required": ["name", "value"], "additionalProperties": false}},
                         "retries": {"type": "integer", "minimum": 0, "maximum": 2},
                         "timeout_s": {"type": "number", "description": "Optional; at most the skill's own"},
-                        "optional": {"type": "boolean", "description": "A failure here does not fail the mission"},
+                        "optional": {"type": "boolean", "description": "A failure here does not fail the mission. Set it on a look whose finding no later step takes when moves follow it: finding nothing would end the mission there"},
                         "why": {"type": "string"}
                     },
                     "required": ["skill", "args"],

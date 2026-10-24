@@ -40,6 +40,8 @@ const FIELDS: [&str; 12] = [
 
 const TOGGLE_WAIT: Duration = Duration::from_secs(5);
 const SHOWN_WAIT: Duration = Duration::from_secs(1);
+/// How often the kept shapes and states are checked against the monitor's own.
+const RESTORE_EVERY: Duration = Duration::from_secs(5);
 
 /// A shape NervROS gave a polygon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -181,28 +183,52 @@ impl Monitor {
             node: config.monitor_node(),
             robot,
             file,
-            kept: Mutex::new(kept.clone()),
+            kept: Mutex::new(kept),
             publishers: tokio::sync::Mutex::new(BTreeMap::new()),
             on: Mutex::new(None),
         });
-        if !kept.is_empty() {
-            let weak = Arc::downgrade(&monitor);
-            tokio::spawn(async move {
-                for (name, k) in kept {
-                    let Some(monitor) = weak.upgrade() else {
-                        return;
-                    };
-                    let restored = match monitor.publish(&name, &k).await {
-                        Ok(()) => monitor.set_on(&name, k.on).await,
-                        Err(why) => Err(why),
-                    };
-                    if let Err(why) = restored {
-                        tracing::warn!(polygon = %name, %why, "a kept collision polygon did not go out");
-                    }
-                }
-            });
-        }
+        // Until the monitor holds what was kept, and again whenever it comes back as its
+        // configuration has it, as after a restart.
+        let weak = Arc::downgrade(&monitor);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(RESTORE_EVERY);
+            loop {
+                tick.tick().await;
+                let Some(monitor) = weak.upgrade() else {
+                    return;
+                };
+                monitor.restore().await;
+            }
+        });
         monitor
+    }
+
+    /// Sends each kept shape that has not gone out, and turns each kept polygon on or off where
+    /// the monitor says otherwise. Nothing while the monitor does not answer.
+    async fn restore(&self) {
+        let kept = crate::lock(&self.kept).clone();
+        if kept.is_empty() {
+            return;
+        }
+        let names: Vec<String> = kept.keys().map(|n| format!("{n}.enabled")).collect();
+        let Ok(now) = get_params(self.robot.as_ref(), &self.node, &names).await else {
+            return;
+        };
+        for ((name, k), (enabled, _)) in kept.iter().zip(now) {
+            let sent = self.publishers.lock().await.contains_key(name);
+            let restored = if sent {
+                Ok(())
+            } else {
+                self.publish(name, k).await
+            };
+            let restored = match restored {
+                Ok(()) if enabled.as_bool() != Some(k.on) => self.set_on(name, k.on).await,
+                other => other,
+            };
+            if let Err(why) = restored {
+                tracing::warn!(polygon = %name, %why, "a kept collision polygon is not as kept");
+            }
+        }
     }
 
     /// The monitor's polygons and the frame they are drawn in.
@@ -554,23 +580,30 @@ impl Tool for Monitor {
                     Err(why) => return Some(Err(ToolOutcome::failed(why))),
                 };
                 let now = self.shape_now(&p).await;
-                // Growing only makes it react sooner: free.
-                // A polygon that takes its shape from a topic and has none yet detects nothing:
-                // any shape it gets is a gain.
+                // A shape that covers the old one only makes it react sooner: free. A polygon that
+                // takes its shape from a topic and has none yet detects nothing: any shape is a
+                // gain.
                 let unshaped = p.shapeable() && now.is_none();
-                if unshaped || now.as_ref().is_some_and(|n| next.area() >= n.area()) {
+                if unshaped || now.as_ref().is_some_and(|n| covers(&next, n)) {
                     return None;
                 }
-                format!(
-                    "makes the collision monitor's `{}` smaller ({} m² from {}): it reacts later \
-                     to an obstacle",
-                    p.name,
-                    (next.area() * 100.0).round() / 100.0,
-                    now.map_or("an unknown size".to_owned(), |n| format!(
-                        "{} m²",
-                        (n.area() * 100.0).round() / 100.0
-                    ))
-                )
+                let m2 = |s: &Shape| format!("{} m²", (s.area() * 100.0).round() / 100.0);
+                match now {
+                    Some(n) if next.area() >= n.area() => format!(
+                        "moves the collision monitor's `{}` off part of where it was ({} from {}): \
+                         it reacts later to an obstacle there",
+                        p.name,
+                        m2(&next),
+                        m2(&n)
+                    ),
+                    now => format!(
+                        "makes the collision monitor's `{}` smaller ({} from {}): it reacts later \
+                         to an obstacle",
+                        p.name,
+                        m2(&next),
+                        now.map_or("an unknown size".to_owned(), |n| m2(&n))
+                    ),
+                }
             }
             _ => return None,
         };
@@ -619,6 +652,61 @@ fn parse_points(text: &str) -> Option<Vec<[f64; 2]>> {
         .map(|q| Some([q.get(0)?.as_f64()?, q.get(1)?.as_f64()?]))
         .collect();
     points.filter(|p| p.len() >= 3)
+}
+
+/// Whether `outer` holds all of `inner`: it then reacts to every obstacle `inner` reacts to. Both
+/// are drawn about the robot's centre.
+fn covers(outer: &Shape, inner: &Shape) -> bool {
+    const SLACK: f64 = 1e-9;
+    match (outer, inner) {
+        (Shape::Radius(r), Shape::Radius(q)) => r + SLACK >= *q,
+        (Shape::Radius(r), Shape::Points(p)) => p.iter().all(|[x, y]| x.hypot(*y) <= r + SLACK),
+        (Shape::Points(o), Shape::Radius(q)) => {
+            within(o, [0.0, 0.0])
+                && edges(o).all(|(a, b)| from_segment([0.0, 0.0], a, b) + SLACK >= *q)
+        }
+        // Every corner inside and no edge across one of `outer`'s: a simple polygon's boundary
+        // inside another's encloses nothing outside it.
+        (Shape::Points(o), Shape::Points(p)) => {
+            p.iter().all(|&v| within(o, v))
+                && !edges(p).any(|(a, b)| edges(o).any(|(c, d)| cross(a, b, c, d)))
+        }
+    }
+}
+
+/// A polygon's edges, the last corner back to the first.
+fn edges(p: &[[f64; 2]]) -> impl Iterator<Item = ([f64; 2], [f64; 2])> + '_ {
+    p.iter()
+        .zip(p.iter().cycle().skip(1))
+        .map(|(a, b)| (*a, *b))
+}
+
+/// Which side of `a`→`b` the point `c` is on: positive left, negative right, zero on the line.
+fn side(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+/// Whether segments `a`-`b` and `c`-`d` cross each other properly: not merely touch or overlap.
+fn cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    let apart = |u: f64, v: f64| (u > 1e-12 && v < -1e-12) || (u < -1e-12 && v > 1e-12);
+    apart(side(a, b, c), side(a, b, d)) && apart(side(c, d, a), side(c, d, b))
+}
+
+/// The distance from `q` to the segment `a`-`b`.
+fn from_segment(q: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let length2 = dx * dx + dy * dy;
+    let t = if length2 > 0.0 {
+        (((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / length2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (q[0] - a[0] - t * dx).hypot(q[1] - a[1] - t * dy)
+}
+
+/// Whether `q` is inside the polygon `p` or on its edge.
+fn within(p: &[[f64; 2]], q: [f64; 2]) -> bool {
+    edges(p).any(|(a, b)| from_segment(q, a, b) <= 1e-9) || crate::builtins::inside(q, p)
 }
 
 fn shoelace(p: &[[f64; 2]]) -> f64 {
@@ -738,6 +826,81 @@ mod tests {
             asked.reason.contains("smaller (0.25 m² from 1 m²)"),
             "{}",
             asked.reason
+        );
+        // Larger, but a strip off to one side: it no longer covers the front.
+        let aside = json!({"action": "shape", "polygon": "PolygonSlow",
+                           "points": [[-2.0, 0.6], [2.0, 0.6], [2.0, 1.0], [-2.0, 1.0]]});
+        let asked = m.assess(&aside).await.unwrap().unwrap();
+        assert!(
+            asked.reason.contains("off part of where it was"),
+            "{}",
+            asked.reason
+        );
+    }
+
+    #[test]
+    fn a_shape_covers_another_only_when_it_holds_all_of_it() {
+        let square = |h: f64| Shape::Points(vec![[h, h], [h, -h], [-h, -h], [-h, h]]);
+        assert!(covers(&square(0.5), &square(0.5)));
+        assert!(covers(&square(0.6), &square(0.5)));
+        assert!(!covers(&square(0.5), &square(0.6)));
+        assert!(covers(&Shape::Radius(0.8), &square(0.5)));
+        assert!(
+            !covers(&Shape::Radius(0.6), &square(0.5)),
+            "the corners stick out"
+        );
+        assert!(covers(&square(0.5), &Shape::Radius(0.5)));
+        assert!(!covers(&square(0.5), &Shape::Radius(0.51)));
+        // An L whose notch takes in the inner square's corner region: corners inside, an edge
+        // across.
+        let l = Shape::Points(vec![
+            [-1.0, -1.0],
+            [1.0, -1.0],
+            [1.0, 0.2],
+            [0.2, 0.2],
+            [0.2, 1.0],
+            [-1.0, 1.0],
+        ]);
+        assert!(!covers(&l, &square(0.5)));
+    }
+
+    #[tokio::test]
+    async fn a_kept_polygon_state_is_set_again_once_the_monitor_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("monitor.json");
+        let kept = BTreeMap::from([(
+            "PolygonSlow".to_owned(),
+            Kept {
+                topic: "polygon_slow".to_owned(),
+                frame: "base_footprint".to_owned(),
+                shape: Shape::Radius(0.5),
+                on: false,
+            },
+        )]);
+        std::fs::write(&file, serde_json::to_vec(&kept).unwrap()).unwrap();
+        let robot = Arc::new(robot());
+        let _m = Monitor::new(
+            &Nav2Config::default(),
+            Arc::clone(&robot) as Arc<dyn RobotPort>,
+            Some(file),
+        );
+        let set = || {
+            robot
+                .calls()
+                .iter()
+                .filter(|(s, _)| s == "/collision_monitor/set_parameters")
+                .count()
+        };
+        for _ in 0..50 {
+            if set() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            set(),
+            1,
+            "the monitor's own state (on) differs from the kept one (off)"
         );
     }
 }

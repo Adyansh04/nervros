@@ -269,7 +269,10 @@ fn no_path(code: u64, said: Option<&str>) -> String {
 
 /// A costmap cost in words.
 fn cost_words(cost: f64) -> &'static str {
-    if cost >= UNKNOWN {
+    // GetCost answers -1 for a point off the costmap.
+    if cost < 0.0 {
+        "unknown: outside the costmap"
+    } else if cost >= UNKNOWN {
         "unknown: no sensor has seen it"
     } else if cost >= LETHAL {
         "an obstacle"
@@ -381,6 +384,7 @@ mod tests {
         assert_eq!(no_path(208, None), "every way there is blocked");
         assert!(no_path(206, Some("goal in collision")).contains("(goal in collision)"));
         assert_eq!(cost_words(0.0), "free");
+        assert_eq!(cost_words(-1.0), "unknown: outside the costmap");
         assert_eq!(cost_words(254.0), "an obstacle");
         assert_eq!(
             costmap_service("global_costmap/global_costmap", "get_cost"),

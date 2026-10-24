@@ -5,8 +5,9 @@ and show the exact words typed.
 
 The clips show a simulated Unitree G1 in a six-room apartment
 ([grove-g1](https://github.com/Adyansh04/grove-g1)). The local Qwen3.5-9B model answers unless a
-section says otherwise. Missions play three or four times faster, and the 23-minute mapping run
-keeps only its start and end. Everything else is real time.
+section says otherwise. Missions play two to four times faster, a model working on a reply plays
+about three times faster, and the mapping run keeps only its start and end. Each reply then holds
+at normal speed, and so does every click.
 
 Setup is in the [README](../README.md). Every setting is in the [profile](profile.md),
 [models](models.md) and [executor](executor.md) pages.
@@ -16,7 +17,7 @@ Setup is in the [README](../README.md). Every setting is in the [profile](profil
   [Pointing and outlining](#pointing-and-outlining)
 - **[Give it a task](#giving-it-a-task):** [Walking somewhere](#walking-somewhere) ·
   [The plan check](#a-short-one-and-the-plan-check) · [Fetching something](#fetching-something) ·
-  [Stopping](#stopping) · [Pausing](#pausing) ·
+  [Fetching something new](#fetching-something-new) · [Stopping](#stopping) · [Pausing](#pausing) ·
   [One step's answer in the next](#one-steps-answer-in-the-next) ·
   [Doing it again](#doing-it-again)
 - **Programs and skills:** [Counting, looping and measuring](#counting-looping-and-measuring) ·
@@ -44,7 +45,9 @@ source scripts/ros-env.sh
 cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 ```
 
-![The window: chat, 3D world and cameras, dock](https://github.com/user-attachments/assets/d0e52596-0a56-49af-a0d3-42b28c34d7ef)
+![The window: chat, 3D world and cameras, dock](https://github.com/user-attachments/assets/9eec2421-b032-4b1c-a02a-eea5fff4b536)
+
+https://github.com/user-attachments/assets/e0dc93d4-d7a2-4946-a151-456be8fdfe14
 
 - **Top bar:** the robot, and the state of ROS, the mission executor and the model. On the right:
   the arming switch (until you arm it, the agent can look and answer but not act),
@@ -65,12 +68,12 @@ cargo run -p nervros-gui -- --profile profiles/example/nervros.toml
 
 ## Asking what it sees
 
-https://github.com/user-attachments/assets/ea9c76e9-0ab1-49e5-8326-06d29deee212
+https://github.com/user-attachments/assets/c1f1afef-fc39-4e29-baad-b917b9fdd13a
 
 > **You:** What can you see right now?
 >
-> **NervROS:** I can see a red wardrobe (mark 1) with two doors, positioned against a plain wall
-> on a wooden floor.
+> **NervROS:** Right now, I see a kitchen corner with a counter (mark 1), stove (mark 2), and
+> dustbin (mark 3) against the far wall.
 
 `look` takes the newest camera frame and draws each detection as a numbered mark, so you and the
 model can both refer to things by number. Under the image, **Show in 3D** pauses the viewer at the
@@ -78,8 +81,9 @@ moment the snapshot was taken, and **Ask about it** starts a message about it.
 
 > **You:** Where is the small white mug?
 >
-> **NervROS:** I found the small white mug (O783) in room R1. It's located at position x=-1.91,
-> y=2.67 meters with a height of 0.78 meters. Would you like me to pick it up?
+> **NervROS:** I found several mugs in the world model. The small white mug you're asking about
+> appears to be O27 - a ceramic mug with a grey exterior and white interior, located in the living
+> room (R1) on support O24 at position (-1.86, -3.79). …
 
 `find_objects` searches the world model, which remembers everything the cameras have seen, room
 by room.
@@ -91,16 +95,17 @@ and how many objects it holds. Then it lists the named places.
 
 ### Pointing and outlining
 
-https://github.com/user-attachments/assets/520b0f75-001f-45a2-a9c7-51a8ac6cbfc0
+https://github.com/user-attachments/assets/1d49a274-87c4-4de4-b3eb-70c54df0438a
 
 > **You:** Point at the tray.
 >
-> **NervROS:** I've pointed at the tray. You can see it marked as mark 4 in the image.
+> **NervROS:** I've pointed at the tray. You can see it as mark 3 in the chest camera's view -
+> it's the wooden tray on the office desk.
 >
 > **You:** Outline the desk.
 >
-> **NervROS:** I've outlined the desk in the image. The desk is marked as region 1 and covers
-> about 11.5% of the frame.
+> **NervROS:** I've outlined the desk in the chest camera's view. You can see it as mark 1,
+> covering about 19% of the frame - it's the wooden desk where the tray sits.
 
 `point` asks a vision model, so it finds things the detector never marked, and it draws a ring
 where it points. `segment` outlines what you name, using a vision model or the robot's own
@@ -114,7 +119,7 @@ plan reach you, as a card to approve.
 
 ### Walking somewhere
 
-https://github.com/user-attachments/assets/7cf1cd95-a8dc-4519-a4cf-155976221887
+https://github.com/user-attachments/assets/347f06fd-e0aa-43d5-bb05-21114d744742
 
 > **You:** Walk to the bedroom, room R3.
 
@@ -124,19 +129,19 @@ the Tree tab draws the behaviour tree step by step with the nodes running inside
 timeline strip shows the steps over time. When it ends, the agent gets a report with its goal checks:
 
 ```text
-report> Mission 01a0feba (Walk to the bedroom, room R3) ended: success after 24 s.
+report> Mission 01a165ec (Walk to the bedroom, room R3) ended: success after 22 s.
         Goal checks: at(R3) holds (the robot is in R3).
 ```
 
 ### A short one, and the plan check
 
-https://github.com/user-attachments/assets/88c9effd-38af-4ce4-96c6-d5887d5ca9fb
+https://github.com/user-attachments/assets/c4b51018-663f-4dbb-8f6a-ebbc0410c6e0
 
 > **You:** Turn left 90 degrees.
 
 NervROS checks every plan against your words: left or right, forward or back, how far, how much,
-which hand. Here the model got the sign right. In an earlier run its first plan was
-`TurnInPlace(degrees=-90)`, a right turn, and the check sent it back before it reached the card:
+which hand. In the clip the model's first plan was `TurnInPlace(degrees=-90)`, a right turn, and
+the check sent it back before it reached the card:
 
 ```text
 run_mission failed s1: the operator said turn left, but degrees=-90 turns the other way
@@ -147,28 +152,31 @@ right, send it again unchanged and the operator sees these concerns when approvi
 If the model sends the same plan again, the concern stays on the card with a one-click fix.
 **Edit** changes, drops or moves a step before you approve.
 
-https://github.com/user-attachments/assets/91718cec-719c-4fad-96ff-6c210f32c287
+https://github.com/user-attachments/assets/85774bca-b1a2-4f62-b0fc-e8783486f8da
 
 > **You:** Look for the wooden tray from here with FindInView, without walking.
 
 A plan with a step that has worked at most half the time on this robot, over two runs or more, also
 goes to the scene check: a vision model shown what each camera sees now. It can only add doubts.
-Here `FindInView` for the tray had worked once in five, and the doubt "there is no tray in the
-current view" shows under the step and in the approval, before anything moves. Gemini 3.5
+Here `FindInView` for the tray had worked once in five, and the doubt "the tray is not in any
+frame" shows under the step and in the approval, before anything moves. Gemini 3.5
 Flash-Lite answered in this clip, and Gemini Robotics-ER 2 made the scene check.
 
 ### Fetching something
 
-https://github.com/user-attachments/assets/0c9381e1-ae1e-4391-a63d-53ef5df6179c
+https://github.com/user-attachments/assets/9db9e88d-0e8f-4cfe-8ed9-3682b3a96143
 
 > **You:** Bring the small white mug from the dining table to the tray on the office desk.
 
-The plan has four steps, and the card tracks each one live while the arms work. The clip plays
-four times faster while the mission runs.
+The plan check sent the first plans back until they named the objects as the arm's detector does
+(`mug_4`, `tray_1`) and made the look optional. The plan has five steps, and the card and the Tree
+tab track each one live while the arms work. The clip plays four times faster while the mission
+runs.
 
 ```text
-plan: GoToPlace(place=dining_table_side) -> PickObject(object_id=mug_4, arm=left)
-      -> GoToPlace(place=office_desk_tray) -> PlaceInto(container_id=tray_1, arm=left)
+plan: GoToPlace(place=dining_table_side) -> FindInView(phrase=mug)
+      -> PickObject(object_id=mug_4, arm=left) -> GoToPlace(place=office_desk_tray)
+      -> PlaceInto(container_id=tray_1, arm=left)
 ```
 
 Under three minutes later the report comes back with its checks. Only the arm's detector knows
@@ -176,13 +184,14 @@ these two objects, so the world model could not judge "inside", and the camera c
 the detector marks a mug inside the tray's box.
 
 ```text
-report> Mission 01a0ff3c (Bring the small white mug from the dining table to the tray on the
-        office desk) ended: success after 170 s. Camera check: inside(mug_4, tray_1): the
+report> Mission 01a16600 (Bring the small white mug from the dining table to the tray on the
+        office desk) ended: success after 174 s. Camera check: inside(mug_4, tray_1): the
         camera agrees: the detector marks a mug (mark 1) in or on the tray (mark 5).
 ```
 
-> **NervROS:** The mission was successful! The small white mug has been brought from the dining
-> table to the tray on the office desk.
+> **NervROS:** Great news! The mission was successful - the robot has brought the small white mug
+> from the dining table to the tray on the office desk. The camera confirms that the mug is now in
+> or on the tray. …
 
 The Tree tab draws the behaviour tree as it runs: each step a card on a spine with its wrappers
 (time limit, retries, optional), its live state and the nodes inside it with their times. The
@@ -192,21 +201,49 @@ A failed mission comes back with the step that failed, why it failed, and what t
 of the object involved. The agent then proposes a changed plan for you to approve. You can keep
 talking while a mission runs.
 
+### Fetching something new
+
+https://github.com/user-attachments/assets/3176b4dd-79dc-41d9-a13b-8f13cce7205a
+
+> **You:** Find the orange toy robot: look on the nightstands first, then on the office desk, and
+> when you find it, pick it up with your right hand and put it on the dining table.
+
+The toy robot is in no map. The agent writes a program that looks in the order you gave and stops
+at the first sighting:
+
+```rhai
+let found = ();
+for p in ["nightstand_west", "nightstand_east", "office_desk_east", "office_desk_tray"] {
+    if found == () {
+        walk(p);
+        let id = find("orange toy robot");
+        if id != () { found = #{place: p, id: id}; }
+    }
+}
+found
+```
+
+It found the toy at the office desk's east end and ran a mission: the pick with the right hand,
+where SAM 3.1 outlines the toy and GraspGen proposes the grasp, the walk to the dining table, and
+`PlaceOn`, which closes on the table's edge and sets the toy down where the hand reaches. The camera
+check saw it on the table, 7 min in all. Naming colour and kind ("orange toy robot") keeps the
+detector off the other toys on the nightstands.
+
 ### Stopping
 
-https://github.com/user-attachments/assets/d3111b11-fab2-429c-a8fb-b387522f74d1
+https://github.com/user-attachments/assets/a5b97882-0def-494f-917c-8106eb45d82c
 
 > **You:** Walk to the office, room R4.
 >
 > **You:** Stop.
 
 A plain "stop" (or "halt", "freeze", "stop!") never waits for a model. It stops the reply and the
-robot at once, through the executor's `StopAll`. In the clip the walk had run for seven seconds:
+robot at once, through the executor's `StopAll`. In the clip the walk had run for nine seconds:
 
 ```text
 [halted: the operator stopped the reply and the robot]
 [the robot stopped: holding posture; hands empty]
-report> Mission 01a0febc (Walk to the office, room R4) ended: canceled after 9 s.
+report> Mission 01a16604 (Walk to the office, room R4) ended: canceled after 10 s.
         It was stopped during s1 GoToPlace(place=R4) (stopped: operator).
 ```
 
@@ -217,7 +254,7 @@ report> Mission 01a0febc (Walk to the office, room R4) ended: canceled after 9 s
 
 ### Pausing
 
-https://github.com/user-attachments/assets/7bf2d1ef-5c5e-4873-b48f-7222fd3dc6f3
+https://github.com/user-attachments/assets/e031c8b7-4071-4cc1-ad3d-c61edbb67d27
 
 > **You:** Walk to the living room, room R1.
 >
@@ -247,14 +284,15 @@ The window's **Pause** button and the plan card's do the same, as in the clip: t
 
 ### One step's answer in the next
 
-https://github.com/user-attachments/assets/99be5972-bc7b-457b-ae5c-feb447bf00e3
+https://github.com/user-attachments/assets/b34c20fb-27b6-4e0f-be4e-a7ced5621dcb
 
-> **You:** Walk to the red mug, look for a mug there, and pick up the one you find with your left
-> hand.
+> **You:** Walk to the kitchen counter, look for a small box there, and pick up the one you find
+> with your left hand.
 
-One mission walks, looks and picks. In the clip the plan check sent the first plan back: on this
-demo robot a look works only for `mug` or `tray`, the names its mock detector knows, and the
-model had planned one for "red mug".
+One mission walks, looks and picks. The box is in no map: SAM 3.1 outlines it from the phrase, and
+the pick takes the name the look hands on. The plan check noted that a look finding nothing would
+end the mission, which is what was asked, and the plan ran: the walk to the kitchen counter, the
+look, and a top-down pick with the left hand, 117 s in all. Claude Haiku 5.5 answered in this clip.
 
 Some skills hand on what they find:
 
@@ -291,12 +329,15 @@ kind the argument takes.
 
 ### Counting, looping and measuring
 
-https://github.com/user-attachments/assets/c46fbd2f-89fd-4069-83ee-c0dcf27b8c6f
+https://github.com/user-attachments/assets/5a4f3361-bdf6-4973-9475-4ec477f817d5
 
 > **You:** Count the chairs in every room.
 >
-> **NervROS:** There are 5 chairs in the living room, 1 in the office, and 1 in the study. All
-> other rooms currently have no chairs recorded.
+> **NervROS:** Here is the chair count for each room:
+> - Living room: 5
+> - Office: 1
+> - Study: 1
+> - Bedroom, hallway, and storage room: 0
 
 For anything that takes a loop, a count or a measurement, the agent writes a short program in
 [Rhai](https://rhai.rs) and runs it as a job. Rhai is a small scripting language with no files,
@@ -306,31 +347,31 @@ network or `eval`. Counting what the world model knows needs no walking, so this
 let n = #{}; for r in rooms() { n[r.type] = objects("chair", r.id).len(); } n
 ```
 
-> **You:** Run a program that looks for a mug in the office, room R4, then at the dining table,
-> and stops at the first place where the camera sees one.
+> **You:** Run a program that goes to each named place in the bedroom and tells me at which of
+> them the camera sees a toy.
 
 ```rhai
-let found = false;
-let places_to_check = ["office", "dining_table"];
-for p in places_to_check {
-  if walk(p) {
-    if find("mug") != () {
-      say("Found a mug!");
-      found = true;
-      break;
+let out = [];
+for p in places() {
+    if p.room == "R3" {
+        let ok = walk(p.name);
+        let f = find("toy");
+        out.push(#{place: p.name, reached: ok, toy: f});
     }
-  }
 }
-found
+out
 ```
 
+`places()` names each place's room, so "each named place in the bedroom" needs no list of names.
+The program walked to both nightstands and saw a toy at each.
+
 A program that moves is approved once, with what it may run and for how long: "it may move the
-base (GoToPlace) and look (FindInView), for at most 5 min". It then runs on its own. The chat
-shows a card with its latest lines and a **Stop** button, and its result comes back as a report
-the agent answers.
+base (GoToPlace) and look (FindInView), for at most 15 min". It then runs on its own. The chat
+shows a card with its latest lines and a **Stop** button, the Tree tab shows each mission it sends,
+and its result comes back as a report the agent answers.
 
 In the clip the look in the office saw no mug, so the program walked on to the dining table, saw
-one there and ended on `true`. A mission would have ended at the empty look. Gemini 3.5 Flash-Lite
+one there and ended on `found: true, place: "dining_table"`. A mission would have ended at the empty look. Gemini 3.5 Flash-Lite
 answered in this clip.
 
 The program's functions are the robot's: `objects(words, room)`, `rooms()`, `places()`, `pose()`,
@@ -357,59 +398,63 @@ again, and each run is approved again.
 
 ### Finding something
 
-https://github.com/user-attachments/assets/51157255-5ddb-487b-b77f-5181f9481dd7
+https://github.com/user-attachments/assets/e713cf11-8a43-46bc-83fd-697840a3555f
 
-> **You:** Where could my keys be? Don't move.
+> **You:** Where could the toy elephant be? Don't move.
 >
-> **NervROS:** Based on what the world model knows, keys are most likely in these places (best
-> first):
-> - R8 (hallway) - 37% likely
-> - R1 (living room) - 26% likely
-> - R3 (bedroom) - 19% likely
-> - R4 (unexplored room) - 9% likely
->
-> The robot can't search for keys itself since the detector only looks for mug and tray. …
+> **NervROS:** I can't tell from the world model: it has no toy elephant, and the camera has
+> already seen about 99% of the mapped area. If you want me to look, the best candidates are the
+> living room places start, dining_table_side, tv_cabinet and kitchen_counter.
 
-The world model has never seen keys, so the ranking is by the rooms keys are usually in. Nothing
-moves. The demo's mock detector knows only mugs and trays, so the robot cannot go and look for
-keys itself.
+The world model has never seen it, so the answer comes from the rooms toys are usually in and the
+places in them. Nothing moves.
 
-> **You:** Find the red mug.
+> **You:** Search for the toy elephant.
 
 `search` ranks where to look:
 
 1. where the world model saw the thing, and how long ago,
 2. where it went since,
-3. the rooms such things are usually in, the least seen first, nearer before farther.
+3. the rooms such things are usually in, the least seen first, nearer before farther; a room with
+   named places in it is looked at from each of them, since from a room's middle the cameras see
+   little of what stands on its tables.
 
-The approval names the first places and why: "O46 (a mug was seen there 6 min ago), then O783 (a
-mug was seen there 89 s ago)", and so on. The search walks to each place and looks with the
-detector, up to four places in ten minutes, until it sees the thing, and reports where. In the
-clip it saw the red mug at the first place.
+To look in an order you give ("on the office desk, then the nightstands"), the agent writes a
+program instead: it can pick the thing up and put it away once found, which a search cannot.
+
+The approval names the first places and why: "start (such things are often in the living room),
+then dining_table_side (such things are often in the living room) …". The search walks to each
+place and looks with the detector, up to four places in ten minutes, until it sees the thing, and
+reports where. In the clip it looked from where it stood and from beside the dining table, and saw
+the toy elephant from the TV cabinet's place, 2 min in all. Claude Haiku 5.5 answered in this clip.
 
 "Where did you last see the red mug?" is a recall, answered at once.
 
 ### Teaching it a skill
 
-https://github.com/user-attachments/assets/4e1bf457-9f63-498c-b293-d18661542491
+https://github.com/user-attachments/assets/f1b6d84f-b106-4ce3-aa96-f8939f821a61
 
-> **You:** Point at the red mug with your right hand.
->
-> **NervROS:** I have started a mission to walk to the red mug (mark O27) and point at it with
-> your right hand.
+> **You:** Teach yourself a skill for pointing at things with a hand, then point at the kettle on
+> the kitchen counter with your right hand.
 
 No skill points, so the agent teaches the robot one. A taught skill is a small tree of the leaves
 the executor allows, such as `MoveHand` and `Wait`, with its own arguments. In the clip it is a
-single leaf:
+point and a short wait:
 
 ```json
-{"name": "PointAt", "description": "Point at an object with the specified arm",
- "args": [{"name": "object", "type": "world_id", "description": "The object to point at"},
-          {"name": "arm", "type": "string", "description": "The arm to use (right or left)"}],
- "body": {"leaf": "MoveHand", "target": "{object}", "arm": "{arm}", "mode": "point"}}
+{"name": "PointAt", "max_s": 30,
+ "description": "Point one hand at an object in the world model, holding the pose for a moment, then bring the arm back.",
+ "args": [{"name": "object", "type": "world_id", "description": "The object to point at, by id or words"},
+          {"name": "arm", "type": "string", "description": "Which hand points: left or right",
+           "enum": ["left", "right"]}],
+ "body": {"sequence": [{"leaf": "MoveHand", "mode": "point", "arm": "{arm}", "target": "{object}"},
+                       {"leaf": "Wait", "seconds": 2}]}}
 ```
 
-A body can also nest `sequence`, `fallback`, `retry`, `timeout_s` and `force_success` nodes.
+`arm` takes the values the executor declares for `MoveHand`'s arm, so the first try ran: the robot
+walked to the kitchen counter and pointed at the kettle (O52) with its right hand, 66 s in all.
+
+A body can also nest `fallback`, `retry`, `timeout_s` and `force_success` nodes.
 
 You approve the teaching first. The executor checks the skill, which is then a draft. The plan
 that uses it comes to you like any plan, with its new step marked as a taught skill on its first
@@ -428,7 +473,7 @@ uses it. The Library tab lists the taught skills, each with what it was taught f
 
 ## Clicking in the 3D view
 
-https://github.com/user-attachments/assets/bfe51e79-41ec-4697-a017-dfaefe0bfd26
+https://github.com/user-attachments/assets/949921e5-2217-4220-b676-4d0a53b9018a
 
 Click a room, an object or a point on the floor in the 3D view. It lights up, and a bar above the
 message box offers what the agent can do with it. **Go there** plans the walk at once, for you to
@@ -436,15 +481,15 @@ approve; the other buttons fill in a message for you to send. In the clip: the o
 **Go there**; then the desk, then **What is it?**, which fills in "Tell me about O47 (desk)." to
 send:
 
-> **NervROS:** O47 is a large grey metal desk with multiple drawers on both sides. It measures 2m
-> x 0.95m and is about 0.88m tall.
+> **NervROS:** O47 is a large grey metal desk with multiple drawers on both sides, located in room
+> R4 (the office). It measures 2.0m x 0.9472m x 0.88m …
 
 **Follow robot** in the top bar keeps the 3D view on the robot as it walks. With it off, the view
 frames the whole map.
 
 ## Commands without the model
 
-https://github.com/user-attachments/assets/e8cce4e9-8e55-47d8-9585-80c6ae21a2d4
+https://github.com/user-attachments/assets/0bd2c6e6-3194-4e74-b688-687dcbec2d29
 
 Ctrl+K opens the command palette: type a few letters and press Enter. Every command also works as
 a `/word` typed in the chat. Most need no model: they open a tab, change the view or stop the
@@ -471,7 +516,7 @@ robot. `/look`, `/places` and `/explore` send their request to the agent. In the
 
 ## Driving by hand
 
-https://github.com/user-attachments/assets/e6edf6ef-67c4-441b-a0b9-3381bf94d3ed
+https://github.com/user-attachments/assets/8f94bba2-5a13-4a88-90a1-f33921aa434b
 
 The Robot tab shows whether the robot is upright, where it is and in which room, what each hand
 holds, and its motors and battery when the robot reports them.
@@ -483,12 +528,12 @@ Driving needs the robot armed.
 
 ## Keeping an eye on it
 
-https://github.com/user-attachments/assets/d5717403-34a7-4bb5-bd64-cc8ebdc6eeef
+https://github.com/user-attachments/assets/2b8bb9b1-f078-4a30-ba10-ecba951239c8
 
 > **You:** Tell me if the chest camera's images drop below 5 Hz.
 >
-> **NervROS:** I'm now watching the chest camera's image rate. I'll let you know if it drops below
-> 5 Hz within the next 30 minutes.
+> **NervROS:** I've set up a watch to monitor the chest camera's frame rate. It will report if the
+> images drop below 5 Hz for the next 30 minutes.
 
 A watch runs in the background and posts to the chat when its condition holds: a rate dropping, a
 value crossing a line, or a log line matching.
@@ -503,8 +548,8 @@ the scheduled walk below.
 A schedule is approved once, runs now and then on its clock, and reports after each run:
 
 ```text
-report> Mission 01a0ff18 (Walk to bedroom R3 every 10 minutes, 3 times, run 1 of 3 of schedule
-        p1) ended: success after 18 s. Goal checks: at(R3) holds (the robot is in R3).
+report> Mission 01a16636 (walk to bedroom R3 three times every 10 minutes, run 1 of 3 of schedule
+        p1) ended: success after 24 s. Goal checks: at(R3) holds (the robot is in R3).
 ```
 
 The Mission tab lists the schedule with a **Cancel** button. A schedule can also wait for
@@ -516,29 +561,30 @@ while a mission runs.
 
 ### Waiting for what a camera shows
 
-https://github.com/user-attachments/assets/1ebe06cc-de7a-490f-b902-597ea91f72d6
+https://github.com/user-attachments/assets/e5a1eff8-b8b4-4d54-8923-e983354753eb
 
-> **You:** Tell me when the head camera shows a red mug.
+> **You:** Tell me when the head camera shows a green toy.
 >
-> **You:** Walk to the dining table.
+> **You:** Walk to the right nightstand.
 
 A watch can also wait for what a camera shows, such as someone putting a box on the sofa. A vision
 model looks every 15 seconds, and the watch posts once it says yes twice in a row, so one glimpse it
-mistook does not count. Here it fires once the robot stands at the table: "the camera model says a
-red mug on the table".
+mistook does not count. Here it fires once the robot stands at the right nightstand: "the camera model
+says a green Yoshi toy".
 
-> **You:** When did the head camera first show the red mug?
+> **You:** When did a camera first show the green toy?
 
 With `[keyframes]`, the cameras keep a frame each time their view changes. `when` shows a vision
 model a dozen of them in time order, those around the moments the world model saw the mug change
 when it did, as for "when did the red mug leave the dining table?". A model reading a dozen frames
 can name the one beside the right one, so the vision check then looks at that frame alone, and at
-its neighbours until one shows it. It answers with the time and the frame: here 60 s ago, the frame
-where the mug comes into view, and **Show in 3D** takes the viewer back to that moment.
+its neighbours until one shows it. It answers with the time and the frame: here 57 s ago, in the
+frame where the toy comes into view, and **Show in 3D** takes the viewer back to that
+moment.
 
 ### A patrol and the digest
 
-https://github.com/user-attachments/assets/e0343475-e62f-4f6a-8e6a-5a693125325d
+https://github.com/user-attachments/assets/1985cf24-50be-4564-ad91-6a3d72b33dab
 
 > **You:** Check on the living room and the bedroom.
 
@@ -547,11 +593,11 @@ quarter turns, each view held still so the world model takes it in. It then repo
 each room and what moved or went missing meanwhile:
 
 ```text
-report> The patrol j1 (living room, bedroom) finished: visited living room, bedroom; saw the
-        living room (R1): 4 chairs, an armchair, a book, a bookshelf, a coffee table, a dining
-        table and a sofa; the bedroom (R3): a bed, a clock, a nightstand and a potted plant, and
-        in view the study (R7): a wardrobe; nothing moved or went missing in the world model
-        meanwhile
+report> The patrol j1 (living_room, bedroom) finished: visited living_room, bedroom; saw the living
+        room (R1): 4 chairs, an armchair, a book, a bookshelf, a bowl, a coffee table, a counter, a
+        dining table, a kettle, a mug and 2 more kinds; the bedroom (R3): a bed, a clock, a
+        nightstand and a potted plant, and in view the study (R7): a wardrobe; nothing moved or went
+        missing in the world model meanwhile
 ```
 
 > **You:** How did today go?
@@ -563,7 +609,7 @@ this clip.
 
 ### Proposed fixes
 
-https://github.com/user-attachments/assets/c23c8e5b-65c4-4367-88e8-5c94d21a6e42
+https://github.com/user-attachments/assets/567fafc8-2e19-4207-bde7-3f6a30db206a
 
 When a step keeps failing, NervROS may propose a lasting fix: a note the planner reads, a keep-out
 zone, or a node parameter the profile lets `param_set` change. It never applies one itself. The
@@ -589,7 +635,7 @@ so it asks every time; a parameter change can be allowed for the rest of the ses
 
 ## When something goes wrong
 
-https://github.com/user-attachments/assets/eb499b8c-4e19-487d-939e-51b98aa5eefa
+https://github.com/user-attachments/assets/df2c5600-4c68-4bab-b255-30d26d98203f
 
 > **You:** Why can't the robot find anything with its head camera?
 >
@@ -629,7 +675,7 @@ The investigator only reads: it never moves the robot.
 
 ### Runs the robot cut short
 
-https://github.com/user-attachments/assets/3c3d470d-7af2-498e-b83c-8c70945c5c65
+https://github.com/user-attachments/assets/04c65502-d726-4362-a398-13405b45e4fe
 
 Not every failed mission is a failed plan. The executor's result says when the robot or the executor
 ended one: the robot could not move or fell, the app's heartbeat stopped, the executor was shutting
@@ -639,7 +685,7 @@ the next start says. In the clip, a walk NervROS was running when it stopped is 
 a walk approved while the base is driven by hand from the Robot tab cannot start:
 
 ```text
-report> Mission 01a149ab (Walk to the office, room R4) ended: rejected after 0 s. It could not
+report> Mission 01a1664d (Walk to the office, room R4) ended: rejected after 0 s. It could not
         start (teleop is driving the base).
 ```
 
@@ -649,7 +695,7 @@ cause beside how it ended.
 
 ## Remembering
 
-https://github.com/user-attachments/assets/4e948469-2f78-470e-b5e3-1755cc7346aa
+https://github.com/user-attachments/assets/0a0b64fc-4169-4892-8e3a-6cca85f90456
 
 > **You:** Remember this spot as the charging spot.
 >
@@ -657,8 +703,8 @@ https://github.com/user-attachments/assets/4e948469-2f78-470e-b5e3-1755cc7346aa
 >
 > **You:** What do you remember?
 >
-> **NervROS:** I remember two things: 1. The living room window sticks (note 1) 2. This spot is
-> the charging spot ...
+> **NervROS:** I remember two things: 1. The living room window sticks (note 1) 2. The charging
+> spot where the robot is currently located …
 
 A named place works from then on, in this session and the next: "go to the charging spot". Notes
 join what the agent knows on every turn, and the Agent tab lists them with **Forget**. "What have
@@ -667,11 +713,12 @@ history.
 
 ## Keeping a goal
 
-https://github.com/user-attachments/assets/2cbd5b3b-22d3-4f12-84ce-f697941a21d9
+https://github.com/user-attachments/assets/6fbc7a91-cd80-4578-8cd8-4fb2435d7989
 
-> **You:** Set a goal to keep the red mug on the wooden tray, then work toward it.
+> **You:** The orange toy robot is on the office desk. Set a goal to keep it on the dining table,
+> then work toward it.
 
-The agent sets a goal with what holds once it is met, in the world model's ids, such as `inside(O27,
+The agent sets a goal with what holds once it is met, in the world model's ids, such as `inside(O783,
 O261)`, and you approve it like an edit. A name only the detector knows, such as `mug_4`, is taken
 as the world model's likeliest object of its kind, and the agent is told which; with none it is
 refused, as the world model could never see that goal met. The agent then plans a mission for it at
@@ -684,21 +731,17 @@ goal's mug. A goal ends when it holds, when its missions (five unless you say) o
 or when the agent gives it up as impossible, with the reason. A run the robot cut short counts
 against no goal. Goals outlast a restart: at start the window says where each one stands.
 
-The clip plays four times faster while the mission runs. Its report ends with the goal, met:
+In the clip the toy is in no map yet, so the agent first walks to the desk and looks, then plans
+the pick, the walk and the place on the dining table, 162 s at four times the speed. The world
+model then has the toy on the table under a new id, the one on the desk gone, and the agent sets
+the goal on it, met at once.
 
-```text
-report> Mission 01a14b19 (Pick up the red mug and place it into the wooden tray) ended: success
-        after 211 s. … Camera check: inside(mug_4, tray_1): the camera agrees: the detector marks
-        a mug (mark 1) in or on the tray (mark 5).
-        Goal: goal 1 (keep the red mug on the wooden tray): met.
-```
-
-The Agent tab lists the goals and where each stands, each with **Drop**. Gemini 3.5 Flash-Lite
+The Agent tab lists the goals and where each stands, each with **Drop**. Claude Haiku 5.5
 answered in this clip.
 
 ## Keeping it out of places
 
-https://github.com/user-attachments/assets/3df05f4a-344a-4d54-a824-6ecfa8bebf57
+https://github.com/user-attachments/assets/7606defe-a7a7-434b-aa79-ef1fa0cc6ee3
 
 > **You:** Keep the robot out of the bedroom.
 >
@@ -740,9 +783,9 @@ the composer, and **Remove** asks the agent to remove one, which you approve.
 
 ## Nav2 and MoveIt
 
-https://github.com/user-attachments/assets/43ac126e-f920-4fce-8a64-9ac0baea3062
+https://github.com/user-attachments/assets/77410286-8fd9-4e43-91f9-bc31c3a2d0e4
 
-https://github.com/user-attachments/assets/3091295f-aee5-4a00-8305-f9cb5ecc8e03
+https://github.com/user-attachments/assets/f6234f46-2ef1-4e02-ab06-115bab6d5782
 
 With [`[nav2]`](profile.md#nav2) and [`[moveit]`](profile.md#moveit) in the profile, the agent
 works the robot's navigation and arm stacks directly: it reads them, changes how they behave, and
@@ -791,13 +834,13 @@ what Nav2 is doing and the speed limit in force, and where each arm is.
   one of them lets go.
 - A route's places are its waypoints: one inside furniture fails the whole route, so name places
   or rooms with room to stand.
-- Grip never opens a hand that holds something: put the object down with a place.
+- Grip never moves a hand that holds something, or may: put the object down with a place.
 
 </details>
 
 ## The robot's self-description
 
-https://github.com/user-attachments/assets/32d93917-9227-47be-83e7-5b408e125657
+https://github.com/user-attachments/assets/525ce149-80a5-4615-8504-96a5b42ab892
 
 The persona tells the model what the robot is. **Draft from the robot** in the Doctor tab, or
 `nervros-cli whoami`, writes a new one from the robot as it is now: the executor's skills as the
@@ -810,7 +853,7 @@ The routine model drafts it in the current persona's style, into `<persona>.draf
 
 ## Mapping a new building
 
-https://github.com/user-attachments/assets/7c772eab-a4a0-4b78-a464-bbe55f937ab0
+https://github.com/user-attachments/assets/f6f775ec-bd0e-4bad-a06e-e8f6f53a1375
 
 > **You:** Explore the building to fill in the map.
 
@@ -841,7 +884,7 @@ until you save, and a save reaches the running world model at once.
 
 ### In the editor
 
-https://github.com/user-attachments/assets/0c4ec282-3535-4302-8221-021d0d24642a
+https://github.com/user-attachments/assets/16d1316a-7224-4e26-82a0-24da0d23bfec
 
 **Edit world** in the top bar (or `/edit`) puts the editor in place of the 3D view: the floor plan
 with every room and object, and in the dock the selection and a list to review, most doubtful
@@ -850,7 +893,7 @@ It is the study, so: pick it, type "study" in **Type**, then **Set type**, **Mar
 **Save**.
 
 ```text
-saved 2 edits to data/worlds/media-mapped; the world model read them
+saved 2 edits to data/worlds/nervros-integrations-test; the world model read them
 ```
 
 On the plan:
@@ -866,7 +909,7 @@ On the plan:
 
 ### In the chat
 
-https://github.com/user-attachments/assets/fce54439-64e5-45ef-8697-3ad88ba75b84
+https://github.com/user-attachments/assets/b961fabb-a1f0-4506-b53d-8a0c20cfb94b
 
 > **You:** Review the new map. What needs a second look?
 >

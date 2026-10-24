@@ -194,7 +194,7 @@ mod tests {
     fn callable() -> Vec<SkillCall> {
         vec![SkillCall {
             name: "PickObject".to_owned(),
-            first_arg: "object_id".to_owned(),
+            args: vec!["object_id".to_owned(), "arm".to_owned()],
         }]
     }
 
@@ -217,6 +217,9 @@ mod tests {
                 run("PickObject", #{object_id: id, arm: "right"});
                 PickObject(id);
                 PickObject();
+                PickObject(id, "left");
+                PickObject(17);
+                PickObject(#{object_id: id, arm: "left"});
             }
             counts
         "#;
@@ -231,6 +234,9 @@ mod tests {
                 "FindInView",
                 "PickObject",
                 "PickObject",
+                "PickObject",
+                "PickObject",
+                "PickObject",
                 "PickObject"
             ]
         );
@@ -241,6 +247,21 @@ mod tests {
             "a skill called by its name"
         );
         assert_eq!(ran[4].1, json!({}), "a skill called with nothing");
+        assert_eq!(
+            ran[5].1,
+            json!({"object_id": "mug_4", "arm": "left"}),
+            "values without names fill the arguments in order"
+        );
+        assert_eq!(
+            ran[6].1,
+            json!({"object_id": 17}),
+            "a number as it is written"
+        );
+        assert_eq!(
+            ran[7].1,
+            json!({"object_id": "mug_4", "arm": "left"}),
+            "a map alone is the arguments by name"
+        );
         assert_eq!(fake.said.lock().unwrap().as_slice(), ["kitchen has 1"]);
     }
 

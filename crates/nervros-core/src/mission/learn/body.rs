@@ -201,6 +201,15 @@ fn leaf(
                 continue;
             }
         };
+        if let Some(allowed) = known.values.get(port.as_str())
+            && bound(&text).is_none()
+            && !allowed.contains(&text)
+        {
+            problems.push(format!(
+                "{at}: {name}.{port} takes only {}, not {text}",
+                allowed.join(" or ")
+            ));
+        }
         if let (Some(takers), Some(arg)) = (&known.world_ids, bound(&text))
             && rules.world_args.contains(&arg)
             && !takers.contains(port)
@@ -328,17 +337,35 @@ mod tests {
                 .collect(),
             ..LearnableLeaf::default()
         };
+        let mut hand = leaf("arms", &["arm", "target", "mode"]);
+        hand.values = BTreeMap::from([(
+            "arm".to_owned(),
+            vec!["left".to_owned(), "right".to_owned()],
+        )]);
         Learnable {
             leaves: BTreeMap::from([
-                (
-                    "MoveHand".to_owned(),
-                    leaf("arms", &["arm", "target", "mode"]),
-                ),
+                ("MoveHand".to_owned(), hand),
                 ("Wait".to_owned(), leaf("", &["seconds"])),
             ]),
             max_duration_s: 300.0,
             max_nodes: 40,
         }
+    }
+
+    #[test]
+    fn a_literal_outside_an_input_s_values_is_named_with_them() {
+        let body =
+            json!({"leaf": "MoveHand", "arm": "left_arm", "target": "{object}", "mode": "point"});
+        let problems = to_xml(&body, &learnable(), &[]).unwrap_err();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("MoveHand.arm takes only left or right, not left_arm")),
+            "{problems:?}"
+        );
+        let bound =
+            json!({"leaf": "MoveHand", "arm": "{arm}", "target": "{object}", "mode": "point"});
+        assert!(to_xml(&bound, &learnable(), &[]).is_ok());
     }
 
     #[test]

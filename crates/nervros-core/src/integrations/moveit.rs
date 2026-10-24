@@ -139,7 +139,10 @@ impl Arms {
         if let Some(s) = crate::lock(&self.srdf).clone() {
             return Ok(s);
         }
-        let names = ["robot_description_semantic".to_owned()];
+        let names = [
+            "robot_description_semantic".to_owned(),
+            "robot_description".to_owned(),
+        ];
         let values = get_params(self.robot.as_ref(), &self.config.move_group, &names).await?;
         let text = values
             .first()
@@ -151,7 +154,11 @@ impl Arms {
                     self.config.move_group
                 )
             })?;
-        let srdf = Arc::new(Srdf::parse(text)?);
+        let urdf = values
+            .get(1)
+            .and_then(|(v, _)| v.as_str())
+            .unwrap_or_default();
+        let srdf = Arc::new(Srdf::parse(text)?.with_urdf(urdf));
         *crate::lock(&self.srdf) = Some(Arc::clone(&srdf));
         Ok(srdf)
     }

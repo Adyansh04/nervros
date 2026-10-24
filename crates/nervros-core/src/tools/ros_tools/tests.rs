@@ -515,6 +515,29 @@ async fn a_nav2_goal_inside_a_keep_out_zone_is_refused() {
 }
 
 #[tokio::test]
+async fn a_slow_zone_alone_refuses_no_straight_move() {
+    let (_, tools, guard) = all_tools(&open(), true);
+    let profile: crate::profile::Profile = toml::from_str(
+        "[robot]\nname = \"x\"\n[models]\nfile = \"m.toml\"\n\
+         [[geofence.zone]]\nname = \"hall\"\npolygon = [[2, -1], [3, -1], [3, 1], [2, 1]]\n\
+         slow = { percent = 50 }\n",
+    )
+    .unwrap();
+    guard.set_zones(crate::zones::Zones::new(&profile, None));
+    let straight = tool(&tools, "action_goal")
+        .call(
+            json!({"action": "/drive_on_heading", "type": "nav2_msgs/action/DriveOnHeading",
+                     "goal": {"target": {"x": 0.5}}}),
+        )
+        .await;
+    assert!(
+        !straight.message.contains("run_mission"),
+        "{}",
+        straight.message
+    );
+}
+
+#[tokio::test]
 async fn a_parameter_is_set_in_its_own_type_and_read_back() {
     let (fake, tools, _) = all_tools(&open(), true);
     let set = tool(&tools, "param_set");

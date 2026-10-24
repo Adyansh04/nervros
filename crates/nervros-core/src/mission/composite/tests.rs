@@ -93,10 +93,106 @@ fn what_a_step_handed_on_fills_the_later_ones_and_unknown_keys_go_as_literals() 
         fill(r#"<SubTree ID="P" object_id="{s1_id}"/>"#, &outputs),
         r#"<SubTree ID="P" object_id="O17"/>"#
     );
+    let inside = BTreeSet::from(["s2"]);
     assert_eq!(
-        unbind(r#"<SubTree ID="P" object_id="{s1_id}" x="1"/>"#),
-        r#"<SubTree ID="P" object_id="s1_id" x="1"/>"#
+        unbind(
+            r#"<SubTree ID="P" object_id="{s1_id}" got="{s2_got}" x="1"/>"#,
+            &inside
+        ),
+        r#"<SubTree ID="P" object_id="s1_id" got="{s2_got}" x="1"/>"#
     );
+}
+
+/// The `[mission]` config of an executor under `/x`.
+fn real_config() -> MissionConfig {
+    serde_json::from_value(json!({
+        "execute": "/x/execute_mission", "validate": "/x/validate_mission",
+        "catalog": "/x/get_catalog", "stop": "/x/stop_all", "state": "/x/robot_state",
+        "pause": "/x/pause_mission",
+    }))
+    .unwrap()
+}
+
+fn pick_and_place_catalog() -> Value {
+    json!({"catalog_json": json!({"catalog_version": "v1", "skills": [
+        {"name": "Pick", "template": "Pick", "max_duration_s": 30.0, "args": [{"name": "item"}],
+         "outputs": [{"name": "got"}]},
+        {"name": "Place", "template": "Place", "max_duration_s": 30.0, "args": [{"name": "item"}]},
+    ]}).to_string()})
+}
+
+#[tokio::test]
+async fn a_stretch_is_checked_with_its_own_hand_ons_and_earlier_ones_as_literals() {
+    let checked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = Arc::clone(&checked);
+    let robot = FakeRobot::new()
+        .with_service("/x/get_catalog", |_| Ok(pick_and_place_catalog()))
+        .with_service("/x/validate_mission", move |r| {
+            seen.lock()
+                .unwrap()
+                .push(r["tree_xml"].as_str().unwrap_or_default().to_owned());
+            Ok(json!({"ok": true, "diagnostics_json": "[]", "worst_case_duration_s": 1.0}))
+        });
+    let c = Composite::new(
+        Arc::new(robot),
+        Some(real_config()),
+        vec![native("Walk", 0, 0.01)],
+    );
+    let tree = r#"<root BTCPP_format="4" main_tree_to_execute="Mission">
+  <BehaviorTree ID="Mission">
+    <Sequence name="mission">
+      <SubTree ID="Walk" name="s1_Walk" how="slowly" said="{s1_said}"/>
+      <SubTree ID="Pick" name="s2_Pick" item="{s1_said}" got="{s2_got}"/>
+      <SubTree ID="Place" name="s3_Place" item="{s2_got}"/>
+    </Sequence>
+  </BehaviorTree>
+</root>"#;
+    let reply = c
+        .call(VALIDATE, "", json!({"tree_xml": tree}), CALL_WAIT)
+        .await
+        .unwrap();
+    assert_eq!(reply["ok"], true, "{reply}");
+    let sent = checked.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].contains(r#"item="s1_said""#), "{}", sent[0]);
+    assert!(
+        sent[0].contains(r#"got="{s2_got}""#),
+        "the output port went: {}",
+        sent[0]
+    );
+    assert!(sent[0].contains(r#"item="{s2_got}""#), "{}", sent[0]);
+}
+
+#[tokio::test]
+async fn without_the_executors_catalog_no_step_runs_as_a_native() {
+    let walk = native("Walk", 0, 0.01);
+    let c = Composite::new(
+        Arc::new(FakeRobot::new()),
+        Some(real_config()),
+        vec![walk.clone()],
+    );
+    let reply = c
+        .call(VALIDATE, "", json!({"tree_xml": TREE}), CALL_WAIT)
+        .await
+        .unwrap();
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert!(
+        reply["diagnostics_json"]
+            .as_str()
+            .unwrap()
+            .contains("catalog could not be read"),
+        "{reply}"
+    );
+    let sent = c
+        .send_goal(
+            EXECUTE,
+            EXECUTE_TYPE,
+            json!({"mission_id": "m7", "tree_xml": TREE}),
+            CALL_WAIT,
+        )
+        .await;
+    assert!(sent.is_err());
+    assert_eq!(walk.runs.load(Ordering::SeqCst), 0);
 }
 
 async fn run(c: &Composite, tree: &str) -> (Value, Vec<Value>) {
@@ -271,11 +367,7 @@ async fn a_mixed_plan_sends_its_executor_stretch_with_what_the_natives_handed_on
                 ..ScriptedRun::default()
             }
         });
-    let real: MissionConfig = serde_json::from_value(json!({
-        "execute": "/x/execute_mission", "validate": "/x/validate_mission",
-        "catalog": "/x/get_catalog", "stop": "/x/stop_all", "state": "/x/robot_state",
-    }))
-    .unwrap();
+    let real = real_config();
     let c = Composite::new(Arc::new(robot), Some(real), vec![native("Walk", 0, 0.01)]);
     let tree = r#"<root BTCPP_format="4" main_tree_to_execute="Mission">
   <BehaviorTree ID="Mission">
@@ -323,11 +415,7 @@ fn with_executor(
                 ..ScriptedRun::default()
             }
         });
-    let real: MissionConfig = serde_json::from_value(json!({
-        "execute": "/x/execute_mission", "validate": "/x/validate_mission",
-        "catalog": "/x/get_catalog", "stop": "/x/stop_all", "state": "/x/robot_state",
-    }))
-    .unwrap();
+    let real = real_config();
     (Composite::new(Arc::new(robot), Some(real), natives), sent)
 }
 
@@ -444,12 +532,7 @@ async fn pause_and_stop_in_an_executor_stretch_go_to_the_executor() {
                 result: json!({"outcome": OUTCOME_SUCCESS, "outputs_json": "{}"}),
             }),
         });
-    let real: MissionConfig = serde_json::from_value(json!({
-        "execute": "/x/execute_mission", "validate": "/x/validate_mission",
-        "catalog": "/x/get_catalog", "stop": "/x/stop_all", "state": "/x/robot_state",
-        "pause": "/x/pause_mission",
-    }))
-    .unwrap();
+    let real = real_config();
     let walk = native("Walk", 0, 0.01);
     let c = Composite::new(Arc::new(robot), Some(real), vec![walk.clone()]);
     let tree = r#"<root BTCPP_format="4" main_tree_to_execute="Mission">
@@ -487,4 +570,115 @@ async fn pause_and_stop_in_an_executor_stretch_go_to_the_executor() {
         0,
         "the native step after the stop never ran"
     );
+}
+
+#[tokio::test]
+async fn a_mission_of_executor_skills_alone_is_paused_by_the_executor() {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&asked);
+    let robot = FakeRobot::new().with_service("/x/pause_mission", move |r| {
+        log.lock().unwrap().push(format!("pause {}", r["pause"]));
+        Ok(json!({"ok": true, "message": "paused"}))
+    });
+    let real = real_config();
+    // The executor runs such a mission without the composite, so nothing runs here.
+    let c = Composite::new(Arc::new(robot), Some(real), Vec::new());
+    let paused = c
+        .call(PAUSE, "", json!({"pause": true}), CALL_WAIT)
+        .await
+        .unwrap();
+    assert_eq!(paused["ok"], true, "{paused}");
+    assert_eq!(*asked.lock().unwrap(), ["pause true"]);
+    let none = composite(Vec::new())
+        .call(PAUSE, "", json!({"pause": true}), CALL_WAIT)
+        .await
+        .unwrap();
+    assert_eq!(none["message"], "no mission is running", "{none}");
+}
+
+#[tokio::test]
+async fn a_stop_while_the_executor_takes_its_stretch_cancels_the_stretch() {
+    use nervros_ros::fake::ScriptedRun;
+    use nervros_ros::{GoalResult, GoalStatus};
+    let robot = FakeRobot::new()
+        .with_latency(Duration::from_millis(200))
+        .with_service("/x/get_catalog", |_| Ok(pick_and_place_catalog()))
+        .with_service("/x/stop_all", |_| {
+            Ok(json!({"ok": true, "message": "stopped", "state_after": "stopped"}))
+        })
+        // Two seconds of work, unless cancelled.
+        .with_action("/x/execute_mission", |_| ScriptedRun {
+            feedback: vec![json!({}); 20],
+            step: Duration::from_millis(100),
+            result: Ok(GoalResult {
+                status: GoalStatus::Succeeded,
+                result: json!({"outcome": OUTCOME_SUCCESS, "outputs_json": "{}"}),
+            }),
+        });
+    let c = Composite::new(
+        Arc::new(robot),
+        Some(real_config()),
+        vec![native("Walk", 0, 0.01)],
+    );
+    let tree = r#"<root BTCPP_format="4" main_tree_to_execute="Mission">
+  <BehaviorTree ID="Mission">
+    <Sequence name="mission">
+      <SubTree ID="Pick" name="s1_Pick" item="mug"/>
+      <SubTree ID="Walk" name="s2_Walk" how="away" said="{s2_said}"/>
+    </Sequence>
+  </BehaviorTree>
+</root>"#;
+    let goal = c
+        .send_goal(
+            EXECUTE,
+            EXECUTE_TYPE,
+            json!({"mission_id": "m5", "tree_xml": tree}),
+            CALL_WAIT,
+        )
+        .await
+        .unwrap();
+    // The stretch's goal is still on its way to the executor.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let stopped = Instant::now();
+    c.call(STOP, "", json!({"reason": "test"}), CALL_WAIT)
+        .await
+        .unwrap();
+    let result = goal.result.await.unwrap().unwrap().result;
+    assert_eq!(result["outcome"], u64::from(OUTCOME_CANCELED), "{result}");
+    assert!(
+        stopped.elapsed() < Duration::from_secs(1),
+        "the stretch ran on for {:?}",
+        stopped.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_pause_does_not_count_against_a_native_steps_time() {
+    let c = Arc::new(composite(vec![native("Walk", 0, 0.4)]));
+    let tree = r#"<root BTCPP_format="4" main_tree_to_execute="Mission">
+  <BehaviorTree ID="Mission">
+    <Sequence name="mission">
+      <Timeout msec="300"><SubTree ID="Walk" name="s1_Walk" how="slowly" said="{s1_said}"/></Timeout>
+    </Sequence>
+  </BehaviorTree>
+</root>"#;
+    let goal = c
+        .send_goal(
+            EXECUTE,
+            EXECUTE_TYPE,
+            json!({"mission_id": "m6", "tree_xml": tree}),
+            CALL_WAIT,
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    c.call(PAUSE, "", json!({"pause": true}), CALL_WAIT)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.call(PAUSE, "", json!({"pause": false}), CALL_WAIT)
+        .await
+        .unwrap();
+    let result = goal.result.await.unwrap().unwrap().result;
+    assert_eq!(result["outcome"], u64::from(OUTCOME_SUCCESS), "{result}");
 }

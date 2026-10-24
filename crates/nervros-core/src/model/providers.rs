@@ -10,7 +10,9 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::secret::KeySource;
+use budget::{BudgetConfig, Price};
 
+pub mod budget;
 pub mod free_only;
 pub mod ledger;
 pub mod openrouter;
@@ -42,6 +44,8 @@ pub enum ProviderKind {
     OpenaiCompat,
     /// Google's Gemini Interactions API, which sends the key only in the `x-goog-api-key` header.
     GeminiInteractions,
+    /// Anthropic's Messages API, which sends the key in `x-api-key`. Paid, so it needs a budget.
+    Anthropic,
 }
 
 /// One endpoint.
@@ -66,6 +70,8 @@ pub struct ProviderConfig {
     /// Per-request timeout in seconds.
     #[serde(default = "default_timeout_s")]
     pub timeout_s: u64,
+    /// The most a paid key may spend in all, across runs and processes; its models need a price.
+    pub budget: Option<BudgetConfig>,
 }
 
 fn default_timeout_s() -> u64 {
@@ -137,6 +143,10 @@ pub struct ModelConfig {
     /// Its replies stream to the window word by word.
     #[serde(default)]
     pub stream: bool,
+    /// What its tokens cost, for a provider with a budget.
+    pub price: Option<Price>,
+    /// The longest reply it may give, in tokens, where the API needs a figure (Anthropic's does).
+    pub max_tokens: Option<u64>,
 }
 
 /// A shared daily budget.
@@ -321,6 +331,18 @@ pub enum ConfigError {
     /// A model breaks its provider's free-only rule.
     #[error(transparent)]
     NotFree(#[from] free_only::FreeOnlyError),
+    /// A paid provider without a budget.
+    #[error("provider `{0}` is paid: give it a budget, the most its key may spend")]
+    Unbudgeted(String),
+    /// A budget that is not a positive amount.
+    #[error("provider `{0}`: the budget must be a positive number of dollars")]
+    BadBudget(String),
+    /// A model on a budgeted provider without a valid price.
+    #[error("model `{0}` runs against a budget: give it a price, finite and not negative")]
+    Unpriced(String),
+    /// An Anthropic model without `max_tokens`.
+    #[error("model `{0}` needs max_tokens: the Messages API takes no reply without a cap")]
+    NoMaxTokens(String),
 }
 
 impl ModelsConfig {
@@ -365,6 +387,15 @@ impl ModelsConfig {
             if p.kind == ProviderKind::OpenaiCompat && p.base_url.is_none() {
                 return Err(ConfigError::NoBaseUrl(p.id.clone()));
             }
+            match &p.budget {
+                None if p.kind == ProviderKind::Anthropic => {
+                    return Err(ConfigError::Unbudgeted(p.id.clone()));
+                }
+                Some(b) if !(b.usd.is_finite() && b.usd > 0.0) => {
+                    return Err(ConfigError::BadBudget(p.id.clone()));
+                }
+                _ => {}
+            }
         }
         let mut models = BTreeSet::new();
         for m in &self.models {
@@ -380,6 +411,16 @@ impl ModelsConfig {
                     kind: "provider",
                     id: m.provider.clone(),
                 });
+            }
+            let provider = self.providers.iter().find(|p| p.id == m.provider);
+            if provider.is_some_and(|p| p.budget.is_some())
+                && !m.price.as_ref().is_some_and(Price::is_valid)
+            {
+                return Err(ConfigError::Unpriced(m.id.clone()));
+            }
+            if provider.is_some_and(|p| p.kind == ProviderKind::Anthropic) && m.max_tokens.is_none()
+            {
+                return Err(ConfigError::NoMaxTokens(m.id.clone()));
             }
             if let Some(pool) = &m.limits.pool
                 && !self.pools.contains_key(pool)
@@ -432,6 +473,60 @@ pub(crate) mod tests {
         assert!(!config.roles.routine.is_empty());
         let local = config.model("qwen3.5-9b-local").unwrap();
         assert!(local.privacy.local && local.vision && local.tools);
+    }
+
+    const CLAUDE: &str = r#"
+        [[provider]]
+        id = "anthropic"
+        kind = "anthropic"
+        key = { env = "NONE" }
+        budget = { usd = 95.0, spent_file = "/tmp/spend.json" }
+
+        [[model]]
+        id = "haiku"
+        provider = "anthropic"
+        model = "claude-haiku-5-5"
+        tools = true
+        max_tokens = 16000
+        price = { input = 0.10, output = 0.50, cache_read = 0.01, cache_write = 0.125 }
+
+        [roles]
+        routine = ["haiku"]
+    "#;
+
+    #[test]
+    fn a_paid_provider_needs_a_budget_and_its_models_a_price_and_a_reply_cap() {
+        let config = ModelsConfig::parse(CLAUDE).unwrap();
+        let haiku = config.model("haiku").unwrap();
+        assert_eq!(haiku.max_tokens, Some(16_000));
+        assert!(config.provider_of(haiku).unwrap().budget.is_some());
+
+        let unbudgeted = CLAUDE.replace(
+            "budget = { usd = 95.0, spent_file = \"/tmp/spend.json\" }",
+            "",
+        );
+        assert!(matches!(
+            ModelsConfig::parse(&unbudgeted),
+            Err(ConfigError::Unbudgeted(_))
+        ));
+        let nothing = CLAUDE.replace("usd = 95.0", "usd = 0.0");
+        assert!(matches!(
+            ModelsConfig::parse(&nothing),
+            Err(ConfigError::BadBudget(_))
+        ));
+        let unpriced = CLAUDE.replace(
+            "price = { input = 0.10, output = 0.50, cache_read = 0.01, cache_write = 0.125 }",
+            "",
+        );
+        assert!(matches!(
+            ModelsConfig::parse(&unpriced),
+            Err(ConfigError::Unpriced(_))
+        ));
+        let uncapped = CLAUDE.replace("max_tokens = 16000", "");
+        assert!(matches!(
+            ModelsConfig::parse(&uncapped),
+            Err(ConfigError::NoMaxTokens(_))
+        ));
     }
 
     #[test]

@@ -160,7 +160,7 @@ mod tests {
         );
         let place = [SkillCall {
             name: "PlaceInto".to_owned(),
-            first_arg: "container_id".to_owned(),
+            args: vec!["container_id".to_owned(), "arm".to_owned()],
         }];
         assert_eq!(
             named_in("PlaceInto(\"O30\");", &place).unwrap(),
