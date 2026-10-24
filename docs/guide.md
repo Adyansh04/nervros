@@ -203,7 +203,7 @@ talking while a mission runs.
 
 ### Fetching something new
 
-https://github.com/user-attachments/assets/PLACEHOLDER-fetching-something-new
+https://github.com/user-attachments/assets/3176b4dd-79dc-41d9-a13b-8f13cce7205a
 
 > **You:** Find the orange toy robot: look on the nightstands first, then on the office desk, and
 > when you find it, pick it up with your right hand and put it on the dining table.
@@ -284,7 +284,7 @@ The window's **Pause** button and the plan card's do the same, as in the clip: t
 
 ### One step's answer in the next
 
-https://github.com/user-attachments/assets/10a5c176-eb65-4fcb-a171-437b025a433e
+https://github.com/user-attachments/assets/b34c20fb-27b6-4e0f-be4e-a7ced5621dcb
 
 > **You:** Walk to the kitchen counter, look for a small box there, and pick up the one you find
 > with your left hand.
@@ -329,7 +329,7 @@ kind the argument takes.
 
 ### Counting, looping and measuring
 
-https://github.com/user-attachments/assets/03296eae-10bb-4b21-8b7c-201bb878d21f
+https://github.com/user-attachments/assets/5a4f3361-bdf6-4973-9475-4ec477f817d5
 
 > **You:** Count the chairs in every room.
 >
@@ -398,7 +398,7 @@ again, and each run is approved again.
 
 ### Finding something
 
-https://github.com/user-attachments/assets/cb019286-ab57-4c49-adeb-b7a85e22029a
+https://github.com/user-attachments/assets/e713cf11-8a43-46bc-83fd-697840a3555f
 
 > **You:** Where could the toy elephant be? Don't move.
 >
@@ -432,7 +432,7 @@ the toy elephant from the TV cabinet's place, 2 min in all. Claude Haiku 5.5 ans
 
 ### Teaching it a skill
 
-https://github.com/user-attachments/assets/fcd62896-e299-45ff-b1ab-977cfc2155af
+https://github.com/user-attachments/assets/f1b6d84f-b106-4ce3-aa96-f8939f821a61
 
 > **You:** Teach yourself a skill for pointing at things with a hand, then point at the kettle on
 > the kitchen counter with your right hand.
@@ -561,7 +561,7 @@ while a mission runs.
 
 ### Waiting for what a camera shows
 
-https://github.com/user-attachments/assets/acc1f8e6-f69e-4266-8383-2b0140183b48
+https://github.com/user-attachments/assets/e5a1eff8-b8b4-4d54-8923-e983354753eb
 
 > **You:** Tell me when the head camera shows a green toy.
 >
@@ -713,7 +713,7 @@ history.
 
 ## Keeping a goal
 
-https://github.com/user-attachments/assets/10d6d147-e73b-4931-9cc2-6c3a182c3a80
+https://github.com/user-attachments/assets/6fbc7a91-cd80-4578-8cd8-4fb2435d7989
 
 > **You:** The orange toy robot is on the office desk. Set a goal to keep it on the dining table,
 > then work toward it.
