@@ -17,7 +17,7 @@ Setup is in the [README](../README.md). Every setting is in the [profile](profil
   [Pointing and outlining](#pointing-and-outlining)
 - **[Give it a task](#giving-it-a-task):** [Walking somewhere](#walking-somewhere) ·
   [The plan check](#a-short-one-and-the-plan-check) · [Fetching something](#fetching-something) ·
-  [Stopping](#stopping) · [Pausing](#pausing) ·
+  [Fetching something new](#fetching-something-new) · [Stopping](#stopping) · [Pausing](#pausing) ·
   [One step's answer in the next](#one-steps-answer-in-the-next) ·
   [Doing it again](#doing-it-again)
 - **Programs and skills:** [Counting, looping and measuring](#counting-looping-and-measuring) ·
@@ -201,6 +201,34 @@ A failed mission comes back with the step that failed, why it failed, and what t
 of the object involved. The agent then proposes a changed plan for you to approve. You can keep
 talking while a mission runs.
 
+### Fetching something new
+
+https://github.com/user-attachments/assets/PLACEHOLDER-fetching-something-new
+
+> **You:** Find the orange toy robot: look on the nightstands first, then on the office desk, and
+> when you find it, pick it up with your right hand and put it on the dining table.
+
+The toy robot is in no map. The agent writes a program that looks in the order you gave and stops
+at the first sighting:
+
+```rhai
+let found = ();
+for p in ["nightstand_west", "nightstand_east", "office_desk_east", "office_desk_tray"] {
+    if found == () {
+        walk(p);
+        let id = find("orange toy robot");
+        if id != () { found = #{place: p, id: id}; }
+    }
+}
+found
+```
+
+It found the toy at the office desk's east end and ran a mission: the pick with the right hand,
+where SAM 3.1 outlines the toy and GraspGen proposes the grasp, the walk to the dining table, and
+`PlaceOn`, which closes on the table's edge and sets the toy down where the hand reaches. The camera
+check saw it on the table, 7 min in all. Naming colour and kind ("orange toy robot") keeps the
+detector off the other toys on the nightstands.
+
 ### Stopping
 
 https://github.com/user-attachments/assets/a5b97882-0def-494f-917c-8106eb45d82c
@@ -258,13 +286,13 @@ The window's **Pause** button and the plan card's do the same, as in the clip: t
 
 https://github.com/user-attachments/assets/10a5c176-eb65-4fcb-a171-437b025a433e
 
-> **You:** Walk to the dining table, look for a mug there, and pick up the one you find with your
-> left hand.
+> **You:** Walk to the kitchen counter, look for a small box there, and pick up the one you find
+> with your left hand.
 
-One mission walks, looks and picks. In the clip the plan check sent the first plans back three
-times: the pick named an answer no earlier step gave, then a look that finds nothing would have
-ended the mission, then an optional look could hand on nothing. The fourth plan ran: a walk to the
-dining table, the look, and the pick of what it found, 75 s in all.
+One mission walks, looks and picks. The box is in no map: SAM 3.1 outlines it from the phrase, and
+the pick takes the name the look hands on. The plan check noted that a look finding nothing would
+end the mission, which is what was asked, and the plan ran: the walk to the kitchen counter, the
+look, and a top-down pick with the left hand, 117 s in all. Claude Haiku 5.5 answered in this clip.
 
 Some skills hand on what they find:
 
@@ -319,30 +347,26 @@ network or `eval`. Counting what the world model knows needs no walking, so this
 let n = #{}; for r in rooms() { n[r.type] = objects("chair", r.id).len(); } n
 ```
 
-> **You:** Run a program that looks for a mug in the office, room R4, then at the dining table,
-> and stops at the first place where the camera sees one.
+> **You:** Run a program that goes to each named place in the bedroom and tells me at which of
+> them the camera sees a toy.
 
 ```rhai
-let result = #{found: false, place: ""};
-if walk("office") {
-    if find("mug") != () {
-        result.found = true;
-        result.place = "office";
+let out = [];
+for p in places() {
+    if p.room == "R3" {
+        let ok = walk(p.name);
+        let f = find("toy");
+        out.push(#{place: p.name, reached: ok, toy: f});
     }
 }
-if !result.found {
-    if walk("dining_table") {
-        if find("mug") != () {
-            result.found = true;
-            result.place = "dining_table";
-        }
-    }
-}
-result
+out
 ```
 
+`places()` names each place's room, so "each named place in the bedroom" needs no list of names.
+The program walked to both nightstands and saw a toy at each.
+
 A program that moves is approved once, with what it may run and for how long: "it may move the
-base (GoToPlace) and look (FindInView), for at most 10 min". It then runs on its own. The chat
+base (GoToPlace) and look (FindInView), for at most 15 min". It then runs on its own. The chat
 shows a card with its latest lines and a **Stop** button, the Tree tab shows each mission it sends,
 and its result comes back as a report the agent answers.
 
@@ -376,17 +400,16 @@ again, and each run is approved again.
 
 https://github.com/user-attachments/assets/cb019286-ab57-4c49-adeb-b7a85e22029a
 
-> **You:** Where could my keys be? Don't move.
+> **You:** Where could the toy elephant be? Don't move.
 >
-> **NervROS:** I couldn't find your keys in the world model. Based on where such items are usually
-> kept, they could be in the living room, hallway, or bedroom, but I am not able to search for
-> them directly since the detector can only look for mugs and trays. …
+> **NervROS:** I can't tell from the world model: it has no toy elephant, and the camera has
+> already seen about 99% of the mapped area. If you want me to look, the best candidates are the
+> living room places start, dining_table_side, tv_cabinet and kitchen_counter.
 
-The world model has never seen keys, so the ranking is by the rooms keys are usually in. Nothing
-moves. The demo's mock detector knows only mugs and trays, so the robot cannot go and look for
-keys itself.
+The world model has never seen it, so the answer comes from the rooms toys are usually in and the
+places in them. Nothing moves.
 
-> **You:** Search for the red mug.
+> **You:** Search for the toy elephant.
 
 `search` ranks where to look:
 
@@ -399,11 +422,11 @@ keys itself.
 To look in an order you give ("on the office desk, then the nightstands"), the agent writes a
 program instead: it can pick the thing up and put it away once found, which a search cannot.
 
-The approval names the first places and why: "O783 (a mug was seen there 9 days ago), then O244
-(a mug was seen there 9 days ago), then O27 …", and so on. The search walks to each place and looks with the
-detector, up to four places in ten minutes, until it sees the thing, and reports where. In the
-clip it saw the red mug at the first place, O783, after a 12-second walk. Gemini 3.5 Flash-Lite
-answered in this clip.
+The approval names the first places and why: "start (such things are often in the living room),
+then dining_table_side (such things are often in the living room) …". The search walks to each
+place and looks with the detector, up to four places in ten minutes, until it sees the thing, and
+reports where. In the clip it looked from where it stood and from beside the dining table, and saw
+the toy elephant from the TV cabinet's place, 2 min in all. Claude Haiku 5.5 answered in this clip.
 
 "Where did you last see the red mug?" is a recall, answered at once.
 
@@ -411,23 +434,25 @@ answered in this clip.
 
 https://github.com/user-attachments/assets/fcd62896-e299-45ff-b1ab-977cfc2155af
 
-> **You:** Teach yourself a skill for pointing at things with a hand, then point at the mug on the
-> dining table with your left hand.
+> **You:** Teach yourself a skill for pointing at things with a hand, then point at the kettle on
+> the kitchen counter with your right hand.
 
 No skill points, so the agent teaches the robot one. A taught skill is a small tree of the leaves
 the executor allows, such as `MoveHand` and `Wait`, with its own arguments. In the clip it is a
 point and a short wait:
 
 ```json
-{"name": "PointAt", "description": "Points at an object with the specified arm", "max_s": 15,
- "args": [{"name": "object", "type": "world_id", "description": "The object to point at"},
-          {"name": "arm", "type": "string", "description": "The arm to use (left_arm or right_arm)"}],
+{"name": "PointAt", "max_s": 30,
+ "description": "Point one hand at an object in the world model, holding the pose for a moment, then bring the arm back.",
+ "args": [{"name": "object", "type": "world_id", "description": "The object to point at, by id or words"},
+          {"name": "arm", "type": "string", "description": "Which hand points: left or right",
+           "enum": ["left", "right"]}],
  "body": {"sequence": [{"leaf": "MoveHand", "mode": "point", "arm": "{arm}", "target": "{object}"},
                        {"leaf": "Wait", "seconds": 2}]}}
 ```
 
-Its first try failed in the executor, "arm must be left or right, not 'left_arm'", and the agent ran
-it again with `arm=left`: the robot walked to the dining table and pointed at the mug (O783).
+`arm` takes the values the executor declares for `MoveHand`'s arm, so the first try ran: the robot
+walked to the kitchen counter and pointed at the kettle (O52) with its right hand, 66 s in all.
 
 A body can also nest `fallback`, `retry`, `timeout_s` and `force_success` nodes.
 
@@ -538,23 +563,23 @@ while a mission runs.
 
 https://github.com/user-attachments/assets/acc1f8e6-f69e-4266-8383-2b0140183b48
 
-> **You:** Tell me when the head camera shows a red mug.
+> **You:** Tell me when the head camera shows a green toy.
 >
-> **You:** Walk to the dining table.
+> **You:** Walk to the right nightstand.
 
 A watch can also wait for what a camera shows, such as someone putting a box on the sofa. A vision
 model looks every 15 seconds, and the watch posts once it says yes twice in a row, so one glimpse it
-mistook does not count. Here it fires once the robot stands at the table: "the camera model says a
-red mug on the table".
+mistook does not count. Here it fires once the robot stands at the right nightstand: "the camera model
+says a green Yoshi toy".
 
-> **You:** When did a camera first show the red mug?
+> **You:** When did a camera first show the green toy?
 
 With `[keyframes]`, the cameras keep a frame each time their view changes. `when` shows a vision
 model a dozen of them in time order, those around the moments the world model saw the mug change
 when it did, as for "when did the red mug leave the dining table?". A model reading a dozen frames
 can name the one beside the right one, so the vision check then looks at that frame alone, and at
-its neighbours until one shows it. It answers with the time and the frame: here 64 s ago, in the
-chest camera's frame where the mug comes into view, and **Show in 3D** takes the viewer back to that
+its neighbours until one shows it. It answers with the time and the frame: here 57 s ago, in the
+frame where the toy comes into view, and **Show in 3D** takes the viewer back to that
 moment.
 
 ### A patrol and the digest
@@ -690,7 +715,8 @@ history.
 
 https://github.com/user-attachments/assets/10d6d147-e73b-4931-9cc2-6c3a182c3a80
 
-> **You:** Set a goal to keep the red mug on the wooden tray, then work toward it.
+> **You:** The orange toy robot is on the office desk. Set a goal to keep it on the dining table,
+> then work toward it.
 
 The agent sets a goal with what holds once it is met, in the world model's ids, such as `inside(O783,
 O261)`, and you approve it like an edit. A name only the detector knows, such as `mug_4`, is taken
@@ -705,16 +731,12 @@ goal's mug. A goal ends when it holds, when its missions (five unless you say) o
 or when the agent gives it up as impossible, with the reason. A run the robot cut short counts
 against no goal. Goals outlast a restart: at start the window says where each one stands.
 
-The clip plays four times faster while the mission runs. Its report ends with the goal, met:
+In the clip the toy is in no map yet, so the agent first walks to the desk and looks, then plans
+the pick, the walk and the place on the dining table, 162 s at four times the speed. The world
+model then has the toy on the table under a new id, the one on the desk gone, and the agent sets
+the goal on it, met at once.
 
-```text
-report> Mission 01a16656 (Pick up the red mug and place it into the wooden tray) ended: success
-        after 211 s. … Camera check: inside(mug_4, tray_1): the camera agrees: the detector marks
-        a mug (mark 1) in or on the tray (mark 6).
-        Goal: goal 1 (keep the red mug on the wooden tray): met.
-```
-
-The Agent tab lists the goals and where each stands, each with **Drop**. Gemini 3.5 Flash-Lite
+The Agent tab lists the goals and where each stands, each with **Drop**. Claude Haiku 5.5
 answered in this clip.
 
 ## Keeping it out of places
