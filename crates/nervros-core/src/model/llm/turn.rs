@@ -10,7 +10,8 @@ use rig::AgentBuilder;
 use rig::agent::tool::{DynamicTool, ToolOutput};
 use rig::agent::{
     AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, InvalidToolCallAction,
-    InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, RequestPatch,
+    InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, RequestPatch, RunSettled,
+    SettledOutcome,
 };
 
 use super::client::{Llm, prompt_setback, stream_setback};
@@ -181,8 +182,26 @@ struct TurnHook {
     on_call: Option<OnCall>,
     /// When the pending call was sent.
     sent: Mutex<Option<Instant>>,
+    /// What the turn's calls have been charged so far.
+    charged: Mutex<CallCost>,
     /// The system prompt for the last call, which says no tool can be called.
     last_word: String,
+}
+
+impl TurnHook {
+    /// Charges `cost` to the model's budget and reports it.
+    fn charge(&self, cost: CallCost) {
+        if let Ok(mut charged) = self.charged.lock() {
+            charged.input_tokens += cost.input_tokens;
+            charged.cached_tokens += cost.cached_tokens;
+            charged.cache_write_tokens += cost.cache_write_tokens;
+            charged.output_tokens += cost.output_tokens;
+        }
+        self.source.spent(&self.model, cost);
+        if let Some(on_call) = &self.on_call {
+            on_call(cost);
+        }
+    }
 }
 
 impl AgentHook for TurnHook {
@@ -240,11 +259,31 @@ impl AgentHook for TurnHook {
             }),
             ..CallCost::of(&event.usage)
         };
-        self.source.spent(&self.model, cost);
-        if let Some(on_call) = &self.on_call {
-            on_call(cost);
-        }
+        self.charge(cost);
         ModelTurnAction::Continue
+    }
+
+    /// A call whose turn was recovered from an invalid tool call fires no model-turn hook, though
+    /// it was billed: what the run's total holds beyond the calls charged one by one is charged
+    /// here. A run that fails keeps such a call uncharged; the run's error carries no counts.
+    async fn on_run_settled(&self, _ctx: &HookContext, event: RunSettled<'_>) {
+        let SettledOutcome::Response(response) = event.outcome else {
+            return;
+        };
+        let total = CallCost::of(&response.usage);
+        let charged = self.charged.lock().map(|c| *c).unwrap_or_default();
+        let rest = CallCost {
+            input_tokens: total.input_tokens.saturating_sub(charged.input_tokens),
+            cached_tokens: total.cached_tokens.saturating_sub(charged.cached_tokens),
+            cache_write_tokens: total
+                .cache_write_tokens
+                .saturating_sub(charged.cache_write_tokens),
+            output_tokens: total.output_tokens.saturating_sub(charged.output_tokens),
+            ms: 0,
+        };
+        if rest != CallCost::default() {
+            self.charge(rest);
+        }
     }
 
     /// Small models invent tool names; the model gets the real ones back as the call's result
@@ -404,6 +443,7 @@ pub async fn chat(
             }),
             on_call: setup.on_call,
             sent: Mutex::new(None),
+            charged: Mutex::new(CallCost::default()),
             last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
         });
     let agent = builder.build();
