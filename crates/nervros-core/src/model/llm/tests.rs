@@ -331,58 +331,88 @@ fn earlier_reasoning_is_dropped_and_turns_left_empty_go_with_it() {
     ));
 }
 
+/// A source whose one model answers as scripted, keeping what each of its calls was charged.
+struct Billed {
+    model: rig::test_utils::MockCompletionModel,
+    costs: std::sync::Mutex<Vec<CallCost>>,
+}
+
+impl Billed {
+    fn new(turns: impl IntoIterator<Item = rig::test_utils::MockTurn>) -> Arc<Self> {
+        Arc::new(Self {
+            model: rig::test_utils::MockCompletionModel::from_turns(turns),
+            costs: std::sync::Mutex::default(),
+        })
+    }
+
+    /// One turn on the model.
+    async fn turn(self: &Arc<Self>) -> Result<String, LlmError> {
+        let setup = TurnSetup {
+            preamble: "",
+            max_turns: 4,
+            tools: &[],
+            started: Arc::default(),
+            window: None,
+            on_call: None,
+            delta: None,
+        };
+        let source: Arc<dyn AgentSource> = Arc::clone(self) as Arc<dyn AgentSource>;
+        chat("m", source, setup, &mut History::default(), "go").await
+    }
+
+    /// Input and output tokens of each call charged, in order.
+    fn charged(&self) -> Vec<(u64, u64)> {
+        crate::lock(&self.costs)
+            .iter()
+            .map(|c| (c.input_tokens, c.output_tokens))
+            .collect()
+    }
+}
+
+impl AgentSource for Billed {
+    fn candidates(&self, _: Role, _: crate::providers::router::Need) -> Vec<String> {
+        Vec::new()
+    }
+    fn builder(&self, _: &str) -> Result<AgentBuilder, LlmError> {
+        Ok(AgentBuilder::new(self.model.clone()))
+    }
+    fn take_request(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn park(&self, _: &str, _: Duration) {}
+    fn spent(&self, _: &str, cost: CallCost) {
+        crate::lock(&self.costs).push(cost);
+    }
+}
+
+fn used(input: u64, output: u64) -> rig::completion::Usage {
+    rig::completion::Usage::new()
+        .input_tokens(input)
+        .output_tokens(output)
+}
+
 #[tokio::test]
 async fn a_call_recovered_from_an_invalid_tool_call_is_charged_once_like_the_rest() {
-    use rig::test_utils::{MockCompletionModel, MockTurn};
-    #[derive(Default)]
-    struct Billed(std::sync::Mutex<Vec<CallCost>>);
-    impl AgentSource for Billed {
-        fn candidates(&self, _: Role, _: crate::providers::router::Need) -> Vec<String> {
-            Vec::new()
-        }
-        fn builder(&self, _: &str) -> Result<AgentBuilder, LlmError> {
-            let used = |input, output| {
-                rig::completion::Usage::new()
-                    .input_tokens(input)
-                    .output_tokens(output)
-            };
-            Ok(AgentBuilder::new(MockCompletionModel::from_turns([
-                MockTurn::tool_call("c1", "no_such_tool", serde_json::json!({}))
-                    .with_usage(used(100, 10)),
-                MockTurn::text("Done.").with_usage(used(50, 5)),
-            ])))
-        }
-        fn take_request(&self, _: &str) -> Result<(), String> {
-            Ok(())
-        }
-        fn park(&self, _: &str, _: Duration) {}
-        fn spent(&self, _: &str, cost: CallCost) {
-            crate::lock(&self.0).push(cost);
-        }
-    }
-    let billed = Arc::new(Billed::default());
-    let setup = TurnSetup {
-        preamble: "",
-        max_turns: 4,
-        tools: &[],
-        started: Arc::default(),
-        window: None,
-        on_call: None,
-        delta: None,
-    };
-    let mut history = History::default();
-    let source: Arc<dyn AgentSource> = billed.clone();
-    let reply = chat("m", source, setup, &mut history, "go").await.unwrap();
-    assert_eq!(reply, "Done.");
-    let costs = crate::lock(&billed.0).clone();
+    use rig::test_utils::MockTurn;
+    let billed = Billed::new([
+        MockTurn::tool_call("c1", "no_such_tool", serde_json::json!({})).with_usage(used(100, 10)),
+        MockTurn::text("Done.").with_usage(used(50, 5)),
+    ]);
+    assert_eq!(billed.turn().await.unwrap(), "Done.");
     assert_eq!(
-        costs.iter().map(|c| c.input_tokens).sum::<u64>(),
-        150,
-        "{costs:?}"
+        billed.charged(),
+        [(100, 10), (50, 5)],
+        "each call, as it ends"
     );
-    assert_eq!(
-        costs.iter().map(|c| c.output_tokens).sum::<u64>(),
-        15,
-        "{costs:?}"
-    );
+}
+
+#[tokio::test]
+async fn a_recovered_call_is_charged_though_the_run_then_fails() {
+    use rig::test_utils::MockTurn;
+    let billed = Billed::new([
+        MockTurn::tool_call("c1", "no_such_tool", serde_json::json!({})).with_usage(used(100, 10)),
+        MockTurn::error("the provider went away"),
+    ]);
+    assert!(billed.turn().await.is_err());
+    assert_eq!(billed.charged(), [(100, 10)]);
 }
