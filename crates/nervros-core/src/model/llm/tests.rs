@@ -427,3 +427,97 @@ async fn a_recovered_call_is_charged_though_the_run_then_fails() {
     assert!(billed.turn().await.is_err());
     assert_eq!(billed.charged(), [(100, 10)]);
 }
+
+#[tokio::test]
+async fn the_turn_hook_counts_each_call_cuts_the_history_and_closes_the_tools() {
+    use super::history::size;
+    use super::turn::TurnHook;
+    use rig::agent::{AgentHook as _, CompletionCallAction, CompletionCallEvent};
+    use rig::test_utils::HookTestHarness;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    /// A source whose quota grants `left` more requests.
+    struct Metered(AtomicUsize);
+    impl AgentSource for Metered {
+        fn candidates(&self, _: Role, _: crate::providers::router::Need) -> Vec<String> {
+            Vec::new()
+        }
+        fn builder(&self, _: &str) -> Result<AgentBuilder, LlmError> {
+            Err(LlmError::Client {
+                provider: String::new(),
+                message: "unused".to_owned(),
+            })
+        }
+        fn take_request(&self, _: &str) -> Result<(), String> {
+            self.0
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .map(drop)
+                .map_err(|_| "its daily limit is used up".to_owned())
+        }
+        fn park(&self, _: &str, _: Duration) {}
+    }
+    let started = Arc::new(AtomicBool::new(false));
+    let setup = TurnSetup {
+        preamble: "Be brief.",
+        max_turns: 3,
+        tools: &[],
+        started: Arc::clone(&started),
+        window: Some(6000),
+        on_call: None,
+        delta: None,
+    };
+    let source: Arc<dyn AgentSource> = Arc::new(Metered(AtomicUsize::new(3)));
+    let harness = HookTestHarness::new().with_hook(TurnHook::new(source, "m", &setup));
+    let prompt = Message::user("and now?");
+    let long: Vec<Arc<Message>> = History::sample(20, 900)
+        .0
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    let call = |turn| {
+        harness.set_turn(turn);
+        harness.hooks().on_completion_call(
+            harness.context(),
+            CompletionCallEvent {
+                prompt: &prompt,
+                history: &long,
+                turn,
+            },
+        )
+    };
+
+    let CompletionCallAction::Patch(first) = call(1).await else {
+        panic!("a long history is cut");
+    };
+    let kept = first.history.expect("the history is replaced");
+    assert!(
+        kept.len() < long.len() && size(&kept) < size(&long),
+        "{}",
+        kept.len()
+    );
+    assert!(first.active_tools.is_none() && first.preamble.is_none());
+
+    let CompletionCallAction::Patch(last) = call(3).await else {
+        panic!("the last call is patched");
+    };
+    assert_eq!(
+        last.active_tools,
+        Some(Vec::new()),
+        "no tool on the last call"
+    );
+    assert!(
+        last.preamble
+            .is_some_and(|p| p.contains("You cannot call a tool now"))
+    );
+
+    started.store(true, Ordering::SeqCst);
+    let CompletionCallAction::Patch(after) = call(2).await else {
+        panic!("a started mission closes the tools");
+    };
+    assert_eq!(after.active_tools, Some(Vec::new()));
+    assert!(after.preamble.is_none(), "only the last call is told why");
+
+    let CompletionCallAction::Stop(why) = call(2).await else {
+        panic!("a spent quota stops the run");
+    };
+    assert_eq!(why, "m: its daily limit is used up");
+}

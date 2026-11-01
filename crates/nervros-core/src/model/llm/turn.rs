@@ -172,7 +172,7 @@ impl AgentSource for Llm {
 }
 
 /// Steers one turn's agent loop.
-struct TurnHook {
+pub(super) struct TurnHook {
     source: Arc<dyn AgentSource>,
     model: String,
     started: Arc<AtomicBool>,
@@ -185,6 +185,24 @@ struct TurnHook {
     sent: Mutex<Option<Instant>>,
     /// The system prompt for the last call, which says no tool can be called.
     last_word: String,
+}
+
+impl TurnHook {
+    /// The hook for a turn of `model` from `source`, as `setup` asks.
+    pub(super) fn new(source: Arc<dyn AgentSource>, model: &str, setup: &TurnSetup<'_>) -> Self {
+        Self {
+            source,
+            model: model.to_owned(),
+            started: Arc::clone(&setup.started),
+            last: setup.max_turns,
+            room: setup.window.map(|w| {
+                w.saturating_sub(fixed_cost(setup.preamble, setup.tools) + RESERVE_TOKENS)
+            }),
+            on_call: setup.on_call.clone(),
+            sent: Mutex::new(None),
+            last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
+        }
+    }
 }
 
 impl AgentHook for TurnHook {
@@ -396,18 +414,7 @@ pub async fn chat(
         .preamble(setup.preamble)
         .default_max_turns(setup.max_turns)
         .dynamic_tools(dynamic)
-        .add_hook(TurnHook {
-            source,
-            model: model_id.to_owned(),
-            started: setup.started,
-            last: setup.max_turns,
-            room: setup.window.map(|w| {
-                w.saturating_sub(fixed_cost(setup.preamble, setup.tools) + RESERVE_TOKENS)
-            }),
-            on_call: setup.on_call,
-            sent: Mutex::new(None),
-            last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
-        });
+        .add_hook(TurnHook::new(source, model_id, &setup));
     let agent = builder.build();
     let failed = |e: &PromptError| LlmError::Turn {
         model: model_id.to_owned(),
