@@ -272,6 +272,11 @@ fn a_failure_says_how_the_model_fares() {
         Some(Setback::Limited(Duration::from_mins(1)))
     );
     assert_eq!(setback(&replied(503, "{}", None)), Some(Setback::Busy));
+    assert_eq!(
+        setback(&rig::ProviderError::Stalled(Duration::from_mins(2)).report()),
+        Some(Setback::Unreachable),
+        "a streamed reply gone silent"
+    );
     assert_eq!(setback(&replied(400, "{}", None)), None);
     let gemini = r#"{"error":{"code":429,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"38s"}]}}"#;
     assert_eq!(

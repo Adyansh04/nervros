@@ -28,7 +28,8 @@ headers = { "X-Title" = "NervROS" }
   `x-goog-api-key` header, never in a URL. `anthropic` is Claude's Messages API, with the key in
   `x-api-key` and the prompt cached between calls.
 - An `openai_compat` provider needs `base_url`. Its `headers` go with each request, and
-  `timeout_s` (60 by default) bounds each call.
+  `timeout_s` (60 by default) bounds each call: the whole reply, or for a model with
+  `stream = true` each silence in it, so a long reply that keeps coming is not cut.
 - `key` is `{ file = "..." }` or `{ env = "NAME" }`, and absent for a local server. Keys are never
   logged. A key that cannot be read leaves its provider's models out, and says why when one of
   them is asked, rather than stopping the app.
@@ -97,7 +98,7 @@ privacy = { trains = true }                     # free endpoints may train on wh
 | `context` | none | Its context window in tokens; see below. Unset, nothing is cut. |
 | `stream` | `false` | Its replies appear word by word in the window. |
 | `price` | none | US dollars per million tokens: `input`, `output`, `cache_read`, `cache_write`; needed on a budgeted provider. |
-| `max_tokens` | none | The longest reply, in tokens; needed on `anthropic`. |
+| `max_tokens` | none | The longest reply, in tokens; needed on `anthropic`, and the bound on a streamed reply. |
 
 With `context` set, the conversation is condensed before a turn once it passes half the window.
 Tool results before the operator's newest message are cut to a line, and when that is not enough,
@@ -175,8 +176,9 @@ Pacific time, as the providers count them.
 - A model answering 429 is set aside for as long as the provider asks, in its `Retry-After` or,
   as Gemini does, in the reply's `retryDelay`, a minute without either, and never past its
   provider's next midnight, when a spent daily quota comes back.
-- A model whose server does not answer, such as a local model that is not running, is tried last
-  for a minute, by that process alone, so its turns meanwhile go quietly to the next model.
+- A model whose server does not answer, such as a local model that is not running, or whose
+  streamed reply goes silent for `timeout_s`, is tried last for a minute, by that process alone,
+  so its turns meanwhile go quietly to the next model.
 - A busy model (a 5xx, such as Gemini's 503 under load) is asked once more two seconds later,
   unless part of the turn already came back.
 - When every model of a turn is held back and the first per-minute limit or 429 lifts within a

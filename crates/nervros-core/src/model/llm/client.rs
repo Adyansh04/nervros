@@ -39,9 +39,10 @@ pub struct Llm {
     keys: HashMap<String, SecretString>,
     /// Why a provider's key could not be loaded; its models fail with this when asked.
     missing_keys: HashMap<String, String>,
-    /// One HTTP client per provider, made once: it keeps its connections open between calls and
-    /// reads the system's certificates once, not on every request.
-    http: HashMap<String, Result<reqwest::Client, String>>,
+    /// One HTTP client per provider, and one more for its streamed models, made once: it keeps
+    /// its connections open between calls and reads the system's certificates once, not on every
+    /// request. Keyed by provider id and whether the model streams.
+    http: HashMap<(String, bool), Result<reqwest::Client, String>>,
 }
 
 impl std::fmt::Debug for Llm {
@@ -77,11 +78,20 @@ impl Llm {
                 }
             }
         }
-        let http = router
-            .config()
+        let config = router.config();
+        let http = config
             .providers
             .iter()
-            .map(|p| (p.id.clone(), http_client(p).map_err(|e| e.to_string())))
+            .flat_map(|p| {
+                let streams = config.models.iter().any(|m| m.provider == p.id && m.stream);
+                [false, true]
+                    .into_iter()
+                    .filter(move |&streamed| !streamed || streams)
+                    .map(move |streamed| {
+                        let client = http_client(p, streamed).map_err(|e| e.to_string());
+                        ((p.id.clone(), streamed), client)
+                    })
+            })
             .collect();
         Self {
             router,
@@ -115,11 +125,14 @@ impl Llm {
     ///
     /// Unknown ids, a missing base URL, the free-only rule, or a rig client error.
     pub fn agent_builder(&self, model: &ModelConfig) -> Result<AgentBuilder, LlmError> {
-        let builder = self.bare_builder(model)?;
-        Ok(match &model.params {
-            Some(params) => builder.additional_params(params.clone()),
-            None => builder,
-        })
+        let mut builder = self.bare_builder(model)?;
+        if let Some(params) = &model.params {
+            builder = builder.additional_params(params.clone());
+        }
+        if let Some(max) = model.max_tokens {
+            builder = builder.max_tokens(max);
+        }
+        Ok(builder)
     }
 
     fn bare_builder(&self, model: &ModelConfig) -> Result<AgentBuilder, LlmError> {
@@ -141,7 +154,7 @@ impl Llm {
             });
         }
         let key = self.keys.get(&provider.id);
-        let http = match self.http.get(&provider.id) {
+        let http = match self.http.get(&(provider.id.clone(), model.stream)) {
             Some(Ok(client)) => client.clone(),
             Some(Err(why)) => {
                 return Err(LlmError::Client {
@@ -149,8 +162,10 @@ impl Llm {
                     message: why.clone(),
                 });
             }
-            None => http_client(provider)?,
+            None => http_client(provider, model.stream)?,
         };
+        // How long a streamed reply may stay silent; a unary one is timed by its HTTP client.
+        let idle = Some(Duration::from_secs(provider.timeout_s));
         match provider.kind {
             ProviderKind::OpenaiCompat => {
                 let base = provider.base_url.as_deref().unwrap_or_default();
@@ -159,7 +174,9 @@ impl Llm {
                 let client = OpenAIConfig::new(key)
                     .with_base_url(base)
                     .connect(ReqwestClient::from(http));
-                Ok(AgentBuilder::new(client.chat(&model.model)))
+                Ok(AgentBuilder::new(
+                    client.chat(&model.model).with_idle_timeout(idle),
+                ))
             }
             ProviderKind::GeminiInteractions => {
                 let key = key.ok_or_else(|| LlmError::Client {
@@ -169,7 +186,9 @@ impl Llm {
                 // The Interactions wire sends the key in x-goog-api-key, never in the URL.
                 let client =
                     GeminiConfig::new(key.expose_secret()).connect(ReqwestClient::from(http));
-                Ok(AgentBuilder::new(client.interactions(&model.model)))
+                Ok(AgentBuilder::new(
+                    client.interactions(&model.model).with_idle_timeout(idle),
+                ))
             }
             ProviderKind::Anthropic => {
                 let key = key.ok_or_else(|| LlmError::Client {
@@ -178,10 +197,7 @@ impl Llm {
                 })?;
                 let client =
                     AnthropicConfig::new(key.expose_secret()).connect(ReqwestClient::from(http));
-                let mut messages = client.completion(&model.model);
-                if let Some(max) = model.max_tokens {
-                    messages.wire = messages.wire.with_default_max_tokens(max);
-                }
+                let messages = client.completion(&model.model).with_idle_timeout(idle);
                 // The system prompt and tools are the same each call: read back from the cache,
                 // they cost a tenth of sending them again.
                 Ok(AgentBuilder::new(messages).cache(CacheRetention::Short))
@@ -248,7 +264,9 @@ impl Llm {
     }
 }
 
-fn http_client(provider: &ProviderConfig) -> Result<reqwest::Client, LlmError> {
+/// The provider's HTTP client: `timeout_s` bounds a unary call whole and the connection of a
+/// streamed one, whose reply may take long while words keep coming (rig times its silences).
+fn http_client(provider: &ProviderConfig, streamed: bool) -> Result<reqwest::Client, LlmError> {
     let mut headers = reqwest::header::HeaderMap::new();
     for (name, value) in &provider.headers {
         let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
@@ -257,11 +275,17 @@ fn http_client(provider: &ProviderConfig) -> Result<reqwest::Client, LlmError> {
             .map_err(|e| client_error(provider, &e))?;
         headers.insert(name, value);
     }
-    reqwest::Client::builder()
+    let timeout = Duration::from_secs(provider.timeout_s);
+    let builder = reqwest::Client::builder()
         .default_headers(headers)
-        .timeout(Duration::from_secs(provider.timeout_s))
-        .build()
-        .map_err(|e| client_error(provider, &e))
+        .connect_timeout(timeout);
+    if streamed {
+        builder
+    } else {
+        builder.timeout(timeout)
+    }
+    .build()
+    .map_err(|e| client_error(provider, &e))
 }
 
 fn client_error(provider: &ProviderConfig, e: &dyn std::fmt::Display) -> LlmError {
@@ -276,10 +300,10 @@ const MAX_PARK: Duration = Duration::from_hours(24);
 
 /// What a failure says about the model: limited by a 429 for as long as the provider asks (its
 /// `Retry-After`, or the wait Gemini writes in the body), else a minute; busy on a server error;
-/// unreachable when nothing answered at all. `None` for any other failure, whatever its text
-/// says, but for [`malformed_call`].
+/// unreachable when nothing answered at all or a streamed reply went silent. `None` for any other
+/// failure, whatever its text says, but for [`malformed_call`].
 pub(super) fn setback(report: &ErrorReport) -> Option<Setback> {
-    if report.kind == ErrorKind::Http {
+    if matches!(report.kind, ErrorKind::Http | ErrorKind::Timeout) {
         return Some(Setback::Unreachable);
     }
     let status = report.provider_response_status();

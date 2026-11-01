@@ -67,7 +67,7 @@ pub struct ProviderConfig {
     /// Extra HTTP headers sent with every request.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    /// Per-request timeout in seconds.
+    /// Seconds a call may take: the whole reply, or each silence in a streamed one.
     #[serde(default = "default_timeout_s")]
     pub timeout_s: u64,
     /// The most a paid key may spend in all, across runs and processes; its models need a price.
