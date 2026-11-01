@@ -20,6 +20,8 @@ pub struct SessionInfo {
     pub first: String,
     /// Messages in it.
     pub messages: usize,
+    /// Whether this version can carry it on; one an earlier version saved is listed for its log.
+    pub resumable: bool,
 }
 
 /// The saved conversations seen so far, each with the time its file was written: a file is read
@@ -56,7 +58,15 @@ impl Listing {
 
 /// One saved conversation, read whole.
 fn read(stamp: u64, path: &Path) -> Option<SessionInfo> {
-    let history = History::load(path).ok()?;
+    let Ok(history) = History::load(path) else {
+        return Some(SessionInfo {
+            when: ago(stamp),
+            first: "Old version".to_owned(),
+            messages: 0,
+            path: path.to_path_buf(),
+            resumable: false,
+        });
+    };
     let exchanges = history.exchanges();
     let first = exchanges.iter().find(|(operator, _)| *operator)?.1.clone();
     Some(SessionInfo {
@@ -64,6 +74,7 @@ fn read(stamp: u64, path: &Path) -> Option<SessionInfo> {
         first: shorten(&first, 48),
         messages: exchanges.len(),
         path: path.to_path_buf(),
+        resumable: true,
     })
 }
 

@@ -233,10 +233,10 @@ async fn a_busy_model_is_asked_once_more_before_the_next() {
 
 #[tokio::test]
 async fn the_model_that_reasoned_gets_its_reasoning_back() {
-    use rig::message::{AssistantContent, Issuer, Message, Reasoning, Sealed};
+    use rig::message::{AssistantContent, Message};
     let model = MockCompletionModel::from_turns([
         MockTurn::from_contents([
-            AssistantContent::Reasoning(Sealed::new(Issuer::from("mock"), Reasoning::new("hm"))),
+            AssistantContent::reasoning("hm"),
             AssistantContent::text("first"),
         ]),
         MockTurn::text("second"),
@@ -256,8 +256,8 @@ async fn the_model_that_reasoned_gets_its_reasoning_back() {
     }
     let requests = model.requests();
     let reasoned = requests[1].chat_history.iter().any(|m| {
-        matches!(m, Message::Assistant { content, .. }
-            if content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))))
+        matches!(m.as_ref(), Message::Assistant(turn)
+            if turn.content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))))
     });
     assert!(reasoned, "{:?}", requests[1].chat_history);
 }

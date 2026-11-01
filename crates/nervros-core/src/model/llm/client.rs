@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use rig::agent::StreamingError;
-use rig::completion::{Message, PromptError};
+use rig::completion::{CacheRetention, Message, PromptError};
+use rig::error::ErrorReport;
 use rig::http_client::ReqwestClient;
 use rig::providers::anthropic::AnthropicConfig;
 use rig::providers::gemini::GeminiConfig;
@@ -179,13 +179,12 @@ impl Llm {
                 let client =
                     AnthropicConfig::new(key.expose_secret()).connect(ReqwestClient::from(http));
                 let mut messages = client.completion(&model.model);
-                // The system prompt and tools are the same each call: read back from the cache,
-                // they cost a tenth of sending them again.
-                messages.wire = messages.wire.with_automatic_caching();
                 if let Some(max) = model.max_tokens {
                     messages.wire = messages.wire.with_default_max_tokens(max);
                 }
-                Ok(AgentBuilder::new(messages))
+                // The system prompt and tools are the same each call: read back from the cache,
+                // they cost a tenth of sending them again.
+                Ok(AgentBuilder::new(messages).cache(CacheRetention::Short))
             }
         }
     }
@@ -229,7 +228,7 @@ impl Llm {
                     self.spent(&model.id, CallCost::of(&response.usage));
                     // A count the provider leaves out is zero tokens to the budget and the report.
                     return Ok(Answer {
-                        text: response.output,
+                        text: response.output(),
                         model: model.id.clone(),
                         input_tokens: response.usage.input_tokens.unwrap_or(0),
                         output_tokens: response.usage.output_tokens.unwrap_or(0),
@@ -278,17 +277,14 @@ const MAX_PARK: Duration = Duration::from_hours(24);
 /// What a failure says about the model: limited by a 429 for what the provider's `Retry-After`
 /// asks, else a minute; busy on a server error; unreachable when nothing answered at all. `None`
 /// for any other failure, whatever its text says, but for [`malformed_call`].
-pub(super) fn setback(
-    kind: ErrorKind,
-    status: Option<reqwest::StatusCode>,
-    headers: Option<&reqwest::header::HeaderMap>,
-) -> Option<Setback> {
-    if kind == ErrorKind::Http {
+pub(super) fn setback(report: &ErrorReport) -> Option<Setback> {
+    if report.kind == ErrorKind::Http {
         return Some(Setback::Unreachable);
     }
-    let status = status?;
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let asked = headers
+    let status = report.provider_response_status();
+    if status == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) {
+        let asked = report
+            .provider_response_headers()
             .and_then(|h| h.get("retry-after"))
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -298,51 +294,28 @@ pub(super) fn setback(
             .clamp(Duration::from_secs(1), MAX_PARK);
         return Some(Setback::Limited(wait));
     }
-    status.is_server_error().then_some(Setback::Busy)
+    if status.is_some_and(|s| s.is_server_error()) {
+        return Some(Setback::Busy);
+    }
+    malformed_call(report)
 }
 
 /// Gemini's 400 for a tool call it wrote as broken JSON, which it asks to be retried: the same
 /// request usually comes back whole. The one 400 judged by its text, since its status alone would
 /// also retry a request that can never succeed.
-fn malformed_call(status: Option<reqwest::StatusCode>, text: &str) -> Option<Setback> {
-    (status == Some(reqwest::StatusCode::BAD_REQUEST)
-        && text.contains("Model generated invalid JSON"))
+fn malformed_call(report: &ErrorReport) -> Option<Setback> {
+    let said = |text: &str| text.contains("Model generated invalid JSON");
+    (report.provider_response_status() == Some(reqwest::StatusCode::BAD_REQUEST)
+        && (said(&report.message) || report.provider_response_body().is_some_and(said)))
     .then_some(Setback::Busy)
 }
 
+/// What a run's failure says about its model; see [`setback`].
 pub(super) fn prompt_setback(error: &PromptError) -> Option<Setback> {
     match error {
-        PromptError::CompletionError(e) => setback(
-            e.kind(),
-            e.provider_response_status(),
-            e.provider_response_headers(),
-        )
-        .or_else(|| malformed_call(e.provider_response_status(), &e.to_string())),
-        PromptError::Report(e) => setback(
-            e.kind,
-            e.provider_response_status(),
-            e.provider_response_headers(),
-        )
-        .or_else(|| malformed_call(e.provider_response_status(), &e.to_string())),
+        PromptError::Provider(e) => setback(&e.report()),
+        PromptError::Report(report) => setback(report),
         _ => None,
-    }
-}
-
-pub(super) fn stream_setback(error: &StreamingError) -> Option<Setback> {
-    match error {
-        StreamingError::Completion(e) => setback(
-            e.kind(),
-            e.provider_response_status(),
-            e.provider_response_headers(),
-        )
-        .or_else(|| malformed_call(e.provider_response_status(), &e.to_string())),
-        StreamingError::Report(e) => setback(
-            e.kind,
-            e.provider_response_status(),
-            e.provider_response_headers(),
-        )
-        .or_else(|| malformed_call(e.provider_response_status(), &e.to_string())),
-        StreamingError::Prompt(e) => prompt_setback(e),
     }
 }
 

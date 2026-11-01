@@ -7,14 +7,16 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures::future::BoxFuture;
 use rig::AgentBuilder;
-use rig::agent::tool::{DynamicTool, ToolOutput};
 use rig::agent::{
     AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, InvalidToolCallAction,
     InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, RequestPatch, RunSettled,
     SettledOutcome,
 };
+use rig::completion::PromptError;
+use rig::message::ToolName;
+use rig::tool::{DynamicTool, ToolOutput};
 
-use super::client::{Llm, prompt_setback, stream_setback};
+use super::client::{Llm, prompt_setback};
 use super::history::{History, RESERVE_TOKENS, cut_old, fit, size, tokens_of};
 use super::{LlmError, Setback};
 use crate::providers::Role;
@@ -411,20 +413,21 @@ pub async fn chat(
     history: &mut History,
     text: &str,
 ) -> Result<String, LlmError> {
+    // A tool's name is never empty: the registry names every tool it holds.
     let dynamic: Vec<DynamicTool> = setup
         .tools
         .iter()
-        .map(|t| {
+        .filter_map(|t| {
             let invoke = std::sync::Arc::clone(&t.invoke);
-            DynamicTool::new(
-                t.name.clone(),
+            Some(DynamicTool::new(
+                ToolName::new(t.name.clone()).ok()?,
                 t.description.clone(),
                 t.parameters.clone(),
                 move |args| {
                     let fut = invoke(args);
                     Box::pin(async move { Ok(ToolOutput::json(fut.await)) })
                 },
-            )
+            ))
         })
         .collect();
     let delta = setup.delta.clone().filter(|_| source.streams(model_id));
@@ -449,37 +452,42 @@ pub async fn chat(
     let agent = builder.build();
     let turn_error = |message: String, setback: Option<Setback>| LlmError::Turn {
         model: model_id.to_owned(),
-        message: without_provider_body(cancel_reason(&message, model_id)),
+        message: without_provider_body(&message),
         setback,
     };
+    let failed = |e: &PromptError| turn_error(failure(e, model_id), prompt_setback(e));
     if let Some(delta) = delta {
-        return streamed(&agent, text, history, delta.as_ref())
-            .await
-            .map(plain)
-            .map_err(|(message, setback)| turn_error(message, setback));
+        return match streamed(&agent, text, history, delta.as_ref()).await {
+            Ok(Some(reply)) => Ok(plain(reply)),
+            Ok(None) => Err(turn_error(
+                "the reply stream ended without a reply".to_owned(),
+                None,
+            )),
+            Err(e) => Err(failed(&e)),
+        };
     }
     agent
         .chat(text, &mut history.0)
         .await
-        .map(|response| plain(response.output))
-        .map_err(|e| turn_error(e.to_string(), prompt_setback(&e)))
+        .map(|response| plain(response.output()))
+        .map_err(|e| failed(&e))
 }
 
 /// One turn with the reply streamed: each text delta to `delta`, and the run's transcript into
-/// `history` at the end, as `chat` appends it.
+/// `history` at the end, as `chat` appends it. `None` when the stream ended without a reply.
 pub(super) async fn streamed(
     agent: &rig::Agent,
     text: &str,
     history: &mut History,
     delta: &(dyn Fn(&str) + Send + Sync),
-) -> Result<String, (String, Option<Setback>)> {
+) -> Result<Option<String>, PromptError> {
     use futures::StreamExt as _;
     use rig::agent::MultiTurnStreamItem;
     use rig::streaming::{Item, StreamEvent};
     let mut stream = agent.prompt(text).history(history.0.clone()).stream();
     let mut done = None;
     while let Some(item) = stream.next().await {
-        match item.map_err(|e| (e.to_string(), stream_setback(&e)))? {
+        match item? {
             MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
                 text,
                 ..
@@ -488,34 +496,28 @@ pub(super) async fn streamed(
             _ => {}
         }
     }
-    let response =
-        done.ok_or_else(|| ("the reply stream ended without a reply".to_owned(), None))?;
-    // The run's transcript: the new messages only, or the history it was given with them.
-    if let Some(messages) = response.messages {
-        if messages.starts_with(&history.0) {
-            history.0 = messages;
-        } else {
-            history.0.extend(messages);
-        }
+    Ok(done.map(|response| {
+        // The run's transcript, without the history it was given.
+        history.0.extend(response.messages.iter().cloned());
+        response.output()
+    }))
+}
+
+/// What a run's failure says: for a turn our own hook cancelled (`<model>: <why>`), the reason
+/// alone, since the error names the model already.
+pub(super) fn failure(e: &PromptError, model: &str) -> String {
+    match e {
+        PromptError::Cancelled { reason, .. } => reason
+            .strip_prefix(model)
+            .and_then(|rest| rest.strip_prefix(": "))
+            .unwrap_or(reason)
+            .to_owned(),
+        other => other.to_string(),
     }
-    Ok(response.output)
 }
 
 /// A provider error with its JSON body replaced by the provider's own message: the body can
 /// carry account ids (OpenRouter's `user_id`) that belong in neither the chat nor the log.
-/// A turn our own hook cancelled, as rig words it (`PromptCancelled: <model>: <why>`), as the
-/// reason alone: the error names the model already.
-pub(super) fn cancel_reason<'a>(message: &'a str, model: &str) -> &'a str {
-    message
-        .strip_prefix("PromptCancelled: ")
-        .map_or(message, |reason| {
-            reason
-                .strip_prefix(model)
-                .and_then(|rest| rest.strip_prefix(": "))
-                .unwrap_or(reason)
-        })
-}
-
 pub(super) fn without_provider_body(text: &str) -> String {
     let Some(start) = text.find('{') else {
         return text.to_owned();

@@ -5,7 +5,7 @@ use rig::message::{AssistantContent, CallId, ToolName, UserContent};
 
 use super::client::Llm;
 use super::history::{CUT_MARK, History, is_user_text, result_text};
-use super::turn::{cancel_reason, plain, streamed, without_provider_body};
+use super::turn::{failure, plain, streamed, without_provider_body};
 use super::*;
 use crate::providers::Role;
 use crate::providers::router::Router;
@@ -15,10 +15,7 @@ fn exchange(n: usize, chars: usize) -> Vec<Message> {
         Message::User {
             content: vec![UserContent::text(format!("request {n}"))],
         },
-        Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::text("x".repeat(chars))],
-        },
+        Message::assistant("x".repeat(chars)),
     ]
 }
 
@@ -73,7 +70,7 @@ fn old_results_are_cut_once_and_up_to_here_counts_the_operator_only() {
                 UserContent::ToolResult(r) => Some(result_text(&r.content)),
                 _ => None,
             }),
-            Message::Assistant { .. } | Message::System { .. } => None,
+            Message::Assistant(_) | Message::System { .. } => None,
         })
         .collect();
     assert!(
@@ -116,7 +113,7 @@ async fn a_streamed_turn_adds_to_the_history_it_was_given() {
     let reply = streamed(&agent, "and one more", &mut history, &|_| {})
         .await
         .unwrap();
-    assert_eq!(reply, "Noted.");
+    assert_eq!(reply.as_deref(), Some("Noted."));
     let exchanges = history.exchanges();
     assert_eq!(exchanges.len(), 6, "{exchanges:?}");
     assert_eq!(exchanges[0].1, "request 0");
@@ -196,15 +193,24 @@ fn the_image_goes_first_unless_the_text_must() {
 
 #[test]
 fn a_cancelled_turn_says_why_once() {
+    use rig::completion::PromptError;
+    let cancelled = |reason: &str| PromptError::Cancelled {
+        chat_history: Vec::new(),
+        reason: reason.to_owned(),
+    };
     assert_eq!(
-        cancel_reason("PromptCancelled: m1: its per-minute limit is used up", "m1"),
+        failure(&cancelled("m1: its per-minute limit is used up"), "m1"),
         "its per-minute limit is used up"
     );
     assert_eq!(
-        cancel_reason("PromptCancelled: the turn was stopped", "m1"),
+        failure(&cancelled("the turn was stopped"), "m1"),
         "the turn was stopped"
     );
-    assert_eq!(cancel_reason("status 429", "m1"), "status 429");
+    let other = PromptError::Report(rig::error::ErrorReport::new(
+        rig::ErrorKind::Provider,
+        "status 429",
+    ));
+    assert_eq!(failure(&other, "m1"), other.to_string());
 }
 
 #[test]
@@ -230,34 +236,45 @@ fn a_provider_error_keeps_its_words_and_loses_its_body() {
     );
 }
 
+/// The report of a reply with `status`, `body` and, when given, a `Retry-After` of `retry_after`.
+fn replied(status: u16, body: &str, retry_after: Option<&'static str>) -> rig::error::ErrorReport {
+    let status = reqwest::StatusCode::from_u16(status).unwrap();
+    let headers = retry_after.map(|value| {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            reqwest::header::HeaderValue::from_static(value),
+        );
+        headers
+    });
+    rig::ProviderError::from_http_response(status, body)
+        .with_response_headers(headers)
+        .report()
+}
+
 #[test]
 fn a_failure_says_how_the_model_fares() {
     use super::client::setback;
-    use reqwest::StatusCode;
     use rig::ErrorKind;
-    let reply = ErrorKind::ProviderResponse;
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        "retry-after",
-        reqwest::header::HeaderValue::from_static("30"),
-    );
     assert_eq!(
-        setback(ErrorKind::Http, None, None),
+        setback(&rig::error::ErrorReport::new(
+            ErrorKind::Http,
+            "connection refused"
+        )),
         Some(Setback::Unreachable)
     );
     assert_eq!(
-        setback(reply, Some(StatusCode::TOO_MANY_REQUESTS), Some(&headers)),
+        setback(&replied(429, "{}", Some("30"))),
         Some(Setback::Limited(Duration::from_secs(30)))
     );
     assert_eq!(
-        setback(reply, Some(StatusCode::TOO_MANY_REQUESTS), None),
+        setback(&replied(429, "{}", None)),
         Some(Setback::Limited(Duration::from_mins(1)))
     );
-    assert_eq!(
-        setback(reply, Some(StatusCode::SERVICE_UNAVAILABLE), None),
-        Some(Setback::Busy)
-    );
-    assert_eq!(setback(reply, Some(StatusCode::BAD_REQUEST), None), None);
+    assert_eq!(setback(&replied(503, "{}", None)), Some(Setback::Busy));
+    assert_eq!(setback(&replied(400, "{}", None)), None);
+    let broken = r#"{"error":{"code":400,"message":"Model generated invalid JSON."}}"#;
+    assert_eq!(setback(&replied(400, broken, None)), Some(Setback::Busy));
 }
 
 #[test]
@@ -293,35 +310,24 @@ fn a_429_parks_a_silent_server_goes_last_and_a_busy_one_stays() {
 
 #[test]
 fn earlier_reasoning_is_dropped_and_turns_left_empty_go_with_it() {
-    use rig::message::{Issuer, Reasoning, Sealed};
-    let thought = |text: &str| {
-        AssistantContent::Reasoning(Sealed::new(
-            Issuer::from("gcp.gemini"),
-            Reasoning::new(text),
-        ))
-    };
+    use rig::message::AssistantMessage;
+    let turn = |content| Message::Assistant(AssistantMessage::new(content));
     let mut history = History(vec![
         Message::User {
             content: vec![UserContent::text("where is the mug?")],
         },
-        Message::Assistant {
-            id: None,
-            content: vec![
-                thought("the kitchen, probably"),
-                AssistantContent::text("In the kitchen."),
-            ],
-        },
-        Message::Assistant {
-            id: None,
-            content: vec![thought("nothing to add")],
-        },
+        turn(vec![
+            AssistantContent::reasoning("the kitchen, probably"),
+            AssistantContent::text("In the kitchen."),
+        ]),
+        turn(vec![AssistantContent::reasoning("nothing to add")]),
     ]);
     history.drop_reasoning();
     assert_eq!(history.0.len(), 2);
     assert!(matches!(
         &history.0[1],
-        Message::Assistant { content, .. } if content.len() == 1
-            && matches!(&content[0], AssistantContent::Text(t) if t.text == "In the kitchen.")
+        Message::Assistant(turn) if turn.content.len() == 1
+            && matches!(&turn.content[0], AssistantContent::Text(t) if t.text == "In the kitchen.")
     ));
 }
 
@@ -335,10 +341,10 @@ async fn a_call_recovered_from_an_invalid_tool_call_is_charged_once_like_the_res
             Vec::new()
         }
         fn builder(&self, _: &str) -> Result<AgentBuilder, LlmError> {
-            let used = |input, output| rig::completion::Usage {
-                input_tokens: Some(input),
-                output_tokens: Some(output),
-                ..rig::completion::Usage::default()
+            let used = |input, output| {
+                rig::completion::Usage::new()
+                    .input_tokens(input)
+                    .output_tokens(output)
             };
             Ok(AgentBuilder::new(MockCompletionModel::from_turns([
                 MockTurn::tool_call("c1", "no_such_tool", serde_json::json!({}))

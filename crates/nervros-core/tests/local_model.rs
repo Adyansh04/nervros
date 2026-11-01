@@ -76,7 +76,7 @@ async fn calls_a_runtime_declared_tool_and_uses_its_result() {
     let called = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&called);
     let tool = DynamicTool::new(
-        "find_objects",
+        rig::message::ToolName::new("find_objects").unwrap(),
         "Find objects the robot has seen, by label. Returns their ids and rooms.",
         serde_json::json!({
             "type": "object",
@@ -103,7 +103,11 @@ async fn calls_a_runtime_declared_tool_and_uses_its_result() {
         .dynamic_tool(tool)
         .default_max_turns(4)
         .build();
-    let reply = agent.prompt("Where is the red ball?").await.unwrap().output;
+    let reply = agent
+        .prompt("Where is the red ball?")
+        .await
+        .unwrap()
+        .output();
     assert!(
         called.load(Ordering::SeqCst),
         "the model never called the tool"

@@ -34,8 +34,9 @@ pub async fn summarise(source: &Arc<dyn AgentSource>, transcript: &str) -> Optio
         match prompt_once_more(&agent, transcript.to_owned(), again).await {
             Ok(response) => {
                 source.spent(&model, CallCost::of(&response.usage));
-                if !response.output.trim().is_empty() {
-                    return Some(response.output);
+                let summary = response.output();
+                if !summary.trim().is_empty() {
+                    return Some(summary);
                 }
             }
             Err(e) => {
