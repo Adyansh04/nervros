@@ -274,22 +274,18 @@ fn client_error(provider: &ProviderConfig, e: &dyn std::fmt::Display) -> LlmErro
 /// The longest a model is set aside: a `Retry-After` past a day is not believed.
 const MAX_PARK: Duration = Duration::from_hours(24);
 
-/// What a failure says about the model: limited by a 429 for what the provider's `Retry-After`
-/// asks, else a minute; busy on a server error; unreachable when nothing answered at all. `None`
-/// for any other failure, whatever its text says, but for [`malformed_call`].
+/// What a failure says about the model: limited by a 429 for as long as the provider asks (its
+/// `Retry-After`, or the wait Gemini writes in the body), else a minute; busy on a server error;
+/// unreachable when nothing answered at all. `None` for any other failure, whatever its text
+/// says, but for [`malformed_call`].
 pub(super) fn setback(report: &ErrorReport) -> Option<Setback> {
     if report.kind == ErrorKind::Http {
         return Some(Setback::Unreachable);
     }
     let status = report.provider_response_status();
     if status == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) {
-        let asked = report
-            .provider_response_headers()
-            .and_then(|h| h.get("retry-after"))
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
-        let wait = asked
+        let wait = report
+            .retry_after(SystemTime::now())
             .unwrap_or(DEFAULT_PARK)
             .clamp(Duration::from_secs(1), MAX_PARK);
         return Some(Setback::Limited(wait));
@@ -316,6 +312,16 @@ pub(super) fn prompt_setback(error: &PromptError) -> Option<Setback> {
         PromptError::Provider(e) => setback(&e.report()),
         PromptError::Report(report) => setback(report),
         _ => None,
+    }
+}
+
+/// Whether a run failed because its request outgrew the model's context window, as the provider
+/// says it in any of its words.
+pub(super) fn overflowed(error: &PromptError) -> bool {
+    match error {
+        PromptError::Provider(e) => e.report().is_context_overflow(),
+        PromptError::Report(report) => report.is_context_overflow(),
+        _ => false,
     }
 }
 

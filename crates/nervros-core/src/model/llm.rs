@@ -160,6 +160,8 @@ pub enum LlmError {
         message: String,
         /// What the failure says about the model, when it says anything.
         setback: Option<Setback>,
+        /// The request did not fit the model's context window.
+        overflowed: bool,
     },
 }
 
@@ -171,6 +173,18 @@ impl LlmError {
             Self::Turn { setback, .. } => *setback,
             _ => None,
         }
+    }
+
+    /// Whether a turn failed because its request did not fit the model's context window.
+    #[must_use]
+    pub fn overflowed(&self) -> bool {
+        matches!(
+            self,
+            Self::Turn {
+                overflowed: true,
+                ..
+            }
+        )
     }
 }
 

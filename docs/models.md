@@ -102,8 +102,10 @@ privacy = { trains = true }                     # free endpoints may train on wh
 With `context` set, the conversation is condensed before a turn once it passes half the window.
 Tool results before the operator's newest message are cut to a line, and when that is not enough,
 a `summarise` model sums up the older part as goal, done, open and facts. Within a turn, each
-request is cut to fit. The window shows how full it is; `/compact` condenses it at once, and
-right-clicking a message condenses everything up to it.
+request is cut to fit. A request the model still refuses as too long for its window, as a model
+without `context` may, is condensed once more and asked again, unless the turn already acted. The
+window shows how full it is; `/compact` condenses it at once, and right-clicking a message
+condenses everything up to it.
 
 ```toml
 [pools]
@@ -170,8 +172,9 @@ Every request is counted, per model and per pool, in `~/.local/state/nervros/quo
 quota refuses ends the turn there. Days roll over at midnight UTC, and for Gemini at midnight
 Pacific time, as the providers count them.
 
-- A model answering 429 is set aside for as long as its `Retry-After` asks, a minute without one,
-  and never past its provider's next midnight, when a spent daily quota comes back.
+- A model answering 429 is set aside for as long as the provider asks, in its `Retry-After` or,
+  as Gemini does, in the reply's `retryDelay`, a minute without either, and never past its
+  provider's next midnight, when a spent daily quota comes back.
 - A model whose server does not answer, such as a local model that is not running, is tried last
   for a minute, by that process alone, so its turns meanwhile go quietly to the next model.
 - A busy model (a 5xx, such as Gemini's 503 under load) is asked once more two seconds later,

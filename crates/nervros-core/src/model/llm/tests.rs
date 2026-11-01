@@ -273,6 +273,12 @@ fn a_failure_says_how_the_model_fares() {
     );
     assert_eq!(setback(&replied(503, "{}", None)), Some(Setback::Busy));
     assert_eq!(setback(&replied(400, "{}", None)), None);
+    let gemini = r#"{"error":{"code":429,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"38s"}]}}"#;
+    assert_eq!(
+        setback(&replied(429, gemini, None)),
+        Some(Setback::Limited(Duration::from_secs(38))),
+        "Gemini says how long in the reply"
+    );
     let broken = r#"{"error":{"code":400,"message":"Model generated invalid JSON."}}"#;
     assert_eq!(setback(&replied(400, broken, None)), Some(Setback::Busy));
 }

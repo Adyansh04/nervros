@@ -15,7 +15,7 @@ use rig::completion::PromptError;
 use rig::message::ToolName;
 use rig::tool::{DynamicTool, ToolOutput};
 
-use super::client::{Llm, prompt_setback};
+use super::client::{Llm, overflowed, prompt_setback};
 use super::history::{History, RESERVE_TOKENS, cut_old, fit, size, tokens_of};
 use super::{LlmError, Setback};
 use crate::providers::Role;
@@ -409,19 +409,21 @@ pub async fn chat(
             last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
         });
     let agent = builder.build();
-    let turn_error = |message: String, setback: Option<Setback>| LlmError::Turn {
+    let failed = |e: &PromptError| LlmError::Turn {
         model: model_id.to_owned(),
-        message: without_provider_body(&message),
-        setback,
+        message: without_provider_body(&failure(e, model_id)),
+        setback: prompt_setback(e),
+        overflowed: overflowed(e),
     };
-    let failed = |e: &PromptError| turn_error(failure(e, model_id), prompt_setback(e));
     if let Some(delta) = delta {
         return match streamed(&agent, text, history, delta.as_ref()).await {
             Ok(Some(reply)) => Ok(plain(reply)),
-            Ok(None) => Err(turn_error(
-                "the reply stream ended without a reply".to_owned(),
-                None,
-            )),
+            Ok(None) => Err(LlmError::Turn {
+                model: model_id.to_owned(),
+                message: "the reply stream ended without a reply".to_owned(),
+                setback: None,
+                overflowed: false,
+            }),
             Err(e) => Err(failed(&e)),
         };
     }
