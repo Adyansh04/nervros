@@ -132,7 +132,7 @@ impl Llm {
         if let Some(max) = model.max_tokens {
             builder = builder.max_tokens(max);
         }
-        Ok(builder)
+        Ok(builder.record_content_telemetry(crate::telemetry::content()))
     }
 
     fn bare_builder(&self, model: &ModelConfig) -> Result<AgentBuilder, LlmError> {
