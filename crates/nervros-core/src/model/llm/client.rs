@@ -184,8 +184,12 @@ impl Llm {
                     message: "gemini_interactions needs a key".to_owned(),
                 })?;
                 // The Interactions wire sends the key in x-goog-api-key, never in the URL.
-                let client =
-                    GeminiConfig::new(key.expose_secret()).connect(ReqwestClient::from(http));
+                let config = GeminiConfig::new(key.expose_secret());
+                let config = match &provider.base_url {
+                    Some(base) => config.with_base_url(base.as_str()),
+                    None => config,
+                };
+                let client = config.connect(ReqwestClient::from(http));
                 Ok(AgentBuilder::new(
                     client.interactions(&model.model).with_idle_timeout(idle),
                 ))
@@ -195,8 +199,12 @@ impl Llm {
                     provider: provider.id.clone(),
                     message: "anthropic needs a key".to_owned(),
                 })?;
-                let client =
-                    AnthropicConfig::new(key.expose_secret()).connect(ReqwestClient::from(http));
+                let config = AnthropicConfig::new(key.expose_secret());
+                let config = match &provider.base_url {
+                    Some(base) => config.with_base_url(base),
+                    None => config,
+                };
+                let client = config.connect(ReqwestClient::from(http));
                 let messages = client.completion(&model.model).with_idle_timeout(idle);
                 // The system prompt and tools are the same each call: read back from the cache,
                 // they cost a tenth of sending them again.

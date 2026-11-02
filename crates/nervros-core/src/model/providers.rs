@@ -56,7 +56,8 @@ pub struct ProviderConfig {
     pub id: String,
     /// Wire protocol.
     pub kind: ProviderKind,
-    /// Base URL; required for `openai_compat`.
+    /// Base URL: required for `openai_compat`; for the others, a gateway or proxy in place of the
+    /// provider's own.
     pub base_url: Option<String>,
     /// API key source; absent for keyless local servers.
     pub key: Option<KeySource>,

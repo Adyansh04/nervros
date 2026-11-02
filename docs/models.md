@@ -27,9 +27,10 @@ headers = { "X-Title" = "NervROS" }
   vLLM, OpenRouter, Groq. `gemini_interactions` is Google's Gemini, whose key travels only in the
   `x-goog-api-key` header, never in a URL. `anthropic` is Claude's Messages API, with the key in
   `x-api-key` and the prompt cached between calls.
-- An `openai_compat` provider needs `base_url`. Its `headers` go with each request, and
-  `timeout_s` (60 by default) bounds each call: the whole reply, or for a model with
-  `stream = true` each silence in it, so a long reply that keeps coming is not cut.
+- An `openai_compat` provider needs `base_url`; another kind takes one for a gateway or proxy in
+  front of the provider. Its `headers` go with each request, and `timeout_s` (60 by default)
+  bounds each call: the whole reply, or for a model with `stream = true` each silence in it, so a
+  long reply that keeps coming is not cut.
 - `key` is `{ file = "..." }` or `{ env = "NAME" }`, and absent for a local server. Keys are never
   logged. A key that cannot be read leaves its provider's models out, and says why when one of
   them is asked, rather than stopping the app.
