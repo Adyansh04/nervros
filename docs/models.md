@@ -26,7 +26,8 @@ headers = { "X-Title" = "NervROS" }
 - `kind` is `openai_compat` for anything that speaks OpenAI's chat completions: llama.cpp, Ollama,
   vLLM, OpenRouter, Groq. `gemini_interactions` is Google's Gemini, whose key travels only in the
   `x-goog-api-key` header, never in a URL. `anthropic` is Claude's Messages API, with the key in
-  `x-api-key` and the prompt cached between calls.
+  `x-api-key` and the prompt cached between calls: the tools and the system prompt on their own,
+  the conversation at its end.
 - An `openai_compat` provider needs `base_url`; another kind takes one for a gateway or proxy in
   front of the provider. Its `headers` go with each request, and `timeout_s` (60 by default)
   bounds each call: the whole reply, or for a model with `stream = true` each silence in it, so a

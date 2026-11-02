@@ -205,9 +205,11 @@ impl Llm {
                     None => config,
                 };
                 let client = config.connect(ReqwestClient::from(http));
-                let messages = client.completion(&model.model).with_idle_timeout(idle);
-                // The system prompt and tools are the same each call: read back from the cache,
-                // they cost a tenth of sending them again.
+                let mut messages = client.completion(&model.model).with_idle_timeout(idle);
+                // Read back from the cache, a prompt costs a tenth of sending it again. The tools
+                // and the system prompt are cached on their own and the conversation at its end,
+                // so a system prompt whose stacks' status changed still finds the tools cached.
+                messages.wire = messages.wire.with_prompt_caching();
                 Ok(AgentBuilder::new(messages).cache(CacheRetention::Short))
             }
         }
