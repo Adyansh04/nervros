@@ -1,0 +1,33 @@
+when:
+  path: /v1beta/interactions
+  method: POST
+  query_param: []
+  header:
+  - name: content-type
+    value: application/json
+  - name: accept
+    value: '*/*'
+  body: '{"input":[{"content":[{"text":"Where is the red mug?","type":"text"}],"type":"user_input"}],"model":"gemini-3.1-flash-lite","stream":false,"system_instruction":"You are a home robot''s assistant. Find things with your tool, then answer in one sentence.","tools":[{"description":"Finds objects the robot has seen, by what they are: their ids and rooms.","name":"find_objects","parameters":{"properties":{"query":{"description":"What to look for","type":"string"}},"required":["query"],"type":"object"},"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  body: '{"created":"1970-01-01T00:00:00Z","id":"v1_ChdiTnJuYXV5OUlaT2UzYm9QX2JPZ2lBbxIXYk5ybmF1eTlJWk9lM2JvUF9iT2dpQW8","model":"gemini-3.1-flash-lite","object":"interaction","service_tier":"standard","status":"requires_action","steps":[{"signature":"EnMKcQFpFH0TA8WEzrr0dkklgUy8XlB8vUNePm+J8hcOPhCO6n3q9WW7ieazbs99ubIWdmBGOTcSG3LYHOEgwllUr9bpHTcW1MZjpjGSA+bKhWJDaGESkc4gXY5qLKhE+/SCrQYjRxHCtXuG7EZg26/P2Zon","type":"thought"},{"arguments":{"query":"red mug"},"id":"call_1298683","name":"find_objects","type":"function_call"}],"updated":"1970-01-01T00:00:00Z","usage":{"initial_input_tokens":67,"input_tokens_by_modality":[{"modality":"text","tokens":93}],"total_cached_tokens":0,"total_input_tokens":93,"total_output_tokens":17,"total_thought_tokens":0,"total_tokens":110,"total_tool_use_tokens":0}}'
+---
+when:
+  path: /v1beta/interactions
+  method: POST
+  query_param: []
+  header:
+  - name: content-type
+    value: application/json
+  - name: accept
+    value: '*/*'
+  body: '{"input":[{"content":[{"text":"Where is the red mug?","type":"text"}],"type":"user_input"},{"signature":"EnMKcQFpFH0TA8WEzrr0dkklgUy8XlB8vUNePm+J8hcOPhCO6n3q9WW7ieazbs99ubIWdmBGOTcSG3LYHOEgwllUr9bpHTcW1MZjpjGSA+bKhWJDaGESkc4gXY5qLKhE+/SCrQYjRxHCtXuG7EZg26/P2Zon","type":"thought"},{"arguments":{"query":"red mug"},"id":"call_1298683","name":"find_objects","type":"function_call"},{"call_id":"call_1298683","name":"find_objects","result":{"objects":[{"id":"O12","label":"red mug","room":"kitchen"}]},"type":"function_result"}],"model":"gemini-3.1-flash-lite","stream":false,"system_instruction":"You are a home robot''s assistant. Find things with your tool, then answer in one sentence.","tools":[{"description":"Finds objects the robot has seen, by what they are: their ids and rooms.","name":"find_objects","parameters":{"properties":{"query":{"description":"What to look for","type":"string"}},"required":["query"],"type":"object"},"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  body: '{"created":"1970-01-01T00:00:00Z","id":"v1_ChdldHJuYXR6UU9PT2prZFVQN0lHYzRBMBIXZXRybmF0elFPT09qa2RVUDdJR2M0QTA","model":"gemini-3.1-flash-lite","object":"interaction","service_tier":"standard","status":"completed","steps":[{"signature":"EnMKcQFpFH0TX0kZzHzwBigw7HZW+XrEM55frH55cButuV7ps811apojon2gP1N5e3C1KFrtKPRrqbjGVSQZ8v5fPCOZu3Rr2rHHMnoWbmDf1XhO0vPTRKLWTcmAdF8xRUeaYUv8s/37whs5RcDPfEt9QXi5","type":"thought"},{"content":[{"text":"The red mug is in the kitchen.","type":"text"}],"type":"model_output"}],"updated":"1970-01-01T00:00:00Z","usage":{"initial_input_tokens":94,"input_tokens_by_modality":[{"modality":"text","tokens":118}],"total_cached_tokens":0,"total_input_tokens":118,"total_output_tokens":8,"total_thought_tokens":0,"total_tokens":126,"total_tool_use_tokens":0}}'

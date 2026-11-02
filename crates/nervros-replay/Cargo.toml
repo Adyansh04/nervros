@@ -1,0 +1,21 @@
+[package]
+name = "nervros-replay"
+description = "Real provider exchanges, recorded once and replayed through NervROS's client and turn loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# Tests only: rig-cassette's recorder keeps JSON keys in insertion order, which nervros-core's own
+# tests must not inherit, since they check the order the shipped build uses.
+[dev-dependencies]
+nervros-core = { path = "../nervros-core" }
+rig-cassette.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

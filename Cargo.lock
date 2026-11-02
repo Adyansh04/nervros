@@ -7516,6 +7516,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nervros-replay"
+version = "0.1.0"
+dependencies = [
+ "nervros-core",
+ "rig-cassette",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "nervros-ros"
 version = "0.1.0"
 dependencies = [
@@ -12477,12 +12488,20 @@ version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca25973567a393cc57f8627e50b8bc4dee4421affbd15609ca6675eb660c8f2"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "futures",
+ "httpdate",
  "rig-agent",
  "rig-core",
+ "rig-reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -13378,6 +13397,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap 2.14.2",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]

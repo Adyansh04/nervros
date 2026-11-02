@@ -5,6 +5,7 @@ members = [
     "crates/nervros-ros",
     "crates/nervros-core",
     "crates/nervros-viz",
+    "crates/nervros-replay",
     "apps/nervros-cli",
     "apps/nervros-gui",
 ]
@@ -75,6 +76,8 @@ rhai = { version = "=1.26.1", features = ["sync", "serde"] }
 # own route would skip. Tools only, no client capabilities.
 rmcp = { version = "=3.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 rig = "=0.46.0"
+# Provider exchanges recorded once and replayed, for nervros-replay's tests.
+rig-cassette = { version = "=0.46.0", features = ["http"] }
 # The mission ledger. Bundled: one SQLite for every build, whatever the host has.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 # The robot's SRDF: MoveIt's groups, end effectors and named poses.
