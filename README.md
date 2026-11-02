@@ -104,7 +104,8 @@ plotted. Waits and walks are sped up.*
 
 1. **You ask**, in the app or in a terminal.
 2. **The agent** uses tools: the cameras, the world model, ROS topics, services and actions, its
-   memory, and any MCP server you add. It is a Rust core with a local or cloud model.
+   memory, and any MCP server you add. It is a Rust core on [rig](https://github.com/0xPlaygrounds/rig)
+   with a local or cloud model.
 3. **Anything that moves the robot is a mission.** The agent plans with the robot's own skills,
    NervROS compiles the plan to a behaviour tree, the robot's executor checks it, and you approve
    it.
@@ -124,7 +125,8 @@ Also included:
 - A context that condenses itself before it fills up.
 - A privacy mode that keeps camera frames on local models.
 - A self-description the robot drafts from its own skills and sensors.
-- OpenTelemetry spans for each turn, model call, tool call and mission.
+- OpenTelemetry spans for each turn, model call, tool call and mission; what the model read and
+  wrote goes in them only when you ask (`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`).
 
 ## Safe by design
 

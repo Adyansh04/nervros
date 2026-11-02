@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use super::Shared;
 use super::calls::Caller;
 use super::event::Event;
-use super::window::{fit_window, preamble, report_context};
+use super::window::{condense_after_overflow, fit_window, preamble, report_context};
 use crate::llm::{AgentSource, History, LoopTool};
 use crate::providers::Role;
 use crate::providers::router::Need;
@@ -303,8 +303,10 @@ pub(super) async fn run_turn(
     .await;
     let mut failures = Vec::new();
     let mut waited = false;
+    // A model whose window the request outgrew is asked once more, the conversation condensed.
+    let (mut again, mut condensed) = (None, false);
     loop {
-        let Some(model) = candidates.next() else {
+        let Some(model) = again.take().or_else(|| candidates.next()) else {
             // Free tiers count requests a minute, and a burst of calls can spend every model's:
             // once a turn, waiting for the first to free up beats failing it.
             if waited {
@@ -347,6 +349,13 @@ pub(super) async fn run_turn(
                     source.set_back(&model, setback);
                 }
                 if !flags.acted.load(Ordering::SeqCst) {
+                    if e.overflowed() && !condensed {
+                        condensed = true;
+                        condense_after_overflow(&shared, &source, &tools, window, &mut history, &e)
+                            .await;
+                        again = Some(model);
+                        continue;
+                    }
                     // With no model after it, the turn's own error says this once.
                     if !candidates.as_slice().is_empty() {
                         shared.emit(Event::Notice {

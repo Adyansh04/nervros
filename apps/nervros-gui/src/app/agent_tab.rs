@@ -25,6 +25,10 @@ use crate::toasts::Kind;
 /// How often the accepted fixes' records are read again.
 const FIX_RECORDS_FRESH: Duration = Duration::from_secs(5);
 
+/// Why a conversation an earlier NervROS saved is listed without a way to carry it on.
+const OLD_VERSION: &str =
+    "Saved by an earlier version of NervROS: it can be saved as a test, not resumed";
+
 /// A fix whose call was sent as the operator's, waiting for it to finish.
 struct Accepting {
     id: u32,
@@ -154,8 +158,9 @@ impl Gui {
                 ui,
                 |ui| {
                     if ui
-                        .add(ReButton::new("Resume").small().secondary())
+                        .add_enabled(s.resumable, ReButton::new("Resume").small().secondary())
                         .on_hover_text("Carry on this conversation")
+                        .on_disabled_hover_text(OLD_VERSION)
                         .clicked()
                     {
                         resume = Some(s.path.clone());
@@ -170,8 +175,13 @@ impl Gui {
                 },
                 |ui| {
                     ui.label(RichText::new(&s.when).monospace().small());
+                    let about = if s.resumable {
+                        format!("{} ({} messages)", s.first, s.messages)
+                    } else {
+                        OLD_VERSION.to_owned()
+                    };
                     ui.label(RichText::new(&s.first).size(13.0))
-                        .on_hover_text(format!("{} ({} messages)", s.first, s.messages));
+                        .on_hover_text(about);
                 },
             );
         }

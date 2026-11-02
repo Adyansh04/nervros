@@ -1,5 +1,7 @@
 //! The conversation: its messages, their size in tokens, and how it is cut, condensed and kept.
 
+use std::borrow::Borrow;
+
 use rig::completion::Message;
 use rig::message::{AssistantContent, ToolResultContent, UserContent};
 
@@ -70,13 +72,14 @@ impl History {
     /// thoughts, while Gemini fails more often without its own.
     pub fn drop_reasoning(&mut self) {
         for message in &mut self.0 {
-            if let Message::Assistant { content, .. } = message {
-                content.retain(|part| !matches!(part, AssistantContent::Reasoning(_)));
+            if let Message::Assistant(turn) = message {
+                turn.content
+                    .retain(|part| !matches!(part, AssistantContent::Reasoning(_)));
             }
         }
         // A turn left with nothing in it is refused as empty.
         self.0
-            .retain(|m| !matches!(m, Message::Assistant { content, .. } if content.is_empty()));
+            .retain(|m| !matches!(m, Message::Assistant(turn) if turn.content.is_empty()));
     }
 
     /// Replaces the first `n` messages with a summary of them.
@@ -89,10 +92,7 @@ impl History {
                     summary.trim()
                 ))],
             },
-            Message::Assistant {
-                id: None,
-                content: vec![AssistantContent::text("Noted.")],
-            },
+            Message::assistant("Noted."),
         ];
         self.0.extend(kept);
     }
@@ -108,13 +108,10 @@ impl History {
         self.0.push(Message::User {
             content: vec![UserContent::text(request)],
         });
-        self.0.push(Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::text(format!(
-                "(My reply was lost after I acted: {}.)",
-                done.join("; ")
-            ))],
-        });
+        self.0.push(Message::assistant(format!(
+            "(My reply was lost after I acted: {}.)",
+            done.join("; ")
+        )));
     }
 
     /// Writes it as JSON, for a later session to resume.
@@ -130,9 +127,17 @@ impl History {
     ///
     /// # Errors
     ///
-    /// The file cannot be read or is not a saved history.
+    /// The file cannot be read or is not a saved history, as one an earlier version saved in a
+    /// form this one cannot read; the file is left as it is.
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
-        Ok(Self(serde_json::from_slice(&std::fs::read(path)?)?))
+        serde_json::from_slice(&std::fs::read(path)?)
+            .map(Self)
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("not a conversation this version can resume: {e}"),
+                )
+            })
     }
 
     /// The operator's messages and the replies, in order, for showing a resumed conversation; a
@@ -153,8 +158,9 @@ impl History {
                         .collect::<Vec<_>>()
                         .join(" "),
                 )),
-                Message::Assistant { content, .. } => {
-                    let text: Vec<&str> = content
+                Message::Assistant(turn) => {
+                    let text: Vec<&str> = turn
+                        .content
                         .iter()
                         .filter_map(|c| match c {
                             AssistantContent::Text(t) => Some(t.text.as_str()),
@@ -180,10 +186,7 @@ impl History {
                         Message::User {
                             content: vec![UserContent::text(format!("request {i}"))],
                         },
-                        Message::Assistant {
-                            id: None,
-                            content: vec![AssistantContent::text("x".repeat(chars))],
-                        },
+                        Message::assistant("x".repeat(chars)),
                     ]
                 })
                 .collect(),
@@ -237,10 +240,10 @@ fn json_len<T: serde::Serialize>(value: &T) -> usize {
 }
 
 /// Roughly how many tokens messages take on the wire.
-pub(super) fn size(messages: &[Message]) -> usize {
+pub(super) fn size<M: Borrow<Message>>(messages: &[M]) -> usize {
     let (mut chars, mut images) = (0, 0);
     for m in messages {
-        match m {
+        match m.borrow() {
             Message::System { content } => chars += content.len(),
             Message::User { content } => {
                 for c in content {
@@ -258,8 +261,8 @@ pub(super) fn size(messages: &[Message]) -> usize {
                     }
                 }
             }
-            Message::Assistant { content, .. } => {
-                for c in content {
+            Message::Assistant(turn) => {
+                for c in &turn.content {
                     match c {
                         AssistantContent::Image(_) => images += 1,
                         other => chars += json_len(other),
@@ -286,7 +289,7 @@ pub(super) fn result_text(parts: &[ToolResultContent]) -> String {
 
 /// The messages with every tool result and image before the last `keep` cut to a line; one cut
 /// before stays as it is.
-pub(super) fn cut_old(messages: &[Message], keep: usize) -> Vec<Message> {
+pub(super) fn cut_old<M: Borrow<Message>>(messages: &[M], keep: usize) -> Vec<Message> {
     let edge = messages.len().saturating_sub(keep);
     let cut = |c: &UserContent| match c {
         // One already as short as its cut stays as it is: the cut would only make it longer.
@@ -307,7 +310,7 @@ pub(super) fn cut_old(messages: &[Message], keep: usize) -> Vec<Message> {
     messages
         .iter()
         .enumerate()
-        .map(|(i, m)| match m {
+        .map(|(i, m)| match m.borrow() {
             Message::User { content } if i < edge => Message::User {
                 content: content.iter().map(cut).collect(),
             },
@@ -349,15 +352,14 @@ pub(super) fn transcript(messages: &[Message]) -> String {
                     }
                 }
             }
-            Message::Assistant { content, .. } => {
-                for c in content {
+            Message::Assistant(turn) => {
+                for c in &turn.content {
                     match c {
                         AssistantContent::Text(t) => {
                             let _ = writeln!(out, "Assistant: {}", t.text);
                         }
                         AssistantContent::ToolCall(call) => {
-                            let args =
-                                crate::tools::clip(&call.function.arguments.to_string(), 200);
+                            let args = crate::tools::clip(&call.function.raw_arguments(), 200);
                             let _ = writeln!(out, "  called {} {args}", call.function.name);
                         }
                         _ => {}

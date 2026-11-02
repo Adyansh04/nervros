@@ -7,14 +7,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures::future::BoxFuture;
 use rig::AgentBuilder;
-use rig::agent::tool::{DynamicTool, ToolOutput};
 use rig::agent::{
     AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, InvalidToolCallAction,
-    InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, RequestPatch, RunSettled,
-    SettledOutcome,
+    InvalidToolCallContext, OutcomeAction, OutcomeEvent, RequestPatch,
 };
+use rig::completion::PromptError;
+use rig::message::ToolName;
+use rig::tool::{DynamicTool, ToolOutput};
 
-use super::client::{Llm, prompt_setback, stream_setback};
+use super::client::{Llm, overflowed, prompt_setback};
 use super::history::{History, RESERVE_TOKENS, cut_old, fit, size, tokens_of};
 use super::{LlmError, Setback};
 use crate::providers::Role;
@@ -171,7 +172,7 @@ impl AgentSource for Llm {
 }
 
 /// Steers one turn's agent loop.
-struct TurnHook {
+pub(super) struct TurnHook {
     source: Arc<dyn AgentSource>,
     model: String,
     started: Arc<AtomicBool>,
@@ -182,24 +183,24 @@ struct TurnHook {
     on_call: Option<OnCall>,
     /// When the pending call was sent.
     sent: Mutex<Option<Instant>>,
-    /// What the turn's calls have been charged so far.
-    charged: Mutex<CallCost>,
     /// The system prompt for the last call, which says no tool can be called.
     last_word: String,
 }
 
 impl TurnHook {
-    /// Charges `cost` to the model's budget and reports it.
-    fn charge(&self, cost: CallCost) {
-        if let Ok(mut charged) = self.charged.lock() {
-            charged.input_tokens += cost.input_tokens;
-            charged.cached_tokens += cost.cached_tokens;
-            charged.cache_write_tokens += cost.cache_write_tokens;
-            charged.output_tokens += cost.output_tokens;
-        }
-        self.source.spent(&self.model, cost);
-        if let Some(on_call) = &self.on_call {
-            on_call(cost);
+    /// The hook for a turn of `model` from `source`, as `setup` asks.
+    pub(super) fn new(source: Arc<dyn AgentSource>, model: &str, setup: &TurnSetup<'_>) -> Self {
+        Self {
+            source,
+            model: model.to_owned(),
+            started: Arc::clone(&setup.started),
+            last: setup.max_turns,
+            room: setup.window.map(|w| {
+                w.saturating_sub(fixed_cost(setup.preamble, setup.tools) + RESERVE_TOKENS)
+            }),
+            on_call: setup.on_call.clone(),
+            sent: Mutex::new(None),
+            last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
         }
     }
 }
@@ -246,44 +247,23 @@ impl AgentHook for TurnHook {
         )
     }
 
-    /// Fired for every call, streamed or not, which a response hook is not.
-    async fn on_model_turn_finished(
-        &self,
-        _ctx: &HookContext,
-        event: ModelTurnFinished<'_>,
-    ) -> ModelTurnAction {
-        let sent = self.sent.lock().ok().and_then(|mut s| s.take());
-        let cost = CallCost {
-            ms: sent.map_or(0, |t| {
-                u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
-            }),
-            ..CallCost::of(&event.usage)
-        };
-        self.charge(cost);
-        ModelTurnAction::Continue
-    }
-
-    /// A call whose turn was recovered from an invalid tool call fires no model-turn hook, though
-    /// it was billed: what the run's total holds beyond the calls charged one by one is charged
-    /// here. A run that fails keeps such a call uncharged; the run's error carries no counts.
-    async fn on_run_settled(&self, _ctx: &HookContext, event: RunSettled<'_>) {
-        let SettledOutcome::Response(response) = event.outcome else {
-            return;
-        };
-        let total = CallCost::of(&response.usage);
-        let charged = self.charged.lock().map(|c| *c).unwrap_or_default();
-        let rest = CallCost {
-            input_tokens: total.input_tokens.saturating_sub(charged.input_tokens),
-            cached_tokens: total.cached_tokens.saturating_sub(charged.cached_tokens),
-            cache_write_tokens: total
-                .cache_write_tokens
-                .saturating_sub(charged.cache_write_tokens),
-            output_tokens: total.output_tokens.saturating_sub(charged.output_tokens),
-            ms: 0,
-        };
-        if rest != CallCost::default() {
-            self.charge(rest);
+    /// Charges every call that brought a whole reply, the ones the run retried or recovered from
+    /// an invalid tool call too: the provider bills them all. Each call is reported with its time.
+    async fn on_outcome(&self, _ctx: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        if let Some(response) = event.completion() {
+            let sent = self.sent.lock().ok().and_then(|mut s| s.take());
+            let cost = CallCost {
+                ms: sent.map_or(0, |t| {
+                    u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+                }),
+                ..CallCost::of(&response.usage)
+            };
+            self.source.spent(&self.model, cost);
+            if let Some(on_call) = &self.on_call {
+                on_call(cost);
+            }
         }
+        OutcomeAction::proceed()
     }
 
     /// Small models invent tool names; the model gets the real ones back as the call's result
@@ -411,20 +391,21 @@ pub async fn chat(
     history: &mut History,
     text: &str,
 ) -> Result<String, LlmError> {
+    // A tool's name is never empty: the registry names every tool it holds.
     let dynamic: Vec<DynamicTool> = setup
         .tools
         .iter()
-        .map(|t| {
+        .filter_map(|t| {
             let invoke = std::sync::Arc::clone(&t.invoke);
-            DynamicTool::new(
-                t.name.clone(),
+            Some(DynamicTool::new(
+                ToolName::new(t.name.clone()).ok()?,
                 t.description.clone(),
                 t.parameters.clone(),
                 move |args| {
                     let fut = invoke(args);
                     Box::pin(async move { Ok(ToolOutput::json(fut.await)) })
                 },
-            )
+            ))
         })
         .collect();
     let delta = setup.delta.clone().filter(|_| source.streams(model_id));
@@ -433,53 +414,48 @@ pub async fn chat(
         .preamble(setup.preamble)
         .default_max_turns(setup.max_turns)
         .dynamic_tools(dynamic)
-        .add_hook(TurnHook {
-            source,
-            model: model_id.to_owned(),
-            started: setup.started,
-            last: setup.max_turns,
-            room: setup.window.map(|w| {
-                w.saturating_sub(fixed_cost(setup.preamble, setup.tools) + RESERVE_TOKENS)
-            }),
-            on_call: setup.on_call,
-            sent: Mutex::new(None),
-            charged: Mutex::new(CallCost::default()),
-            last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
-        });
+        .add_hook(TurnHook::new(source, model_id, &setup));
     let agent = builder.build();
-    let turn_error = |message: String, setback: Option<Setback>| LlmError::Turn {
+    let failed = |e: &PromptError| LlmError::Turn {
         model: model_id.to_owned(),
-        message: without_provider_body(cancel_reason(&message, model_id)),
-        setback,
+        message: without_provider_body(&failure(e, model_id)),
+        setback: prompt_setback(e),
+        overflowed: overflowed(e),
     };
     if let Some(delta) = delta {
-        return streamed(&agent, text, history, delta.as_ref())
-            .await
-            .map(plain)
-            .map_err(|(message, setback)| turn_error(message, setback));
+        return match streamed(&agent, text, history, delta.as_ref()).await {
+            Ok(Some(reply)) => Ok(plain(reply)),
+            Ok(None) => Err(LlmError::Turn {
+                model: model_id.to_owned(),
+                message: "the reply stream ended without a reply".to_owned(),
+                setback: None,
+                overflowed: false,
+            }),
+            Err(e) => Err(failed(&e)),
+        };
     }
     agent
         .chat(text, &mut history.0)
         .await
-        .map(|response| plain(response.output))
-        .map_err(|e| turn_error(e.to_string(), prompt_setback(&e)))
+        .map(|response| plain(response.output()))
+        .map_err(|e| failed(&e))
 }
 
 /// One turn with the reply streamed: each text delta to `delta`, and the run's transcript into
-/// `history` at the end, as `chat` appends it.
+/// `history` at the end, as `chat` appends it. `None` when the stream ended without a reply.
 pub(super) async fn streamed(
     agent: &rig::Agent,
     text: &str,
     history: &mut History,
     delta: &(dyn Fn(&str) + Send + Sync),
-) -> Result<String, (String, Option<Setback>)> {
+) -> Result<Option<String>, PromptError> {
     use futures::StreamExt as _;
     use rig::agent::MultiTurnStreamItem;
     use rig::streaming::{Item, StreamEvent};
     let mut stream = agent.prompt(text).history(history.0.clone()).stream();
     let mut done = None;
     while let Some(item) = stream.next().await {
-        match item.map_err(|e| (e.to_string(), stream_setback(&e)))? {
+        match item? {
             MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
                 text,
                 ..
@@ -488,34 +464,28 @@ pub(super) async fn streamed(
             _ => {}
         }
     }
-    let response =
-        done.ok_or_else(|| ("the reply stream ended without a reply".to_owned(), None))?;
-    // The run's transcript: the new messages only, or the history it was given with them.
-    if let Some(messages) = response.messages {
-        if messages.starts_with(&history.0) {
-            history.0 = messages;
-        } else {
-            history.0.extend(messages);
-        }
+    Ok(done.map(|response| {
+        // The run's transcript, without the history it was given.
+        history.0.extend(response.messages.iter().cloned());
+        response.output()
+    }))
+}
+
+/// What a run's failure says: for a turn our own hook cancelled (`<model>: <why>`), the reason
+/// alone, since the error names the model already.
+pub(super) fn failure(e: &PromptError, model: &str) -> String {
+    match e {
+        PromptError::Cancelled { reason, .. } => reason
+            .strip_prefix(model)
+            .and_then(|rest| rest.strip_prefix(": "))
+            .unwrap_or(reason)
+            .to_owned(),
+        other => other.to_string(),
     }
-    Ok(response.output)
 }
 
 /// A provider error with its JSON body replaced by the provider's own message: the body can
 /// carry account ids (OpenRouter's `user_id`) that belong in neither the chat nor the log.
-/// A turn our own hook cancelled, as rig words it (`PromptCancelled: <model>: <why>`), as the
-/// reason alone: the error names the model already.
-pub(super) fn cancel_reason<'a>(message: &'a str, model: &str) -> &'a str {
-    message
-        .strip_prefix("PromptCancelled: ")
-        .map_or(message, |reason| {
-            reason
-                .strip_prefix(model)
-                .and_then(|rest| rest.strip_prefix(": "))
-                .unwrap_or(reason)
-        })
-}
-
 pub(super) fn without_provider_body(text: &str) -> String {
     let Some(start) = text.find('{') else {
         return text.to_owned();

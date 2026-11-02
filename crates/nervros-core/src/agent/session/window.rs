@@ -21,11 +21,34 @@ pub(super) async fn fit_window(
     let Some(window) = candidates.first().and_then(|m| source.context(m)) else {
         return;
     };
-    let room =
-        window.saturating_sub(llm::fixed_cost(&preamble(shared), tools) + llm::RESERVE_TOKENS);
+    let room = room_in(shared, tools, window);
     if history.size() > room / 2 {
         compact(shared, source, history, room, Condense::ToFit).await;
     }
+}
+
+/// After a model refused a request as too long for its window, as `why` says: tells the operator,
+/// and condenses the history below half the room the estimate gave it, or to [`COMPACT_ROOM`] when
+/// the window is unknown.
+pub(super) async fn condense_after_overflow(
+    shared: &Shared,
+    source: &Arc<dyn AgentSource>,
+    tools: &[LoopTool],
+    window: Option<usize>,
+    history: &mut History,
+    why: &impl std::fmt::Display,
+) {
+    shared.emit(Event::Notice {
+        text: format!("{why}; condensing the conversation and asking again"),
+    });
+    let room = window.map_or(COMPACT_ROOM, |w| room_in(shared, tools, w) / 2);
+    compact(shared, source, history, room, Condense::Now).await;
+}
+
+/// Room for the history in a window of `window` tokens, once the system prompt, the tools and a
+/// reply are counted.
+fn room_in(shared: &Shared, tools: &[LoopTool], window: usize) -> usize {
+    window.saturating_sub(llm::fixed_cost(&preamble(shared), tools) + llm::RESERVE_TOKENS)
 }
 
 /// Tells the UI how full the model's window was: as the provider counted, or as estimated.

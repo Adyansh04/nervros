@@ -108,6 +108,40 @@ async fn ask_where_the_cup_is(source: &Arc<Scripted>) -> Vec<Event> {
 }
 
 #[tokio::test]
+async fn a_request_too_long_for_the_window_is_condensed_and_asked_again_once() {
+    let too_long = "This model's maximum context length is 32768 tokens.";
+    let source = Arc::new(Scripted::new(MockCompletionModel::from_turns([
+        MockTurn::error(too_long),
+        MockTurn::text("The cup is in the kitchen."),
+    ])));
+    let events = ask_where_the_cup_is(&source).await;
+    let at = |what: fn(&Event) -> bool| events.iter().position(what);
+    let (Some(notice), Some(compacted), Some(reply)) = (
+        at(|e| matches!(e, Event::Notice { text } if text.contains("condensing"))),
+        at(|e| matches!(e, Event::Compacted { .. })),
+        at(|e| matches!(e, Event::Reply { .. })),
+    ) else {
+        panic!("{events:?}");
+    };
+    assert!(notice < compacted && compacted < reply, "{events:?}");
+
+    let twice = Arc::new(Scripted::new(MockCompletionModel::from_turns([
+        MockTurn::error(too_long),
+        MockTurn::error(too_long),
+    ])));
+    let events = ask_where_the_cup_is(&twice).await;
+    let condensed = events
+        .iter()
+        .filter(|e| matches!(e, Event::Notice { text } if text.contains("condensing")))
+        .count();
+    assert_eq!(condensed, 1, "{events:?}");
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Error { .. })),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_turn_waits_once_for_a_per_minute_limit_to_lift() {
     let waiting = |refusals: usize| {
         Arc::new(Scripted {
@@ -233,10 +267,10 @@ async fn a_busy_model_is_asked_once_more_before_the_next() {
 
 #[tokio::test]
 async fn the_model_that_reasoned_gets_its_reasoning_back() {
-    use rig::message::{AssistantContent, Issuer, Message, Reasoning, Sealed};
+    use rig::message::{AssistantContent, Message};
     let model = MockCompletionModel::from_turns([
         MockTurn::from_contents([
-            AssistantContent::Reasoning(Sealed::new(Issuer::from("mock"), Reasoning::new("hm"))),
+            AssistantContent::reasoning("hm"),
             AssistantContent::text("first"),
         ]),
         MockTurn::text("second"),
@@ -256,8 +290,8 @@ async fn the_model_that_reasoned_gets_its_reasoning_back() {
     }
     let requests = model.requests();
     let reasoned = requests[1].chat_history.iter().any(|m| {
-        matches!(m, Message::Assistant { content, .. }
-            if content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))))
+        matches!(m.as_ref(), Message::Assistant(turn)
+            if turn.content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))))
     });
     assert!(reasoned, "{:?}", requests[1].chat_history);
 }

@@ -1,0 +1,79 @@
+when:
+  path: /v1/chat/completions
+  method: POST
+  query_param: []
+  header:
+  - name: content-type
+    value: application/json
+  - name: accept
+    value: text/event-stream
+  body: '{"max_tokens":1024,"messages":[{"content":[{"text":"You are a home robot''s assistant. Find things with your tool, then answer in one sentence.","type":"text"}],"role":"system"},{"content":"Where is the red mug?","role":"user"}],"model":"qwen3.5-9b","stream":true,"stream_options":{"include_usage":true},"tools":[{"function":{"description":"Finds objects the robot has seen, by what they are: their ids and rooms.","name":"find_objects","parameters":{"properties":{"query":{"description":"What to look for","type":"string"}},"required":["query"],"type":"object"}},"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: text/event-stream
+  body: |+
+    data: {"choices":[{"delta":{"content":null,"role":"assistant"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-Um6HHh7R4CB5q9kzSt7VXsm3rNOw9Stl","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{","name":"find_objects"},"id":"y1VnWN71EHuvP7W478ub0VDESK6uxe8G","index":0,"type":"function"}]},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-Um6HHh7R4CB5q9kzSt7VXsm3rNOw9Stl","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"query\":\""},"index":0}]},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-Um6HHh7R4CB5q9kzSt7VXsm3rNOw9Stl","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"red"},"index":0}]},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-Um6HHh7R4CB5q9kzSt7VXsm3rNOw9Stl","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":" mug"},"index":0}]},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-Um6HHh7R4CB5q9kzSt7VXsm3rNOw9Stl","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\""},"index":0}]},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-Um6HHh7R4CB5q9kzSt7VXsm3rNOw9Stl","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"}"},"index":0}]},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-Um6HHh7R4CB5q9kzSt7VXsm3rNOw9Stl","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}],"created":0,"id":"chatcmpl-Um6HHh7R4CB5q9kzSt7VXsm3rNOw9Stl","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[],"created":0,"id":"chatcmpl-Um6HHh7R4CB5q9kzSt7VXsm3rNOw9Stl","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db","timings":{"cache_n":0,"predicted_ms":429.178,"predicted_n":26,"predicted_per_second":58.25088890856475,"predicted_per_token_ms":17.16712,"prompt_ms":155.183,"prompt_n":317,"prompt_per_second":2042.7495279766472,"prompt_per_token_ms":0.48953627760252366},"usage":{"completion_tokens":26,"prompt_tokens":317,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":343}}
+
+    data: [DONE]
+
+---
+when:
+  path: /v1/chat/completions
+  method: POST
+  query_param: []
+  header:
+  - name: content-type
+    value: application/json
+  - name: accept
+    value: text/event-stream
+  body: '{"max_tokens":1024,"messages":[{"content":[{"text":"You are a home robot''s assistant. Find things with your tool, then answer in one sentence.","type":"text"}],"role":"system"},{"content":"Where is the red mug?","role":"user"},{"role":"assistant","tool_calls":[{"function":{"arguments":"{\"query\":\"red mug\"}","name":"find_objects"},"id":"y1VnWN71EHuvP7W478ub0VDESK6uxe8G","type":"function"}]},{"content":"{\"objects\":[{\"id\":\"O12\",\"label\":\"red mug\",\"room\":\"kitchen\"}]}","role":"tool","tool_call_id":"y1VnWN71EHuvP7W478ub0VDESK6uxe8G"}],"model":"qwen3.5-9b","stream":true,"stream_options":{"include_usage":true},"tools":[{"function":{"description":"Finds objects the robot has seen, by what they are: their ids and rooms.","name":"find_objects","parameters":{"properties":{"query":{"description":"What to look for","type":"string"}},"required":["query"],"type":"object"}},"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: text/event-stream
+  body: |+
+    data: {"choices":[{"delta":{"content":null,"role":"assistant"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-RnccfitKzeVF7THEDfdJ7G89MQo6K4AJ","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"content":"The"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-RnccfitKzeVF7THEDfdJ7G89MQo6K4AJ","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"content":" red"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-RnccfitKzeVF7THEDfdJ7G89MQo6K4AJ","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"content":" mug"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-RnccfitKzeVF7THEDfdJ7G89MQo6K4AJ","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"content":" is"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-RnccfitKzeVF7THEDfdJ7G89MQo6K4AJ","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"content":" located"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-RnccfitKzeVF7THEDfdJ7G89MQo6K4AJ","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"content":" in"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-RnccfitKzeVF7THEDfdJ7G89MQo6K4AJ","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"content":" the"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-RnccfitKzeVF7THEDfdJ7G89MQo6K4AJ","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"content":" kitchen"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-RnccfitKzeVF7THEDfdJ7G89MQo6K4AJ","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{"content":"."},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-RnccfitKzeVF7THEDfdJ7G89MQo6K4AJ","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":0,"id":"chatcmpl-RnccfitKzeVF7THEDfdJ7G89MQo6K4AJ","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db"}
+
+    data: {"choices":[],"created":0,"id":"chatcmpl-RnccfitKzeVF7THEDfdJ7G89MQo6K4AJ","model":"qwen3.5-9b","object":"chat.completion.chunk","system_fingerprint":"b11151-bd4f514db","timings":{"cache_n":342,"predicted_ms":154.654,"predicted_n":10,"predicted_per_second":58.19442109483104,"predicted_per_token_ms":17.183777777777777,"prompt_ms":69.462,"prompt_n":38,"prompt_per_second":547.0617028015317,"prompt_per_token_ms":1.8279473684210528},"usage":{"completion_tokens":10,"prompt_tokens":380,"prompt_tokens_details":{"cached_tokens":342},"total_tokens":390}}
+
+    data: [DONE]
+

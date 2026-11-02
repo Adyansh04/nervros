@@ -4,8 +4,9 @@
 //! A turn is one span named as the `GenAI` conventions name an agent run (`invoke_agent`), so rig
 //! records its token use on it and nests its `chat` and `execute_tool` spans inside. Work that
 //! outlives its turn (a mission, a schedule, a watch) is a job: a trace of its own, linked to the
-//! turn that started it. Prompts, replies and tool results stay out: rig records them only when an
-//! agent asks it to, and none here does.
+//! turn that started it. Prompts, replies, tool results and the tools each call offered stay out
+//! unless `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`, the variable OpenTelemetry's
+//! `GenAI` instrumentations read: then rig records them on its spans.
 
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -61,6 +62,19 @@ pub fn init() -> Telemetry {
     }
 }
 
+/// Whether rig puts what the model reads and writes on its spans: only when they are exported and
+/// the operator asked for it, since the frames' descriptions and the operator's words are in it.
+pub(crate) fn content() -> bool {
+    #[cfg(feature = "otlp")]
+    {
+        otlp::exporting()
+            && std::env::var("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT")
+                .is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+    }
+    #[cfg(not(feature = "otlp"))]
+    false
+}
+
 /// The span of work that outlives the turn that started it, such as a mission: a trace of its own,
 /// linked to the turn's. `kind` names it in a trace viewer; record `nervros.outcome` at its end.
 pub(crate) fn job(kind: &'static str, id: &str, what: &str) -> tracing::Span {
@@ -84,11 +98,16 @@ mod otlp {
     use tracing::Level;
     use tracing_subscriber::filter::Targets;
 
+    /// Whether the standard variables name a collector to send spans to.
+    pub(super) fn exporting() -> bool {
+        let set = |v: &str| std::env::var_os(v).is_some_and(|v| !v.is_empty());
+        set("OTEL_EXPORTER_OTLP_ENDPOINT") || set("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+    }
+
     /// A provider sending where the standard variables say, or none when neither is set: the
     /// exporter reads them itself, adding `/v1/traces` to the general one.
     pub(super) fn provider() -> Result<Option<SdkTracerProvider>, String> {
-        let set = |v: &str| std::env::var_os(v).is_some_and(|v| !v.is_empty());
-        if !set("OTEL_EXPORTER_OTLP_ENDPOINT") && !set("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") {
+        if !exporting() {
             return Ok(None);
         }
         let exporter = SpanExporter::builder()

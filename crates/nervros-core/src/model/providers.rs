@@ -56,7 +56,8 @@ pub struct ProviderConfig {
     pub id: String,
     /// Wire protocol.
     pub kind: ProviderKind,
-    /// Base URL; required for `openai_compat`.
+    /// Base URL: required for `openai_compat`; for the others, a gateway or proxy in place of the
+    /// provider's own.
     pub base_url: Option<String>,
     /// API key source; absent for keyless local servers.
     pub key: Option<KeySource>,
@@ -67,7 +68,7 @@ pub struct ProviderConfig {
     /// Extra HTTP headers sent with every request.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    /// Per-request timeout in seconds.
+    /// Seconds a call may take: the whole reply, or each silence in a streamed one.
     #[serde(default = "default_timeout_s")]
     pub timeout_s: u64,
     /// The most a paid key may spend in all, across runs and processes; its models need a price.
