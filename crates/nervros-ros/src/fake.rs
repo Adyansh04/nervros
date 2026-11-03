@@ -64,7 +64,7 @@ pub struct FakeRobot {
     actions: HashMap<String, ActionFn>,
     topics: Mutex<HashMap<String, Value>>,
     frames: HashMap<String, FrameSender>,
-    tf: Mutex<TfBuffer>,
+    tf: Arc<Mutex<TfBuffer>>,
     latency: Duration,
     calls: Arc<Mutex<Vec<(String, Value)>>>,
     graph: Option<GraphDetail>,
@@ -85,7 +85,7 @@ impl std::fmt::Debug for FakeRobot {
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -146,6 +146,11 @@ impl FakeRobot {
     pub fn with_transform(self, parent: &str, child: &str, t: Transform) -> Self {
         lock(&self.tf).insert(parent, child, t);
         self
+    }
+
+    /// Its transforms, for what moves it as it runs.
+    pub(crate) fn tf(&self) -> Arc<Mutex<TfBuffer>> {
+        Arc::clone(&self.tf)
     }
 
     /// Delays every call and goal acceptance.
