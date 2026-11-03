@@ -22,6 +22,7 @@ otlp = ["nervros-core/otlp"]
 anyhow.workspace = true
 clap.workspace = true
 nervros-core = { path = "../../crates/nervros-core" }
+image.workspace = true
 nervros-ros = { path = "../../crates/nervros-ros", default-features = false, features = ["scripted"] }
 serde.workspace = true
 serde_json.workspace = true

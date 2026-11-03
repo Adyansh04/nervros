@@ -198,8 +198,12 @@ fn scripted_robot(files: &[PathBuf]) -> Result<Arc<dyn RobotPort>> {
     for file in files {
         let text =
             std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-        let next: ScriptedRobot =
+        let mut next: ScriptedRobot =
             toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
+        let folder = file.parent().unwrap_or_else(|| Path::new("."));
+        for image in next.frames.values_mut() {
+            *image = folder.join(&*image);
+        }
         robot = robot.with(next);
     }
     Ok(Arc::new(robot.build().map_err(anyhow::Error::msg)?))
