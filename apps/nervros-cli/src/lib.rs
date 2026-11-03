@@ -172,7 +172,7 @@ enum Command {
         limit: usize,
     },
     /// Write the live robot as a scripted robot file for `eval --robot`: its graph, nodes,
-    /// parameters, the profile's topics and the executor's catalog.
+    /// parameters, the profile's topics, a frame from each camera and the executor's catalog.
     #[cfg(feature = "ros")]
     Record {
         /// The file to write.

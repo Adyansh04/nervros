@@ -1057,8 +1057,9 @@ and an `expect` table (`tools`, `not_tools`, `tool_said`, `skills`, `mission`, `
 </details>
 
 `--robot <file>` runs a suite against a robot that a file describes, instead of the live graph.
-Nothing moves on a scripted robot and no camera gives an image, so a run judges what the model
-says and plans; a case that measures the robot's motion cannot pass there. A model comparison
+A successful mission moves a scripted robot as its plan says, and each camera gives one fixed
+image, so a run judges what the model says, plans and sees. Nothing else in the world changes: an
+object stays where it was after a pick, and a mission takes about a second. A model comparison
 takes minutes with no simulator running, though the model server must still be up.
 
 <details>
@@ -1068,12 +1069,36 @@ The flag repeats, and a later file replaces an earlier one's entries key by key.
 the graph and the nodes each component container hosts, what each node publishes and subscribes
 to, parameters with their descriptions, topic rates and messages, frames, and fixed answers for
 services and actions. `scenarios/robot/robot.toml` has a mission executor that accepts every plan
-and finishes every mission.
+and finishes every mission. Three more sections bring it closer to a live robot:
+
+```toml
+[frames]                                  # each camera's image, relative to this file
+"/camera/color/image_raw" = "robot-frames/camera_color_image_raw.png"
+
+[replies."/world/find_objects"]           # the answer whose word the request's field holds
+field = "query"
+otherwise = { found = false }
+[replies."/world/find_objects".by]
+mug = { found = true }
+
+[motion]                                  # how a successful mission moves the robot
+action = "/executor/execute_mission"
+planner = "/compute_path_to_pose"         # answered with a straight line to the goal
+parent = "map"
+child = "base_footprint"
+walk = { skill = "WalkStraight", metres = "distance_m", direction = "direction" }
+turn = { skill = "TurnInPlace", degrees = "degrees" }
+places = { kitchen = { x = 3.0, y = 4.0 } }   # a step's argument naming one goes there
+```
+
+A step's `x;y;yaw` station argument moves the robot there too.
 
 `nervros-cli record robot.toml` writes such a file from the live robot: the graph, the
 containers, each node's topics and services, the parameters (those `param_read_deny` hides are
 written as `(hidden)`), the rates and last messages of the topics the profile names, the robot's
-pose on the map and the executor's catalog. It records no images, point clouds, maps or TF.
+pose on the map, one frame from each of the profile's cameras (in a `robot-frames` folder beside
+the file), `[motion]` from the profile's checks, places and world model, and the executor's
+catalog. It records no point clouds, maps or TF.
 
 </details>
 
