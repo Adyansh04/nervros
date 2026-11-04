@@ -55,7 +55,10 @@ impl Tool for BackgroundTool {
                 ToolOutcome::ok(json!({"running": running}))
             }
             Some("cancel") => {
-                let id = args["id"].as_str().unwrap_or("all");
+                // Nothing named ends nothing: `all` stops patrols and searches too.
+                let Some(id) = args["id"].as_str().filter(|i| !i.is_empty()) else {
+                    return ToolOutcome::failed("say which to cancel by its id, or all");
+                };
                 // Each registry is asked: `all` reaches every one, and an id only its own.
                 let ended = self.registries.iter().filter(|r| r.end(id)).count() > 0;
                 // Ending all of none is done, not a mistake.
@@ -105,6 +108,9 @@ mod tests {
         let cancel = |id: &'static str| tool.call(json!({"action": "cancel", "id": id}));
         assert_eq!(list().await.data["running"].as_array().unwrap().len(), 2);
         assert_eq!(cancel("x9").await.status, Status::Failed);
+        let unnamed = tool.call(json!({"action": "cancel"})).await;
+        assert_eq!(unnamed.status, Status::Failed);
+        assert_eq!(list().await.data["running"].as_array().unwrap().len(), 2);
         assert_eq!(cancel("j1").await.status, Status::Succeeded);
         assert_eq!(list().await.data["running"], json!([{"id": "w1"}]));
         assert_eq!(cancel("all").await.status, Status::Succeeded);

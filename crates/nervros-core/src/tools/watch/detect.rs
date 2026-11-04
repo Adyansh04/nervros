@@ -101,12 +101,14 @@ pub(crate) struct Detector {
     robot: Arc<dyn RobotPort>,
     source: Source,
     was: bool,
-    known: BTreeSet<String>,
+    /// The objects seen so far; none before the first read that answered.
+    known: Option<BTreeSet<String>>,
 }
 
 impl Detector {
-    /// Starts looking; `objects` is where the robot's world model publishes them. What holds
-    /// already is news to the first look, unless [`Self::settle`] takes it in.
+    /// Starts looking; `objects` is where the robot's world model publishes them. A condition
+    /// that holds already is news to the first look, unless [`Self::settle`] takes it in; objects
+    /// there already never are: "appears" means after this.
     ///
     /// # Errors
     ///
@@ -142,7 +144,7 @@ impl Detector {
             robot: Arc::clone(robot),
             source,
             was: false,
-            known: BTreeSet::new(),
+            known: None,
         })
     }
 
@@ -185,14 +187,22 @@ impl Detector {
                 Ok(seen.filter(|_| fired))
             }
             Source::Object { feed, phrase, room } => {
-                let msg = self
+                // A read that went unanswered says nothing: as an empty world, it would make every
+                // object new at the next one.
+                let Ok(msg) = self
                     .robot
                     .latest(&feed.topic, &feed.msg_type, OBJECT_WAIT)
                     .await
-                    .unwrap_or(Value::Null);
+                else {
+                    return Ok(None);
+                };
                 let now = objects(&msg, phrase, room.as_deref());
-                let new: Vec<String> = now.difference(&self.known).cloned().collect();
-                self.known.extend(now);
+                let Some(known) = &mut self.known else {
+                    self.known = Some(now);
+                    return Ok(None);
+                };
+                let new: Vec<String> = now.difference(known).cloned().collect();
+                known.extend(now);
                 Ok((!new.is_empty()).then(|| format!("{} appeared", new.join(" and "))))
             }
         }
@@ -292,6 +302,39 @@ mod tests {
             Some("O5 appeared")
         );
         assert_eq!(detector.newly().await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn objects_there_already_never_fire_even_after_an_unanswered_read() {
+        let fake = Arc::new(FakeRobot::new());
+        let robot = Arc::clone(&fake) as Arc<dyn RobotPort>;
+        let trigger = Trigger::Object {
+            phrase: "cup".to_owned(),
+            room: None,
+        };
+        let mut detector = Detector::open(trigger, &robot, Some(feed())).await.unwrap();
+        assert_eq!(
+            detector.newly().await,
+            Ok(None),
+            "the topic has said nothing"
+        );
+        fake.set_topic(
+            "/objects",
+            json!({"objects": [object("O1", "white cup", "R2", 0)]}),
+        );
+        assert_eq!(
+            detector.newly().await,
+            Ok(None),
+            "O1 was there before anyone heard"
+        );
+        fake.set_topic(
+            "/objects",
+            json!({"objects": [object("O1", "white cup", "R2", 0), object("O2", "cup", "R2", 0)]}),
+        );
+        assert_eq!(
+            detector.newly().await.unwrap().as_deref(),
+            Some("O2 appeared")
+        );
     }
 
     #[tokio::test]
