@@ -180,19 +180,12 @@ impl Scene {
             .as_ref()
             .map(|s| self.arms.planning_frame(s))
             .ok_or("MoveIt's SRDF is not read yet")??;
-        let half = o.yaw / 2.0;
-        let on_map = Transform {
-            translation: o.at,
-            rotation: [0.0, 0.0, half.sin(), half.cos()],
-        };
-        let pose = map_to_planning.compose(&on_map);
-        let [x, y, z] = pose.translation;
-        let [qx, qy, qz, qw] = pose.rotation;
+        let pose = map_to_planning.compose(&Transform::from_yaw(o.at, o.yaw));
         Ok(json!({
             "header": {"frame_id": planning},
             "id": id,
             "primitives": [o.shape.primitive()],
-            "primitive_poses": [{"position": {"x": x, "y": y, "z": z}, "orientation": {"x": qx, "y": qy, "z": qz, "w": qw}}],
+            "primitive_poses": [pose.to_pose()],
             "operation": ADD,
         }))
     }

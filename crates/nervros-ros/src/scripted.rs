@@ -222,7 +222,7 @@ impl Motion {
         tf.insert(
             &self.parent,
             &self.child,
-            pose_at(x, y, now.translation[2], yaw),
+            Transform::from_yaw([x, y, now.translation[2]], yaw),
         );
     }
 
@@ -256,14 +256,6 @@ fn station(value: &str) -> Option<Spot> {
             yaw: Some(yaw),
         }),
         _ => None,
-    }
-}
-
-fn pose_at(x: f64, y: f64, z: f64, yaw: f64) -> Transform {
-    let half = yaw / 2.0;
-    Transform {
-        translation: [x, y, z],
-        rotation: [0.0, 0.0, half.sin(), half.cos()],
     }
 }
 
@@ -540,7 +532,11 @@ impl ScriptedRobot {
             robot = robot.with_rate(&topic, rate.hz, rate.bytes);
         }
         for f in self.transforms {
-            robot = robot.with_transform(&f.parent, &f.child, pose_at(f.x, f.y, f.z, f.yaw));
+            robot = robot.with_transform(
+                &f.parent,
+                &f.child,
+                Transform::from_yaw([f.x, f.y, f.z], f.yaw),
+            );
         }
         if graph != GraphDetail::default() {
             graph.topics.sort();

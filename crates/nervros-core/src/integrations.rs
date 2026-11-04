@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nervros_ros::RobotPort;
+use nervros_ros::{RobotPort, Transform};
 use serde_json::{Value, json};
 
 use crate::doctor::Check;
@@ -722,10 +722,7 @@ pub(crate) fn beside(
 pub(crate) fn stamped(frame: &str, x: f64, y: f64, yaw: f64) -> Value {
     json!({
         "header": {"frame_id": frame},
-        "pose": {
-            "position": {"x": x, "y": y, "z": 0.0},
-            "orientation": {"x": 0.0, "y": 0.0, "z": (yaw / 2.0).sin(), "w": (yaw / 2.0).cos()},
-        },
+        "pose": Transform::from_yaw([x, y, 0.0], yaw).to_pose(),
     })
 }
 
