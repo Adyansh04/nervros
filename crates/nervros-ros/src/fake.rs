@@ -173,7 +173,7 @@ impl FakeRobot {
             loop {
                 std::thread::sleep(period);
                 let Some(tx) = sender.upgrade() else { return };
-                frame.stamp_s = crate::scripted::now_s();
+                frame.stamp_s = crate::now_s();
                 tx.send_replace(Some(Arc::new(frame.clone())));
             }
         });

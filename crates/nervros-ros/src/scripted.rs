@@ -270,13 +270,6 @@ fn pose_at(x: f64, y: f64, z: f64, yaw: f64) -> Transform {
 /// How often a scripted camera sends its frame again.
 const FRAME_PERIOD: Duration = Duration::from_millis(500);
 
-/// Seconds since the epoch.
-pub(crate) fn now_s() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64())
-}
-
 /// An image file as a camera's one frame.
 fn frame_of(topic: &str, file: &std::path::Path) -> Result<Frame, String> {
     let image = image::open(file)
@@ -284,7 +277,7 @@ fn frame_of(topic: &str, file: &std::path::Path) -> Result<Frame, String> {
         .into_rgb8();
     let (width, height) = image.dimensions();
     Ok(Frame {
-        stamp_s: now_s(),
+        stamp_s: crate::now_s(),
         frame_id: "scripted".to_owned(),
         width,
         height,

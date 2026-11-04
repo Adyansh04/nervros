@@ -30,6 +30,14 @@ pub use r2r_port::{R2rConfig, R2rPort};
 
 pub use crate::image::Frame;
 
+/// Now, in seconds since the Unix epoch.
+#[must_use]
+pub fn now_s() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
 /// A mutex's guard, poisoned or not: a panic while it was held leaves data still worth reading.
 pub fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)

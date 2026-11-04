@@ -50,12 +50,14 @@ pub(crate) fn stamp_s(stamp: &serde_json::Value) -> f64 {
     stamp["sec"].as_f64().unwrap_or(0.0) + stamp["nanosec"].as_f64().unwrap_or(0.0) * 1e-9
 }
 
-/// Now, in seconds since the Unix epoch.
-#[must_use]
-pub fn now_s() -> f64 {
-    std::time::SystemTime::now()
+pub use nervros_ros::now_s;
+
+/// Now as a ROS `builtin_interfaces/Time`.
+pub(crate) fn stamp_now() -> serde_json::Value {
+    let since = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64())
+        .unwrap_or_default();
+    serde_json::json!({"sec": since.as_secs(), "nanosec": since.subsec_nanos()})
 }
 
 /// `n` and its noun, which takes an "s" unless `n` is 1: "1 step", "3 steps".

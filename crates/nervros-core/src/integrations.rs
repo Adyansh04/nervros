@@ -213,11 +213,8 @@ impl Drop for Tracked {
 
 /// An `OpenGoals` message of `open`.
 fn open_goals(open: &[(String, uuid::Uuid)]) -> Value {
-    let since = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
     json!({
-        "stamp": {"sec": since.as_secs(), "nanosec": since.subsec_nanos()},
+        "stamp": crate::stamp_now(),
         "client": crate::mission::client_id(),
         "actions": open.iter().map(|(a, _)| a).collect::<Vec<_>>(),
         "goal_ids": open.iter().map(|(_, id)| json!({"uuid": id.as_bytes()})).collect::<Vec<_>>(),

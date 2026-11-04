@@ -333,11 +333,8 @@ pub(crate) fn client_id() -> String {
 impl crate::session::Pulse for Missions {
     fn pulse(&self) {
         if let Some(publisher) = lock(&self.heartbeat).as_ref() {
-            let since = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
             publisher.send(json!({
-                "stamp": {"sec": since.as_secs(), "nanosec": since.subsec_nanos()},
+                "stamp": crate::stamp_now(),
                 "client": self.client,
             }));
         }

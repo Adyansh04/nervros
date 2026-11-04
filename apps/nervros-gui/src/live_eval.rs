@@ -282,9 +282,7 @@ impl Capture {
         match ffmpeg {
             Ok(ffmpeg) => {
                 let now = Instant::now();
-                let epoch = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0.0, |d| d.as_secs_f64());
+                let epoch = nervros_core::now_s();
                 Some(Self {
                     ffmpeg,
                     base: base.to_owned(),
