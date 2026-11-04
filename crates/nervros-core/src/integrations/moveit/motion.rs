@@ -367,8 +367,9 @@ impl Native {
         }
         let turned = m.arms.tip_orientation(&planning, &tip);
         let constraints = point_constraints(&planning, &tip, at, &turned);
-        // What the hand holds stays as level as it is now the whole way: a full mug spills.
-        let held = !m.holding(&group).await?.is_empty();
+        // What the hand holds stays as level as it is now the whole way: a full mug spills. Not
+        // knowing what it holds is no reason not to move.
+        let held = m.holding(&group).await.is_ok_and(|h| !h.is_empty());
         let path = held.then(|| held_level(&planning, &tip, &turned));
         m.lent(ARM_S, m.move_group(&group, (constraints, path), ctl))
             .await

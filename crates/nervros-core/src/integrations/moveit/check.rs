@@ -283,7 +283,8 @@ impl ArmCheck {
             return ToolOutcome::failed("line needs distance_m");
         };
         let direction = args["direction"].as_str().unwrap_or_default();
-        let way = match along(direction, metres.clamp(0.0, MAX_LINE_M)) {
+        let metres = metres.clamp(0.0, MAX_LINE_M);
+        let way = match along(direction, metres) {
             Ok(w) => w,
             Err(why) => return ToolOutcome::failed(why),
         };
@@ -307,6 +308,8 @@ impl ArmCheck {
             .await;
         ToolOutcome::ok(json!({
             "group": group,
+            "direction": direction,
+            "distance_m": metres,
             "clear": share >= CLEAR_SHARE,
             "clear_share": (share * 100.0).round() / 100.0,
             "drawn": drawn,
