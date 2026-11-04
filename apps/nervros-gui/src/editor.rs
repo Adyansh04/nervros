@@ -4,11 +4,11 @@
 //! operator's are one history, and each shows in the other within a poll.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nervros_core::editor::EditorClient;
-use nervros_ros::RobotPort;
+use nervros_ros::{RobotPort, lock};
 use rerun::external::egui::{self, Pos2, Rect, Vec2};
 use serde_json::Value;
 
@@ -151,10 +151,6 @@ pub(crate) struct WorldEditor {
     last_poll: Option<Instant>,
     /// Where the canvas was last drawn, for centring on a thing picked from the dock.
     canvas: Rect,
-}
-
-fn lock(m: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl WorldEditor {

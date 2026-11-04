@@ -2,10 +2,12 @@
 //! view's properties from Rust, and the panes need theirs (the 3D view's eye, background and
 //! grid, the camera views' background, the log's columns).
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+
 use std::time::{Duration, Instant};
 
+use nervros_ros::lock;
 use rerun::blueprint::components::{
     ActiveTab, AutoLayout, AutoViews, BackgroundKind, ColumnShare, ContainerKind, Eye3DKind,
     IncludedContent, QueryExpression, RootContainer, RowShare, TextLogColumn, TimelineColumn,
@@ -184,8 +186,8 @@ impl Layout {
     /// Sends the layout and makes it active, not only the default: the viewer would otherwise
     /// restore the last session's, closed panes and an older version's layout included.
     pub(super) fn send(&self) {
-        let bounds = *self.bounds.lock().unwrap_or_else(PoisonError::into_inner);
-        *self.framed.lock().unwrap_or_else(PoisonError::into_inner) = bounds;
+        let bounds = *lock(&self.bounds);
+        *lock(&self.framed) = bounds;
         let strip = self.strip.load(Ordering::Relaxed);
         let root = panes(&self.cameras, bounds, self.following(), strip);
         if let Err(e) = send(&self.rec, &root) {
@@ -204,22 +206,14 @@ impl Layout {
 
     /// Shows the strip's Plots tab, where a plot the agent just started draws.
     pub(super) fn show_plots(&self, for_s: u64) {
-        *self
-            .plots_until
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) =
-            Some(Instant::now() + Duration::from_secs(for_s));
+        *lock(&self.plots_until) = Some(Instant::now() + Duration::from_secs(for_s));
         self.show_strip(PLOTS_TAB);
     }
 
     /// Shows the strip's Mission tab, where a mission's steps draw as it runs, unless a plot
     /// still draws there.
     pub(super) fn show_mission(&self) {
-        let plotting = self
-            .plots_until
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some_and(|until| Instant::now() < until);
+        let plotting = lock(&self.plots_until).is_some_and(|until| Instant::now() < until);
         if !plotting {
             self.show_strip(MISSION_TAB);
         }
@@ -234,8 +228,8 @@ impl Layout {
     /// Frames the 3D view on the first map, and again while a map being built outgrows what it
     /// was framed on; a map that holds still leaves the operator's view alone.
     pub(super) fn map(&self, extent: [f32; 4]) {
-        *self.bounds.lock().unwrap_or_else(PoisonError::into_inner) = Some(extent);
-        let framed = *self.framed.lock().unwrap_or_else(PoisonError::into_inner);
+        *lock(&self.bounds) = Some(extent);
+        let framed = *lock(&self.framed);
         if framed.is_none_or(|framed| outgrows(framed, extent)) {
             self.send();
         }

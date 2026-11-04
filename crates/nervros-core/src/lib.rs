@@ -66,10 +66,7 @@ pub(crate) fn duration_words(seconds: f64) -> String {
     }
 }
 
-/// A mutex's guard, poisoned or not: a panic while it was held leaves data still worth reading.
-pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+pub(crate) use nervros_ros::lock;
 
 #[cfg(test)]
 mod tests {

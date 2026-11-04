@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,6 +14,7 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::lock;
 use crate::tf::TfBuffer;
 use crate::{
     Frame, Goal, GoalResult, GoalStatus, Graph, GraphDetail, NodeEntities, Publisher, RobotPort,
@@ -83,10 +84,6 @@ impl std::fmt::Debug for FakeRobot {
             .field("actions", &self.actions.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
-}
-
-pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl FakeRobot {

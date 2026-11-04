@@ -18,8 +18,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::fake::{FakeRobot, ScriptedRun, lock};
+use crate::fake::{FakeRobot, ScriptedRun};
 use crate::image::Frame;
+use crate::lock;
 use crate::tf::TfBuffer;
 use crate::{
     Endpoint, GoalResult, GoalStatus, GraphDetail, NamesAndTypes, NodeEntities, QosInfo,

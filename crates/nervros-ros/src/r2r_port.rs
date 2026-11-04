@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,7 @@ use r2r::QosProfile;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::lock;
 use crate::tf::TfBuffer;
 use crate::{
     Endpoint, Frame, Goal, GoalResult, GoalStatus, Graph, GraphDetail, NamesAndTypes, NodeEntities,
@@ -151,10 +152,6 @@ impl std::fmt::Debug for R2rPort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("R2rPort").finish_non_exhaustive()
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn mw(e: impl std::fmt::Display) -> RosError {

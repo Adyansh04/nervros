@@ -2,9 +2,9 @@
 //! profile's `[[viz.layer]]` list, and the switches the operator hides any layer with.
 
 use std::collections::BTreeSet;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard};
 
-use nervros_ros::Transform;
+use nervros_ros::{Transform, lock};
 use rerun::RecordingStream;
 use serde_json::{Value, json};
 
@@ -17,7 +17,7 @@ pub struct Layers(Mutex<Vec<(String, bool)>>);
 
 impl Layers {
     fn lock(&self) -> MutexGuard<'_, Vec<(String, bool)>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.0)
     }
 
     /// Adds a layer at the end, unless one has that name.

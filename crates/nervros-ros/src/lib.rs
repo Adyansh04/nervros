@@ -29,6 +29,11 @@ pub mod tf;
 pub use r2r_port::{R2rConfig, R2rPort};
 
 pub use crate::image::Frame;
+
+/// A mutex's guard, poisoned or not: a panic while it was held leaves data still worth reading.
+pub fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 pub use crate::tf::Transform;
 
 /// A ROS operation that failed.
