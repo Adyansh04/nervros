@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use crate::job::envelope::{DEFAULT_MINUTES, MAX_MINUTES};
 use crate::job::{Approval, Context, Envelope, JobKind, Jobs};
+use crate::mission::MissionEnd;
 use crate::mission::catalog::GO_TO_PLACE;
 use crate::mission::check::{self, Observed};
 use crate::mission::{Missions, Outcome};
@@ -102,26 +103,13 @@ async fn patrol(
     for (n, place) in places.iter().enumerate() {
         ctx.log(format!("{}. {place}", n + 1));
         let steps = json!([{"skill": GO_TO_PLACE, "args": {"place": place}}]);
-        let end = missions
-            .run_for_job(ctx, &format!("patrol to {place}"), steps)
-            .await
-            .map_err(|e| format!("the patrol could not go on: {e}"))?;
-        if let Some(fault) = end.fault {
-            return Err(format!(
-                "the patrol stopped at {place}, cut short by the robot ({}): {}",
-                fault.as_str(),
-                end.reason
-            ));
+        let end = run_at(missions, ctx, place, &format!("patrol to {place}"), steps).await?;
+        if end.outcome != Outcome::Success {
+            ctx.log(format!("could not get to {place}: {}", end.reason));
+            missed.push(place.clone());
+            continue;
         }
-        match end.outcome {
-            Outcome::Success => visited.push(place.clone()),
-            Outcome::Canceled => return Err("the patrol was stopped".to_owned()),
-            _ => {
-                ctx.log(format!("could not get to {place}: {}", end.reason));
-                missed.push(place.clone());
-                continue;
-            }
-        }
+        visited.push(place.clone());
         let arrived = crate::now_s();
         match turn {
             Some(turn) => look_around(missions, ctx, place, turn).await?,
@@ -161,6 +149,31 @@ async fn patrol(
     Ok(text)
 }
 
+/// Runs `steps` at `place` as a job; an end that is not a fault or a cancel is the caller's to read.
+async fn run_at(
+    missions: &Arc<Missions>,
+    ctx: &Context,
+    place: &str,
+    intent: &str,
+    steps: Value,
+) -> Result<MissionEnd, String> {
+    let end = missions
+        .run_for_job(ctx, intent, steps)
+        .await
+        .map_err(|e| format!("the patrol could not go on: {e}"))?;
+    if let Some(fault) = end.fault {
+        return Err(format!(
+            "the patrol stopped at {place}, cut short by the robot ({}): {}",
+            fault.as_str(),
+            end.reason
+        ));
+    }
+    if end.outcome == Outcome::Canceled {
+        return Err("the patrol was stopped".to_owned());
+    }
+    Ok(end)
+}
+
 /// The views of a full turn on the spot at `place`, each held still: a turn mid-way is no view to
 /// the world model. A turn that fails ends the look and the round goes on: the place was reached,
 /// and the views taken still count.
@@ -173,24 +186,11 @@ async fn look_around(
     let quarter = json!([{"skill": turn.skill, "args": {turn.degrees.as_str(): LOOK_STEP_DEG}}]);
     for view in 0..LOOK_VIEWS {
         if view > 0 {
-            let end = missions
-                .run_for_job(ctx, &format!("look around at {place}"), quarter.clone())
-                .await
-                .map_err(|e| format!("the patrol could not go on: {e}"))?;
-            if let Some(fault) = end.fault {
-                return Err(format!(
-                    "the patrol stopped at {place}, cut short by the robot ({}): {}",
-                    fault.as_str(),
-                    end.reason
-                ));
-            }
-            match end.outcome {
-                Outcome::Success => {}
-                Outcome::Canceled => return Err("the patrol was stopped".to_owned()),
-                _ => {
-                    ctx.log(format!("could not look around at {place}: {}", end.reason));
-                    return Ok(());
-                }
+            let intent = format!("look around at {place}");
+            let end = run_at(missions, ctx, place, &intent, quarter.clone()).await?;
+            if end.outcome != Outcome::Success {
+                ctx.log(format!("could not look around at {place}: {}", end.reason));
+                return Ok(());
             }
         }
         hold(ctx).await?;

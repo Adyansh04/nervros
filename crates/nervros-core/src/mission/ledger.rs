@@ -311,11 +311,21 @@ impl Ledger {
         target: &str,
         since_s: f64,
     ) -> rusqlite::Result<Option<Track>> {
+        self.tally(skill, Some(target), since_s)
+    }
+
+    /// The runs of `skill` that count, on `target` or, with none, on whatever it acted on.
+    fn tally(
+        &self,
+        skill: &str,
+        target: Option<&str>,
+        since_s: f64,
+    ) -> rusqlite::Result<Option<Track>> {
         let db = self.db();
         let mut runs = db.prepare_cached(
             "SELECT steps.outcome, steps.seconds, steps.reason FROM steps
              JOIN missions ON missions.id = steps.mission
-             WHERE steps.skill = ?1 AND steps.target = ?2
+             WHERE steps.skill = ?1 AND (?5 OR steps.target = ?2)
                AND steps.outcome IN ('success', 'failure')
                AND missions.fault = '' AND missions.outcome <> 'running'
                AND missions.started >= ?4
@@ -328,13 +338,22 @@ impl Ledger {
             last_failure: None,
         };
         let mut times = Vec::new();
-        let rows = runs.query_map(params![skill, target, TRACK_RUNS, since_s], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<f64>>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
+        let rows = runs.query_map(
+            params![
+                skill,
+                target.unwrap_or_default(),
+                TRACK_RUNS,
+                since_s,
+                target.is_none()
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<f64>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )?;
         for row in rows {
             let (outcome, seconds, reason) = row?;
             track.runs += 1;
@@ -360,21 +379,9 @@ impl Ledger {
     ///
     /// The read failed.
     pub fn skill_runs(&self, skill: &str) -> rusqlite::Result<(u32, u32)> {
-        let db = self.db();
-        let mut runs = db.prepare_cached(
-            "SELECT steps.outcome FROM steps JOIN missions ON missions.id = steps.mission
-             WHERE steps.skill = ?1 AND steps.outcome IN ('success', 'failure')
-               AND missions.fault = '' AND missions.outcome <> 'running'
-             ORDER BY missions.started DESC LIMIT ?2",
-        )?;
-        let outcomes: Vec<String> = runs
-            .query_map(params![skill, TRACK_RUNS], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        let succeeded = outcomes.iter().filter(|o| *o == "success").count();
-        Ok((
-            u32::try_from(outcomes.len()).unwrap_or(u32::MAX),
-            u32::try_from(succeeded).unwrap_or(u32::MAX),
-        ))
+        Ok(self
+            .tally(skill, None, 0.0)?
+            .map_or((0, 0), |t| (t.runs, t.succeeded)))
     }
 
     /// Marks the missions still kept as running, other than `still`, as cut short when NervROS
