@@ -30,6 +30,7 @@ mod tests;
 mod tf;
 
 pub use config::RosToolsConfig;
+pub use params::param_value;
 
 // Limits that keep a sample, an echo or a burst of messages small and short.
 const MAX_SAMPLE: Duration = Duration::from_secs(10);
@@ -45,13 +46,22 @@ const PARAMS_MAX: usize = 80;
 const ARRAY_ITEMS: usize = 8;
 const TEXT_CHARS: usize = 120;
 /// Message types too large to read message by message: echoed, watched or plotted.
-pub(crate) const BULK_TYPES: [&str; 5] = [
+pub const BULK_TYPES: [&str; 5] = [
     "sensor_msgs/msg/Image",
     "sensor_msgs/msg/CompressedImage",
     "sensor_msgs/msg/PointCloud2",
     "nav_msgs/msg/OccupancyGrid",
     "octomap_msgs/msg/Octomap",
 ];
+
+/// Whether `name` matches one of the `patterns`, whatever the case.
+#[must_use]
+pub fn masked(patterns: &[String], name: &str) -> bool {
+    let name = name.to_lowercase();
+    patterns
+        .iter()
+        .any(|p| glob_match(&p.to_lowercase(), &name))
+}
 
 struct Ctx {
     robot: Arc<dyn RobotPort>,
@@ -63,11 +73,7 @@ struct Ctx {
 impl Ctx {
     /// Whether a parameter's value is hidden, whatever the case of its name: `apiKey` too.
     fn masked(&self, name: &str) -> bool {
-        let name = name.to_lowercase();
-        self.config
-            .param_read_deny
-            .iter()
-            .any(|p| glob_match(&p.to_lowercase(), &name))
+        masked(&self.config.param_read_deny, name)
     }
 
     fn hidden(&self, name: &str) -> bool {

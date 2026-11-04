@@ -16,16 +16,12 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use nervros_core::profile::Profile;
+use nervros_core::ros_tools::{BULK_TYPES, param_value};
 use nervros_ros::{GraphDetail, RobotPort};
 use serde_json::{Map, Value, json};
 
-/// Types too large to keep a message of: images, clouds, grids and masks.
-const BULK: [&str; 7] = [
-    "sensor_msgs/msg/Image",
-    "sensor_msgs/msg/CompressedImage",
-    "sensor_msgs/msg/PointCloud2",
-    "nav_msgs/msg/OccupancyGrid",
-    "octomap_msgs/msg/Octomap",
+/// Types too large to keep a message of, besides the tool's [`BULK_TYPES`].
+const ALSO_BULK: [&str; 2] = [
     "canopy_msgs/msg/InstanceMaskArray",
     "tf2_msgs/msg/TFMessage",
 ];
@@ -55,10 +51,9 @@ const FRAME_WAIT: Duration = Duration::from_secs(5);
 ///
 /// The profile cannot be loaded, the robot cannot be reached, or the file cannot be written.
 pub(crate) async fn record(profile_path: &Path, out: &Path) -> Result<()> {
-    let profile = Profile::load(profile_path).context("loading the profile")?;
-    let robot = nervros_core::app::connect(&profile)?;
+    let profile = crate::load(profile_path)?;
     // A recording of half the graph would be a different robot.
-    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
+    let robot = crate::live(&profile).await?;
     let graph = robot.graph_detail().await.context("reading the graph")?;
     let mut doc = Map::new();
     let first = |items: &[(String, Vec<String>)]| -> Map<String, Value> {
@@ -285,23 +280,6 @@ async fn nodes(robot: &Arc<dyn RobotPort>, graph: &GraphDetail) -> Value {
     Value::Object(out)
 }
 
-/// A `rcl_interfaces/msg/ParameterValue` as plain JSON.
-fn plain(v: &Value) -> Value {
-    let field = match v["type"].as_u64() {
-        Some(1) => "bool_value",
-        Some(2) => "integer_value",
-        Some(3) => "double_value",
-        Some(4) => "string_value",
-        Some(5) => "byte_array_value",
-        Some(6) => "bool_array_value",
-        Some(7) => "integer_array_value",
-        Some(8) => "double_array_value",
-        Some(9) => "string_array_value",
-        _ => return Value::Null,
-    };
-    v[field].clone()
-}
-
 /// One node's parameters with their descriptions; none when it does not answer. A value the
 /// profile hides from the agent, such as a key, is not written down either.
 async fn node_params(
@@ -344,14 +322,10 @@ async fn node_params(
         .unwrap_or_default();
     let mut out = Map::new();
     for (i, name) in names.iter().enumerate() {
-        let lower = name.to_lowercase();
-        let value = if masked
-            .iter()
-            .any(|p| nervros_core::guard::glob_match(&p.to_lowercase(), &lower))
-        {
+        let value = if nervros_core::ros_tools::masked(&masked, name) {
             json!("(hidden)")
         } else {
-            values.get(i).map(plain).unwrap_or_default()
+            values.get(i).map(param_value).unwrap_or_default()
         };
         if value.is_null() {
             continue;
@@ -473,7 +447,7 @@ async fn messages(
         let Some(ty) = type_of(graph, topic) else {
             continue;
         };
-        if BULK.contains(&ty) {
+        if BULK_TYPES.contains(&ty) || ALSO_BULK.contains(&ty) {
             continue;
         }
         if let Ok(message) = robot.latest(topic, ty, Duration::from_secs(2)).await

@@ -88,7 +88,7 @@ pub(crate) async fn run(
         .with_context(|| format!("reading {}", suite_path.display()))?;
     let suite: Suite =
         toml::from_str(&text).with_context(|| format!("parsing {}", suite_path.display()))?;
-    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let profile = crate::load(profile_path)?;
     let models =
         ModelsConfig::load(&profile.resolve(&profile.models.file)).context("loading the models")?;
     if let Some(m) = options.models.iter().find(|m| models.model(m).is_none()) {
@@ -164,9 +164,7 @@ pub(crate) async fn run(
 /// scripted robot they describe.
 async fn robot_for(profile: &Profile, files: &[PathBuf]) -> Result<Arc<dyn RobotPort>> {
     if files.is_empty() {
-        let robot = nervros_core::app::connect(profile)?;
-        nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
-        return Ok(robot);
+        return crate::live(profile).await;
     }
     scripted_robot(files)
 }

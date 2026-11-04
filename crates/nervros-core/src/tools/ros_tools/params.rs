@@ -64,7 +64,8 @@ struct Params {
 }
 
 /// A `rcl_interfaces/msg/ParameterValue` as plain JSON.
-pub(crate) fn param_value(v: &Value) -> Value {
+#[must_use]
+pub fn param_value(v: &Value) -> Value {
     match v["type"].as_u64() {
         Some(1) => v["bool_value"].clone(),
         Some(2) => v["integer_value"].clone(),

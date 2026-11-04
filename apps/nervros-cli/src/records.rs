@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use nervros_core::mission::ledger::Ledger;
-use nervros_core::profile::Profile;
 use serde_json::Value;
 
 /// A session log by path, or `last` for the newest under the state folder.
@@ -120,7 +119,7 @@ fn describe(e: &Value) -> Option<String> {
 /// The robot's mission ledger, or `None`, said, when it has run none yet: an empty record is not
 /// an error.
 fn open_ledger(profile: &Path) -> Result<Option<std::sync::Arc<Ledger>>> {
-    let profile = Profile::load(profile).context("loading the profile")?;
+    let profile = crate::load(profile)?;
     let path = nervros_core::app::mission_ledger_file(&profile, &nervros_core::app::state_dir());
     if !path.exists() {
         println!("no missions recorded yet ({})", path.display());
@@ -212,7 +211,7 @@ pub fn gaps(profile: &Path, limit: usize) -> Result<()> {
 /// The proposed fixes, each accepted one with its step's record before and since; with
 /// `dismiss`, that one turned down first.
 pub fn inbox(profile_path: &Path, dismiss: Option<u32>) -> Result<()> {
-    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let profile = crate::load(profile_path)?;
     let file = nervros_core::app::inbox_file(&profile, &nervros_core::app::state_dir());
     if let Some(id) = dismiss {
         nervros_core::mission::inbox::dismiss_in(&file, id).map_err(anyhow::Error::msg)?;
@@ -254,7 +253,7 @@ pub fn digest(profile: &Path, hours: f64) -> Result<()> {
         Some(ledger) => ledger.since(since)?,
         None => Vec::new(),
     };
-    let profile = Profile::load(profile).context("loading the profile")?;
+    let profile = crate::load(profile)?;
     let state = nervros_core::app::state_dir();
     let (file, _) = nervros_core::app::incident_files(&profile, &state);
     let incidents: Vec<_> = nervros_core::incident::read(&file)
@@ -280,7 +279,7 @@ pub fn digest(profile: &Path, hours: f64) -> Result<()> {
 
 /// The robot's incidents, newest first, or one in full by its id.
 pub fn incidents(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
-    let profile = Profile::load(profile).context("loading the profile")?;
+    let profile = crate::load(profile)?;
     let (file, _) = nervros_core::app::incident_files(&profile, &nervros_core::app::state_dir());
     let all = nervros_core::incident::read(&file);
     let now = nervros_core::now_s();

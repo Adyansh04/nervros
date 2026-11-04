@@ -5,7 +5,6 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 use nervros_core::mcp::{self, Lock, McpServer, Pin};
-use nervros_core::profile::Profile;
 
 /// Lists every server's named tools with their pins, or pins one server's tools.
 pub async fn run(
@@ -14,7 +13,7 @@ pub async fn run(
     server: Option<&str>,
     tools: &[String],
 ) -> Result<()> {
-    let profile = Profile::load(profile).context("loading the profile")?;
+    let profile = crate::load(profile)?;
     let lock_path = profile.resolve(Path::new(mcp::LOCK_FILE));
     let mut lock = Lock::load(&lock_path).map_err(anyhow::Error::msg)?;
     if profile.mcp_servers.is_empty() {

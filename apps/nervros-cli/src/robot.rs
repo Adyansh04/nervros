@@ -5,13 +5,12 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use nervros_core::look::LookTool;
-use nervros_core::profile::Profile;
 use nervros_core::segment::SegmentTool;
 use nervros_core::tools::{Status, Tool};
 use nervros_core::vision::{Cameras, SnapshotStore};
 
 pub(crate) async fn look(profile_path: &Path, camera: Option<String>, out: &Path) -> Result<()> {
-    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let profile = crate::load(profile_path)?;
     let config = profile
         .look
         .clone()
@@ -29,7 +28,7 @@ pub(crate) async fn segment(
 ) -> Result<()> {
     use nervros_core::llm::Llm;
 
-    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let profile = crate::load(profile_path)?;
     let look = profile
         .look
         .clone()
@@ -87,7 +86,7 @@ pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<(
 
     let args: serde_json::Value =
         serde_json::from_str(args).context("the arguments are not JSON")?;
-    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let profile = crate::load(profile_path)?;
     let robot = nervros_core::app::connect(&profile)?;
     let schemas: Arc<dyn SchemaSource> =
         Arc::new(RosidlSchemas::load(&profile).context("loading the interfaces")?);
@@ -545,9 +544,8 @@ async fn interactive(
 }
 
 pub(crate) async fn doctor(profile_path: &Path) -> Result<()> {
-    let profile = Profile::load(profile_path).context("loading the profile")?;
-    let robot = nervros_core::app::connect(&profile)?;
-    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
+    let profile = crate::load(profile_path)?;
+    let robot = crate::live(&profile).await?;
     let checks = nervros_core::doctor::run(&profile, robot.as_ref()).await;
     for c in &checks {
         println!("{} {}", if c.ok { "ok     " } else { "MISSING" }, c.what);
@@ -561,9 +559,8 @@ pub(crate) async fn doctor(profile_path: &Path) -> Result<()> {
 
 /// Investigates the robot now and prints the incident, kept with the robot's others.
 pub(crate) async fn why(profile_path: &Path) -> Result<()> {
-    let profile = Profile::load(profile_path).context("loading the profile")?;
-    let robot = nervros_core::app::connect(&profile)?;
-    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
+    let profile = crate::load(profile_path)?;
+    let robot = crate::live(&profile).await?;
     let (file, remembered) =
         nervros_core::app::incident_files(&profile, &nervros_core::app::state_dir());
     let investigator =
@@ -582,9 +579,8 @@ pub(crate) async fn why(profile_path: &Path) -> Result<()> {
 
 /// Drafts the robot's self-description from the live robot, or prints the facts it would use.
 pub(crate) async fn whoami(profile_path: &Path, only_facts: bool) -> Result<()> {
-    let profile = Profile::load(profile_path).context("loading the profile")?;
-    let robot = nervros_core::app::connect(&profile)?;
-    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
+    let profile = crate::load(profile_path)?;
+    let robot = crate::live(&profile).await?;
     let facts = nervros_core::whoami::facts(&profile, robot.as_ref()).await;
     if only_facts {
         println!("{}", serde_json::to_string_pretty(&facts)?);
