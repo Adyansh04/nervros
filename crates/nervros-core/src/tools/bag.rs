@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
+use futures::stream::BoxStream;
 use mcap::records::MessageHeader;
 use nervros_ros::RobotPort;
 use serde::{Deserialize, Serialize};
@@ -32,8 +33,12 @@ const MAX_S: u64 = 3600;
 const MAX_BYTES: u64 = 2 << 30;
 const MAX_TOPICS: usize = 32;
 const MAX_RECORDINGS: usize = 2;
-/// Messages waiting for the disk. A full queue drops and counts rather than falling behind.
+/// What recordings may hold in all: they are not removed by this tool.
+const MAX_FOLDER_BYTES: u64 = 20 << 30;
+/// Messages waiting for the disk, and their bytes: raw images fill memory long before the count.
+/// A full queue drops and counts rather than falling behind.
 const QUEUE: usize = 4096;
+const QUEUE_BYTES: u64 = 256 << 20;
 /// How often a recording looks at its stop and its limits when nothing arrives.
 const LOOK: Duration = Duration::from_millis(200);
 
@@ -134,6 +139,7 @@ impl Bags {
                 "a recording `{name}` exists already; give another name"
             ));
         }
+        self.has_room()?;
         let mut topics = self.topics(args).await?;
         let seconds = args["seconds"]
             .as_u64()
@@ -147,36 +153,25 @@ impl Bags {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let (tx, rx) = mpsc::sync_channel(QUEUE);
-        let mut readers = Vec::with_capacity(topics.len());
-        for (at, t) in topics.iter().enumerate() {
-            let mut messages = self
+        // Every subscription first: a topic that cannot be read leaves nothing running.
+        let mut streams = Vec::with_capacity(topics.len());
+        for t in &topics {
+            let messages = self
                 .robot
                 .raw(&t.topic, &t.ty)
                 .await
                 .map_err(|e| format!("cannot read {}: {e}", t.topic))?;
-            let (tx, dropped) = (tx.clone(), Arc::clone(&t.dropped));
-            readers.push(tokio::spawn(async move {
-                while let Some(bytes) = messages.next().await {
-                    let now = crate::now_s();
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        reason = "nanoseconds since the epoch, for centuries yet"
-                    )]
-                    let at_ns = (now * 1e9) as u64;
-                    match tx.try_send((at, at_ns, bytes)) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(_)) => {
-                            dropped.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(TrySendError::Disconnected(_)) => return,
-                    }
-                }
-            }));
+            streams.push(messages);
+        }
+        let (mut running, id) = self.room()?;
+        let (tx, rx) = mpsc::sync_channel(QUEUE);
+        let queued = Arc::new(AtomicU64::new(0));
+        let mut readers = Vec::with_capacity(topics.len());
+        for (at, (t, messages)) in topics.iter().zip(streams).enumerate() {
+            let queue = (tx.clone(), Arc::clone(&queued), Arc::clone(&t.dropped));
+            readers.push(tokio::spawn(read_into(at, messages, queue)));
         }
         drop(tx);
-        let (mut running, id) = self.room()?;
         let (stop, stopped) = watch::channel(false);
         let session = self.session.get().cloned();
         let (task_id, dir) = (id.clone(), self.dir.clone());
@@ -185,7 +180,7 @@ impl Bags {
             let ended = tokio::task::spawn_blocking(move || {
                 std::fs::create_dir_all(&dir)
                     .map_err(|e| format!("making {}: {e}", dir.display()))?;
-                write(&file, &mut topics, &rx, &stopped, until)
+                write(&file, &mut topics, (&rx, &queued), &stopped, until)
             })
             .await
             .map_err(|e| e.to_string())
@@ -193,20 +188,7 @@ impl Bags {
             for reader in readers {
                 reader.abort();
             }
-            let report = match ended {
-                Ok(s) => format!(
-                    "Recording {task_id} ended: {} in {:.0} s, {} MB, in {}.{}",
-                    crate::counted(
-                        s.topics.values().map(|t| t.messages).sum::<u64>(),
-                        "message"
-                    ),
-                    s.seconds,
-                    s.bytes >> 20,
-                    s.file.display(),
-                    lost(&s)
-                ),
-                Err(e) => format!("Recording {task_id} failed: {e}."),
-            };
+            let report = said(&task_id, ended);
             if let Some(s) = session {
                 s.send(Command::Report(report));
             }
@@ -248,6 +230,32 @@ impl Bags {
             });
         }
         Ok(topics)
+    }
+
+    /// Why no recording may start now, if so.
+    fn has_room(&self) -> Result<(), String> {
+        let mut running = self.lock();
+        running.retain(|e| !e.task.is_finished());
+        if running.len() >= MAX_RECORDINGS {
+            return Err(format!(
+                "{MAX_RECORDINGS} recordings run already; cancel one with background first"
+            ));
+        }
+        let held: u64 = std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        if held >= MAX_FOLDER_BYTES {
+            return Err(format!(
+                "the recordings in {} hold {} GB already: ask the operator to clear some",
+                self.dir.display(),
+                held >> 30
+            ));
+        }
+        Ok(())
     }
 
     /// The running recordings, with room for one more, and its id.
@@ -292,6 +300,55 @@ fn summary_of(path: &Path) -> Option<Summary> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
+/// Queues each message of topic number `at` for the file until the stream or the file ends. The
+/// queue is `(sender, the bytes in it, the messages dropped)`.
+async fn read_into(
+    at: usize,
+    mut messages: BoxStream<'static, Vec<u8>>,
+    (tx, queued, dropped): (mpsc::SyncSender<Arrived>, Arc<AtomicU64>, Arc<AtomicU64>),
+) {
+    while let Some(bytes) = messages.next().await {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "nanoseconds since the epoch, for centuries yet"
+        )]
+        let at_ns = (crate::now_s() * 1e9) as u64;
+        let size = bytes.len() as u64;
+        if queued.load(Ordering::Relaxed) + size > QUEUE_BYTES {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        queued.fetch_add(size, Ordering::Relaxed);
+        match tx.try_send((at, at_ns, bytes)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                queued.fetch_sub(size, Ordering::Relaxed);
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => return,
+        }
+    }
+}
+
+/// What a recording's report says of how it ended.
+fn said(id: &str, ended: Result<Summary, String>) -> String {
+    match ended {
+        Ok(s) => format!(
+            "Recording {id} ended: {} in {:.0} s, {} MB, in {}.{}",
+            crate::counted(
+                s.topics.values().map(|t| t.messages).sum::<u64>(),
+                "message"
+            ),
+            s.seconds,
+            s.bytes >> 20,
+            s.file.display(),
+            lost(&s)
+        ),
+        Err(e) => format!("Recording {id} failed: {e}."),
+    }
+}
+
 /// What a report says about messages the disk could not keep up with.
 fn lost(summary: &Summary) -> String {
     let dropped: u64 = summary.topics.values().map(|t| t.dropped).sum();
@@ -334,7 +391,7 @@ fn bag_name(args: &Value) -> Result<String, String> {
 fn write(
     file: &Path,
     topics: &mut [Recorded],
-    arrivals: &mpsc::Receiver<Arrived>,
+    (arrivals, queued): (&mpsc::Receiver<Arrived>, &AtomicU64),
     stopped: &watch::Receiver<bool>,
     until: Duration,
 ) -> Result<Summary, String> {
@@ -358,24 +415,32 @@ fn write(
         );
     }
     let mut bytes = 0u64;
-    while !*stopped.borrow() && started.0.elapsed() < until && bytes < MAX_BYTES {
+    let mut keep = |bag: &mut mcap::Writer<BufWriter<File>>, (at, time, data): Arrived| {
+        let t: &mut Recorded = &mut topics[at];
+        let header = MessageHeader {
+            channel_id: channels[at],
+            sequence: u32::try_from(t.messages).unwrap_or(u32::MAX),
+            log_time: time,
+            publish_time: time,
+        };
+        bag.write_to_known_channel(&header, &data).map_err(failed)?;
+        t.messages += 1;
+        let size = data.len() as u64;
+        bytes += size;
+        queued.fetch_sub(size, Ordering::Relaxed);
+        Ok::<_, String>(bytes)
+    };
+    let mut held = 0;
+    while !*stopped.borrow() && started.0.elapsed() < until && held < MAX_BYTES {
         match arrivals.recv_timeout(LOOK) {
-            Ok((at, time, data)) => {
-                let t = &mut topics[at];
-                let sequence = u32::try_from(t.messages).unwrap_or(u32::MAX);
-                let header = MessageHeader {
-                    channel_id: channels[at],
-                    sequence,
-                    log_time: time,
-                    publish_time: time,
-                };
-                bag.write_to_known_channel(&header, &data).map_err(failed)?;
-                t.messages += 1;
-                bytes += data.len() as u64;
-            }
+            Ok(arrived) => held = keep(&mut bag, arrived)?,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+    // What arrived before the stop belongs in the file.
+    while let Ok(arrived) = arrivals.try_recv() {
+        keep(&mut bag, arrived)?;
     }
     bag.finish().map_err(failed)?;
     drop(bag);

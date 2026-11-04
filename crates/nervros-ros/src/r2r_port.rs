@@ -89,6 +89,8 @@ enum Cmd {
     SubscribeRaw {
         topic: String,
         ty: String,
+        /// As its publishers offer, rather than best effort.
+        as_offered: bool,
         reply: oneshot::Sender<Result<BoxStream<'static, Vec<u8>>, RosError>>,
     },
     SubscribeSample {
@@ -614,10 +616,21 @@ fn handle(node: &mut r2r::Node, runtime: &tokio::runtime::Handle, cmd: Cmd) {
         } => {
             let _ = reply.send(node_entities(node, &name, &namespace));
         }
-        Cmd::SubscribeRaw { topic, ty, reply } => {
-            // Best effort, as `ros2 topic hz` subscribes: it matches every publisher.
+        Cmd::SubscribeRaw {
+            topic,
+            ty,
+            as_offered,
+            reply,
+        } => {
+            // Best effort, as `ros2 topic hz` subscribes, matches every publisher; only a
+            // subscription that asks as they offer hears what a latched topic holds already.
+            let qos = if as_offered {
+                auto_qos(node, &topic, 10)
+            } else {
+                QosProfile::sensor_data()
+            };
             let stream = node
-                .subscribe_raw(&topic, &ty, QosProfile::sensor_data())
+                .subscribe_raw(&topic, &ty, qos)
                 .map(futures::StreamExt::boxed)
                 .map_err(|e| type_error(&ty, &e));
             let _ = reply.send(stream);
@@ -973,6 +986,7 @@ impl RobotPort for R2rPort {
         self.send(Cmd::SubscribeRaw {
             topic: topic.to_owned(),
             ty: ty.to_owned(),
+            as_offered: false,
             reply,
         })?;
         Ok(rx.await.map_err(mw)??.map(|bytes| bytes.len()).boxed())
@@ -983,6 +997,7 @@ impl RobotPort for R2rPort {
         self.send(Cmd::SubscribeRaw {
             topic: topic.to_owned(),
             ty: ty.to_owned(),
+            as_offered: true,
             reply,
         })?;
         Ok(rx.await.map_err(mw)??.boxed())

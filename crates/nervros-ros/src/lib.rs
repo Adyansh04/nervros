@@ -376,8 +376,8 @@ pub trait RobotPort: Send + Sync {
         unsupported("following a topic")
     }
 
-    /// Each message on a topic from now until the stream is dropped, serialized as it arrives,
-    /// subscribing as [`RobotPort::arrivals`] does.
+    /// Each message on a topic until the stream is dropped, serialized as it arrives, subscribing
+    /// as its publishers offer, so that a latched topic gives what it holds already.
     async fn raw(
         &self,
         _topic: &str,
