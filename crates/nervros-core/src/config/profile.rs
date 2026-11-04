@@ -802,14 +802,7 @@ impl Profile {
                     name: z.name.clone(),
                 });
             }
-            let zone = crate::zones::Zone {
-                name: z.name.clone(),
-                polygon: z.polygon.clone(),
-                rule: z
-                    .slow
-                    .map_or(crate::zones::Rule::KeepOut, crate::zones::Rule::Slow),
-                fixed: true,
-            };
+            let zone = crate::zones::Zone::from(z);
             let speed = z.slow.map_or(Ok(()), |limit| {
                 limit.check(self.geofence.slowest_percent, self.geofence.top_speed_mps)
             });

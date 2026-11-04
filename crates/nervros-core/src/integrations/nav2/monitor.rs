@@ -57,7 +57,7 @@ impl Shape {
     /// Its area, m².
     fn area(&self) -> f64 {
         match self {
-            Self::Points(p) => shoelace(p),
+            Self::Points(p) => crate::builtins::area(p),
             Self::Radius(r) => std::f64::consts::PI * r * r,
         }
     }
@@ -704,17 +704,6 @@ fn from_segment(q: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
 /// Whether `q` is inside the polygon `p` or on its edge.
 fn within(p: &[[f64; 2]], q: [f64; 2]) -> bool {
     edges(p).any(|(a, b)| from_segment(q, a, b) <= 1e-9) || crate::builtins::inside(q, p)
-}
-
-fn shoelace(p: &[[f64; 2]]) -> f64 {
-    let n = p.len();
-    let twice: f64 = (0..n)
-        .map(|i| {
-            let ([x1, y1], [x2, y2]) = (p[i], p[(i + 1) % n]);
-            x1 * y2 - x2 * y1
-        })
-        .sum();
-    twice.abs() / 2.0
 }
 
 #[cfg(test)]

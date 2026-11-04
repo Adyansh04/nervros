@@ -46,18 +46,12 @@ pub struct Status {
 
 /// The room whose outline holds `(x, y)`.
 pub fn room_at(rooms: &Value, x: f64, y: f64) -> Option<&Value> {
-    rooms["rooms"].as_array()?.iter().find(|r| {
-        let points: Vec<(f64, f64)> = r["outline"]["points"]
-            .as_array()
-            .map_or(&[][..], Vec::as_slice)
-            .iter()
-            .filter_map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)))
-            .collect();
-        nervros_core::builtins::inside((x, y), &points)
-    })
+    rooms["rooms"]
+        .as_array()?
+        .iter()
+        .find(|r| nervros_core::builtins::holds(&r["outline"], x, y))
 }
 
-/// Whether a polygon holds a point, by counting the edges a ray to the right crosses.
 /// The hottest motor in a diagnostics message, as `(name, °C)`; none when all read zero, as in
 /// the simulator.
 pub fn hottest(diagnostics: &Value) -> Option<(String, f64)> {

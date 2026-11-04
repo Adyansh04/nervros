@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use crate::places::Places;
-use crate::profile::Profile;
+use crate::profile::{Profile, ZoneConfig};
 use crate::tools::{Assessment, Risk, Tool, ToolOutcome, ToolSpec};
 
 /// A zone smaller than this is a mistake, not a fence.
@@ -106,6 +106,17 @@ pub struct Zone {
     pub fixed: bool,
 }
 
+impl From<&ZoneConfig> for Zone {
+    fn from(z: &ZoneConfig) -> Self {
+        Self {
+            name: z.name.clone(),
+            polygon: z.polygon.clone(),
+            rule: z.slow.map_or(Rule::KeepOut, Rule::Slow),
+            fixed: true,
+        }
+    }
+}
+
 impl Zone {
     /// Whether it keeps the robot out.
     #[must_use]
@@ -156,14 +167,7 @@ impl Zone {
     /// Its area, by the shoelace formula.
     #[must_use]
     pub fn area(&self) -> f64 {
-        let n = self.polygon.len();
-        let twice: f64 = (0..n)
-            .map(|i| {
-                let ([x1, y1], [x2, y2]) = (self.polygon[i], self.polygon[(i + 1) % n]);
-                x1 * y2 - x2 * y1
-            })
-            .sum();
-        twice.abs() / 2.0
+        crate::builtins::area(&self.polygon)
     }
 
     /// Why this is not a usable zone, if it is not; the profile's are held to it too.
@@ -215,17 +219,7 @@ impl Zones {
     /// The profile's zones, and the operator's remembered in `file` when it exists.
     #[must_use]
     pub fn new(profile: &Profile, file: Option<PathBuf>) -> Arc<Self> {
-        let fixed = profile
-            .geofence
-            .zones
-            .iter()
-            .map(|z| Zone {
-                name: z.name.clone(),
-                polygon: z.polygon.clone(),
-                rule: z.slow.map_or(Rule::KeepOut, Rule::Slow),
-                fixed: true,
-            })
-            .collect();
+        let fixed = profile.geofence.zones.iter().map(Zone::from).collect();
         let added = file
             .as_deref()
             .map(crate::persist::read_or_default)

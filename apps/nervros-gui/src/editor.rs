@@ -361,9 +361,10 @@ mod tests {
     use rerun::external::egui::Color32;
     use serde_json::json;
 
-    use super::geometry::{in_polygon, wall_yaw};
+    use super::geometry::wall_yaw;
     use super::world::Object;
     use super::*;
+    use nervros_core::builtins::inside;
 
     #[test]
     fn a_box_knows_its_corners_and_what_it_holds() {
@@ -461,8 +462,8 @@ mod tests {
     #[test]
     fn rooms_are_found_by_outline_and_the_walls_by_the_common_yaw() {
         let square = vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]];
-        assert!(in_polygon(&square, [1.0, 1.0]));
-        assert!(!in_polygon(&square, [5.0, 1.0]));
+        assert!(inside([1.0, 1.0], &square));
+        assert!(!inside([5.0, 1.0], &square));
         let objects = [0.1, 0.1 + std::f64::consts::FRAC_PI_2, 0.4].map(|yaw| Object {
             yaw,
             ..Object::default()

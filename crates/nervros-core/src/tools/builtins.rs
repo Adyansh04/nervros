@@ -92,6 +92,19 @@ pub fn inside<P: Copy + Into<[f64; 2]>>(point: impl Into<[f64; 2]>, polygon: &[P
     hit
 }
 
+/// A polygon's area by the shoelace formula, its corners in order.
+#[must_use]
+pub fn area(polygon: &[[f64; 2]]) -> f64 {
+    let n = polygon.len();
+    let twice: f64 = (0..n)
+        .map(|i| {
+            let ([x1, y1], [x2, y2]) = (polygon[i], polygon[(i + 1) % n]);
+            x1 * y2 - x2 * y1
+        })
+        .sum();
+    twice.abs() / 2.0
+}
+
 /// Whether a `geometry_msgs/Polygon` as JSON, such as a room's outline, holds the point.
 #[must_use]
 pub fn holds(outline: &Value, x: f64, y: f64) -> bool {
