@@ -233,11 +233,8 @@ impl Motion {
 
     /// Moves the robot in `tf` to the last pose `goal` names, as a walk there would.
     fn walk_to(&self, tf: &Mutex<TfBuffer>, goal: &Value) {
-        let last = |list: &Value| list.as_array().and_then(|l| l.last()).cloned();
-        let Some(stamped) = last(&goal["poses"])
-            .or_else(|| last(&goal["path"]["poses"]))
-            .or_else(|| goal.get("pose").cloned())
-        else {
+        let last = goal["poses"].as_array().and_then(|l| l.last());
+        let Some(stamped) = last.or_else(|| goal.get("pose")) else {
             return;
         };
         let (at, turned) = (
@@ -828,7 +825,7 @@ mod tests {
             "transforms": [{"parent": "map", "child": "base"}],
             "motion": {
                 "action": "/execute", "parent": "map", "child": "base",
-                "route": "/route", "walks": ["/through", "/follow"],
+                "route": "/route", "walks": ["/through", "/to"],
             },
         }));
         let send = |action: &'static str, goal: Value| {
@@ -844,7 +841,7 @@ mod tests {
         let pose = |x: f64| json!({"pose": {"position": {"x": x, "y": 1.0}}});
         send("/through", json!({"poses": [pose(1.0), pose(2.0)]})).await;
         assert!((robot.transform("map", "base").unwrap().planar().0 - 2.0).abs() < 1e-9);
-        send("/follow", json!({"path": {"poses": [pose(5.0)]}})).await;
+        send("/to", json!({"pose": pose(5.0)})).await;
         assert!((robot.transform("map", "base").unwrap().planar().0 - 5.0).abs() < 1e-9);
         let route = send("/route", json!({"goal": pose(9.0)})).await;
         assert_eq!(route.result["path"]["poses"][1], pose(9.0));

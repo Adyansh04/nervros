@@ -34,6 +34,9 @@ const STRAIGHT_MAX_M: f64 = 2.0;
 const ROUND_M: f64 = 1.0;
 /// How high a walk's drawing floats over the floor, m.
 const DRAWN_Z: f64 = 0.05;
+/// How far apart the points of a walk along the route graph are, m: well past the 0.7 m at which
+/// a route's point counts as passed, and near enough that the planner keeps to the lane.
+const LANE_STEP_M: f64 = 2.0;
 
 /// The motions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,8 +158,9 @@ impl Motions {
         self.send(types, goal, ctl, Some(&again)).await.map(|_| ())
     }
 
-    /// Walks to `goal` along the robot's route graph, then the last of the way the graph does not
-    /// reach.
+    /// Walks to `goal` by the way the robot's route graph gives: through points along it, with
+    /// Nav2's planner between them, so that the walk goes round what the graph does not know of and
+    /// keeps Nav2's recoveries, which tracking the route's own path does not.
     async fn walk_graph(&self, goal: Value, ctl: &Control) -> Result<(), String> {
         let asked = json!({"goal": goal, "use_poses": true, "use_start": false});
         let types = ("compute_route", "nav2_msgs/action/ComputeRoute");
@@ -169,13 +173,19 @@ impl Motions {
                  {GO_TO_PLACE}, which plans around it"
             ));
         }
-        let follow = json!({"path": path, "controller_id": "", "goal_checker_id": "",
-                            "progress_checker_id": ""});
-        // Resumed, it follows the same path from the nearest point on it.
-        let again = |goal: &Value, _: &Value| goal.clone();
-        let types = ("follow_path", "nav2_msgs/action/FollowPath");
-        self.send(types, follow, ctl, Some(&again)).await?;
-        self.walk(goal, ctl).await
+        let mut poses: Vec<Value> = along_lane(path)
+            .into_iter()
+            .map(|(x, y, yaw)| self.pose(x, y, yaw))
+            .collect();
+        poses.push(goal);
+        let through = json!({"poses": poses, "behavior_tree": ""});
+        let types = (
+            "navigate_through_poses",
+            "nav2_msgs/action/NavigateThroughPoses",
+        );
+        self.send(types, through, ctl, Some(&route_left))
+            .await
+            .map(|_| ())
     }
 
     /// The keep-out zone a path crosses, if any.
@@ -501,11 +511,7 @@ impl NativeSkill for Native {
         match self.kind {
             Kind::GoToPose | Kind::GoToTarget => vec![name("navigate_to_pose")],
             Kind::WalkRoute => vec![name("navigate_through_poses")],
-            Kind::WalkGraph => vec![
-                name("compute_route"),
-                name("follow_path"),
-                name("navigate_to_pose"),
-            ],
+            Kind::WalkGraph => vec![name("compute_route"), name("navigate_through_poses")],
             Kind::TurnInPlace => vec![name("spin")],
             Kind::WalkStraight => vec![name("drive_on_heading")],
             Kind::Wait => Vec::new(),
@@ -657,6 +663,45 @@ impl NativeSkill for Native {
             }
         }
     }
+}
+
+/// Points along a route's path, each [`LANE_STEP_M`] on from the last and facing the next, short
+/// of the path's end, which the walk's goal stands in for.
+fn along_lane(path: &Value) -> Vec<(f64, f64, f64)> {
+    let at = |pose: &Value| {
+        let at = &pose["pose"]["position"];
+        (
+            at["x"].as_f64().unwrap_or(0.0),
+            at["y"].as_f64().unwrap_or(0.0),
+        )
+    };
+    let all: Vec<(f64, f64)> = path["poses"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .map(at)
+        .collect();
+    let Some(&end) = all.last() else {
+        return Vec::new();
+    };
+    let dist = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1);
+    let mut picked = Vec::new();
+    let mut walked = 0.0;
+    for pair in all.windows(2) {
+        walked += dist(pair[0], pair[1]);
+        if walked >= LANE_STEP_M && dist(pair[1], end) >= LANE_STEP_M / 2.0 {
+            picked.push(pair[1]);
+            walked = 0.0;
+        }
+    }
+    picked
+        .iter()
+        .enumerate()
+        .map(|(i, &(x, y))| {
+            let (next_x, next_y) = picked.get(i + 1).copied().unwrap_or(end);
+            (x, y, (next_y - y).atan2(next_x - x))
+        })
+        .collect()
 }
 
 /// Resumed, a route walks on through the places it had not reached.
@@ -836,10 +881,7 @@ mod tests {
                     }),
                     ..Default::default()
                 })
-                .with_action("/follow_path", |_| {
-                    nervros_ros::fake::ScriptedRun::default()
-                })
-                .with_action("/navigate_to_pose", |_| {
+                .with_action("/navigate_through_poses", |_| {
                     nervros_ros::fake::ScriptedRun::default()
                 }),
         );
@@ -864,17 +906,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_walk_along_the_graph_follows_its_route_then_walks_the_rest() {
+    async fn a_walk_along_the_graph_asks_its_route_then_walks_through_it() {
         let (walk, fake) = along_the_graph(&[3.0, 3.5]);
         let (_stop, stop) = tokio::sync::watch::channel(false);
         let (_pause, paused) = tokio::sync::watch::channel(false);
         let args = BTreeMap::from([("target".to_owned(), "far".to_owned())]);
         let done = walk.run(&args, &Control { stop, paused }).await.unwrap();
         assert_eq!(done["target_id"], "far");
-        assert_eq!(
-            sent(&fake),
-            ["/compute_route", "/follow_path", "/navigate_to_pose"]
-        );
+        assert_eq!(sent(&fake), ["/compute_route", "/navigate_through_poses"]);
+    }
+
+    #[test]
+    fn a_lane_gives_a_point_every_few_metres_each_facing_the_next() {
+        let path = |xs: &[f64]| {
+            let poses: Vec<Value> = xs
+                .iter()
+                .map(|x| json!({"pose": {"position": {"x": x, "y": 0.0}}}))
+                .collect();
+            json!({"poses": poses})
+        };
+        // Every half metre for 7 m: 6 m is the last point more than half a step from the end.
+        let long: Vec<f64> = (0..=14).map(|i| f64::from(i) * 0.5).collect();
+        let points = along_lane(&path(&long));
+        let xs: Vec<f64> = points.iter().map(|p| p.0).collect();
+        assert_eq!(xs, [2.0, 4.0, 6.0]);
+        assert!(points.iter().all(|p| p.2.abs() < 1e-9), "{points:?}");
+        // The goal alone does for a short way, and for no way.
+        assert!(along_lane(&path(&[0.0, 0.5, 1.0])).is_empty());
+        assert!(along_lane(&json!({})).is_empty());
     }
 
     #[tokio::test]

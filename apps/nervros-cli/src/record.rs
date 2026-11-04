@@ -202,7 +202,7 @@ fn motion(profile: &Profile, doc: &Map<String, Value>) -> Option<Value> {
         "planner": profile.nav2.as_ref().map(|n| n.name("compute_path_to_pose")),
         "route": profile.nav2.as_ref().map(|n| n.name("compute_route")),
         "walks": profile.nav2.as_ref().map_or_else(Vec::new, |n| {
-            ["navigate_to_pose", "navigate_through_poses", "follow_path"]
+            ["navigate_to_pose", "navigate_through_poses"]
                 .map(|a| n.name(a))
                 .to_vec()
         }),
