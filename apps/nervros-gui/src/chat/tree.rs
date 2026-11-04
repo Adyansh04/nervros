@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use nervros_core::duration_words;
 use nervros_core::mission::Outcome;
 use nervros_core::mission::plan::PlannedStep;
 use nervros_core::session::Command;
@@ -12,7 +13,7 @@ use rerun::external::egui::{
 };
 use rerun::external::re_ui::ReButton;
 
-use super::plan::{capitalise, minutes};
+use super::plan::capitalise;
 use super::{Action, Node, PlanCard};
 use crate::theme;
 
@@ -165,14 +166,14 @@ fn header(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut Vec<Ac
             .filter(|s| step_state(p, s) == State::Succeeded)
             .count();
         let elapsed = match (&p.finished, p.started) {
-            (Some((.., secs)), _) => format!(" · took {}", minutes(*secs)),
-            (None, Some(_)) => format!(" · {}", minutes(now_s(p))),
+            (Some((.., secs)), _) => format!(" · took {}", duration_words(*secs)),
+            (None, Some(_)) => format!(" · {}", duration_words(now_s(p))),
             (None, None) => String::new(),
         };
         let meta = format!(
             "{done} of {} steps{elapsed} · at most {}",
             p.steps.len(),
-            minutes(p.worst_case_s)
+            duration_words(p.worst_case_s)
         );
         ui.label(RichText::new(meta).size(12.5).color(theme::FAINT));
     });
@@ -337,8 +338,10 @@ fn arguments(s: &PlannedStep) -> String {
 
 /// The wrappers the plan put round the step, and how it went before.
 fn badges(ui: &mut egui::Ui, s: &PlannedStep) {
-    let mut items: Vec<(String, Color32)> =
-        vec![(format!("at most {}", minutes(s.timeout_s)), theme::FAINT)];
+    let mut items: Vec<(String, Color32)> = vec![(
+        format!("at most {}", duration_words(s.timeout_s)),
+        theme::FAINT,
+    )];
     if s.retries > 0 {
         items.push((format!("{} tries", s.retries + 1), theme::FAINT));
     }
@@ -418,7 +421,7 @@ fn seconds(s: f64) -> String {
     if s < 10.0 {
         format!("{:.1} s", s.max(0.0))
     } else {
-        minutes(s)
+        duration_words(s)
     }
 }
 

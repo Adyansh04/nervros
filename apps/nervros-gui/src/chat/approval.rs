@@ -3,12 +3,12 @@
 use std::cell::Cell;
 use std::time::Duration;
 
+use nervros_core::duration_words;
 use nervros_core::session::{Command, NotApproved, Unanswered};
 use rerun::external::egui;
 use rerun::external::egui::{Align, CornerRadius, Frame, Layout, Margin, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _, icons};
 
-use super::plan::minutes;
 use super::view::{code, pretty, spinner};
 use super::{Action, Approval, PlanCard};
 use crate::plan_edit::EditStep;
@@ -60,7 +60,7 @@ pub(super) fn approval_card(
                     ui.label(
                         RichText::new(format!(
                             "{steps} · at most {} · plan {short}",
-                            minutes(p.worst_case_s)
+                            duration_words(p.worst_case_s)
                         ))
                         .size(13.0)
                         .color(theme::DIM),

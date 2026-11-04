@@ -69,7 +69,8 @@ pub(crate) fn counted<N: std::fmt::Display + PartialEq + From<u8> + Copy>(
 
 /// A duration as the window words it: seconds under a minute and a half, else minutes, so an
 /// approval's "at most" reads as its plan card's.
-pub(crate) fn duration_words(seconds: f64) -> String {
+#[must_use]
+pub fn duration_words(seconds: f64) -> String {
     if seconds < 90.0 {
         format!("{seconds:.0} s")
     } else {
