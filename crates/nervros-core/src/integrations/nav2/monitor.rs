@@ -477,10 +477,7 @@ impl Monitor {
         let Some(file) = &self.file else {
             return;
         };
-        if let Err(e) = serde_json::to_vec_pretty(all)
-            .map_err(|e| e.to_string())
-            .and_then(|text| crate::persist::write_atomic(file, &text).map_err(|e| e.to_string()))
-        {
+        if let Err(e) = crate::persist::write_json(file, all) {
             tracing::warn!(error = %e, "the collision monitor's shapes were not kept");
         }
     }

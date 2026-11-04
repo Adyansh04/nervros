@@ -309,9 +309,7 @@ impl Zones {
         let Some(file) = &self.file else {
             return Ok(());
         };
-        let text = serde_json::to_vec_pretty(added).map_err(|e| e.to_string())?;
-        crate::persist::write_atomic(file, &text)
-            .map_err(|e| format!("keeping the zones in {}: {e}", file.display()))
+        crate::persist::write_json(file, added)
     }
 
     /// Adds a zone of the operator's.

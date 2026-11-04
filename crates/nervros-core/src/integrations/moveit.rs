@@ -126,10 +126,7 @@ impl Arms {
         let Some(file) = &self.settings_file else {
             return;
         };
-        if let Err(e) = serde_json::to_vec_pretty(&now)
-            .map_err(|e| e.to_string())
-            .and_then(|text| crate::persist::write_atomic(file, &text).map_err(|e| e.to_string()))
-        {
+        if let Err(e) = crate::persist::write_json(file, &now) {
             tracing::warn!(error = %e, "the arm settings were not kept");
         }
     }

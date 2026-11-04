@@ -173,8 +173,7 @@ impl Ledger {
         }
         self.days = days;
         self.parked_until = parked;
-        let text = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        crate::persist::write_atomic(&path, &text)
+        crate::persist::write_json(&path, self).map_err(std::io::Error::other)
     }
 
     /// Requests counted today under `key` (a model id or a pool name).

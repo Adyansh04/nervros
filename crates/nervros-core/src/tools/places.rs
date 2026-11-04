@@ -63,10 +63,7 @@ impl Places {
         let Some(file) = &self.file else {
             return Ok(());
         };
-        let text = serde_json::to_vec_pretty(&tagged.iter().map(to_json).collect::<Vec<_>>())
-            .map_err(|e| e.to_string())?;
-        crate::persist::write_atomic(file, &text)
-            .map_err(|e| format!("saving {}: {e}", file.display()))
+        crate::persist::write_json(file, &tagged.iter().map(to_json).collect::<Vec<_>>())
     }
 
     /// Remembers a place, replacing one remembered under that name before.

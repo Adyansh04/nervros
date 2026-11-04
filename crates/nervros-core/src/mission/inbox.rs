@@ -219,9 +219,7 @@ impl Inbox {
         let Some(file) = &self.file else {
             return Ok(());
         };
-        let text = serde_json::to_vec_pretty(proposals).map_err(|e| e.to_string())?;
-        crate::persist::write_atomic(file, &text)
-            .map_err(|e| format!("saving {}: {e}", file.display()))
+        crate::persist::write_json(file, proposals)
     }
 
     /// Every proposal, oldest first.
@@ -350,9 +348,7 @@ impl Inbox {
 pub fn dismiss_in(file: &std::path::Path, id: u32) -> Result<Proposal, String> {
     let mut proposals = Inbox::read(file);
     let settled = settle_in(&mut proposals, id, |p| p.state = State::Dismissed)?;
-    let text = serde_json::to_vec_pretty(&proposals).map_err(|e| e.to_string())?;
-    crate::persist::write_atomic(file, &text)
-        .map_err(|e| format!("saving {}: {e}", file.display()))?;
+    crate::persist::write_json(file, &proposals)?;
     Ok(settled)
 }
 
