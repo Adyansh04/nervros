@@ -15,10 +15,6 @@ use crate::zones::Zones;
 /// The robot on the map: x, y and its heading in radians, when known.
 type Pose = (f64, f64, Option<f64>);
 
-fn number(step: &PlannedStep, name: &str) -> Option<f64> {
-    arg(&step.args, name)?.parse().ok()
-}
-
 /// What a walk to a place or a target heads for: a place's name, an id, or a label.
 fn target(step: &PlannedStep) -> Option<String> {
     if step.skill == GO_TO_TARGET {
@@ -149,7 +145,7 @@ pub(crate) fn check(
         }
         if let Some(walk) = checks.walk.as_ref().filter(|w| w.skill == step.skill) {
             let back = arg(&step.args, &walk.direction).is_some_and(|d| d.starts_with("back"));
-            pose = match (pose, number(step, &walk.metres)) {
+            pose = match (pose, step.number(&walk.metres)) {
                 (Some((x, y, Some(yaw))), Some(metres)) if metres > 0.0 => {
                     let along = if back { -metres } else { metres };
                     let end = (x + along * yaw.cos(), y + along * yaw.sin());
@@ -177,8 +173,9 @@ pub(crate) fn check(
         }
         if let Some(turn) = checks.turn.as_ref().filter(|t| t.skill == step.skill) {
             pose = pose.map(|(x, y, yaw)| {
-                let left =
-                    number(step, &turn.degrees).map(|d| if turn.positive_left { d } else { -d });
+                let left = step
+                    .number(&turn.degrees)
+                    .map(|d| if turn.positive_left { d } else { -d });
                 (x, y, yaw.zip(left).map(|(h, d)| h + d.to_radians()))
             });
             continue;

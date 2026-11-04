@@ -539,6 +539,18 @@ pub struct PlannedStep {
 }
 
 impl PlannedStep {
+    /// The value of argument `name`, trimmed.
+    #[must_use]
+    pub fn arg(&self, name: &str) -> Option<&str> {
+        arg(&self.args, name)
+    }
+
+    /// Argument `name` read as a number.
+    #[must_use]
+    pub fn number(&self, name: &str) -> Option<f64> {
+        self.arg(name)?.parse().ok()
+    }
+
     /// The step as the profile's rules read it: every argument trimmed, and a walk's `place` as
     /// said and as resolved, so a rule on a room's id holds whatever name the model used.
     #[must_use]
