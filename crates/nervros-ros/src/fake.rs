@@ -63,7 +63,7 @@ pub struct FakeRobot {
     services: HashMap<String, ServiceFn>,
     actions: HashMap<String, ActionFn>,
     topics: Mutex<HashMap<String, Value>>,
-    frames: HashMap<String, FrameSender>,
+    frames: HashMap<String, Arc<FrameSender>>,
     tf: Arc<Mutex<TfBuffer>>,
     latency: Duration,
     calls: Arc<Mutex<Vec<(String, Value)>>>,
@@ -137,7 +137,7 @@ impl FakeRobot {
     #[must_use]
     pub fn with_frame(mut self, topic: &str, frame: Frame) -> Self {
         let (tx, _) = watch::channel(Some(Arc::new(frame)));
-        self.frames.insert(topic.to_owned(), tx);
+        self.frames.insert(topic.to_owned(), Arc::new(tx));
         self
     }
 
@@ -163,6 +163,25 @@ impl FakeRobot {
     /// Replaces a topic's newest message.
     pub fn set_topic(&self, name: &str, value: Value) {
         lock(&self.topics).insert(name.to_owned(), value);
+    }
+
+    /// Adds an image topic that sends `frame` every `period`, stamped anew, as long as the robot
+    /// lives: a camera that goes quiet reads as a stopped one.
+    #[must_use]
+    pub fn with_camera(mut self, topic: &str, mut frame: Frame, period: Duration) -> Self {
+        let (tx, _) = watch::channel(Some(Arc::new(frame.clone())));
+        let tx = Arc::new(tx);
+        let sender = Arc::downgrade(&tx);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(period);
+                let Some(tx) = sender.upgrade() else { return };
+                frame.stamp_s = crate::scripted::now_s();
+                tx.send_replace(Some(Arc::new(frame.clone())));
+            }
+        });
+        self.frames.insert(topic.to_owned(), tx);
+        self
     }
 
     /// Sends a new frame on an image topic added with [`FakeRobot::with_frame`].
