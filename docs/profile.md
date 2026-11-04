@@ -538,6 +538,7 @@ info = "/speed_filter_info"             # optional: NervROS publishes the filter
 | `costmaps` | `["global_costmap/global_costmap", "local_costmap/local_costmap"]` | The costmap nodes, whose clear and cost services `nav_admin` and `nav_check` call. |
 | `drive_speed_mps` | `0.25` | How fast a straight walk NervROS runs itself goes. |
 | `docking` | `false` | Whether the robot runs Nav2's docking server: then missions may dock and undock. |
+| `route_server` | `false` | Whether the robot runs Nav2's route server with a graph: then missions may walk its lanes with `WalkGraph`, given a world model. |
 
 Missions also get Nav2's motions as steps NervROS runs itself, where the robot's executor has no
 skill of the name: `GoToPose`, `GoToTarget` (with a world model), `WalkRoute`, `TurnInPlace`,

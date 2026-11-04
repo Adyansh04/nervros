@@ -160,12 +160,38 @@ impl ArmStatus {
         let spec = ToolSpec::new(
             "arm_status",
             "MoveIt now: each arm group, the named poses it can move to and the one it is at, \
-             each hand and its named poses, the planners MoveIt has, and the obstacles in its \
+             each hand and its named poses, the planners MoveIt has, the controllers running, and the obstacles in its \
              planning scene and what each hand holds.",
             json!({"type": "object", "properties": {}, "additionalProperties": false}),
             Risk::Observe,
         );
         Self { spec, arms }
+    }
+
+    /// The controllers and how each stands; none when the robot's manager does not answer.
+    async fn controllers(&self) -> Value {
+        let service = self.arms.config.name("controller_manager/list_controllers");
+        match self
+            .arms
+            .robot
+            .call(
+                &service,
+                "controller_manager_msgs/srv/ListControllers",
+                json!({}),
+                SCENE_WAIT,
+            )
+            .await
+        {
+            Ok(r) => Value::Array(
+                r["controller"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|c| json!({"name": c["name"], "state": c["state"]}))
+                    .collect(),
+            ),
+            Err(_) => Value::Null,
+        }
     }
 
     async fn planners(&self) -> Value {
@@ -205,10 +231,11 @@ impl Tool for ArmStatus {
             Ok(s) => s,
             Err(why) => return ToolOutcome::failed(why),
         };
-        let (joints, scene, planners) = tokio::join!(
+        let (joints, scene, planners, controllers) = tokio::join!(
             self.arms.joints(),
             scene_summary(&self.arms),
-            self.planners()
+            self.planners(),
+            self.controllers()
         );
         let joints = joints.unwrap_or_default();
         let at: BTreeMap<String, Option<String>> = arms_at(&srdf, &joints).into_iter().collect();
@@ -251,6 +278,7 @@ impl Tool for ArmStatus {
             "arms": arms,
             "hands": hands,
             "planners": planners,
+            "controllers": controllers,
             "scene": scene,
         }))
     }

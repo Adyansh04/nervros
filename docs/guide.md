@@ -628,6 +628,15 @@ parameters", "any errors in the logs?".
 - Nodes composed into a container are listed under it.
 - `params` gives each parameter's value with its description.
 - The read tools take `odom` for `/odom`.
+- `ros_graph` answers `ros2 topic list -v`, `topic info -v` (full QoS, and subscribers a publisher
+  cannot reach), `topic find`, `service info`, `action info` and `node info` with its actions. Its
+  `lifecycle` kind and a node's details say how managed nodes stand; changing a state is left to
+  the robot's own skills.
+- `topic_sample` also measures `delay`, how old messages are on arrival, and echoes whole arrays
+  with `full`. `interface_show` lists the interfaces and packages the agent knows.
+- `bag` records topics to an MCAP file that `ros2 bag info` and `ros2 bag play` read, from the raw
+  messages, up to an hour and 2 GB: "record the scan and the odometry for a minute". It runs in the
+  background and does not play back, since that would publish on the robot's topics.
 
 Acting through ROS (a service call, an action goal, a parameter change or a publish) needs the
 profile to allow it, an absolute name, and your approval. A call or a publish may move the robot,
@@ -808,15 +817,17 @@ runs their standard motions itself where the robot's executor has no skill for t
 |---|---|---|
 | Navigation's state, a path's length and the zones it crosses, the cost at a spot | `nav_status`, `nav_check` | Nothing. A path check waits while Nav2 walks, since it would cut into Nav2's own planning |
 | The collision monitor: on or off, each polygon, a polygon's shape | `collision_monitor` | Turning on and growing are free; turning off and shrinking ask |
-| Costmaps, localization, the navigation servers, maps | `nav_admin` | Each asks, and none runs during a mission |
-| The arms: where each is, its named poses, the planners | `arm_status` | Nothing |
-| Whether a hand reaches something, whether a pose is clear, the path an arm would take | `arm_check` | Nothing; the path is drawn in the 3D view |
+| Costmaps, localization, the navigation servers, maps and route graphs | `nav_admin` | Each asks, and none runs during a mission |
+| The arms: where each is, its named poses, the planners, the controllers | `arm_status` | Nothing |
+| Whether a hand reaches something, whether a pose is clear, the path an arm would take, whether a straight move is clear | `arm_check` | Nothing; the path is drawn in the 3D view |
 | The obstacles the arms plan around, attaching an object to a hand, the octomap | `scene` | Adding is free; the rest asks |
 | How fast the arm moves NervROS runs go, the planner, poses remembered by name | `arm_settings` | Slower is free; faster and another planner ask |
 
 Plans may hold motions NervROS runs itself beside the executor's skills: a route through places
-without stopping at each (`WalkRoute`), a wait, a short straight hand move (`HandLine`), and, on a
-robot whose executor lacks them, walks, turns, arm poses and grips. The plan card marks such a
+without stopping at each (`WalkRoute`), a walk along the robot's fixed lanes (`WalkGraph`, with
+`route_server` in the profile), a wait, a short straight hand move (`HandLine`), and, on a robot
+whose executor lacks them, walks, turns, arm poses and grips. `HandTo` keeps what a hand holds as
+level as it is now, all the way. `nav_status` says what failed in Nav2's behaviour tree lately. The plan card marks such a
 step **NervROS runs it through Nav2** (or MoveIt), its preview shows where a walk or a route goes,
 and the 3D view draws the way while it runs. Stop and Pause work as for any step: a stopped step
 ends as stopped, a paused walk stands and goes on with what was left when you resume, and an arm
@@ -835,6 +846,8 @@ what Nav2 is doing and the speed limit in force, and where each arm is.
   one of them lets go.
 - A route's places are its waypoints: one inside furniture fails the whole route, so name places
   or rooms with room to stand.
+- A route graph's lanes are what `WalkGraph` follows: a keep-out zone across one stops it before
+  it moves, while the ordinary walk plans around the zone.
 - Grip never moves a hand that holds something, or may: put the object down with a place.
 
 </details>
