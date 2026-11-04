@@ -188,6 +188,15 @@ async fn search(missions: &Arc<Missions>, ctx: &Context, plan: Plan) -> Result<S
             .await
             // The robot cannot run missions now: looking further would fail the same way.
             .map_err(|e| format!("the search could not go on: {e}"))?;
+        // Walking on to the next place would run into the same fault.
+        if let Some(fault) = end.fault {
+            return Err(format!(
+                "the search stopped at {}, cut short by the robot ({}): {}",
+                l.target,
+                fault.as_str(),
+                end.reason
+            ));
+        }
         match (end.outcome, end.failed_step.as_str()) {
             (Outcome::Success, _) => {
                 let id = end
