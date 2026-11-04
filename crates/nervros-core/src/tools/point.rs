@@ -186,8 +186,7 @@ impl PointTool {
                 entry
             })
             .collect();
-        let jpeg = nervros_ros::image::encode_jpeg(&drawn, nervros_ros::image::JPEG_QUALITY)
-            .map_err(|e| e.to_string())?;
+        let jpeg = crate::vision::jpeg(&drawn)?;
         let marks_listed = marks_json(&marks);
         let snapshot = self
             .snapshots

@@ -72,10 +72,10 @@ impl Attachments {
 
     fn add(&mut self, ctx: &egui::Context, img: &image::DynamicImage) {
         let rgb = nervros_ros::image::capped(&img.to_rgb8(), EDGE_PX);
-        let jpeg = match nervros_ros::image::encode_jpeg(&rgb, nervros_ros::image::JPEG_QUALITY) {
+        let jpeg = match nervros_core::vision::jpeg(&rgb) {
             Ok(j) => j,
             Err(e) => {
-                self.problem = Some(e.to_string());
+                self.problem = Some(e);
                 return;
             }
         };
