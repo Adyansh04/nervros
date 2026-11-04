@@ -39,6 +39,12 @@ pub fn unix_secs(at: std::time::SystemTime) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// A ROS `builtin_interfaces` Time or Duration as seconds, a missing field counting as zero.
+#[must_use]
+pub(crate) fn stamp_s(stamp: &serde_json::Value) -> f64 {
+    stamp["sec"].as_f64().unwrap_or(0.0) + stamp["nanosec"].as_f64().unwrap_or(0.0) * 1e-9
+}
+
 /// Now, in seconds since the Unix epoch.
 #[must_use]
 pub fn now_s() -> f64 {

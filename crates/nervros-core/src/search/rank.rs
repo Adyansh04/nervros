@@ -75,10 +75,6 @@ fn text<'v>(v: &'v Value, key: &str) -> &'v str {
     v[key].as_str().unwrap_or_default()
 }
 
-fn stamp_s(stamp: &Value) -> f64 {
-    stamp["sec"].as_f64().unwrap_or(0.0) + stamp["nanosec"].as_f64().unwrap_or(0.0) * 1e-9
-}
-
 /// How much what was seen `at` still counts, now.
 fn fresh(at: f64, now_s: f64) -> f64 {
     if at <= 0.0 {
@@ -134,7 +130,7 @@ fn sightings(seen: &Seen<'_>) -> Vec<Lookout> {
         .iter()
         .filter_map(|o| matches(o, &words).map(|exact| (o, exact)))
         .map(|(o, exact)| {
-            let at = stamp_s(&o["last_seen"]);
+            let at = crate::stamp_s(&o["last_seen"]);
             let name = [text(o, "name"), text(o, "label")]
                 .into_iter()
                 .find(|n| !n.is_empty())
@@ -181,7 +177,7 @@ fn moves(seen: &Seen<'_>) -> Vec<Lookout> {
         .filter(|e| matches!(text(e, "kind"), "moved" | "appeared" | "seen_again"))
         .filter(|e| !text(e, "room_id").is_empty())
         .map(|e| {
-            let at = stamp_s(&e["stamp"]);
+            let at = crate::stamp_s(&e["stamp"]);
             let p = &e["position"];
             Lookout {
                 target: text(e, "room_id").to_owned(),

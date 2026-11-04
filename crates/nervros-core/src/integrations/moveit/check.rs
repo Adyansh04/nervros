@@ -244,7 +244,9 @@ impl ArmCheck {
             .filter_map(|n| n.as_str().map(str::to_owned))
             .collect();
         let points = trajectory["points"].as_array().cloned().unwrap_or_default();
-        let duration = points.last().map_or(0.0, |p| secs(&p["time_from_start"]));
+        let duration = points
+            .last()
+            .map_or(0.0, |p| crate::stamp_s(&p["time_from_start"]));
         let drawn = self
             .draw(
                 &planning,
@@ -353,10 +355,6 @@ fn travel(now: &BTreeMap<String, f64>, solved: &Value) -> f64 {
         .sum()
 }
 
-fn secs(d: &Value) -> f64 {
-    num(&d["sec"]) + num(&d["nanosec"]) / 1e9
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +364,6 @@ mod tests {
         let now = BTreeMap::from([("a".to_owned(), 0.0), ("b".to_owned(), 1.0)]);
         let solved = json!({"name": ["a", "b", "c"], "position": [0.5, 0.75, 9.0]});
         assert!((travel(&now, &solved) - 0.75).abs() < 1e-9);
-        assert!((secs(&json!({"sec": 2, "nanosec": 500_000_000})) - 2.5).abs() < 1e-9);
+        assert!((crate::stamp_s(&json!({"sec": 2, "nanosec": 500_000_000})) - 2.5).abs() < 1e-9);
     }
 }

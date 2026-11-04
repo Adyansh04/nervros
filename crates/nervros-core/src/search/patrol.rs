@@ -213,8 +213,7 @@ fn seen_from_here(seen: &Observed, since_s: f64) -> Option<String> {
     let mut rooms: Vec<(&str, Vec<(&str, usize)>)> = Vec::new();
     for o in seen.objects["objects"].as_array()? {
         let label = o["label"].as_str().unwrap_or_default();
-        let at = o["last_seen"]["sec"].as_f64().unwrap_or(0.0)
-            + o["last_seen"]["nanosec"].as_f64().unwrap_or(0.0) * 1e-9;
+        let at = crate::stamp_s(&o["last_seen"]);
         if label.is_empty() || o["state"].as_u64() != Some(0) || at < since_s {
             continue;
         }

@@ -42,10 +42,6 @@ fn px(v: f64) -> u32 {
     out
 }
 
-fn stamp(header: &Value) -> f64 {
-    f64_at(header, "/stamp/sec") + f64_at(header, "/stamp/nanosec") * 1e-9
-}
-
 /// Parses an `InstanceMaskArray` or a `Detection2DArray` from JSON.
 #[must_use]
 pub fn parse_detections(msg: &Value) -> Detections {
@@ -108,7 +104,7 @@ pub fn parse_detections(msg: &Value) -> Detections {
         }
     }
     Detections {
-        stamp_s: stamp(&header),
+        stamp_s: crate::stamp_s(&header["stamp"]),
         instances,
     }
 }
