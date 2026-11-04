@@ -36,12 +36,12 @@ A mission may hold steps NervROS runs itself beside the robot executor's skills:
 
 | Stack | Steps |
 |---|---|
-| Nav2 | `GoToPose`, `GoToTarget` (with a world model), `WalkRoute` (through places without stopping), `TurnInPlace`, `WalkStraight` (forward or back), `Wait`, `Dock` and `Undock` (with `[nav2] docking`) |
+| Nav2 | `GoToPose`, `GoToTarget` (with a world model), `WalkRoute` (through places without stopping), `WalkGraph` (along the route graph, with `route_server`), `TurnInPlace`, `WalkStraight` (forward or back), `Wait`, `Dock` and `Undock` (with `[nav2] docking`) |
 | MoveIt | `ArmTo` (a named or remembered pose), `HandTo` (just above an object, or a point), `HandLine` (a short straight hand move), `Grip` (a hand's named state) |
 
 They take the names an executor's skills would. A skill of the same name in the executor's catalog
 is used instead: on the G1 the executor walks, turns and moves the arms itself, and NervROS runs
-only routes, waits and straight hand moves. While the executor's catalog cannot be read, no step
+only routes, walks along the route graph, waits and straight hand moves. While the executor's catalog cannot be read, no step
 runs as a native one, since none can be told from the executor's own. A robot with no executor at
 all plans with native steps only.
 

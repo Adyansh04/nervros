@@ -635,8 +635,9 @@ parameters", "any errors in the logs?".
 - `topic_sample` also measures `delay`, how old messages are on arrival, and echoes whole arrays
   with `full`. `interface_show` lists the interfaces and packages the agent knows.
 - `bag` records topics to an MCAP file that `ros2 bag info` and `ros2 bag play` read, from the raw
-  messages, up to an hour and 2 GB: "record the scan and the odometry for a minute". It runs in the
-  background and does not play back, since that would publish on the robot's topics.
+  messages, up to an hour and 2 GB: "record the scan and the odometry for a minute". Latched topics
+  such as `/tf_static` give what they hold. It runs in the background and does not play back, since
+  that would publish on the robot's topics.
 
 Acting through ROS (a service call, an action goal, a parameter change or a publish) needs the
 profile to allow it, an absolute name, and your approval. A call or a publish may move the robot,
@@ -827,7 +828,9 @@ Plans may hold motions NervROS runs itself beside the executor's skills: a route
 without stopping at each (`WalkRoute`), a walk along the robot's fixed lanes (`WalkGraph`, with
 `route_server` in the profile), a wait, a short straight hand move (`HandLine`), and, on a robot
 whose executor lacks them, walks, turns, arm poses and grips. `HandTo` keeps what a hand holds as
-level as it is now, all the way. `nav_status` says what failed in Nav2's behaviour tree lately. The plan card marks such a
+level as it is now, all the way. `nav_status` says what failed in Nav2's behaviour tree lately. `WalkGraph` takes the way the graph
+gives and walks through points along it with Nav2's planner between them, so it goes round what the
+graph does not know of. The plan card marks such a
 step **NervROS runs it through Nav2** (or MoveIt), its preview shows where a walk or a route goes,
 and the 3D view draws the way while it runs. Stop and Pause work as for any step: a stopped step
 ends as stopped, a paused walk stands and goes on with what was left when you resume, and an arm
