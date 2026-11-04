@@ -27,7 +27,9 @@ pub use mission::check::how_long;
 pub(crate) use mission::schedule;
 pub use model::{llm, providers};
 pub use tools::places::room_label;
-pub use tools::{builtins, editor, look, mcp, ros_tools, segment, skills, vision, watch, zones};
+pub use tools::{
+    background, builtins, editor, look, mcp, ros_tools, segment, skills, vision, watch, zones,
+};
 pub(crate) use tools::{memory, places, point};
 
 /// Whole seconds since the Unix epoch; 0 for a clock set before it.

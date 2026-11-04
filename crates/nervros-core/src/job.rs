@@ -149,6 +149,23 @@ impl std::fmt::Debug for Jobs {
     }
 }
 
+impl crate::background::Background for Jobs {
+    fn list(&self) -> Vec<serde_json::Value> {
+        Self::list(self)
+            .into_iter()
+            .map(|j| {
+                let result = (!j.summary.is_empty()).then(|| crate::tools::from_world(&j.summary));
+                serde_json::json!({"id": j.id, "kind": j.kind.as_str(), "what": j.name,
+                                   "state": j.state.as_str(), "result": result})
+            })
+            .collect()
+    }
+
+    fn end(&self, id: &str) -> bool {
+        self.stop(id)
+    }
+}
+
 impl Jobs {
     /// No jobs yet; [`Self::attach`] connects them to the session.
     #[must_use]

@@ -169,7 +169,7 @@ impl Gui {
         let Some(schedules) = &self.agent.schedules else {
             return;
         };
-        let list = schedules.list();
+        let list = schedules.running();
         if list.is_empty() {
             return;
         }

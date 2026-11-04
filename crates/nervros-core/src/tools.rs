@@ -4,6 +4,7 @@
 //! builtins (`look`, `list_places`, `robot_state`, `stop`) are written once. Every tool has a spec
 //! (name, description, JSON Schema, risk) and returns an outcome whose message the model can read.
 
+pub mod background;
 pub mod builtins;
 pub mod editor;
 pub mod look;

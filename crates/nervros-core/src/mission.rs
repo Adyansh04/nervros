@@ -474,6 +474,11 @@ impl Missions {
         &self.robot
     }
 
+    /// Where the world model publishes its objects.
+    pub(crate) fn objects_topic(&self) -> Option<crate::profile::TopicRef> {
+        self.profile.world.as_ref()?.objects.clone()
+    }
+
     /// Topics the profile keeps from being read, for the triggers that watch topics.
     pub(crate) fn read_deny(&self) -> &[String] {
         self.profile

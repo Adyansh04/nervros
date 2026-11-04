@@ -553,8 +553,9 @@ report> Mission 01a16636 (walk to bedroom R3 three times every 10 minutes, run 1
 ```
 
 The Mission tab lists the schedule with a **Cancel** button. A schedule can also wait for
-something: an object of a kind appearing, or a condition on a topic. With nothing to run, it only
-tells you: "Tell me when a mug appears in the bedroom" needs no approval.
+something to run its plan: an object of a kind appearing, or a condition on a topic. To only be told,
+ask for a watch, which needs no approval: "Tell me when a mug appears in the bedroom". "What is
+running in the background?" lists the watches, schedules and jobs, and any can be cancelled by its id.
 
 "Check the robot's health" runs the same connection check as the Doctor tab. You can ask it even
 while a mission runs.
