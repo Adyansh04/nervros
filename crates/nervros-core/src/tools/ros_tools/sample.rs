@@ -210,46 +210,44 @@ impl TopicSample {
         ToolOutcome::ok(json!({"topic": topic, "type": ty, "messages": shown}))
     }
 
-    /// The age of each message on `topic` over `window`.
+    /// The age of each message on `topic` as it arrives, over `window`.
     async fn delays(
         &self,
         topic: &str,
         ty: &str,
         window: Duration,
     ) -> Result<Vec<f64>, ToolOutcome> {
-        let stamps: Vec<Option<f64>> = if BULK_TYPES.contains(&ty) {
+        let no_stamp =
+            || ToolOutcome::failed(format!("`{ty}` has no header.stamp, which delay reads"));
+        let end = tokio::time::Instant::now() + window;
+        let mut delays = Vec::new();
+        if BULK_TYPES.contains(&ty) {
             let mut raw = self
                 .ctx
                 .robot
                 .raw(topic, ty)
                 .await
                 .map_err(|e| failed(&e))?;
-            let end = tokio::time::Instant::now() + window;
-            let mut stamps = Vec::new();
             while let Ok(Some(bytes)) = tokio::time::timeout_at(end, raw.next()).await {
-                stamps.push(raw_stamp(&bytes));
+                delays.push(nervros_ros::now_s() - raw_stamp(&bytes).ok_or_else(no_stamp)?);
             }
-            stamps
         } else {
-            self.ctx
+            let mut messages = self
+                .ctx
                 .robot
-                .sample_messages(topic, ty, 10_000, window)
+                .messages(topic, ty)
                 .await
-                .map_err(|e| failed(&e))?
-                .iter()
-                .map(|m| {
-                    let stamp = &m["header"]["stamp"];
-                    stamp.is_object().then(|| crate::stamp_s(stamp))
-                })
-                .collect()
-        };
-        if stamps.iter().any(Option::is_none) {
-            return Err(ToolOutcome::failed(format!(
-                "`{ty}` has no header.stamp, which delay reads"
-            )));
+                .map_err(|e| failed(&e))?;
+            while let Ok(Some(message)) = tokio::time::timeout_at(end, messages.next()).await {
+                let message = message.map_err(|e| failed(&e))?;
+                let stamp = &message["header"]["stamp"];
+                if !stamp.is_object() {
+                    return Err(no_stamp());
+                }
+                delays.push(nervros_ros::now_s() - crate::stamp_s(stamp));
+            }
         }
-        let now = nervros_ros::now_s();
-        Ok(stamps.into_iter().flatten().map(|s| now - s).collect())
+        Ok(delays)
     }
 }
 

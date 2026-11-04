@@ -406,6 +406,29 @@ async fn a_node_says_its_actions_and_lifecycle_and_an_action_its_ends() {
 }
 
 #[tokio::test]
+async fn a_delay_is_measured_on_arrival_and_not_after_the_window() {
+    let fake = FakeRobot::new()
+        .with_graph(GraphDetail {
+            topics: vec![("/stamped".into(), vec!["std_msgs/msg/Header".into()])],
+            ..GraphDetail::default()
+        })
+        .with_topic(
+            "/stamped",
+            json!({"header": {"stamp": {"sec": nervros_ros::now_s(), "nanosec": 0}}}),
+        );
+    let robot: Arc<dyn RobotPort> = Arc::new(fake);
+    let schemas: Arc<dyn SchemaSource> = Arc::new(Schemas);
+    let guard = Arc::new(Guard::new(Policy::default()));
+    let tools = tools(&RosToolsConfig::default(), &robot, &schemas, &guard);
+    let out = tool(&tools, "topic_sample")
+        .call(json!({"topic": "/stamped", "mode": "delay", "seconds": 0.5}))
+        .await;
+    // Aged on arrival, the mean is near half the window; aged at its end, all of it.
+    assert!(out.data["delay_s"].as_f64().unwrap() < 0.45, "{}", out.data);
+    assert!(out.data["min_s"].as_f64().unwrap() < 0.2, "{}", out.data);
+}
+
+#[tokio::test]
 async fn an_echo_in_full_keeps_its_arrays() {
     let (_, tools, _) = all_tools(&RosToolsConfig::default(), false);
     let sample = tool(&tools, "topic_sample");
