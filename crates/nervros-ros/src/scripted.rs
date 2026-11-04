@@ -108,6 +108,11 @@ pub struct Motion {
     pub action: String,
     /// A path planner's action, answered with a straight line to the goal.
     pub planner: Option<String>,
+    /// A route planner's action, answered the same way.
+    pub route: Option<String>,
+    /// Actions that walk the robot, to the last pose their goal names.
+    #[serde(default)]
+    pub walks: Vec<String>,
     /// The map's frame.
     pub parent: String,
     /// The base's frame.
@@ -223,6 +228,32 @@ impl Motion {
             &self.parent,
             &self.child,
             Transform::from_yaw([x, y, now.translation[2]], yaw),
+        );
+    }
+
+    /// Moves the robot in `tf` to the last pose `goal` names, as a walk there would.
+    fn walk_to(&self, tf: &Mutex<TfBuffer>, goal: &Value) {
+        let last = |list: &Value| list.as_array().and_then(|l| l.last()).cloned();
+        let Some(stamped) = last(&goal["poses"])
+            .or_else(|| last(&goal["path"]["poses"]))
+            .or_else(|| goal.get("pose").cloned())
+        else {
+            return;
+        };
+        let (at, turned) = (
+            &stamped["pose"]["position"],
+            &stamped["pose"]["orientation"],
+        );
+        let number = |v: &Value| v.as_f64().unwrap_or(0.0);
+        let yaw = 2.0 * number(&turned["z"]).atan2(turned["w"].as_f64().unwrap_or(1.0));
+        let mut tf = lock(tf);
+        let z = tf
+            .lookup(&self.parent, &self.child)
+            .map_or(0.0, |t| t.translation[2]);
+        tf.insert(
+            &self.parent,
+            &self.child,
+            Transform::from_yaw([number(&at["x"]), number(&at["y"]), z], yaw),
         );
     }
 
@@ -560,16 +591,27 @@ fn with_actions(
     motion: Option<&Motion>,
 ) -> Result<FakeRobot, String> {
     let tf = robot.tf();
-    if let Some(motion) = motion.cloned().filter(|m| m.planner.is_some()) {
-        let planner = motion.planner.clone().unwrap_or_default();
-        let tf = Arc::clone(&tf);
-        robot = robot.with_action(&planner, move |goal| ScriptedRun {
-            result: Ok(GoalResult {
-                status: GoalStatus::Succeeded,
-                result: motion.path(&tf, goal),
-            }),
-            ..ScriptedRun::default()
-        });
+    if let Some(motion) = motion.cloned() {
+        for planner in [motion.planner.clone(), motion.route.clone()]
+            .into_iter()
+            .flatten()
+        {
+            let (motion, tf) = (motion.clone(), Arc::clone(&tf));
+            robot = robot.with_action(&planner, move |goal| ScriptedRun {
+                result: Ok(GoalResult {
+                    status: GoalStatus::Succeeded,
+                    result: motion.path(&tf, goal),
+                }),
+                ..ScriptedRun::default()
+            });
+        }
+        for walk in motion.walks.clone() {
+            let (motion, tf) = (motion.clone(), Arc::clone(&tf));
+            robot = robot.with_action(&walk, move |goal| {
+                motion.walk_to(&tf, goal);
+                ScriptedRun::default()
+            });
+        }
     }
     for (name, run) in actions {
         let status = match run.status.as_str() {
@@ -778,6 +820,34 @@ mod tests {
             };
             assert!(file.build().is_err(), "{hz}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_walk_goes_to_the_last_pose_its_goal_names() {
+        let robot = robot(&json!({
+            "transforms": [{"parent": "map", "child": "base"}],
+            "motion": {
+                "action": "/execute", "parent": "map", "child": "base",
+                "route": "/route", "walks": ["/through", "/follow"],
+            },
+        }));
+        let send = |action: &'static str, goal: Value| {
+            let robot = &robot;
+            async move {
+                let goal = robot
+                    .send_goal(action, "t", goal, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                goal.result.await.unwrap().unwrap()
+            }
+        };
+        let pose = |x: f64| json!({"pose": {"position": {"x": x, "y": 1.0}}});
+        send("/through", json!({"poses": [pose(1.0), pose(2.0)]})).await;
+        assert!((robot.transform("map", "base").unwrap().planar().0 - 2.0).abs() < 1e-9);
+        send("/follow", json!({"path": {"poses": [pose(5.0)]}})).await;
+        assert!((robot.transform("map", "base").unwrap().planar().0 - 5.0).abs() < 1e-9);
+        let route = send("/route", json!({"goal": pose(9.0)})).await;
+        assert_eq!(route.result["path"]["poses"][1], pose(9.0));
     }
 
     #[tokio::test]

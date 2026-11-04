@@ -200,6 +200,12 @@ fn motion(profile: &Profile, doc: &Map<String, Value>) -> Option<Value> {
     Some(json!({
         "action": mission.execute,
         "planner": profile.nav2.as_ref().map(|n| n.name("compute_path_to_pose")),
+        "route": profile.nav2.as_ref().map(|n| n.name("compute_route")),
+        "walks": profile.nav2.as_ref().map_or_else(Vec::new, |n| {
+            ["navigate_to_pose", "navigate_through_poses", "follow_path"]
+                .map(|a| n.name(a))
+                .to_vec()
+        }),
         "parent": profile.ros.map_frame,
         "child": profile.ros.base_frame,
         "walk": checks.walk.as_ref().map(|w| json!({
