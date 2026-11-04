@@ -70,6 +70,7 @@ pub struct FakeRobot {
     calls: Arc<Mutex<Vec<(String, Value)>>>,
     graph: Option<GraphDetail>,
     endpoints: HashMap<String, TopicEndpoints>,
+    raw: HashMap<String, Vec<Vec<u8>>>,
     nodes: HashMap<String, NodeEntities>,
     rates: HashMap<String, (f64, usize)>,
     published: Arc<Mutex<Vec<(String, Value)>>>,
@@ -212,6 +213,13 @@ impl FakeRobot {
     #[must_use]
     pub fn with_node(mut self, node: &str, entities: NodeEntities) -> Self {
         self.nodes.insert(node.to_owned(), entities);
+        self
+    }
+
+    /// What a raw subscription to a topic gets, then silence.
+    #[must_use]
+    pub fn with_raw(mut self, topic: &str, messages: Vec<Vec<u8>>) -> Self {
+        self.raw.insert(topic.to_owned(), messages);
         self
     }
 
@@ -392,6 +400,13 @@ impl RobotPort for FakeRobot {
                 tokio::time::sleep(step).await;
                 b
             })
+            .boxed())
+    }
+
+    async fn raw(&self, topic: &str, _ty: &str) -> Result<BoxStream<'static, Vec<u8>>, RosError> {
+        let messages = self.raw.get(topic).cloned().unwrap_or_default();
+        Ok(futures::stream::iter(messages)
+            .chain(futures::stream::pending())
             .boxed())
     }
 

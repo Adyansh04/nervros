@@ -25,6 +25,7 @@ uuid.workspace = true
 base64.workspace = true
 futures.workspace = true
 image.workspace = true
+mcap.workspace = true
 reqwest.workspace = true
 rhai.workspace = true
 rig.workspace = true

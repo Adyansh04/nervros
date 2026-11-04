@@ -7470,6 +7470,7 @@ dependencies = [
  "bytes",
  "futures",
  "image",
+ "mcap",
  "nervros-ros",
  "opentelemetry",
  "opentelemetry-otlp",

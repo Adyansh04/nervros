@@ -5,6 +5,7 @@
 //! (name, description, JSON Schema, risk) and returns an outcome whose message the model can read.
 
 pub mod background;
+pub mod bag;
 pub mod builtins;
 pub mod editor;
 pub mod look;
@@ -442,6 +443,11 @@ pub trait SchemaSource: Send + Sync {
     /// An interface as its `.msg`, `.srv` or `.action` text, when known.
     fn show(&self, _ros_type: &str) -> Option<String> {
         None
+    }
+
+    /// An interface with everything it is built of, as an MCAP file's `ros2msg` schema holds it.
+    fn definition(&self, ros_type: &str) -> Option<String> {
+        self.show(ros_type)
     }
 
     /// The interfaces known, by name, sorted.

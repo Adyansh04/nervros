@@ -28,7 +28,7 @@ pub(crate) use mission::schedule;
 pub use model::{llm, providers};
 pub use tools::places::room_label;
 pub use tools::{
-    background, builtins, editor, look, mcp, ros_tools, segment, skills, vision, watch, zones,
+    background, bag, builtins, editor, look, mcp, ros_tools, segment, skills, vision, watch, zones,
 };
 pub(crate) use tools::{memory, places, point};
 
