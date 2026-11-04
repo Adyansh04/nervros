@@ -39,6 +39,11 @@ pub fn unix_secs(at: std::time::SystemTime) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The string at `key` of a JSON object, empty when there is none.
+pub(crate) fn text<'v>(v: &'v serde_json::Value, key: &str) -> &'v str {
+    v[key].as_str().unwrap_or_default()
+}
+
 /// A ROS `builtin_interfaces` Time or Duration as seconds, a missing field counting as zero.
 #[must_use]
 pub(crate) fn stamp_s(stamp: &serde_json::Value) -> f64 {

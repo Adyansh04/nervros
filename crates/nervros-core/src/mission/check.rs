@@ -9,6 +9,7 @@ use serde_json::Value;
 use super::plan::{PlannedStep, predicate as predicate_of};
 use crate::builtins::holds;
 use crate::profile::PlaceConfig;
+use crate::text;
 
 /// How far from a place's pose still counts as there.
 const AT_PLACE_M: f64 = 0.5;
@@ -537,10 +538,6 @@ fn support_of<'a>(found: &Value, seen: &'a Observed) -> Option<&'a Value> {
                 && (y - hy).abs() <= sy / 2.0
         })
         .min_by(|a, b| area(a).total_cmp(&area(b)))
-}
-
-fn text<'a>(v: &'a Value, key: &str) -> &'a str {
-    v[key].as_str().unwrap_or_default()
 }
 
 /// When an object was last seen, in seconds since the epoch; 0 when it never was.

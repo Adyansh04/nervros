@@ -18,7 +18,7 @@ use nervros_ros::Transform;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::Arms;
+use super::{Arms, num};
 use crate::tools::{Assessment, Resource, Risk, Tool, ToolOutcome, ToolSpec};
 
 const CALL_WAIT: Duration = Duration::from_secs(5);
@@ -545,10 +545,6 @@ fn moved(before: &Transform, now: &Transform) -> bool {
         .abs()
         .min(1.0);
     d > MOVED_M || 2.0 * dot.acos() > TURNED_RAD
-}
-
-fn num(v: &Value) -> f64 {
-    v.as_f64().unwrap_or(0.0)
 }
 
 #[cfg(test)]

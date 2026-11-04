@@ -9,6 +9,7 @@ use super::priors::{room_type, rooms_for};
 use crate::builtins::holds;
 use crate::mission::check::{how_long, named};
 use crate::profile::PlaceConfig;
+use crate::text;
 
 /// How fast what the world model saw goes stale: an hour old counts about 0.96 of new, a day 0.37.
 const DAY_S: f64 = 86_400.0;
@@ -69,10 +70,6 @@ pub fn rank(seen: &Seen<'_>) -> Vec<Lookout> {
     let mut seen_targets = std::collections::BTreeSet::new();
     out.retain(|l| seen_targets.insert(l.target.clone()));
     out
-}
-
-fn text<'v>(v: &'v Value, key: &str) -> &'v str {
-    v[key].as_str().unwrap_or_default()
 }
 
 /// How much what was seen `at` still counts, now.
