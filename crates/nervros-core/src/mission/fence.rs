@@ -8,6 +8,7 @@
 
 use super::catalog::{Catalog, GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, WALK_ROUTE};
 use super::plan::{PlannedStep, Problem, World, arg};
+use crate::builtins::triple;
 use crate::profile::PlanChecks;
 use crate::zones::Zones;
 
@@ -30,15 +31,8 @@ fn target(step: &PlannedStep) -> Option<String> {
 /// Where a walk to a place, a pose or a target leaves the robot.
 fn destination(step: &PlannedStep, world: &World) -> Option<Pose> {
     if step.skill == GO_TO_POSE {
-        let station = arg(&step.args, "station")?;
-        let v: Vec<f64> = station
-            .split(';')
-            .map(|p| p.trim().parse().ok())
-            .collect::<Option<_>>()?;
-        return match v.as_slice() {
-            [x, y, yaw] => Some((*x, *y, Some(*yaw))),
-            _ => None,
-        };
+        let [x, y, yaw] = triple(arg(&step.args, "station")?)?;
+        return Some((x, y, Some(yaw)));
     }
     let target = target(step)?;
     if let Some(p) = world.places.iter().find(|p| p.name == target) {

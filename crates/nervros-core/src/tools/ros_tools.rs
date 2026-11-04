@@ -127,15 +127,15 @@ impl Ctx {
         let zones = self.guard.zones()?;
         let poses = match destinations(ty, payload) {
             Destinations::Poses(poses) => poses,
-            // A mission step is checked for entering a keep-out zone, which a move from wherever the
-            // robot stands cannot be here; a slow zone refuses no move, there or here.
-            Destinations::Relative if !zones.keep_out().is_empty() => {
+            // A mission step is checked for entering a keep-out zone, which a move with no pose
+            // on the map cannot be here; a slow zone refuses no move, there or here.
+            Destinations::Unchecked if !zones.keep_out().is_empty() => {
                 return Some(ToolOutcome::refused(
-                    "with keep-out zones set, a straight move is checked against them only as a \
-                     mission step: walk with run_mission",
+                    "with keep-out zones set, a move with no pose on the map is checked against \
+                     them only as a mission step: walk with run_mission",
                 ));
             }
-            Destinations::Relative | Destinations::Elsewhere => return None,
+            Destinations::Unchecked | Destinations::Elsewhere => return None,
         };
         for stamped in poses {
             let frame = stamped["header"]["frame_id"].as_str().unwrap_or_default();

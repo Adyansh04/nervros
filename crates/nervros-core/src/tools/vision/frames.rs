@@ -79,6 +79,8 @@ pub struct Camera {
     pub(crate) detected: Option<Arc<History>>,
     /// Detections of a frame older than this, against the newest, are of another moment.
     pub(crate) max_age: Duration,
+    /// At most this many marks, the surest first: a mark's number means one thing in every tool.
+    pub(crate) max_marks: usize,
 }
 
 impl Camera {
@@ -164,6 +166,9 @@ impl Camera {
                 return unmarked(newest, Some(why));
             }
             if let Some(frame) = self.frame_of(dets.stamp_s).filter(|_| !stale) {
+                let mut dets = dets;
+                dets.instances.sort_by(|a, b| b.score.total_cmp(&a.score));
+                dets.instances.truncate(self.max_marks);
                 return (dets, frame, age, None);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -241,6 +246,7 @@ impl Cameras {
                 history,
                 detected,
                 max_age: look.max_age,
+                max_marks: look.max_marks,
             });
         }
         Ok(Arc::new(Self(cameras)))

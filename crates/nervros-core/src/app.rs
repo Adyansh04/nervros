@@ -226,7 +226,6 @@ fn seeing_tools(
         seen_by = Some(Arc::clone(&cameras));
         let eyes: Arc<dyn crate::look::Eyes> = Arc::clone(&llm) as Arc<dyn crate::look::Eyes>;
         let look_tool = Arc::new(LookTool::new(
-            look,
             Arc::clone(&cameras),
             Arc::clone(&robot),
             Arc::clone(&snapshots),

@@ -23,6 +23,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::builtins::triple;
 use crate::integrations::{Control, NativeSkill};
 use crate::profile::{MissionConfig, PlanChecks, TurnSkill, WalkSkill};
 
@@ -224,8 +225,8 @@ fn arg_problem(arg: &Value, value: &str) -> Option<String> {
                 )
             })
         }
-        "station" => (value.split(';').filter_map(number).count() != 3
-            || value.split(';').count() != 3)
+        "station" => triple(value)
+            .is_none()
             .then(|| "must be x;y;yaw".to_owned()),
         _ => None,
     }

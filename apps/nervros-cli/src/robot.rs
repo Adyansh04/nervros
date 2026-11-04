@@ -18,13 +18,7 @@ pub(crate) async fn look(profile_path: &Path, camera: Option<String>, out: &Path
         .context("the profile has no [look] section")?;
     let robot = nervros_core::app::connect(&profile)?;
     let cameras = Cameras::start(&config, &robot).context("subscribing to the cameras")?;
-    let tool = LookTool::new(
-        config,
-        cameras,
-        robot,
-        Arc::new(SnapshotStore::default()),
-        None,
-    );
+    let tool = LookTool::new(cameras, robot, Arc::new(SnapshotStore::default()), None);
     run_once(&tool, serde_json::json!({ "camera": camera }), out).await
 }
 
@@ -105,8 +99,12 @@ pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<(
         .iter()
         .find(|t| t.spec().name == name)
         .with_context(|| format!("no ROS tool `{name}`; there are {}", names.join(", ")))?;
-    // The profile's rules hold here as in a session.
-    if let Some(rule) = guard.rule(name, &args) {
+    // The profile's rules hold here as in a session, on the call as it will run too.
+    let settled = tool.rule_view(&args);
+    let rule = guard
+        .rule(name, &args)
+        .or_else(|| guard.rule(name, settled.as_ref()?));
+    if let Some(rule) = rule {
         bail!(
             "`{name}` with these arguments {} by the profile: {}",
             match rule.then {

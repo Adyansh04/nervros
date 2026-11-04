@@ -12,6 +12,7 @@ use nervros_ros::{GoalResult, GoalStatus};
 use serde_json::{Value, json};
 
 use super::{Arms, Goal, error_words, point_constraints};
+use crate::builtins::triple;
 use crate::integrations::{Control, Goals, NativeSkill, run_goal};
 
 /// How far above an object the hand goes, m: the object itself is in the way.
@@ -337,13 +338,9 @@ fn along(direction: &str, metres: f64) -> Result<[f64; 3], String> {
 
 /// The arguments `Arms::point` takes for a target: `x;y;z` on the map, else an object's id.
 fn target_args(target: &str) -> Value {
-    let v: Option<Vec<f64>> = target
-        .split(';')
-        .map(|p| p.trim().parse().ok().filter(|v: &f64| v.is_finite()))
-        .collect();
-    match v.as_deref() {
-        Some(&[x, y, z]) => json!({"x": x, "y": y, "z": z}),
-        _ => json!({"object": target}),
+    match triple(target) {
+        Some([x, y, z]) => json!({"x": x, "y": y, "z": z}),
+        None => json!({"object": target}),
     }
 }
 

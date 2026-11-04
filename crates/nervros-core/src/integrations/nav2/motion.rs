@@ -11,6 +11,7 @@ use nervros_ros::{GoalResult, GoalStatus, RobotPort};
 use serde_json::{Value, json};
 
 use super::Nav2Config;
+use crate::builtins::triple;
 use crate::integrations::{
     Again, Control, Goals, NativeSkill, Spot, beside, locate, run_goal, stamped, turns,
 };
@@ -315,14 +316,8 @@ fn number(args: &BTreeMap<String, String>, name: &str) -> Result<f64, String> {
 
 /// `x;y;yaw` on the map.
 fn station(text: &str) -> Result<(f64, f64, f64), String> {
-    let v: Option<Vec<f64>> = text
-        .split(';')
-        .map(|p| p.trim().parse().ok().filter(|v: &f64| v.is_finite()))
-        .collect();
-    match v.as_deref() {
-        Some(&[x, y, yaw]) => Ok((x, y, yaw)),
-        _ => Err(format!("`{text}` is not x;y;yaw")),
-    }
+    let [x, y, yaw] = triple(text).ok_or_else(|| format!("`{text}` is not x;y;yaw"))?;
+    Ok((x, y, yaw))
 }
 
 /// One motion.

@@ -393,7 +393,6 @@ mod tests {
         let snapshots = Arc::new(SnapshotStore::default());
         let vision = Vision {
             look: Arc::new(LookTool::new(
-                look,
                 Arc::clone(&cameras),
                 Arc::clone(&robot),
                 Arc::clone(&snapshots),
