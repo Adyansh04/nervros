@@ -13,6 +13,8 @@ pub const GO_TO_TARGET: &str = "GoToTarget";
 pub const GO_TO_PLACE: &str = "GoToPlace";
 /// Walks through places in turn without stopping at each, as Nav2 runs it for NervROS.
 pub const WALK_ROUTE: &str = "WalkRoute";
+/// Walks to a target along the robot's route graph, as Nav2 runs it for `NervROS`.
+pub const WALK_GRAPH: &str = "WalkGraph";
 /// The skill that looks for something with the detector, and says what it calls it.
 pub const FIND_IN_VIEW: &str = "FindInView";
 

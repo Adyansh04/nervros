@@ -50,6 +50,9 @@ pub struct Nav2Config {
     /// Whether the robot runs Nav2's docking server, for docking and undocking steps.
     #[serde(default)]
     pub docking: bool,
+    /// Whether the robot runs Nav2's route server with a graph, for walks along its lanes.
+    #[serde(default)]
+    pub route_server: bool,
 }
 
 fn default_drive_speed() -> f64 {
@@ -82,6 +85,7 @@ impl Default for Nav2Config {
             costmaps: default_costmaps(),
             drive_speed_mps: default_drive_speed(),
             docking: false,
+            route_server: false,
         }
     }
 }
@@ -183,7 +187,12 @@ impl Nav2 {
         let (motions, natives) = motion::Motions::natives(
             config,
             parts.profile,
-            (robot(), Arc::clone(parts.places), goals),
+            (
+                robot(),
+                Arc::clone(parts.places),
+                goals,
+                Arc::clone(parts.zones),
+            ),
         );
         let goals = Arc::clone(goals);
         Arc::new(Self {

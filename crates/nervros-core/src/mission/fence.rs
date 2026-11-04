@@ -6,7 +6,7 @@
 //! table does, leaves the pose unknown until the next walk to a place, and a straight walk from an
 //! unknown pose is left to Nav2's keepout filter, which stops it at the zone's edge.
 
-use super::catalog::{Catalog, GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, WALK_ROUTE};
+use super::catalog::{Catalog, GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, WALK_GRAPH, WALK_ROUTE};
 use super::plan::{PlannedStep, Problem, World, arg};
 use crate::builtins::triple;
 use crate::profile::PlanChecks;
@@ -17,7 +17,7 @@ type Pose = (f64, f64, Option<f64>);
 
 /// What a walk to a place or a target heads for: a place's name, an id, or a label.
 fn target(step: &PlannedStep) -> Option<String> {
-    if step.skill == GO_TO_TARGET {
+    if step.skill == GO_TO_TARGET || step.skill == WALK_GRAPH {
         arg(&step.args, "target").map(str::to_owned)
     } else {
         step.target.clone()
@@ -101,7 +101,7 @@ pub(crate) fn check(
     let mut problems = Vec::new();
     let mut pose: Option<Pose> = start.map(|(x, y, yaw)| (x, y, Some(yaw)));
     for step in steps {
-        if [GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET].contains(&step.skill.as_str()) {
+        if [GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, WALK_GRAPH].contains(&step.skill.as_str()) {
             pose = destination(step, world);
             if let Some((x, y, _)) = pose
                 && let Some(zone) = zones.at(x, y)

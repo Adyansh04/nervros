@@ -15,8 +15,10 @@ use crate::builtins::triple;
 use crate::integrations::{
     Again, Control, Goals, NativeSkill, Spot, beside, locate, run_goal, stamped, turns,
 };
+use crate::mission::catalog::GO_TO_PLACE;
 use crate::places::Places;
 use crate::profile::Profile;
+use crate::zones::Zones;
 
 /// How far from an object's box a walk to it stops.
 const BESIDE_M: f64 = 0.5;
@@ -39,6 +41,7 @@ enum Kind {
     GoToPose,
     GoToTarget,
     WalkRoute,
+    WalkGraph,
     TurnInPlace,
     WalkStraight,
     Wait,
@@ -53,6 +56,7 @@ pub(super) struct Motions {
     robot: Arc<dyn RobotPort>,
     places: Arc<Places>,
     goals: Arc<Goals>,
+    zones: Arc<Zones>,
     /// Where a walk's goal or route is drawn while it runs.
     session: OnceLock<crate::session::SessionHandle>,
 }
@@ -63,7 +67,7 @@ impl Motions {
     pub(super) fn natives(
         config: &Nav2Config,
         profile: &Profile,
-        (robot, places, goals): (Arc<dyn RobotPort>, Arc<Places>, &Arc<Goals>),
+        (robot, places, goals, zones): (Arc<dyn RobotPort>, Arc<Places>, &Arc<Goals>, Arc<Zones>),
     ) -> (Arc<Self>, Vec<Arc<dyn NativeSkill>>) {
         let world = profile
             .world
@@ -75,6 +79,7 @@ impl Motions {
             robot,
             places,
             goals: Arc::clone(goals),
+            zones,
             session: OnceLock::new(),
         });
         let mut kinds = vec![
@@ -86,6 +91,9 @@ impl Motions {
         ];
         if world {
             kinds.push(Kind::GoToTarget);
+        }
+        if world && config.route_server {
+            kinds.push(Kind::WalkGraph);
         }
         if config.docking {
             kinds.extend([Kind::Dock, Kind::Undock]);
@@ -145,6 +153,45 @@ impl Motions {
         let again = |goal: &Value, _: &Value| goal.clone();
         let types = ("navigate_to_pose", "nav2_msgs/action/NavigateToPose");
         self.send(types, goal, ctl, Some(&again)).await.map(|_| ())
+    }
+
+    /// Walks to `goal` along the robot's route graph, then the last of the way the graph does not
+    /// reach.
+    async fn walk_graph(&self, goal: Value, ctl: &Control) -> Result<(), String> {
+        let asked = json!({"goal": goal, "use_poses": true, "use_start": false});
+        let types = ("compute_route", "nav2_msgs/action/ComputeRoute");
+        let route = self.send(types, asked, ctl, None).await?;
+        let path = &route["path"];
+        // A route's edges are the graph's, which Nav2's keep-out filter never sees.
+        if let Some(zone) = self.crossed(path) {
+            return Err(format!(
+                "the route graph's way there crosses the keep-out zone `{zone}`: walk with \
+                 {GO_TO_PLACE}, which plans around it"
+            ));
+        }
+        let follow = json!({"path": path, "controller_id": "", "goal_checker_id": "",
+                            "progress_checker_id": ""});
+        // Resumed, it follows the same path from the nearest point on it.
+        let again = |goal: &Value, _: &Value| goal.clone();
+        let types = ("follow_path", "nav2_msgs/action/FollowPath");
+        self.send(types, follow, ctl, Some(&again)).await?;
+        self.walk(goal, ctl).await
+    }
+
+    /// The keep-out zone a path crosses, if any.
+    fn crossed(&self, path: &Value) -> Option<String> {
+        let at = |p: &Value| {
+            let at = &p["pose"]["position"];
+            (
+                at["x"].as_f64().unwrap_or(0.0),
+                at["y"].as_f64().unwrap_or(0.0),
+            )
+        };
+        let poses = path["poses"].as_array()?;
+        poses
+            .windows(2)
+            .find_map(|w| self.zones.crossed(at(&w[0]), at(&w[1])))
+            .map(|(zone, _)| zone.name)
     }
 
     /// Sends `goal` to Nav2's action `name` and follows it to its end, as [`run_goal`] does.
@@ -285,11 +332,11 @@ fn ended(r: GoalResult) -> Result<Value, String> {
 /// Nav2's error codes in words: the navigators pass on their planner's and controller's.
 fn error_words(code: u64) -> &'static str {
     match code {
-        102 | 202 | 702 | 722 => "a frame could not be looked up (TF)",
+        102 | 202 | 401 | 702 | 722 => "a frame could not be looked up (TF)",
         103 => "the path was invalid",
         104 | 105 => "the robot made no progress",
         106 => "no velocity it could send was safe",
-        107 | 207 | 701 | 721 => "it ran out of time",
+        107 | 207 | 404 | 701 | 721 => "it ran out of time",
         203 => "the robot is off the map",
         204 => "the goal is off the map",
         205 => "the robot stands in an obstacle",
@@ -297,6 +344,9 @@ fn error_words(code: u64) -> &'static str {
         208 => "no path reaches it",
         703 | 723 => "something is in the way",
         724 => "it was asked for something it cannot do",
+        402 => "no route graph is loaded",
+        403 => "the route graph has no node near the start or the goal",
+        405 => "the route graph has no way there",
         901 => "no such dock",
         902 => "the dock is not valid",
         903 => "it could not reach the dock's staging pose",
@@ -328,6 +378,7 @@ struct Native {
 
 #[async_trait]
 impl NativeSkill for Native {
+    #[expect(clippy::too_many_lines, reason = "one catalog entry per motion")]
     fn skill(&self) -> Value {
         let base = json!(["base"]);
         let (name, description, args, outputs, effects, resources, max) = match self.kind {
@@ -366,6 +417,19 @@ impl NativeSkill for Native {
                 json!([]),
                 base,
                 WALK_S * 2.0,
+            ),
+            Kind::WalkGraph => (
+                "WalkGraph",
+                "Walk to a room or an object along the robot's route graph, its fixed lanes, \
+                 rather than the shortest way Nav2 would plan: for \"keep to the lanes\" or \
+                 \"take the marked route\". Otherwise use the ordinary walk.",
+                json!([{"name": "target", "type": "world_id", "format": "phrase",
+                        "description": "The id of a room or an object in the world model, such as R2 or O17; or what it is."}]),
+                json!([{"name": "target_id", "type": "world_id",
+                        "description": "The id of the room or object it walked to."}]),
+                json!(["near(target)"]),
+                base,
+                WALK_S,
             ),
             Kind::TurnInPlace => (
                 "TurnInPlace",
@@ -437,6 +501,11 @@ impl NativeSkill for Native {
         match self.kind {
             Kind::GoToPose | Kind::GoToTarget => vec![name("navigate_to_pose")],
             Kind::WalkRoute => vec![name("navigate_through_poses")],
+            Kind::WalkGraph => vec![
+                name("compute_route"),
+                name("follow_path"),
+                name("navigate_to_pose"),
+            ],
             Kind::TurnInPlace => vec![name("spin")],
             Kind::WalkStraight => vec![name("drive_on_heading")],
             Kind::Wait => Vec::new(),
@@ -457,10 +526,16 @@ impl NativeSkill for Native {
                     "walks there along Nav2's path".to_owned(),
                 )
             }
-            Kind::GoToTarget => {
+            Kind::GoToTarget | Kind::WalkGraph => {
                 let (spot, _) = m.target(arg("target")).await.ok()?;
                 let at = (spot.x, spot.y, spot.yaw.unwrap_or_default());
-                (Some(at), Vec::new(), format!("walks to {}", spot.what))
+                let how = if self.kind == Kind::WalkGraph {
+                    " along the route graph"
+                } else {
+                    ""
+                };
+                let note = format!("walks to {}{how}", spot.what);
+                (Some(at), Vec::new(), note)
             }
             Kind::WalkRoute => {
                 let route = m.route(arg("places")).await.ok()?;
@@ -497,14 +572,19 @@ impl NativeSkill for Native {
                 let _shown = m.show(&format!("to ({x:.1}, {y:.1})"), &[(x, y)]);
                 m.walk(m.pose(x, y, yaw), ctl).await.map(|()| none)
             }
-            Kind::GoToTarget => {
+            Kind::GoToTarget | Kind::WalkGraph => {
                 let (spot, id) = m.target(arg("target")).await?;
                 let _shown = m.show(&format!("to {}", spot.what), &[(spot.x, spot.y)]);
                 let yaw = spot.yaw.unwrap_or_else(|| {
                     m.here()
                         .map_or(0.0, |(x, y, _)| (spot.y - y).atan2(spot.x - x))
                 });
-                m.walk(m.pose(spot.x, spot.y, yaw), ctl).await?;
+                let pose = m.pose(spot.x, spot.y, yaw);
+                if self.kind == Kind::WalkGraph {
+                    m.walk_graph(pose, ctl).await?;
+                } else {
+                    m.walk(pose, ctl).await?;
+                }
                 Ok(BTreeMap::from([("target_id".to_owned(), id)]))
             }
             Kind::WalkRoute => {
@@ -722,6 +802,93 @@ mod tests {
         );
         assert_eq!(named(&objects, "o3", &["id"]).as_deref(), Some("O3"));
         assert!(nearest(&objects, "plate", None).is_none());
+    }
+
+    /// The motions of a robot with a route server, a place 4 m along x and a zone across the way.
+    fn along_the_graph(
+        path_x: &[f64],
+    ) -> (Arc<dyn NativeSkill>, Arc<nervros_ros::fake::FakeRobot>) {
+        let toml = r#"
+            [robot]
+            name = "t"
+            [world]
+            objects = { topic = "/objects", type = "canopy_msgs/msg/WorldObjectArray" }
+            [[place]]
+            name = "far"
+            pose = { x = 4.0, y = 0.0, yaw = 0.0 }
+            [[geofence.zone]]
+            name = "wet floor"
+            polygon = [[1.0, -1.0], [2.0, -1.0], [2.0, 1.0], [1.0, 1.0]]
+            [models]
+            file = "m.toml"
+        "#;
+        let profile = Profile::from_toml(toml, std::path::Path::new("nervros.toml")).unwrap();
+        let poses: Vec<Value> = path_x
+            .iter()
+            .map(|x| json!({"pose": {"position": {"x": x, "y": 0.0}}}))
+            .collect();
+        let fake = Arc::new(
+            nervros_ros::fake::FakeRobot::new()
+                .with_action("/compute_route", move |_| nervros_ros::fake::ScriptedRun {
+                    result: Ok(GoalResult {
+                        status: GoalStatus::Succeeded,
+                        result: json!({"path": {"poses": poses.clone()}, "error_code": 0}),
+                    }),
+                    ..Default::default()
+                })
+                .with_action("/follow_path", |_| {
+                    nervros_ros::fake::ScriptedRun::default()
+                })
+                .with_action("/navigate_to_pose", |_| {
+                    nervros_ros::fake::ScriptedRun::default()
+                }),
+        );
+        let robot = Arc::clone(&fake) as Arc<dyn RobotPort>;
+        let config = Nav2Config {
+            route_server: true,
+            ..Nav2Config::default()
+        };
+        let goals = Goals::published(Arc::clone(&robot), None);
+        let places = Places::new(&profile, None);
+        let zones = Zones::new(&profile, None);
+        let (_, natives) = Motions::natives(&config, &profile, (robot, places, &goals, zones));
+        let walk = natives
+            .into_iter()
+            .find(|n| n.skill()["name"] == "WalkGraph")
+            .unwrap();
+        (walk, fake)
+    }
+
+    fn sent(fake: &nervros_ros::fake::FakeRobot) -> Vec<String> {
+        fake.calls().into_iter().map(|(name, _)| name).collect()
+    }
+
+    #[tokio::test]
+    async fn a_walk_along_the_graph_follows_its_route_then_walks_the_rest() {
+        let (walk, fake) = along_the_graph(&[3.0, 3.5]);
+        let (_stop, stop) = tokio::sync::watch::channel(false);
+        let (_pause, paused) = tokio::sync::watch::channel(false);
+        let args = BTreeMap::from([("target".to_owned(), "far".to_owned())]);
+        let done = walk.run(&args, &Control { stop, paused }).await.unwrap();
+        assert_eq!(done["target_id"], "far");
+        assert_eq!(
+            sent(&fake),
+            ["/compute_route", "/follow_path", "/navigate_to_pose"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_across_a_keep_out_zone_stops_before_it_moves() {
+        let (walk, fake) = along_the_graph(&[0.0, 3.0]);
+        let (_stop, stop) = tokio::sync::watch::channel(false);
+        let (_pause, paused) = tokio::sync::watch::channel(false);
+        let args = BTreeMap::from([("target".to_owned(), "far".to_owned())]);
+        let why = walk
+            .run(&args, &Control { stop, paused })
+            .await
+            .unwrap_err();
+        assert!(why.contains("wet floor"), "{why}");
+        assert_eq!(sent(&fake), ["/compute_route"]);
     }
 
     #[tokio::test]
