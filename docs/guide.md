@@ -1042,7 +1042,7 @@ $ nervros-cli --profile nervros.toml eval eval/apartment.toml --out eval-r3
 That run covered the suite's first 44 cases.
 
 - `--only <text>` runs the cases whose ids contain it.
-- `--repeat k` runs each case k times, for pass^k.
+- `--repeat k` runs the suite k times, for pass^k; a scripted robot starts each run anew.
 - `--models a,b` compares models.
 - `nervros-cli case last --id my-case --append suite.toml` keeps a session as a new case.
 
