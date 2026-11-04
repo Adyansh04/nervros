@@ -6,6 +6,7 @@
 //! the spinning thread.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
@@ -499,8 +500,12 @@ fn full_name(namespace: &str, name: &str) -> String {
 }
 
 fn qos_info(q: &QosProfile) -> QosInfo {
-    use r2r::qos::{DurabilityPolicy as D, HistoryPolicy as H, ReliabilityPolicy as R};
+    use r2r::qos::{
+        DurabilityPolicy as D, HistoryPolicy as H, LivelinessPolicy as L, ReliabilityPolicy as R,
+    };
     let word = |s: &str| s.to_owned();
+    // The middleware says "none" with zero or with its very long infinity.
+    let limit = |d: Duration| (!d.is_zero() && d.as_secs() < 1 << 31).then_some(d);
     QosInfo {
         reliability: word(match q.reliability {
             R::Reliable => "reliable",
@@ -518,6 +523,14 @@ fn qos_info(q: &QosProfile) -> QosInfo {
             _ => "system_default",
         }),
         depth: q.depth,
+        deadline: limit(q.deadline),
+        lifespan: limit(q.lifespan),
+        liveliness: word(match q.liveliness {
+            L::Automatic => "automatic",
+            L::ManualByTopic => "manual_by_topic",
+            _ => "system_default",
+        }),
+        lease: limit(q.liveliness_lease_duration),
     }
 }
 
@@ -528,6 +541,10 @@ fn endpoints(infos: Vec<r2r::TopicEndpointInfo>) -> Vec<Endpoint> {
             node: full_name(&i.node_namespace, &i.node_name),
             topic_type: i.topic_type,
             qos: qos_info(&i.qos_profile),
+            gid: i.endpoint_gid[..16].iter().fold(String::new(), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            }),
         })
         .collect();
     out.sort_by(|a, b| a.node.cmp(&b.node));
@@ -959,6 +976,16 @@ impl RobotPort for R2rPort {
             reply,
         })?;
         Ok(rx.await.map_err(mw)??.map(|bytes| bytes.len()).boxed())
+    }
+
+    async fn raw(&self, topic: &str, ty: &str) -> Result<BoxStream<'static, Vec<u8>>, RosError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::SubscribeRaw {
+            topic: topic.to_owned(),
+            ty: ty.to_owned(),
+            reply,
+        })?;
+        Ok(rx.await.map_err(mw)??.boxed())
     }
 
     async fn messages(

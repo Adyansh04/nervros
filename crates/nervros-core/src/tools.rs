@@ -443,6 +443,11 @@ pub trait SchemaSource: Send + Sync {
     fn show(&self, _ros_type: &str) -> Option<String> {
         None
     }
+
+    /// The interfaces known, by name, sorted.
+    fn names(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Which part of an interface.

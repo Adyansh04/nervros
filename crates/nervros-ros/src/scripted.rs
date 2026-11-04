@@ -424,7 +424,9 @@ fn endpoints(nodes: &BTreeMap<String, NodeFile>) -> BTreeMap<String, TopicEndpoi
                 durability: "volatile".into(),
                 history: "keep_last".into(),
                 depth: 10,
+                ..QosInfo::default()
             },
+            gid: String::new(),
         };
         for (topic, ty) in &n.publishers {
             out.entry(topic.clone())

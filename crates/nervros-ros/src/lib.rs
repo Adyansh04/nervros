@@ -219,6 +219,14 @@ pub struct QosInfo {
     pub history: String,
     /// The queue depth for `keep_last`.
     pub depth: usize,
+    /// How often it promises or asks for a message, when it says.
+    pub deadline: Option<Duration>,
+    /// How long a message stays valid, when it says.
+    pub lifespan: Option<Duration>,
+    /// `automatic` or `manual_by_topic`.
+    pub liveliness: String,
+    /// How long it may stay silent and still count as alive, when it says.
+    pub lease: Option<Duration>,
 }
 
 /// One publisher or subscriber of a topic.
@@ -230,6 +238,8 @@ pub struct Endpoint {
     pub topic_type: String,
     /// Its `QoS`.
     pub qos: QosInfo,
+    /// Its unique id, in hexadecimal.
+    pub gid: String,
 }
 
 /// Who publishes and who subscribes to a topic.
@@ -363,6 +373,16 @@ pub trait RobotPort: Send + Sync {
         _topic: &str,
         _msg_type: &str,
     ) -> Result<BoxStream<'static, usize>, RosError> {
+        unsupported("following a topic")
+    }
+
+    /// Each message on a topic from now until the stream is dropped, serialized as it arrives,
+    /// subscribing as [`RobotPort::arrivals`] does.
+    async fn raw(
+        &self,
+        _topic: &str,
+        _msg_type: &str,
+    ) -> Result<BoxStream<'static, Vec<u8>>, RosError> {
         unsupported("following a topic")
     }
 

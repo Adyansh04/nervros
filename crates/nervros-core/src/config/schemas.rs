@@ -102,6 +102,12 @@ impl SchemaSource for RosidlSchemas {
             .map_err(|e| e.to_string())
     }
 
+    fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.registry.types().map(ToString::to_string).collect();
+        names.sort();
+        names
+    }
+
     fn show(&self, ros_type: &str) -> Option<String> {
         let ty: TypeName = ros_type.parse().ok()?;
         Some(match self.registry.get(&ty)? {
