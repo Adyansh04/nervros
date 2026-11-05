@@ -59,6 +59,7 @@ bytes = "=1.12.1"
 r2r = "=0.9.7"
 proptest = "=1.11.0"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
+mcap = { version = "=0.25.0", default-features = false }
 uuid = { version = "=1.26.1", features = ["v4", "v7", "serde"] }
 mimalloc = "=0.1.52"
 rerun = { version = "=0.38.1", default-features = false, features = ["native_viewer", "sdk"] }

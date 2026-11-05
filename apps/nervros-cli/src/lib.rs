@@ -172,7 +172,7 @@ enum Command {
         limit: usize,
     },
     /// Write the live robot as a scripted robot file for `eval --robot`: its graph, nodes,
-    /// parameters, the profile's topics and the executor's catalog.
+    /// parameters, the profile's topics, a frame from each camera and the executor's catalog.
     #[cfg(feature = "ros")]
     Record {
         /// The file to write.
@@ -228,10 +228,23 @@ enum Command {
     },
 }
 
+/// The profile at `path`.
+fn load(path: &Path) -> Result<Profile> {
+    Profile::load(path).context("loading the profile")
+}
+
+/// The live robot `profile` names, once discovery has had a moment.
+#[cfg(feature = "ros")]
+async fn live(profile: &Profile) -> Result<std::sync::Arc<dyn nervros_ros::RobotPort>> {
+    let robot = nervros_core::app::connect(profile)?;
+    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
+    Ok(robot)
+}
+
 /// The profile's models, with its privacy mode: a frame from a home robot stays on local models
 /// here as it does in a session.
 fn router(profile: &Path) -> Result<Router> {
-    let profile = Profile::load(profile).context("loading the profile")?;
+    let profile = load(profile)?;
     nervros_core::app::router(&profile).context("loading the models")
 }
 
@@ -335,7 +348,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 fn skills(profile: &Path) -> Result<()> {
-    let profile = nervros_core::profile::Profile::load(profile).context("loading the profile")?;
+    let profile = crate::load(profile)?;
     let (skills, problems) = nervros_core::skills::load_for(&profile);
     match nervros_core::skills::index(&skills) {
         Some(index) => println!("{index}"),

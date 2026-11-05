@@ -157,9 +157,7 @@ impl Goals {
         let Some(file) = &self.file else {
             return Ok(());
         };
-        let text = serde_json::to_vec_pretty(goals).map_err(|e| e.to_string())?;
-        crate::persist::write_atomic(file, &text)
-            .map_err(|e| format!("saving {}: {e}", file.display()))
+        crate::persist::write_json(file, goals)
     }
 
     /// Every goal, oldest first.

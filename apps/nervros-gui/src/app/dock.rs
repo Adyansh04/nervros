@@ -1,6 +1,7 @@
 //! The dock's tabs: the mission, the robot, approvals, events and the health checks.
 
 use nervros_core::session::Command;
+use nervros_ros::lock;
 use rerun::external::egui;
 use rerun::external::egui::{CornerRadius, Frame, Margin, RichText};
 use rerun::external::re_ui::{ReButton, UiExt as _, icons};
@@ -169,7 +170,7 @@ impl Gui {
         let Some(schedules) = &self.agent.schedules else {
             return;
         };
-        let list = schedules.list();
+        let list = schedules.running();
         if list.is_empty() {
             return;
         }
@@ -347,9 +348,7 @@ impl Gui {
                     "asked from the Doctor tab",
                 );
                 investigator.investigate(asked).await;
-                live.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .investigating = false;
+                lock(&live).investigating = false;
                 wake.request_repaint();
             });
         }
@@ -390,9 +389,7 @@ impl Gui {
                     Ok(text) => nervros_core::whoami::save(&profile, &text).map(|p| (p, text)),
                     Err(e) => Err(e.to_string()),
                 };
-                let mut l = live
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut l = lock(&live);
                 l.drafting = false;
                 l.draft = Some(drafted);
                 l.draft_fresh = true;

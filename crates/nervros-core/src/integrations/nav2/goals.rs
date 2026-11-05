@@ -7,9 +7,9 @@ use serde_json::Value;
 pub(crate) enum Destinations<'a> {
     /// The stamped poses it goes to, or plans a path to.
     Poses(Vec<&'a Value>),
-    /// A move relative to where the robot stands: a straight drive or a back-up, which only a
-    /// mission step can check against the zones.
-    Relative,
+    /// A move with no pose on the map to read, relative to where the robot stands or given in
+    /// another way, which only a mission step can check against the zones.
+    Unchecked,
     /// Not a move of the base.
     Elsewhere,
 }
@@ -28,8 +28,19 @@ pub(crate) fn destinations<'a>(ty: &str, payload: &'a Value) -> Destinations<'a>
         }
         "nav2_msgs/action/ComputePathThroughPoses" => Destinations::Poses(list(&payload["goals"])),
         "nav2_msgs/action/FollowPath" => Destinations::Poses(list(&payload["path"]["poses"])),
+        // By pose only: a route's node ids mean nothing without its graph.
+        "nav2_msgs/action/ComputeRoute" | "nav2_msgs/action/ComputeAndTrackRoute"
+            if payload["use_poses"].as_bool() == Some(true) =>
+        {
+            Destinations::Poses(vec![&payload["goal"]])
+        }
         "geometry_msgs/msg/PoseStamped" => Destinations::Poses(vec![payload]),
-        "nav2_msgs/action/DriveOnHeading" | "nav2_msgs/action/BackUp" => Destinations::Relative,
+        "nav2_msgs/action/DriveOnHeading"
+        | "nav2_msgs/action/BackUp"
+        | "nav2_msgs/action/AssistedTeleop"
+        | "nav2_msgs/action/ComputeRoute"
+        | "nav2_msgs/action/ComputeAndTrackRoute"
+        | "nav2_msgs/action/FollowGPSWaypoints" => Destinations::Unchecked,
         _ => Destinations::Elsewhere,
     }
 }
@@ -54,8 +65,20 @@ mod tests {
         assert_eq!(stops.len(), 2);
         assert_eq!(
             destinations("nav2_msgs/action/BackUp", &json!({})),
-            Destinations::Relative
+            Destinations::Unchecked
         );
+        let by_pose = json!({"use_poses": true, "goal": {"header": {"frame_id": "map"}}});
+        assert_eq!(
+            destinations("nav2_msgs/action/ComputeAndTrackRoute", &by_pose),
+            Destinations::Poses(vec![&by_pose["goal"]])
+        );
+        for ty in ["ComputeRoute", "FollowGPSWaypoints", "AssistedTeleop"] {
+            assert_eq!(
+                destinations(&format!("nav2_msgs/action/{ty}"), &json!({"goal_id": 3})),
+                Destinations::Unchecked,
+                "{ty}"
+            );
+        }
         assert_eq!(
             destinations("nav2_msgs/action/Spin", &json!({})),
             Destinations::Elsewhere

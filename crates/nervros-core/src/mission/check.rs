@@ -9,6 +9,7 @@ use serde_json::Value;
 use super::plan::{PlannedStep, predicate as predicate_of};
 use crate::builtins::holds;
 use crate::profile::PlaceConfig;
+use crate::text;
 
 /// How far from a place's pose still counts as there.
 const AT_PLACE_M: f64 = 0.5;
@@ -378,7 +379,7 @@ pub fn story(events: &[Value], now_s: f64) -> Vec<String> {
     let mut lines: Vec<(String, String)> = Vec::new();
     for e in events {
         let id = text(e, "id");
-        let ago = how_long(now_s - stamp_s(&e["stamp"]));
+        let ago = how_long(now_s - crate::stamp_s(&e["stamp"]));
         let room = text(e, "room_id");
         let other = text(e, "other_id");
         let mut phrase = match text(e, "kind") {
@@ -410,11 +411,6 @@ pub fn story(events: &[Value], now_s: f64) -> Vec<String> {
         }
     }
     lines.into_iter().map(|(_, line)| line).collect()
-}
-
-fn stamp_s(stamp: &Value) -> f64 {
-    let sec = stamp["sec"].as_f64().unwrap_or(0.0);
-    sec + stamp["nanosec"].as_f64().unwrap_or(0.0) * 1e-9
 }
 
 /// The world model's object that `keys` (ids or names such as `mug_4`) or `phrase` (the
@@ -544,13 +540,9 @@ fn support_of<'a>(found: &Value, seen: &'a Observed) -> Option<&'a Value> {
         .min_by(|a, b| area(a).total_cmp(&area(b)))
 }
 
-fn text<'a>(v: &'a Value, key: &str) -> &'a str {
-    v[key].as_str().unwrap_or_default()
-}
-
 /// When an object was last seen, in seconds since the epoch; 0 when it never was.
 fn seen_at(o: &Value) -> f64 {
-    stamp_s(&o["last_seen"])
+    crate::stamp_s(&o["last_seen"])
 }
 
 /// Whether an object's label or name is, or holds, `words`.

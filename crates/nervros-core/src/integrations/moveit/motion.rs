@@ -11,17 +11,18 @@ use async_trait::async_trait;
 use nervros_ros::{GoalResult, GoalStatus};
 use serde_json::{Value, json};
 
-use super::{Arms, Goal, error_words, point_constraints};
+use super::{Arms, CLEAR_SHARE, Goal, error_words, point_constraints};
+use crate::builtins::triple;
 use crate::integrations::{Control, Goals, NativeSkill, run_goal};
 
 /// How far above an object the hand goes, m: the object itself is in the way.
 const ABOVE_M: f64 = 0.10;
-/// The share of a straight hand move that must be clear for it to run.
-const CLEAR_SHARE: f64 = 0.98;
-/// How fine a straight move is cut, m.
-const LINE_STEP_M: f64 = 0.01;
 const ARM_S: f64 = 60.0;
 const CALL_WAIT: Duration = Duration::from_secs(10);
+/// How far a held thing may tilt on the way, radians.
+const HELD_TILT: f64 = 0.2;
+/// Constrained planning needs longer than a free move, s.
+const HELD_PLANNING_S: f64 = 10.0;
 
 /// The motions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,23 +63,30 @@ impl Motions {
             .collect()
     }
 
-    /// Plans and moves `group` to `constraints` through `move_group`.
+    /// Plans and moves `group` to `constraints` through `move_group`, within `path` all the way
+    /// when given.
     async fn move_group(
         &self,
         group: &str,
-        constraints: Value,
+        (constraints, path): (Value, Option<Value>),
         ctl: &Control,
     ) -> Result<(), String> {
         let s = self.arms.settings();
+        let planning_s = if path.is_some() {
+            s.planning_s.max(HELD_PLANNING_S)
+        } else {
+            s.planning_s
+        };
         let goal = json!({
             "request": {
                 "group_name": group,
                 "start_state": {"is_diff": true},
                 "goal_constraints": [constraints],
+                "path_constraints": path.unwrap_or_else(|| json!({})),
                 "pipeline_id": s.pipeline,
                 "planner_id": s.planner,
                 "num_planning_attempts": 1,
-                "allowed_planning_time": s.planning_s,
+                "allowed_planning_time": planning_s,
                 "max_velocity_scaling_factor": s.scaling,
                 "max_acceleration_scaling_factor": s.scaling,
             },
@@ -104,46 +112,7 @@ impl Motions {
 
     /// Moves the hand of `group` straight by `along` in the planning frame.
     async fn line(&self, group: &str, along: [f64; 3], ctl: &Control) -> Result<(), String> {
-        let srdf = self.arms.srdf().await?;
-        let planning = self.arms.planning_frame(&srdf)?;
-        let tip = srdf
-            .tip(group)
-            .ok_or_else(|| format!("the SRDF gives {group} no tip link"))?;
-        let now = self
-            .arms
-            .robot
-            .transform(&planning, &tip)
-            .map_err(|e| format!("where the hand is: {e}"))?;
-        let [x, y, z] = now.translation;
-        let [qx, qy, qz, qw] = now.rotation;
-        let s = self.arms.settings();
-        let request = json!({
-            "header": {"frame_id": planning},
-            "start_state": {"is_diff": true},
-            "group_name": group,
-            "link_name": tip,
-            "waypoints": [{
-                "position": {"x": x + along[0], "y": y + along[1], "z": z + along[2]},
-                "orientation": {"x": qx, "y": qy, "z": qz, "w": qw},
-            }],
-            "max_step": LINE_STEP_M,
-            "jump_threshold": 0.0,
-            "avoid_collisions": true,
-            "max_velocity_scaling_factor": s.scaling,
-            "max_acceleration_scaling_factor": s.scaling,
-        });
-        let service = self.arms.config.name("compute_cartesian_path");
-        let path = self
-            .arms
-            .robot
-            .call(
-                &service,
-                "moveit_msgs/srv/GetCartesianPath",
-                request,
-                CALL_WAIT,
-            )
-            .await
-            .map_err(|e| format!("MoveIt's straight-line planner did not answer: {e}"))?;
+        let path = self.arms.straight(group, along).await?;
         let share = path["fraction"].as_f64().unwrap_or(0.0);
         if share < CLEAR_SHARE {
             if share <= 0.0
@@ -317,8 +286,21 @@ fn ended(r: &GoalResult) -> Result<(), String> {
     }
 }
 
+/// Path constraints that keep `tip` turned as `orientation`, within a small tilt.
+fn held_level(planning: &str, tip: &str, orientation: &Value) -> Value {
+    json!({"orientation_constraints": [{
+        "header": {"frame_id": planning},
+        "link_name": tip,
+        "orientation": orientation,
+        "absolute_x_axis_tolerance": HELD_TILT,
+        "absolute_y_axis_tolerance": HELD_TILT,
+        "absolute_z_axis_tolerance": HELD_TILT,
+        "weight": 1.0,
+    }]})
+}
+
 /// A hand move along `direction` by `metres`, in the planning frame: x forward, y left, z up.
-fn along(direction: &str, metres: f64) -> Result<[f64; 3], String> {
+pub(super) fn along(direction: &str, metres: f64) -> Result<[f64; 3], String> {
     let unit = match direction {
         "forward" => [1.0, 0.0, 0.0],
         "back" | "backward" => [-1.0, 0.0, 0.0],
@@ -337,13 +319,9 @@ fn along(direction: &str, metres: f64) -> Result<[f64; 3], String> {
 
 /// The arguments `Arms::point` takes for a target: `x;y;z` on the map, else an object's id.
 fn target_args(target: &str) -> Value {
-    let v: Option<Vec<f64>> = target
-        .split(';')
-        .map(|p| p.trim().parse().ok().filter(|v: &f64| v.is_finite()))
-        .collect();
-    match v.as_deref() {
-        Some(&[x, y, z]) => json!({"x": x, "y": y, "z": z}),
-        _ => json!({"object": target}),
+    match triple(target) {
+        Some([x, y, z]) => json!({"x": x, "y": y, "z": z}),
+        None => json!({"object": target}),
     }
 }
 
@@ -372,8 +350,11 @@ impl Native {
         else {
             return Err(format!("`{pose}` is not a named pose of {group}"));
         };
-        m.lent(ARM_S, m.move_group(&group, joint_constraints(&at), ctl))
-            .await
+        m.lent(
+            ARM_S,
+            m.move_group(&group, (joint_constraints(&at), None), ctl),
+        )
+        .await
     }
 
     async fn hand_to(&self, arm: &str, target: &str, ctl: &Control) -> Result<(), String> {
@@ -384,13 +365,14 @@ impl Native {
         if args.get("object").is_some() {
             at[2] += ABOVE_M;
         }
-        let constraints = point_constraints(
-            &planning,
-            &tip,
-            at,
-            &m.arms.tip_orientation(&planning, &tip),
-        );
-        m.lent(ARM_S, m.move_group(&group, constraints, ctl)).await
+        let turned = m.arms.tip_orientation(&planning, &tip);
+        let constraints = point_constraints(&planning, &tip, at, &turned);
+        // What the hand holds stays as level as it is now the whole way: a full mug spills. Not
+        // knowing what it holds is no reason not to move.
+        let held = m.holding(&group).await.is_ok_and(|h| !h.is_empty());
+        let path = held.then(|| held_level(&planning, &tip, &turned));
+        m.lent(ARM_S, m.move_group(&group, (constraints, path), ctl))
+            .await
     }
 
     async fn grip(&self, arm: &str, state: &str, ctl: &Control) -> Result<(), String> {
@@ -417,7 +399,7 @@ impl Native {
         }
         m.lent(
             ARM_S,
-            m.move_group(&hand, joint_constraints(&pose.joints), ctl),
+            m.move_group(&hand, (joint_constraints(&pose.joints), None), ctl),
         )
         .await
     }
@@ -438,8 +420,8 @@ impl NativeSkill for Native {
             ),
             Kind::HandTo => (
                 "HandTo",
-                "Move a hand to just above an object, or to a point, keeping it turned as it is. \
-                 It stops above an object, not on it, and only within the arm's reach. To show \
+                "Move a hand to just above an object, or to a point, keeping it turned as it is, \
+                 and level all the way when it holds something. It stops above an object, not on it, and only within the arm's reach. To show \
                  the operator where something is, use point instead.",
                 json!([arm, {"name": "target", "type": "string",
                              "description": "An object's id, such as O17, or a point x;y;z on the map in metres."}]),
@@ -526,6 +508,16 @@ impl NativeSkill for Native {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_thing_stays_turned_as_it_is() {
+        let turned = json!({"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0});
+        let level = held_level("pelvis", "hand", &turned);
+        let kept = &level["orientation_constraints"][0];
+        assert_eq!(kept["link_name"], "hand");
+        assert_eq!(kept["orientation"], turned);
+        assert_eq!(kept["absolute_x_axis_tolerance"], json!(HELD_TILT));
+    }
 
     #[test]
     fn a_target_is_a_point_or_an_object() {

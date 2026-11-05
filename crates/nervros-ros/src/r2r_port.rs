@@ -6,9 +6,10 @@
 //! the spinning thread.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,7 @@ use r2r::QosProfile;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::lock;
 use crate::tf::TfBuffer;
 use crate::{
     Endpoint, Frame, Goal, GoalResult, GoalStatus, Graph, GraphDetail, NamesAndTypes, NodeEntities,
@@ -87,6 +89,8 @@ enum Cmd {
     SubscribeRaw {
         topic: String,
         ty: String,
+        /// As its publishers offer, rather than best effort.
+        as_offered: bool,
         reply: oneshot::Sender<Result<BoxStream<'static, Vec<u8>>, RosError>>,
     },
     SubscribeSample {
@@ -151,10 +155,6 @@ impl std::fmt::Debug for R2rPort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("R2rPort").finish_non_exhaustive()
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn mw(e: impl std::fmt::Display) -> RosError {
@@ -502,8 +502,12 @@ fn full_name(namespace: &str, name: &str) -> String {
 }
 
 fn qos_info(q: &QosProfile) -> QosInfo {
-    use r2r::qos::{DurabilityPolicy as D, HistoryPolicy as H, ReliabilityPolicy as R};
+    use r2r::qos::{
+        DurabilityPolicy as D, HistoryPolicy as H, LivelinessPolicy as L, ReliabilityPolicy as R,
+    };
     let word = |s: &str| s.to_owned();
+    // The middleware says "none" with zero or with its very long infinity.
+    let limit = |d: Duration| (!d.is_zero() && d.as_secs() < 1 << 31).then_some(d);
     QosInfo {
         reliability: word(match q.reliability {
             R::Reliable => "reliable",
@@ -521,6 +525,14 @@ fn qos_info(q: &QosProfile) -> QosInfo {
             _ => "system_default",
         }),
         depth: q.depth,
+        deadline: limit(q.deadline),
+        lifespan: limit(q.lifespan),
+        liveliness: word(match q.liveliness {
+            L::Automatic => "automatic",
+            L::ManualByTopic => "manual_by_topic",
+            _ => "system_default",
+        }),
+        lease: limit(q.liveliness_lease_duration),
     }
 }
 
@@ -531,6 +543,10 @@ fn endpoints(infos: Vec<r2r::TopicEndpointInfo>) -> Vec<Endpoint> {
             node: full_name(&i.node_namespace, &i.node_name),
             topic_type: i.topic_type,
             qos: qos_info(&i.qos_profile),
+            gid: i.endpoint_gid[..16].iter().fold(String::new(), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            }),
         })
         .collect();
     out.sort_by(|a, b| a.node.cmp(&b.node));
@@ -600,10 +616,21 @@ fn handle(node: &mut r2r::Node, runtime: &tokio::runtime::Handle, cmd: Cmd) {
         } => {
             let _ = reply.send(node_entities(node, &name, &namespace));
         }
-        Cmd::SubscribeRaw { topic, ty, reply } => {
-            // Best effort, as `ros2 topic hz` subscribes: it matches every publisher.
+        Cmd::SubscribeRaw {
+            topic,
+            ty,
+            as_offered,
+            reply,
+        } => {
+            // Best effort, as `ros2 topic hz` subscribes, matches every publisher; only a
+            // subscription that asks as they offer hears what a latched topic holds already.
+            let qos = if as_offered {
+                auto_qos(node, &topic, 10)
+            } else {
+                QosProfile::sensor_data()
+            };
             let stream = node
-                .subscribe_raw(&topic, &ty, QosProfile::sensor_data())
+                .subscribe_raw(&topic, &ty, qos)
                 .map(futures::StreamExt::boxed)
                 .map_err(|e| type_error(&ty, &e));
             let _ = reply.send(stream);
@@ -959,9 +986,21 @@ impl RobotPort for R2rPort {
         self.send(Cmd::SubscribeRaw {
             topic: topic.to_owned(),
             ty: ty.to_owned(),
+            as_offered: false,
             reply,
         })?;
         Ok(rx.await.map_err(mw)??.map(|bytes| bytes.len()).boxed())
+    }
+
+    async fn raw(&self, topic: &str, ty: &str) -> Result<BoxStream<'static, Vec<u8>>, RosError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::SubscribeRaw {
+            topic: topic.to_owned(),
+            ty: ty.to_owned(),
+            as_offered: true,
+            reply,
+        })?;
+        Ok(rx.await.map_err(mw)??.boxed())
     }
 
     async fn messages(

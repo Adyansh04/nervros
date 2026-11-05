@@ -47,16 +47,17 @@ impl NavAdmin {
         let spec = ToolSpec::new(
             "nav_admin",
             "Keeps Nav2 working. clear_costmaps: forget the obstacles in its global, local or \
-             both costmaps (around_m: only around the robot), as when it is stuck behind \
-             something gone. set_pose: tell localization the robot stands at a place, a room, an \
+             both costmaps (around_m: only around the robot, or around a place, room, object or \
+             x and y), as when it is stuck behind something gone. set_pose: tell localization the robot stands at a place, a room, an \
              object or x, y and yaw on the map. relocalize: localization searches the whole map. \
              navigation: pause, resume, reset or startup Nav2's servers. save_map: save the map \
-             as name. load_map: switch to the map at url. Each needs the operator's approval; \
+             as name. load_map: switch to the map at url. load_route_graph: switch the route \
+             server to the graph file at url. Each needs the operator's approval; \
              none runs during a mission.",
             json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["clear_costmaps", "set_pose", "relocalize", "navigation", "save_map", "load_map"]},
+                    "action": {"type": "string", "enum": ["clear_costmaps", "set_pose", "relocalize", "navigation", "save_map", "load_map", "load_route_graph"]},
                     "costmap": {"type": "string", "enum": ["global", "local", "both"]},
                     "around_m": {"type": "number", "description": "For clear_costmaps: only within this distance of the robot"},
                     "place": {"type": "string"},
@@ -67,7 +68,7 @@ impl NavAdmin {
                     "yaw": {"type": "number", "description": "Radians, counter-clockwise from the map's x axis"},
                     "command": {"type": "string", "enum": ["pause", "resume", "reset", "startup"]},
                     "name": {"type": "string", "description": "For save_map"},
-                    "url": {"type": "string", "description": "For load_map: the map's YAML file on the robot"},
+                    "url": {"type": "string", "description": "For load_map or load_route_graph: the file on the robot"},
                 },
                 "required": ["action"],
             }),
@@ -109,9 +110,27 @@ impl NavAdmin {
         let around = args["around_m"]
             .as_f64()
             .filter(|d| d.is_finite() && *d > 0.0);
+        let names_a_spot = ["place", "room", "object", "x"]
+            .iter()
+            .any(|k| !args[k].is_null());
+        let spot = match around.filter(|_| names_a_spot) {
+            Some(_) => {
+                let ctx = (&self.profile, &*self.places, self.robot.as_ref());
+                match locate(args, ctx, None, 0.5).await {
+                    Ok(s) => Some(stamped(&self.profile.ros.map_frame, s.x, s.y, 0.0)),
+                    Err(why) => return ToolOutcome::failed(why),
+                }
+            }
+            None => None,
+        };
         let mut cleared = Vec::new();
         for costmap in self.costmaps(args) {
             let (service, ty, request) = match around {
+                Some(d) if spot.is_some() => (
+                    costmap_service(costmap, "clear_around_pose"),
+                    "nav2_msgs/srv/ClearCostmapAroundPose",
+                    json!({"pose": spot, "reset_distance": d}),
+                ),
                 Some(d) => (
                     costmap_service(costmap, "clear_around"),
                     "nav2_msgs/srv/ClearCostmapAroundRobot",
@@ -295,6 +314,31 @@ impl NavAdmin {
         ))
     }
 
+    async fn load_route_graph(&self, args: &Value) -> ToolOutcome {
+        let url = args["url"].as_str().map(str::trim).unwrap_or_default();
+        if url.is_empty() {
+            return ToolOutcome::failed(
+                "load_route_graph needs the graph file's path on the robot",
+            );
+        }
+        let service = self.config.name("route_server/set_route_graph");
+        match self
+            .call_service(
+                &service,
+                "nav2_msgs/srv/SetRouteGraph",
+                json!({"graph_filepath": url}),
+                MAP_WAIT,
+            )
+            .await
+        {
+            Ok(r) if r["success"].as_bool() == Some(true) => {
+                ToolOutcome::ok(json!({"route_graph": url}))
+            }
+            Ok(_) => ToolOutcome::failed(format!("the route server would not load {url}")),
+            Err(why) => ToolOutcome::failed(why),
+        }
+    }
+
     async fn load_map(&self, args: &Value) -> ToolOutcome {
         let url = args["url"].as_str().map(str::trim).unwrap_or_default();
         if url.is_empty() {
@@ -384,6 +428,14 @@ impl Tool for NavAdmin {
                 Vec::new(),
                 format!("saves the map as {}", args["name"].as_str().unwrap_or("?")),
             ),
+            "load_route_graph" => (
+                Risk::WorldEdit,
+                base,
+                format!(
+                    "switches the route server to the graph {}",
+                    args["url"].as_str().unwrap_or("?")
+                ),
+            ),
             "load_map" => (
                 Risk::WorldEdit,
                 base,
@@ -410,9 +462,10 @@ impl Tool for NavAdmin {
             "navigation" => self.navigation(&args).await,
             "save_map" => self.save_map(&args).await,
             "load_map" => self.load_map(&args).await,
+            "load_route_graph" => self.load_route_graph(&args).await,
             other => ToolOutcome::failed(format!(
                 "action `{other}` is not one of clear_costmaps, set_pose, relocalize, navigation, \
-                 save_map, load_map"
+                 save_map, load_map, load_route_graph"
             )),
         }
     }

@@ -3,8 +3,10 @@
 //!
 //! It keeps the graph, the nodes each component container hosts, every node's topics, services
 //! and parameters, the rates and messages of the topics the profile names and of the sensors', the
-//! robot's place on the map, and the mission executor's catalog, with answers that accept every
-//! plan and finish every mission: nothing moves when a recording runs one.
+//! robot's place on the map, a frame from each of the profile's cameras (in a folder beside the
+//! file), and the mission executor's catalog, with answers that accept every plan and finish every
+//! mission. A mission then moves the recording as its plan says, by the profile's walk and turn
+//! skills, its places and the world model's rooms and objects; nothing else about the world changes.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -14,21 +16,19 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use nervros_core::profile::Profile;
+use nervros_core::ros_tools::{BULK_TYPES, param_value};
 use nervros_ros::{GraphDetail, RobotPort};
 use serde_json::{Map, Value, json};
 
-/// Types too large to keep a message of: images, clouds, grids and masks.
-const BULK: [&str; 7] = [
-    "sensor_msgs/msg/Image",
-    "sensor_msgs/msg/CompressedImage",
-    "sensor_msgs/msg/PointCloud2",
-    "nav_msgs/msg/OccupancyGrid",
-    "octomap_msgs/msg/Octomap",
+/// Types too large to keep a message of, besides the tool's [`BULK_TYPES`].
+const ALSO_BULK: [&str; 2] = [
     "canopy_msgs/msg/InstanceMaskArray",
     "tf2_msgs/msg/TFMessage",
 ];
-/// Sensor types whose rates a suite asks about.
-const SENSORS: [&str; 6] = [
+/// Types whose rates a suite asks about, or an incident's checks read: a costmap that looks silent
+/// would raise a false alarm.
+const SENSORS: [&str; 7] = [
+    "nav_msgs/msg/OccupancyGrid",
     "sensor_msgs/msg/LaserScan",
     "sensor_msgs/msg/Image",
     "sensor_msgs/msg/Imu",
@@ -42,6 +42,8 @@ const RATE_WINDOW: Duration = Duration::from_secs(2);
 const CALL: Duration = Duration::from_secs(3);
 /// Nodes asked at once for their parameters.
 const AT_ONCE: usize = 8;
+/// How long a camera has to give its first frame.
+const FRAME_WAIT: Duration = Duration::from_secs(5);
 
 /// Records the robot `profile_path` names into `out`.
 ///
@@ -49,10 +51,9 @@ const AT_ONCE: usize = 8;
 ///
 /// The profile cannot be loaded, the robot cannot be reached, or the file cannot be written.
 pub(crate) async fn record(profile_path: &Path, out: &Path) -> Result<()> {
-    let profile = Profile::load(profile_path).context("loading the profile")?;
-    let robot = nervros_core::app::connect(&profile)?;
+    let profile = crate::load(profile_path)?;
     // A recording of half the graph would be a different robot.
-    nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
+    let robot = crate::live(&profile).await?;
     let graph = robot.graph_detail().await.context("reading the graph")?;
     let mut doc = Map::new();
     let first = |items: &[(String, Vec<String>)]| -> Map<String, Value> {
@@ -86,6 +87,10 @@ pub(crate) async fn record(profile_path: &Path, out: &Path) -> Result<()> {
     let (services, actions) = executor(&robot, &profile).await;
     doc.insert("services".into(), services);
     doc.insert("actions".into(), actions);
+    doc.insert("frames".into(), frames(&robot, &profile, out).await?);
+    if let Some(motion) = motion(&profile, &doc) {
+        doc.insert("motion".into(), motion);
+    }
     if let Ok(pose) = robot.transform(&profile.ros.map_frame, &profile.ros.base_frame) {
         let (x, y, yaw) = pose.planar();
         doc.insert(
@@ -97,7 +102,8 @@ pub(crate) async fn record(profile_path: &Path, out: &Path) -> Result<()> {
         .context("writing the recording as TOML")?;
     let header = format!(
         "# Recorded by `nervros-cli record` from {} at {}: run a suite on it with\n\
-         # `nervros-cli eval <suite> --robot <this file>`. Nothing moves; every plan is accepted.\n\n",
+         # `nervros-cli eval <suite> --robot <this file>`. Every plan is accepted, and a mission\n\
+         # moves the recording as its plan says.\n\n",
         profile_path.display(),
         humantime::format_rfc3339_seconds(std::time::SystemTime::now())
     );
@@ -105,6 +111,111 @@ pub(crate) async fn record(profile_path: &Path, out: &Path) -> Result<()> {
         .with_context(|| format!("writing {}", out.display()))?;
     eprintln!("recorded into {}", out.display());
     Ok(())
+}
+
+/// A frame from each of the profile's cameras, saved in a folder beside `out`: each topic with the
+/// file's path relative to `out`, as `eval --robot` reads it.
+async fn frames(robot: &Arc<dyn RobotPort>, profile: &Profile, out: &Path) -> Result<Value> {
+    let Some(look) = &profile.look else {
+        return Ok(json!({}));
+    };
+    let folder = format!(
+        "{}-frames",
+        out.file_stem().unwrap_or_default().to_string_lossy()
+    );
+    let dir = out.with_file_name(&folder);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let topics = std::iter::once(&look.image).chain(look.cameras.values().map(|c| &c.image));
+    let mut files = Map::new();
+    for topic in topics {
+        let name = format!("{}.png", topic.trim_matches('/').replace('/', "_"));
+        match first_frame(robot, topic).await {
+            Ok(image) => {
+                image
+                    .save(dir.join(&name))
+                    .with_context(|| format!("saving {name}"))?;
+                files.insert(topic.clone(), json!(format!("{folder}/{name}")));
+            }
+            Err(e) => eprintln!("no frame from {topic}: {e:#}"),
+        }
+    }
+    Ok(Value::Object(files))
+}
+
+async fn first_frame(robot: &Arc<dyn RobotPort>, topic: &str) -> Result<image::RgbImage> {
+    let mut frames = robot.frames(topic)?;
+    let arrived = frames.wait_for(Option::is_some);
+    let frame = tokio::time::timeout(FRAME_WAIT, arrived)
+        .await
+        .context("waiting for a frame")??
+        .clone()
+        .context("no frame")?;
+    Ok(frame.to_rgb()?)
+}
+
+/// How a mission moves the recording: the profile's walk and turn skills, and where a step's
+/// argument can send it, by the profile's places and the world model's rooms and objects in `doc`.
+fn motion(profile: &Profile, doc: &Map<String, Value>) -> Option<Value> {
+    let mission = profile.mission.as_ref()?;
+    let mut places = Map::new();
+    let mut spot = |name: &str, at: &Value, yaw: Option<f64>| {
+        if !name.is_empty() {
+            places.insert(
+                name.to_owned(),
+                json!({"x": at["x"], "y": at["y"], "yaw": yaw}),
+            );
+        }
+    };
+    let topic = |t: Option<&nervros_core::profile::TopicRef>| {
+        t.and_then(|t| doc.get("topics")?.get(&t.topic)).cloned()
+    };
+    let world = profile.world.as_ref();
+    if let Some(objects) = topic(world.and_then(|w| w.objects.as_ref())) {
+        for object in objects["objects"].as_array().into_iter().flatten() {
+            let at = &object["pose"]["position"];
+            for key in ["id", "name"] {
+                spot(object[key].as_str().unwrap_or_default(), at, None);
+            }
+        }
+    }
+    if let Some(rooms) = topic(world.and_then(|w| w.rooms.as_ref())) {
+        for room in rooms["rooms"].as_array().into_iter().flatten() {
+            for key in ["id", "name", "type"] {
+                spot(
+                    room[key].as_str().unwrap_or_default(),
+                    &room["centroid"],
+                    None,
+                );
+            }
+        }
+    }
+    for place in &profile.places {
+        let at = json!({"x": place.pose.x, "y": place.pose.y});
+        spot(&place.name, &at, Some(place.pose.yaw));
+        for alias in &place.aliases {
+            spot(alias, &at, Some(place.pose.yaw));
+        }
+    }
+    let checks = &mission.checks;
+    Some(json!({
+        "action": mission.execute,
+        "planner": profile.nav2.as_ref().map(|n| n.name("compute_path_to_pose")),
+        "route": profile.nav2.as_ref().map(|n| n.name("compute_route")),
+        "walks": profile.nav2.as_ref().map_or_else(Vec::new, |n| {
+            ["navigate_to_pose", "navigate_through_poses"]
+                .map(|a| n.name(a))
+                .to_vec()
+        }),
+        "parent": profile.ros.map_frame,
+        "child": profile.ros.base_frame,
+        "walk": checks.walk.as_ref().map(|w| json!({
+            "skill": w.skill, "metres": w.metres, "direction": w.direction,
+        })),
+        "turn": checks.turn.as_ref().map(|t| json!({
+            "skill": t.skill, "degrees": t.degrees, "positive_left": t.positive_left,
+        })),
+        "places": places,
+    }))
 }
 
 /// TOML has no null: a field left out reads as its default. An array with a null in it, as a
@@ -175,23 +286,6 @@ async fn nodes(robot: &Arc<dyn RobotPort>, graph: &GraphDetail) -> Value {
     Value::Object(out)
 }
 
-/// A `rcl_interfaces/msg/ParameterValue` as plain JSON.
-fn plain(v: &Value) -> Value {
-    let field = match v["type"].as_u64() {
-        Some(1) => "bool_value",
-        Some(2) => "integer_value",
-        Some(3) => "double_value",
-        Some(4) => "string_value",
-        Some(5) => "byte_array_value",
-        Some(6) => "bool_array_value",
-        Some(7) => "integer_array_value",
-        Some(8) => "double_array_value",
-        Some(9) => "string_array_value",
-        _ => return Value::Null,
-    };
-    v[field].clone()
-}
-
 /// One node's parameters with their descriptions; none when it does not answer. A value the
 /// profile hides from the agent, such as a key, is not written down either.
 async fn node_params(
@@ -234,14 +328,10 @@ async fn node_params(
         .unwrap_or_default();
     let mut out = Map::new();
     for (i, name) in names.iter().enumerate() {
-        let lower = name.to_lowercase();
-        let value = if masked
-            .iter()
-            .any(|p| nervros_core::guard::glob_match(&p.to_lowercase(), &lower))
-        {
+        let value = if nervros_core::ros_tools::masked(&masked, name) {
             json!("(hidden)")
         } else {
-            values.get(i).map(plain).unwrap_or_default()
+            values.get(i).map(param_value).unwrap_or_default()
         };
         if value.is_null() {
             continue;
@@ -363,7 +453,7 @@ async fn messages(
         let Some(ty) = type_of(graph, topic) else {
             continue;
         };
-        if BULK.contains(&ty) {
+        if BULK_TYPES.contains(&ty) || ALSO_BULK.contains(&ty) {
             continue;
         }
         if let Ok(message) = robot.latest(topic, ty, Duration::from_secs(2)).await

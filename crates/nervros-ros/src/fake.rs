@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,6 +14,7 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::lock;
 use crate::tf::TfBuffer;
 use crate::{
     Frame, Goal, GoalResult, GoalStatus, Graph, GraphDetail, NodeEntities, Publisher, RobotPort,
@@ -63,12 +64,13 @@ pub struct FakeRobot {
     services: HashMap<String, ServiceFn>,
     actions: HashMap<String, ActionFn>,
     topics: Mutex<HashMap<String, Value>>,
-    frames: HashMap<String, FrameSender>,
-    tf: Mutex<TfBuffer>,
+    frames: HashMap<String, Arc<FrameSender>>,
+    tf: Arc<Mutex<TfBuffer>>,
     latency: Duration,
     calls: Arc<Mutex<Vec<(String, Value)>>>,
     graph: Option<GraphDetail>,
     endpoints: HashMap<String, TopicEndpoints>,
+    raw: HashMap<String, Vec<Vec<u8>>>,
     nodes: HashMap<String, NodeEntities>,
     rates: HashMap<String, (f64, usize)>,
     published: Arc<Mutex<Vec<(String, Value)>>>,
@@ -83,10 +85,6 @@ impl std::fmt::Debug for FakeRobot {
             .field("actions", &self.actions.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl FakeRobot {
@@ -137,7 +135,7 @@ impl FakeRobot {
     #[must_use]
     pub fn with_frame(mut self, topic: &str, frame: Frame) -> Self {
         let (tx, _) = watch::channel(Some(Arc::new(frame)));
-        self.frames.insert(topic.to_owned(), tx);
+        self.frames.insert(topic.to_owned(), Arc::new(tx));
         self
     }
 
@@ -146,6 +144,11 @@ impl FakeRobot {
     pub fn with_transform(self, parent: &str, child: &str, t: Transform) -> Self {
         lock(&self.tf).insert(parent, child, t);
         self
+    }
+
+    /// Its transforms, for what moves it as it runs.
+    pub(crate) fn tf(&self) -> Arc<Mutex<TfBuffer>> {
+        Arc::clone(&self.tf)
     }
 
     /// Delays every call and goal acceptance.
@@ -158,6 +161,25 @@ impl FakeRobot {
     /// Replaces a topic's newest message.
     pub fn set_topic(&self, name: &str, value: Value) {
         lock(&self.topics).insert(name.to_owned(), value);
+    }
+
+    /// Adds an image topic that sends `frame` every `period`, stamped anew, as long as the robot
+    /// lives: a camera that goes quiet reads as a stopped one.
+    #[must_use]
+    pub fn with_camera(mut self, topic: &str, mut frame: Frame, period: Duration) -> Self {
+        let (tx, _) = watch::channel(Some(Arc::new(frame.clone())));
+        let tx = Arc::new(tx);
+        let sender = Arc::downgrade(&tx);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(period);
+                let Some(tx) = sender.upgrade() else { return };
+                frame.stamp_s = crate::now_s();
+                tx.send_replace(Some(Arc::new(frame.clone())));
+            }
+        });
+        self.frames.insert(topic.to_owned(), tx);
+        self
     }
 
     /// Sends a new frame on an image topic added with [`FakeRobot::with_frame`].
@@ -191,6 +213,13 @@ impl FakeRobot {
     #[must_use]
     pub fn with_node(mut self, node: &str, entities: NodeEntities) -> Self {
         self.nodes.insert(node.to_owned(), entities);
+        self
+    }
+
+    /// What a raw subscription to a topic gets, then silence.
+    #[must_use]
+    pub fn with_raw(mut self, topic: &str, messages: Vec<Vec<u8>>) -> Self {
+        self.raw.insert(topic.to_owned(), messages);
         self
     }
 
@@ -371,6 +400,13 @@ impl RobotPort for FakeRobot {
                 tokio::time::sleep(step).await;
                 b
             })
+            .boxed())
+    }
+
+    async fn raw(&self, topic: &str, _ty: &str) -> Result<BoxStream<'static, Vec<u8>>, RosError> {
+        let messages = self.raw.get(topic).cloned().unwrap_or_default();
+        Ok(futures::stream::iter(messages)
+            .chain(futures::stream::pending())
             .boxed())
     }
 

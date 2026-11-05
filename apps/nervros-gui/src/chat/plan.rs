@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use nervros_core::duration_words;
 use nervros_core::mission::Outcome;
 use nervros_core::mission::plan::PlannedStep;
 use nervros_core::session::Command;
@@ -110,7 +111,7 @@ fn track_label(ui: &mut egui::Ui, s: &PlannedStep) {
     };
     let mut text = format!("{} of {}", track.succeeded, track.runs);
     if let Some(typical) = track.typical_s {
-        let _ = write!(text, " · {}", minutes(typical));
+        let _ = write!(text, " · {}", duration_words(typical));
     }
     // Under three in four is worth a second look before approving.
     let color = if track.succeeded * 4 < track.runs * 3 {
@@ -127,14 +128,6 @@ fn track_label(ui: &mut egui::Ui, s: &PlannedStep) {
     }
     ui.label(RichText::new(text).small().color(color))
         .on_hover_text(hover);
-}
-
-pub(super) fn minutes(seconds: f64) -> String {
-    if seconds < 90.0 {
-        format!("{seconds:.0} s")
-    } else {
-        format!("{:.0} min", seconds / 60.0)
-    }
 }
 
 /// A plan and its mission: steps with live state, and one action while it runs.
@@ -171,7 +164,8 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut
         ui.horizontal(|ui| {
             let state = match (&p.finished, p.started) {
                 (Some((Outcome::Success, .., secs)), _) => {
-                    RichText::new(format!("Done in {}", minutes(*secs))).color(theme::SUCCESS)
+                    RichText::new(format!("Done in {}", duration_words(*secs)))
+                        .color(theme::SUCCESS)
                 }
                 (Some((outcome, step, reason, _)), _) => {
                     let at = if step.is_empty() {
@@ -189,7 +183,7 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut
                 }
                 (None, Some(since)) => {
                     ui.ctx().request_repaint_after(Duration::from_secs(1));
-                    let elapsed = minutes(since.elapsed().as_secs_f64());
+                    let elapsed = duration_words(since.elapsed().as_secs_f64());
                     if p.paused {
                         RichText::new(format!("Paused · started {elapsed} ago")).color(theme::WARN)
                     } else {
@@ -206,7 +200,7 @@ pub fn plan_card(ui: &mut egui::Ui, p: &PlanCard, can_pause: bool, actions: &mut
                 .color(theme::FAINT),
                 (None, None) => RichText::new(format!(
                     "Checked · at most {} · waiting to run",
-                    minutes(p.worst_case_s)
+                    duration_words(p.worst_case_s)
                 ))
                 .color(theme::DIM),
             };

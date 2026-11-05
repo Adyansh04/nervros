@@ -288,10 +288,7 @@ mod tests {
     #[test]
     fn snapshot_history() {
         let ledger = Ledger::in_memory().unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
+        let now = nervros_core::now_s();
         let step = |id: &str, skill: &str, outcome: &str, seconds: f64, reason: &str| StepRecord {
             id: id.to_owned(),
             skill: skill.to_owned(),

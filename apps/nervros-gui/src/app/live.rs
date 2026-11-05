@@ -1,10 +1,11 @@
 //! What the window keeps up to date in the background: the robot, the graph and the checks.
 
 use std::collections::HashMap;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use nervros_core::app::Agent;
+use nervros_ros::lock;
 use rerun::external::egui;
 use tokio::sync::broadcast;
 
@@ -39,7 +40,7 @@ fn watch_robot(agent: &Agent, live: &SharedLive, ctx: &egui::Context) {
             };
             let pose = robot.transform(&map, &base).ok().map(|t| t.planar());
             let changed = {
-                let mut l = live.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut l = lock(&live);
                 let changed = l.executor != executor || l.pose != pose;
                 l.executor = executor;
                 l.pose = pose;
@@ -126,7 +127,7 @@ pub(super) fn watch(
             )
             .await;
             {
-                let mut l = live_graph.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut l = lock(&live_graph);
                 l.topics = topics;
                 l.rooms = rooms;
                 l.objects = objects;
@@ -145,10 +146,7 @@ pub(super) fn watch(
         tokio::time::sleep(Duration::from_secs(3)).await;
         loop {
             let checks = nervros_core::doctor::run(&profile, robot.as_ref()).await;
-            live_checks
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .checks = Some(checks);
+            lock(&live_checks).checks = Some(checks);
             wake.request_repaint();
             if rx.recv().await.is_none() {
                 return;

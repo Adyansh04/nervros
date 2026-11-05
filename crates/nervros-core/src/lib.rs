@@ -27,7 +27,9 @@ pub use mission::check::how_long;
 pub(crate) use mission::schedule;
 pub use model::{llm, providers};
 pub use tools::places::room_label;
-pub use tools::{builtins, editor, look, mcp, ros_tools, segment, skills, vision, watch, zones};
+pub use tools::{
+    background, bag, builtins, editor, look, mcp, ros_tools, segment, skills, vision, watch, zones,
+};
 pub(crate) use tools::{memory, places, point};
 
 /// Whole seconds since the Unix epoch; 0 for a clock set before it.
@@ -37,12 +39,25 @@ pub fn unix_secs(at: std::time::SystemTime) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Now, in seconds since the Unix epoch.
+/// The string at `key` of a JSON object, empty when there is none.
+pub(crate) fn text<'v>(v: &'v serde_json::Value, key: &str) -> &'v str {
+    v[key].as_str().unwrap_or_default()
+}
+
+/// A ROS `builtin_interfaces` Time or Duration as seconds, a missing field counting as zero.
 #[must_use]
-pub fn now_s() -> f64 {
-    std::time::SystemTime::now()
+pub(crate) fn stamp_s(stamp: &serde_json::Value) -> f64 {
+    stamp["sec"].as_f64().unwrap_or(0.0) + stamp["nanosec"].as_f64().unwrap_or(0.0) * 1e-9
+}
+
+pub use nervros_ros::now_s;
+
+/// Now as a ROS `builtin_interfaces/Time`.
+pub(crate) fn stamp_now() -> serde_json::Value {
+    let since = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64())
+        .unwrap_or_default();
+    serde_json::json!({"sec": since.as_secs(), "nanosec": since.subsec_nanos()})
 }
 
 /// `n` and its noun, which takes an "s" unless `n` is 1: "1 step", "3 steps".
@@ -56,7 +71,8 @@ pub(crate) fn counted<N: std::fmt::Display + PartialEq + From<u8> + Copy>(
 
 /// A duration as the window words it: seconds under a minute and a half, else minutes, so an
 /// approval's "at most" reads as its plan card's.
-pub(crate) fn duration_words(seconds: f64) -> String {
+#[must_use]
+pub fn duration_words(seconds: f64) -> String {
     if seconds < 90.0 {
         format!("{seconds:.0} s")
     } else {
@@ -64,10 +80,7 @@ pub(crate) fn duration_words(seconds: f64) -> String {
     }
 }
 
-/// A mutex's guard, poisoned or not: a panic while it was held leaves data still worth reading.
-pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+pub(crate) use nervros_ros::lock;
 
 #[cfg(test)]
 mod tests {

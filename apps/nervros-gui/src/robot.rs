@@ -5,13 +5,13 @@
 //! clamps and ramps each command, and stops the base when commands pause, so a closed window or
 //! a dropped link stops the robot too.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::theme;
 use nervros_core::mission::held_by;
 use nervros_core::profile::Profile;
-use nervros_ros::{Publisher, RobotPort};
+use nervros_ros::{Publisher, RobotPort, lock};
 use rerun::external::egui::{self, Key, RichText};
 use rerun::external::re_ui::ReButton;
 use serde_json::{Value, json};
@@ -46,18 +46,12 @@ pub struct Status {
 
 /// The room whose outline holds `(x, y)`.
 pub fn room_at(rooms: &Value, x: f64, y: f64) -> Option<&Value> {
-    rooms["rooms"].as_array()?.iter().find(|r| {
-        let points: Vec<(f64, f64)> = r["outline"]["points"]
-            .as_array()
-            .map_or(&[][..], Vec::as_slice)
-            .iter()
-            .filter_map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)))
-            .collect();
-        nervros_core::builtins::inside((x, y), &points)
-    })
+    rooms["rooms"]
+        .as_array()?
+        .iter()
+        .find(|r| nervros_core::builtins::holds(&r["outline"], x, y))
 }
 
-/// Whether a polygon holds a point, by counting the edges a ray to the right crosses.
 /// The hottest motor in a diagnostics message, as `(name, °C)`; none when all read zero, as in
 /// the simulator.
 pub fn hottest(diagnostics: &Value) -> Option<(String, f64)> {
@@ -123,7 +117,7 @@ impl Drive {
     }
 
     fn link(&self) -> std::sync::MutexGuard<'_, Link> {
-        self.link.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.link)
     }
 
     /// Asks the executor to hand the base over, or to take it back.
@@ -136,7 +130,7 @@ impl Drive {
                 match robot.publisher(&topic, "geometry_msgs/msg/Twist").await {
                     Ok(p) => Some(p),
                     Err(e) => {
-                        let mut l = link.lock().unwrap_or_else(PoisonError::into_inner);
+                        let mut l = lock(&link);
                         l.busy = false;
                         l.note = Some(format!("cannot send drive commands: {e}"));
                         return;
@@ -153,7 +147,7 @@ impl Drive {
                     SERVICE_TIMEOUT,
                 )
                 .await;
-            let mut l = link.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut l = lock(&link);
             l.busy = false;
             match reply {
                 Ok(r) if r["ok"].as_bool() == Some(true) => {

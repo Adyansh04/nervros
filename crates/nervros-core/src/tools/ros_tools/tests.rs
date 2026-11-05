@@ -41,6 +41,7 @@ fn qos(reliability: &str, durability: &str) -> QosInfo {
         durability: durability.into(),
         history: "keep_last".into(),
         depth: 10,
+        ..QosInfo::default()
     }
 }
 
@@ -71,11 +72,13 @@ fn robot() -> FakeRobot {
         node: "/viewer".into(),
         topic_type: "std_msgs/msg/String".into(),
         qos: qos("reliable", "volatile"),
+        gid: String::new(),
     };
     let lossy_pub = Endpoint {
         node: "/talker".into(),
         topic_type: "std_msgs/msg/String".into(),
         qos: qos("best_effort", "volatile"),
+        gid: "ab".into(),
     };
     FakeRobot::new()
         .with_graph(graph)
@@ -297,6 +300,142 @@ async fn hz_and_echo_measure_and_summarise() {
         .call(json!({"topic": "odom", "mode": "hz", "seconds": 2}))
         .await;
     assert_eq!(relative.data["rate_hz"], 50.0, "{}", relative.message);
+}
+
+#[tokio::test]
+async fn the_graph_answers_what_the_verbose_verbs_do() {
+    let (_, tools, _) = all_tools(&RosToolsConfig::default(), false);
+    let graph = tool(&tools, "ros_graph");
+    let found = graph
+        .call(json!({"kind": "topics", "type": "nav_msgs/msg/Odometry"}))
+        .await;
+    assert_eq!(
+        found.data["items"],
+        json!([{"name": "/odom", "type": "nav_msgs/msg/Odometry"}])
+    );
+    let counted = graph
+        .call(json!({"kind": "topics", "filter": "/status", "counts": true}))
+        .await;
+    assert_eq!(counted.data["items"][0]["publishers"], 1);
+    assert_eq!(counted.data["items"][0]["subscribers"], 1);
+    let info = graph.call(json!({"name": "/status"})).await;
+    let publisher = &info.data["publishers"][0];
+    assert_eq!(publisher["history"], "keep_last");
+    assert_eq!(publisher["gid"], "ab");
+}
+
+#[test]
+fn a_slower_deadline_than_asked_is_a_mismatch() {
+    let with_deadline = |secs: Option<u64>| Endpoint {
+        qos: QosInfo {
+            deadline: secs.map(Duration::from_secs),
+            ..qos("reliable", "volatile")
+        },
+        ..Endpoint::default()
+    };
+    assert!(qos_matches(&with_deadline(None), &with_deadline(None)));
+    assert!(qos_matches(
+        &with_deadline(Some(1)),
+        &with_deadline(Some(2))
+    ));
+    assert!(!qos_matches(
+        &with_deadline(Some(2)),
+        &with_deadline(Some(1))
+    ));
+    assert!(!qos_matches(&with_deadline(None), &with_deadline(Some(1))));
+}
+
+#[tokio::test]
+async fn a_node_says_its_actions_and_lifecycle_and_an_action_its_ends() {
+    let end = |node: &str| Endpoint {
+        node: node.into(),
+        ..Endpoint::default()
+    };
+    let graph = GraphDetail {
+        topics: vec![(
+            "/spin/_action/feedback".into(),
+            vec!["nav2_msgs/action/Spin_FeedbackMessage".into()],
+        )],
+        services: vec![(
+            "/behavior_server/get_state".into(),
+            vec!["lifecycle_msgs/srv/GetState".into()],
+        )],
+        nodes: vec!["/behavior_server".into()],
+    };
+    let fake = FakeRobot::new()
+        .with_graph(graph)
+        .with_node(
+            "/behavior_server",
+            NodeEntities {
+                services: vec![(
+                    "/spin/_action/send_goal".into(),
+                    vec!["nav2_msgs/action/Spin_SendGoal".into()],
+                )],
+                ..NodeEntities::default()
+            },
+        )
+        .with_endpoints(
+            "/spin/_action/feedback",
+            TopicEndpoints {
+                publishers: vec![end("/behavior_server")],
+                subscribers: vec![end("/bt_navigator")],
+            },
+        )
+        .with_service("/behavior_server/get_state", |_| {
+            Ok(json!({"current_state": {"id": 3, "label": "active"}}))
+        });
+    let robot: Arc<dyn RobotPort> = Arc::new(fake);
+    let schemas: Arc<dyn SchemaSource> = Arc::new(Schemas);
+    let guard = Arc::new(Guard::new(Policy::default()));
+    let tools = tools(&RosToolsConfig::default(), &robot, &schemas, &guard);
+    let graph = tool(&tools, "ros_graph");
+    let node = graph.call(json!({"name": "/behavior_server"})).await;
+    assert_eq!(
+        node.data["action_servers"],
+        json!([{"name": "/spin", "type": "nav2_msgs/action/Spin"}])
+    );
+    assert_eq!(node.data["lifecycle_state"], "active");
+    let action = graph.call(json!({"name": "/spin"})).await;
+    assert_eq!(action.data["servers"], json!(["/behavior_server"]));
+    assert_eq!(action.data["clients"], json!(["/bt_navigator"]));
+    let managed = graph.call(json!({"kind": "lifecycle"})).await;
+    assert_eq!(
+        managed.data["items"],
+        json!([{"name": "/behavior_server", "state": "active"}])
+    );
+}
+
+#[tokio::test]
+async fn a_delay_is_measured_on_arrival_and_not_after_the_window() {
+    let fake = FakeRobot::new()
+        .with_graph(GraphDetail {
+            topics: vec![("/stamped".into(), vec!["std_msgs/msg/Header".into()])],
+            ..GraphDetail::default()
+        })
+        .with_topic(
+            "/stamped",
+            json!({"header": {"stamp": {"sec": nervros_ros::now_s(), "nanosec": 0}}}),
+        );
+    let robot: Arc<dyn RobotPort> = Arc::new(fake);
+    let schemas: Arc<dyn SchemaSource> = Arc::new(Schemas);
+    let guard = Arc::new(Guard::new(Policy::default()));
+    let tools = tools(&RosToolsConfig::default(), &robot, &schemas, &guard);
+    let out = tool(&tools, "topic_sample")
+        .call(json!({"topic": "/stamped", "mode": "delay", "seconds": 0.5}))
+        .await;
+    // Aged on arrival, the mean is near half the window; aged at its end, all of it.
+    assert!(out.data["delay_s"].as_f64().unwrap() < 0.45, "{}", out.data);
+    assert!(out.data["min_s"].as_f64().unwrap() < 0.2, "{}", out.data);
+}
+
+#[tokio::test]
+async fn an_echo_in_full_keeps_its_arrays() {
+    let (_, tools, _) = all_tools(&RosToolsConfig::default(), false);
+    let sample = tool(&tools, "topic_sample");
+    let out = sample.call(json!({"topic": "/status", "full": true})).await;
+    let first = &out.data["messages"][0];
+    assert_eq!(first["list"].as_array().unwrap().len(), 20);
+    assert_eq!(first["data"].as_str().unwrap().len(), 300);
 }
 
 #[tokio::test]

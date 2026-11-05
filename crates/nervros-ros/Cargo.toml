@@ -24,6 +24,7 @@ async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
 r2r = { workspace = true, optional = true }
+roxmltree.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

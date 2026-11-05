@@ -17,3 +17,13 @@ pub(crate) use marks::CLOSE_UP_PX;
 pub use marks::draw_marks;
 pub(crate) use marks::{PALETTE, badge, close_up, marks_json, tint};
 pub use snapshot::{Snapshot, SnapshotStore};
+
+/// `img` as a JPEG at the quality every kept or sent frame uses.
+///
+/// # Errors
+///
+/// The encoder failed.
+pub fn jpeg(img: &image::RgbImage) -> Result<Vec<u8>, String> {
+    nervros_ros::image::encode_jpeg(img, nervros_ros::image::JPEG_QUALITY)
+        .map_err(|e| e.to_string())
+}

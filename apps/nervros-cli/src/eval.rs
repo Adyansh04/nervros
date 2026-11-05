@@ -2,8 +2,9 @@
 //! a fresh session, approving every request, and checks what the agent did against what each case
 //! expects.
 //!
-//! Each case runs `repeat` times on each model asked for, the models taking turns so a change in
-//! the world falls on all of them alike. The report gives pass^k, what the calls cost, and where
+//! The suite runs `repeat` times on each model asked for, the models taking turns so a change in
+//! the world falls on all of them alike. Cases carry the robot's place from one to the next, so a
+//! scripted robot starts each run anew. The report gives pass^k, what the calls cost, and where
 //! the run came from: the checkout, the suite's hash, the models and the server behind each.
 
 use std::collections::BTreeSet;
@@ -87,7 +88,7 @@ pub(crate) async fn run(
         .with_context(|| format!("reading {}", suite_path.display()))?;
     let suite: Suite =
         toml::from_str(&text).with_context(|| format!("parsing {}", suite_path.display()))?;
-    let profile = Profile::load(profile_path).context("loading the profile")?;
+    let profile = crate::load(profile_path)?;
     let models =
         ModelsConfig::load(&profile.resolve(&profile.models.file)).context("loading the models")?;
     if let Some(m) = options.models.iter().find(|m| models.model(m).is_none()) {
@@ -111,14 +112,6 @@ pub(crate) async fn run(
         repeat: options.repeat,
         models: describe_models(&models, &options.models).await,
     };
-    let run = Run {
-        profile_path,
-        profile: &profile,
-        robot: &robot,
-        ledger: &ledger,
-        truth: suite.truth.as_ref(),
-        out,
-    };
     let mut trials = Vec::new();
     let cases: Vec<&Case> = suite
         .cases
@@ -136,37 +129,23 @@ pub(crate) async fn run(
                 .map_or_else(String::new, |o| format!(" has an id with `{o}`"))
         );
     }
-    for case in cases {
-        for trial in 1..=options.repeat {
-            for model in &arms {
-                eprintln!(
-                    "== {} #{trial}{}",
-                    case.id,
-                    model.map_or(String::new(), |m| format!(" on {m}"))
-                );
-                let seen = run_case(&run, case, *model, trial).await?;
-                let problems = judge(&case.expect, &seen);
-                let passed = problems.is_empty();
-                eprintln!(
-                    "   {} in {:.0} s, {} calls{}",
-                    if passed { "PASS" } else { "FAIL" },
-                    seen.seconds,
-                    seen.calls,
-                    if passed {
-                        String::new()
-                    } else {
-                        format!(": {}", problems.join("; "))
-                    }
-                );
-                trials.push(Trial {
-                    case: case.id.clone(),
-                    model: model.map(str::to_owned),
-                    attempt: trial,
-                    passed,
-                    problems,
-                    notes: notes(&seen),
-                    seen,
-                });
+    for trial in 1..=options.repeat {
+        for model in &arms {
+            let robot = if options.robot.is_empty() {
+                Arc::clone(&robot)
+            } else {
+                scripted_robot(&options.robot)?
+            };
+            let run = Run {
+                profile_path,
+                profile: &profile,
+                robot: &robot,
+                ledger: &ledger,
+                truth: suite.truth.as_ref(),
+                out,
+            };
+            for case in &cases {
+                trials.push(run_trial(&run, case, *model, trial).await?);
                 save(out, &provenance, &trials)?;
             }
         }
@@ -185,9 +164,7 @@ pub(crate) async fn run(
 /// scripted robot they describe.
 async fn robot_for(profile: &Profile, files: &[PathBuf]) -> Result<Arc<dyn RobotPort>> {
     if files.is_empty() {
-        let robot = nervros_core::app::connect(profile)?;
-        nervros_core::app::settled(robot.as_ref(), profile.ros.discovery_timeout).await;
-        return Ok(robot);
+        return crate::live(profile).await;
     }
     scripted_robot(files)
 }
@@ -198,8 +175,12 @@ fn scripted_robot(files: &[PathBuf]) -> Result<Arc<dyn RobotPort>> {
     for file in files {
         let text =
             std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-        let next: ScriptedRobot =
+        let mut next: ScriptedRobot =
             toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
+        let folder = file.parent().unwrap_or_else(|| Path::new("."));
+        for image in next.frames.values_mut() {
+            *image = folder.join(&*image);
+        }
         robot = robot.with(next);
     }
     Ok(Arc::new(robot.build().map_err(anyhow::Error::msg)?))
@@ -341,6 +322,43 @@ async fn truth_pose(robot: &Arc<dyn RobotPort>, truth: &Truth) -> Option<(f64, f
 fn travel(a: (f64, f64, f64), b: (f64, f64, f64)) -> (f64, f64) {
     let turn = (b.2 - a.2 + PI).rem_euclid(TAU) - PI;
     ((b.0 - a.0).hypot(b.1 - a.1), turn.to_degrees())
+}
+
+/// Runs one trial of `case` and judges it, saying how it went.
+async fn run_trial(
+    run: &Run<'_>,
+    case: &Case,
+    model: Option<&str>,
+    attempt: usize,
+) -> Result<Trial> {
+    eprintln!(
+        "== {} #{attempt}{}",
+        case.id,
+        model.map_or(String::new(), |m| format!(" on {m}"))
+    );
+    let seen = run_case(run, case, model, attempt).await?;
+    let problems = judge(&case.expect, &seen);
+    let passed = problems.is_empty();
+    eprintln!(
+        "   {} in {:.0} s, {} calls{}",
+        if passed { "PASS" } else { "FAIL" },
+        seen.seconds,
+        seen.calls,
+        if passed {
+            String::new()
+        } else {
+            format!(": {}", problems.join("; "))
+        }
+    );
+    Ok(Trial {
+        case: case.id.clone(),
+        model: model.map(str::to_owned),
+        attempt,
+        passed,
+        problems,
+        notes: notes(&seen),
+        seen,
+    })
 }
 
 async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize) -> Result<Seen> {

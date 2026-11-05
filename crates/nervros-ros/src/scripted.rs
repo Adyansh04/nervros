@@ -1,19 +1,27 @@
 //! A robot from a file: what the scenario tests talk to, and what `nervros-cli eval --robot` runs a
 //! suite against, so models can be compared in seconds, without a simulator.
 //!
-//! Services answer with a fixed response, actions run to a fixed end and topics hold one message.
-//! The graph, what each node publishes and subscribes to, the nodes each component container
-//! hosts, parameters, topic rates and frames make it look to the ROS tools like a live graph; a
-//! camera gives no image yet, and a service the graph lists without a response is not reachable.
+//! Services answer with a fixed response, or one chosen by a word in the request; actions run to a
+//! fixed end and topics hold one message. A camera gives the one image its file holds, and a
+//! mission that succeeds moves the robot as its plan says, so a suite can judge looking, walking
+//! and turning. The graph, what each node publishes and subscribes to, the nodes each component
+//! container hosts, parameters, topic rates and frames make it look to the ROS tools like a live
+//! graph; a service the graph lists without a response is not reachable.
 //! Callers parse the file (TOML in this repository) into [`ScriptedRobot`] and
 //! [`ScriptedRobot::build`] it.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::fake::{FakeRobot, ScriptedRun};
+use crate::image::Frame;
+use crate::lock;
+use crate::tf::TfBuffer;
 use crate::{
     Endpoint, GoalResult, GoalStatus, GraphDetail, NamesAndTypes, NodeEntities, QosInfo,
     TopicEndpoints, Transform,
@@ -29,6 +37,9 @@ pub struct ScriptedRobot {
     /// Services by name, each with the response it always gives.
     #[serde(default)]
     pub services: BTreeMap<String, Value>,
+    /// Services by name, each answering by a word in the request.
+    #[serde(default)]
+    pub replies: BTreeMap<String, Reply>,
     /// Actions by name, each with how a goal runs.
     #[serde(default)]
     pub actions: BTreeMap<String, Run>,
@@ -53,6 +64,248 @@ pub struct ScriptedRobot {
     /// Frames, each a child's pose in its parent.
     #[serde(default)]
     pub transforms: Vec<FrameFile>,
+    /// Camera topics, each with the image file it gives. A relative path is the caller's to resolve
+    /// against the robot file's folder.
+    #[serde(default)]
+    pub frames: BTreeMap<String, PathBuf>,
+    /// How a mission moves the robot; without it, nothing does.
+    pub motion: Option<Motion>,
+}
+
+/// A service that answers by what a request's text field says.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reply {
+    /// The request's field to read.
+    pub field: String,
+    /// Answers by word: the longest one the field holds, in lower case, answers.
+    pub by: BTreeMap<String, Value>,
+    /// The answer when none does.
+    pub otherwise: Value,
+}
+
+impl Reply {
+    fn answer(&self, request: &Value) -> Value {
+        let said = request[&self.field]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase();
+        self.by
+            .iter()
+            .filter(|(word, _)| said.contains(word.as_str()))
+            .max_by_key(|(word, _)| word.len())
+            .map_or(&self.otherwise, |(_, answer)| answer)
+            .clone()
+    }
+}
+
+/// How a successful mission moves the robot: its plan, read from the goal's behaviour tree, step by
+/// step, nothing in the way.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Motion {
+    /// The mission action.
+    pub action: String,
+    /// A path planner's action, answered with a straight line to the goal.
+    pub planner: Option<String>,
+    /// A route planner's action, answered the same way.
+    pub route: Option<String>,
+    /// Actions that walk the robot, to the last pose their goal names.
+    #[serde(default)]
+    pub walks: Vec<String>,
+    /// The map's frame.
+    pub parent: String,
+    /// The base's frame.
+    pub child: String,
+    /// The skill that walks a distance.
+    pub walk: Option<Walk>,
+    /// The skill that turns on the spot.
+    pub turn: Option<Turn>,
+    /// Where any step's argument naming one of these sends the robot.
+    #[serde(default)]
+    pub places: BTreeMap<String, Spot>,
+    /// How long a mission takes, seconds.
+    #[serde(default = "mission_seconds")]
+    pub seconds: f64,
+}
+
+fn mission_seconds() -> f64 {
+    1.0
+}
+
+/// The skill that walks a distance, and its arguments' names.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Walk {
+    /// The skill.
+    pub skill: String,
+    /// Its metres.
+    pub metres: String,
+    /// Its direction: `forward`, `backward`, `left` or `right`.
+    pub direction: Option<String>,
+}
+
+/// The skill that turns on the spot, and its argument's name.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Turn {
+    /// The skill.
+    pub skill: String,
+    /// Its degrees.
+    pub degrees: String,
+    /// Whether positive degrees turn left.
+    #[serde(default = "turns_left")]
+    pub positive_left: bool,
+}
+
+fn turns_left() -> bool {
+    true
+}
+
+/// A pose on the map.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Spot {
+    /// Metres.
+    pub x: f64,
+    /// Metres.
+    pub y: f64,
+    /// Radians, or none to keep the robot's heading.
+    pub yaw: Option<f64>,
+}
+
+impl Motion {
+    /// Where the plan in `tree` leaves a robot at `(x, y, yaw)`; an unreadable tree moves nothing.
+    fn after(&self, tree: &str, (mut x, mut y, mut yaw): (f64, f64, f64)) -> (f64, f64, f64) {
+        let Ok(doc) = roxmltree::Document::parse(tree) else {
+            return (x, y, yaw);
+        };
+        let number = |node: &roxmltree::Node, name: &str| -> Option<f64> {
+            node.attribute(name)?.parse().ok()
+        };
+        for node in doc.descendants().filter(roxmltree::Node::is_element) {
+            // NervROS writes each step as a `SubTree` that names its skill.
+            let skill = node
+                .attribute("ID")
+                .unwrap_or_else(|| node.tag_name().name());
+            if let Some(walk) = self.walk.as_ref().filter(|w| w.skill == skill) {
+                let metres = number(&node, &walk.metres).unwrap_or(0.0);
+                let side = walk.direction.as_deref().and_then(|d| node.attribute(d));
+                let (along, across) = match side {
+                    Some("backward" | "back") => (-metres, 0.0),
+                    Some("left") => (0.0, metres),
+                    Some("right") => (0.0, -metres),
+                    _ => (metres, 0.0),
+                };
+                x += along * yaw.cos() - across * yaw.sin();
+                y += along * yaw.sin() + across * yaw.cos();
+            } else if let Some(turn) = self.turn.as_ref().filter(|t| t.skill == skill) {
+                let degrees = number(&node, &turn.degrees).unwrap_or(0.0);
+                let sign = if turn.positive_left { 1.0 } else { -1.0 };
+                yaw += sign * degrees.to_radians();
+            } else if let Some(spot) = node.attributes().find_map(|a| {
+                self.places
+                    .get(a.value())
+                    .copied()
+                    .or_else(|| station(a.value()))
+            }) {
+                (x, y) = (spot.x, spot.y);
+                yaw = spot.yaw.unwrap_or(yaw);
+            }
+        }
+        (x, y, yaw)
+    }
+
+    /// Moves the robot in `tf` as `goal`'s plan says.
+    fn apply(&self, tf: &Mutex<TfBuffer>, goal: &Value) {
+        let mut tf = lock(tf);
+        let Ok(now) = tf.lookup(&self.parent, &self.child) else {
+            return;
+        };
+        let tree = goal["tree_xml"].as_str().unwrap_or_default();
+        let (x, y, yaw) = self.after(tree, now.planar());
+        tf.insert(
+            &self.parent,
+            &self.child,
+            Transform::from_yaw([x, y, now.translation[2]], yaw),
+        );
+    }
+
+    /// Moves the robot in `tf` to the last pose `goal` names, as a walk there would.
+    fn walk_to(&self, tf: &Mutex<TfBuffer>, goal: &Value) {
+        let last = goal["poses"].as_array().and_then(|l| l.last());
+        let Some(stamped) = last.or_else(|| goal.get("pose")) else {
+            return;
+        };
+        let (at, turned) = (
+            &stamped["pose"]["position"],
+            &stamped["pose"]["orientation"],
+        );
+        let number = |v: &Value| v.as_f64().unwrap_or(0.0);
+        let yaw = 2.0 * number(&turned["z"]).atan2(turned["w"].as_f64().unwrap_or(1.0));
+        let mut tf = lock(tf);
+        let z = tf
+            .lookup(&self.parent, &self.child)
+            .map_or(0.0, |t| t.translation[2]);
+        tf.insert(
+            &self.parent,
+            &self.child,
+            Transform::from_yaw([number(&at["x"]), number(&at["y"]), z], yaw),
+        );
+    }
+
+    /// A straight path from the robot, or the goal's start, to its target.
+    fn path(&self, tf: &Mutex<TfBuffer>, goal: &Value) -> Value {
+        let at = |p: &Value| json!({"pose": {"position": {"x": p["x"], "y": p["y"]}}});
+        let target = &goal["goal"]["pose"]["position"];
+        let start = if goal["use_start"].as_bool().unwrap_or(false) {
+            goal["start"]["pose"]["position"].clone()
+        } else {
+            let (x, y, _) = lock(tf)
+                .lookup(&self.parent, &self.child)
+                .map_or((0.0, 0.0, 0.0), |t| t.planar());
+            json!({"x": x, "y": y})
+        };
+        json!({"error_code": 0, "path": {"poses": [at(&start), at(target)]}})
+    }
+}
+
+/// A `station` argument, `x;y;yaw`, as the executor contract writes a pose.
+fn station(value: &str) -> Option<Spot> {
+    let numbers: Vec<f64> = value
+        .split(';')
+        .map(|n| n.trim().parse())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    match numbers[..] {
+        [x, y, yaw] => Some(Spot {
+            x,
+            y,
+            yaw: Some(yaw),
+        }),
+        _ => None,
+    }
+}
+
+/// How often a scripted camera sends its frame again.
+const FRAME_PERIOD: Duration = Duration::from_millis(500);
+
+/// An image file as a camera's one frame.
+fn frame_of(topic: &str, file: &std::path::Path) -> Result<Frame, String> {
+    let image = image::open(file)
+        .map_err(|e| format!("{topic}: {}: {e}", file.display()))?
+        .into_rgb8();
+    let (width, height) = image.dimensions();
+    Ok(Frame {
+        stamp_s: crate::now_s(),
+        frame_id: "scripted".to_owned(),
+        width,
+        height,
+        encoding: "rgb8".to_owned(),
+        step: width * 3,
+        is_bigendian: false,
+        data: image.into_raw().into(),
+    })
 }
 
 /// How a goal runs.
@@ -199,7 +452,9 @@ fn endpoints(nodes: &BTreeMap<String, NodeFile>) -> BTreeMap<String, TopicEndpoi
                 durability: "volatile".into(),
                 history: "keep_last".into(),
                 depth: 10,
+                ..QosInfo::default()
             },
+            gid: String::new(),
         };
         for (topic, ty) in &n.publishers {
             out.entry(topic.clone())
@@ -228,6 +483,9 @@ impl ScriptedRobot {
     #[must_use]
     pub fn with(mut self, other: Self) -> Self {
         self.services.extend(other.services);
+        self.replies.extend(other.replies);
+        self.frames.extend(other.frames);
+        self.motion = other.motion.or(self.motion);
         self.actions.extend(other.actions);
         self.topics.extend(other.topics);
         self.graph.topics.extend(other.graph.topics);
@@ -245,7 +503,8 @@ impl ScriptedRobot {
     ///
     /// # Errors
     ///
-    /// An action's status is not one of succeeded, aborted or canceled, or a rate is out of reach.
+    /// An action's status is not one of succeeded, aborted or canceled, a rate is out of reach, or
+    /// a camera's image cannot be read.
     pub fn build(self) -> Result<FakeRobot, String> {
         let mut robot = FakeRobot::new().with_idle_cameras();
         let mut graph = GraphDetail {
@@ -256,22 +515,13 @@ impl ScriptedRobot {
         for (name, response) in self.services {
             robot = robot.with_service(&name, move |_| Ok(response.clone()));
         }
-        for (name, run) in self.actions {
-            let status = match run.status.as_str() {
-                "succeeded" => GoalStatus::Succeeded,
-                "aborted" => GoalStatus::Aborted,
-                "canceled" => GoalStatus::Canceled,
-                other => return Err(format!("{name}: no status {other}")),
-            };
-            robot = robot.with_action(&name, move |_| ScriptedRun {
-                feedback: run.feedback.clone(),
-                result: Ok(GoalResult {
-                    status,
-                    result: run.result.clone(),
-                }),
-                ..ScriptedRun::default()
-            });
+        for (name, reply) in self.replies {
+            robot = robot.with_service(&name, move |request| Ok(reply.answer(request)));
         }
+        for (topic, file) in &self.frames {
+            robot = robot.with_camera(topic, frame_of(topic, file)?, FRAME_PERIOD);
+        }
+        robot = with_actions(robot, self.actions, self.motion.as_ref())?;
         for (name, message) in self.topics {
             robot = robot.with_topic(&name, message);
         }
@@ -312,12 +562,11 @@ impl ScriptedRobot {
             robot = robot.with_rate(&topic, rate.hz, rate.bytes);
         }
         for f in self.transforms {
-            let half = f.yaw / 2.0;
-            let pose = Transform {
-                translation: [f.x, f.y, f.z],
-                rotation: [0.0, 0.0, half.sin(), half.cos()],
-            };
-            robot = robot.with_transform(&f.parent, &f.child, pose);
+            robot = robot.with_transform(
+                &f.parent,
+                &f.child,
+                Transform::from_yaw([f.x, f.y, f.z], f.yaw),
+            );
         }
         if graph != GraphDetail::default() {
             graph.topics.sort();
@@ -330,6 +579,63 @@ impl ScriptedRobot {
         }
         Ok(robot)
     }
+}
+
+/// `robot` with the file's actions, and the planner and mission that move it as `motion` says.
+fn with_actions(
+    mut robot: FakeRobot,
+    actions: BTreeMap<String, Run>,
+    motion: Option<&Motion>,
+) -> Result<FakeRobot, String> {
+    let tf = robot.tf();
+    if let Some(motion) = motion.cloned() {
+        for planner in [motion.planner.clone(), motion.route.clone()]
+            .into_iter()
+            .flatten()
+        {
+            let (motion, tf) = (motion.clone(), Arc::clone(&tf));
+            robot = robot.with_action(&planner, move |goal| ScriptedRun {
+                result: Ok(GoalResult {
+                    status: GoalStatus::Succeeded,
+                    result: motion.path(&tf, goal),
+                }),
+                ..ScriptedRun::default()
+            });
+        }
+        for walk in motion.walks.clone() {
+            let (motion, tf) = (motion.clone(), Arc::clone(&tf));
+            robot = robot.with_action(&walk, move |goal| {
+                motion.walk_to(&tf, goal);
+                ScriptedRun::default()
+            });
+        }
+    }
+    for (name, run) in actions {
+        let status = match run.status.as_str() {
+            "succeeded" => GoalStatus::Succeeded,
+            "aborted" => GoalStatus::Aborted,
+            "canceled" => GoalStatus::Canceled,
+            other => return Err(format!("{name}: no status {other}")),
+        };
+        let motion = motion.cloned().filter(|m| m.action == name);
+        let tf = Arc::clone(&tf);
+        robot = robot.with_action(&name, move |goal| {
+            let mut step = ScriptedRun::default().step;
+            if let Some(motion) = motion.as_ref().filter(|_| status == GoalStatus::Succeeded) {
+                motion.apply(&tf, goal);
+                step = Duration::from_secs_f64(motion.seconds.max(0.0));
+            }
+            ScriptedRun {
+                feedback: run.feedback.clone(),
+                result: Ok(GoalResult {
+                    status,
+                    result: run.result.clone(),
+                }),
+                step,
+            }
+        });
+    }
+    Ok(robot)
 }
 
 /// A node's parameter services, answering from `params`; a set is refused, since the file is the
@@ -511,6 +817,145 @@ mod tests {
             };
             assert!(file.build().is_err(), "{hz}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_walk_goes_to_the_last_pose_its_goal_names() {
+        let robot = robot(&json!({
+            "transforms": [{"parent": "map", "child": "base"}],
+            "motion": {
+                "action": "/execute", "parent": "map", "child": "base",
+                "route": "/route", "walks": ["/through", "/to"],
+            },
+        }));
+        let send = |action: &'static str, goal: Value| {
+            let robot = &robot;
+            async move {
+                let goal = robot
+                    .send_goal(action, "t", goal, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                goal.result.await.unwrap().unwrap()
+            }
+        };
+        let pose = |x: f64| json!({"pose": {"position": {"x": x, "y": 1.0}}});
+        send("/through", json!({"poses": [pose(1.0), pose(2.0)]})).await;
+        assert!((robot.transform("map", "base").unwrap().planar().0 - 2.0).abs() < 1e-9);
+        send("/to", json!({"pose": pose(5.0)})).await;
+        assert!((robot.transform("map", "base").unwrap().planar().0 - 5.0).abs() < 1e-9);
+        let route = send("/route", json!({"goal": pose(9.0)})).await;
+        assert_eq!(route.result["path"]["poses"][1], pose(9.0));
+    }
+
+    #[tokio::test]
+    async fn a_mission_moves_the_robot_as_its_plan_says() {
+        let robot = robot(&json!({
+            "actions": {"/execute": {"status": "succeeded"}},
+            "transforms": [{"parent": "map", "child": "base"}],
+            "motion": {
+                "action": "/execute", "planner": "/plan", "parent": "map", "child": "base",
+                "seconds": 0.0,
+                "walk": {"skill": "Walk", "metres": "m", "direction": "way"},
+                "turn": {"skill": "Turn", "degrees": "deg"},
+                "places": {"kitchen": {"x": 3.0, "y": 4.0}},
+            },
+        }));
+        let run = |tree: &'static str| {
+            let robot = &robot;
+            async move {
+                let goal = robot
+                    .send_goal(
+                        "/execute",
+                        "t",
+                        json!({"tree_xml": tree}),
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap();
+                goal.result.await.unwrap().unwrap();
+                robot.transform("map", "base").unwrap().planar()
+            }
+        };
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        let (x, y, _) = run(
+            r#"<root><Timeout msec="9"><SubTree ID="Walk" m="2" way="forward"/></Timeout></root>"#,
+        )
+        .await;
+        assert!(near(x, 2.0) && near(y, 0.0));
+        let (_, _, yaw) = run(r#"<root><Turn deg="90"/></root>"#).await;
+        assert!(near(yaw, std::f64::consts::FRAC_PI_2));
+        let (x, y, _) = run(r#"<root><Walk m="1" way="backward"/></root>"#).await;
+        assert!(
+            near(x, 2.0) && near(y, -1.0),
+            "along its new heading: {x} {y}"
+        );
+        let (x, y, yaw) = run(r#"<root><Go place="kitchen"/></root>"#).await;
+        assert!(near(x, 3.0) && near(y, 4.0) && near(yaw, std::f64::consts::FRAC_PI_2));
+        let (x, _, yaw) = run(r#"<root><SubTree ID="Pose" station="1.5;-2;0.5"/></root>"#).await;
+        assert!(near(x, 1.5) && near(yaw, 0.5));
+        let (x, y, _) = run(r#"<root><Go place="kitchen"/></root>"#).await;
+        assert!(near(x, 3.0) && near(y, 4.0));
+        let path = robot
+            .send_goal(
+                "/plan",
+                "t",
+                json!({"goal": {"pose": {"position": {"x": 3.0, "y": 8.0}}}}),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+            .result
+            .await
+            .unwrap()
+            .unwrap()
+            .result;
+        assert_eq!(path["path"]["poses"][0]["pose"]["position"]["y"], 4.0);
+        assert_eq!(path["path"]["poses"][1]["pose"]["position"]["y"], 8.0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_goes_by_the_longest_word_the_request_holds() {
+        let robot = robot(&json!({"replies": {"/find": {
+            "field": "query",
+            "by": {"mug": {"n": 1}, "red mug": {"n": 2}},
+            "otherwise": {"n": 0},
+        }}}));
+        let ask = |query: &'static str| {
+            let robot = &robot;
+            async move {
+                robot
+                    .call(
+                        "/find",
+                        "t",
+                        json!({"query": query}),
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap()["n"]
+                    .as_u64()
+            }
+        };
+        assert_eq!(ask("the small Red Mug").await, Some(2));
+        assert_eq!(ask("a mug").await, Some(1));
+        assert_eq!(ask("sofa").await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_camera_gives_its_file() {
+        let dir = std::env::temp_dir().join(format!("scripted-frame-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.png");
+        image::RgbImage::new(4, 2).save(&file).unwrap();
+        let robot = robot(&json!({"frames": {"/cam": file}}));
+        let mut frames = robot.frames("/cam").unwrap();
+        let frame = frames.borrow_and_update().clone().unwrap();
+        assert_eq!((frame.width, frame.height, frame.step), (4, 2, 12));
+        tokio::time::timeout(FRAME_PERIOD * 4, frames.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(frames.borrow().as_ref().unwrap().stamp_s > frame.stamp_s);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

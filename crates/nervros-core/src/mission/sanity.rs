@@ -130,20 +130,12 @@ pub fn dead_ends(steps: &[PlannedStep], catalog: &Catalog) -> Vec<Concern> {
         .collect()
 }
 
-fn arg<'a>(step: &'a PlannedStep, name: &str) -> Option<&'a str> {
-    super::plan::arg(&step.args, name)
-}
-
-fn number(step: &PlannedStep, name: &str) -> Option<f64> {
-    arg(step, name)?.parse().ok()
-}
-
 fn turns(asked: &Asked, skill: &TurnSkill, steps: &[PlannedStep], out: &mut Vec<Concern>) {
     let arg = skill.degrees.as_str();
     let turns: Vec<(&PlannedStep, f64)> = steps
         .iter()
         .filter(|s| s.skill == skill.skill)
-        .filter_map(|s| Some((s, number(s, arg)?)))
+        .filter_map(|s| Some((s, s.number(arg)?)))
         .collect();
     let positive = if skill.positive_left {
         Side::Left
@@ -193,8 +185,8 @@ fn walks(asked: &Asked, skill: &WalkSkill, steps: &[PlannedStep], out: &mut Vec<
         .iter()
         .filter(|s| s.skill == skill.skill)
         .filter_map(|s| {
-            let backward = arg(s, &skill.direction)? == "backward";
-            Some((s, backward, number(s, &skill.metres)?))
+            let backward = s.arg(&skill.direction)? == "backward";
+            Some((s, backward, s.number(&skill.metres)?))
         })
         .collect();
     if let Some(backward) = asked.backward {
@@ -236,7 +228,7 @@ fn walks(asked: &Asked, skill: &WalkSkill, steps: &[PlannedStep], out: &mut Vec<
 fn hands(side: Side, name: &str, steps: &[PlannedStep], out: &mut Vec<Concern>) {
     for s in steps {
         // `right` or a group named for its side, such as `right_arm`.
-        if let Some(arm) = arg(s, name)
+        if let Some(arm) = s.arg(name)
             && !arm
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .any(|w| w == side.name())

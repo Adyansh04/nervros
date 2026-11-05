@@ -1,4 +1,4 @@
-//! The `watch`, `watches` and `plot` tools: a condition on a topic kept in view in the
+//! The `watch` and `plot` tools: a condition on a topic kept in view in the
 //! background, as someone debugging a robot leaves a monitor running. When it holds, the watch
 //! reports into the session, and the agent tells the operator: the camera's rate falling, a value
 //! crossing a line, a log line matching. A plot draws a number over time in the viewer instead.
@@ -16,12 +16,18 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
 
+use crate::background::Background;
 use crate::llm::{ImageInput, Shot};
 use crate::look::Seer;
+use crate::profile::TopicRef;
 use crate::providers::Role;
 use crate::session::{Command, Event, SessionHandle};
 use crate::tools::{Risk, SchemaPart, SchemaSource, Tool, ToolOutcome, ToolSpec};
 use crate::vision::Cameras;
+
+mod detect;
+
+pub(crate) use detect::{Detector, Trigger};
 
 /// How often a value or a message is looked at.
 const PERIOD: Duration = Duration::from_millis(500);
@@ -103,7 +109,7 @@ impl Condition {
                 Some(t) => Ok(Self::Text(t.to_lowercase())),
             },
             other => Err(format!(
-                "`condition` is rate_below, value or text, not `{other}`"
+                "`condition` is rate_below, value or text, or name an `object`; not `{other}`"
             )),
         }
     }
@@ -440,6 +446,8 @@ pub struct Watches {
     sight: OnceLock<(Arc<Cameras>, Arc<dyn Seer>)>,
     /// The robot's interfaces, to check a plot's field on a topic that is quiet now.
     schemas: OnceLock<Arc<dyn SchemaSource>>,
+    /// Where the world model publishes its objects, for a watch on one appearing.
+    objects: OnceLock<TopicRef>,
 }
 
 impl Watches {
@@ -455,6 +463,7 @@ impl Watches {
             next: AtomicU64::new(1),
             sight: OnceLock::new(),
             schemas: OnceLock::new(),
+            objects: OnceLock::new(),
         })
     }
 
@@ -462,6 +471,12 @@ impl Watches {
     pub fn read_types(&self, schemas: Arc<dyn SchemaSource>) {
         // Set once, at start-up.
         let _ = self.schemas.set(schemas);
+    }
+
+    /// Lets a watch wait for an object to appear in the world model.
+    pub fn read_objects(&self, objects: TopicRef) {
+        // Set once, at start-up.
+        let _ = self.objects.set(objects);
     }
 
     /// Lets a watch wait for what `cameras` show, each look asked of `seer`'s `watch` role.
@@ -479,16 +494,12 @@ impl Watches {
         crate::lock(&self.running)
     }
 
-    /// The `watch` and `watches` tools.
+    /// The `watch` and `plot` tools.
     #[must_use]
     pub fn tools(self: &Arc<Self>) -> Vec<Arc<dyn Tool>> {
         vec![
             Arc::new(WatchTool {
                 spec: watch_spec(),
-                watches: Arc::clone(self),
-            }),
-            Arc::new(WatchesTool {
-                spec: watches_spec(),
                 watches: Arc::clone(self),
             }),
             Arc::new(PlotTool {
@@ -506,61 +517,42 @@ impl Watches {
         if args["condition"] == "sees" {
             return self.start_sight(args);
         }
-        let condition = Condition::parse(args)?;
-        let (topic, ty) = self.topic(args, condition.reads_messages()).await?;
-        let mut eyes = Looker::open(self.robot.as_ref(), &topic, &ty, &condition)
-            .await
-            .map_err(|e| format!("cannot read {topic}: {e}"))?;
-        let for_s = args["for_s"]
-            .as_u64()
-            .unwrap_or(DEFAULT_FOR_S)
-            .clamp(1, MAX_FOR_S);
-        let repeat = args["repeat"].as_bool().unwrap_or(false);
-        let say = args["say"].as_str().unwrap_or_default().trim().to_owned();
-        let mut running = self.lock();
-        running.retain(|e| !e.task.is_finished());
-        if running.len() >= MAX_WATCHES {
-            return Err(format!(
-                "{MAX_WATCHES} watches already run; cancel one with watches first"
-            ));
-        }
-        let id = format!("w{}", self.next.fetch_add(1, Ordering::Relaxed));
-        let what = condition.describe(&topic);
-        let (robot, session) = (Arc::clone(&self.robot), self.session.get().cloned());
+        let trigger = Trigger::parse(args, self.robot.as_ref(), &self.read_deny).await?;
+        let what = trigger.describe();
+        let objects = self.objects.get().cloned();
+        let mut detector = Detector::open(trigger, &self.robot, objects).await?;
+        let (for_s, repeat, say) = options(args);
+        let (mut running, id) = self.room(false)?;
+        let session = self.session.get().cloned();
         let (task_id, task_what) = (id.clone(), what.clone());
         let span = crate::telemetry::job("watch", &id, &what);
         let task = tokio::spawn(
             async move {
                 let deadline = Instant::now() + Duration::from_secs(for_s);
-                let mut was = false;
                 while Instant::now() < deadline {
                     let looked = Instant::now();
-                    let seen = match eyes.look(robot.as_ref(), &topic, &ty, &condition).await {
-                        Ok(seen) => seen,
-                        // Watching what cannot be read would report silence for hours.
-                        Err(e) => {
-                            if let Some(s) = &session {
-                                s.send(Command::Report(format!(
-                                    "Watch {task_id} ({task_what}) stopped: it cannot read {topic} ({e})."
-                                )));
-                            }
-                            return;
-                        }
-                    };
-                    if let Some(seen) = &seen
-                        && !was
-                    {
+                    let tell = |report: String| {
                         if let Some(s) = &session {
-                            let report = fired_report(&task_id, &task_what, seen, repeat, &say);
                             s.send(Command::Report(report));
                         }
-                        if !repeat {
+                    };
+                    match detector.newly().await {
+                        Ok(None) => {}
+                        Ok(Some(seen)) => {
+                            tell(fired_report(&task_id, &task_what, &seen, repeat, &say));
+                            if !repeat {
+                                return;
+                            }
+                        }
+                        // Watching what cannot be read would report silence for hours.
+                        Err(e) => {
+                            tell(format!("Watch {task_id} ({task_what}) stopped: {e}."));
                             return;
                         }
                     }
-                    was = seen.is_some();
-                    // Rate and text looks span a window already; a value look, or a failed one, waits.
-                    tokio::time::sleep(PERIOD.saturating_sub(looked.elapsed())).await;
+                    // Rate and text looks span a window already; a value look, or a failed one,
+                    // does not.
+                    tokio::time::sleep(detector.period().saturating_sub(looked.elapsed())).await;
                 }
             }
             .instrument(span),
@@ -595,27 +587,8 @@ impl Watches {
             )?
             .to_owned();
         let camera = cameras.get(args["camera"].as_str())?.name.clone();
-        let for_s = args["for_s"]
-            .as_u64()
-            .unwrap_or(DEFAULT_FOR_S)
-            .clamp(1, MAX_FOR_S);
-        let repeat = args["repeat"].as_bool().unwrap_or(false);
-        let say = args["say"].as_str().unwrap_or_default().trim().to_owned();
-        let mut running = self.lock();
-        running.retain(|e| !e.task.is_finished());
-        if running.len() >= MAX_WATCHES {
-            return Err(format!(
-                "{MAX_WATCHES} watches already run; cancel one with watches first"
-            ));
-        }
-        if running.iter().filter(|e| e.sight).count() >= MAX_SIGHTS {
-            return Err(format!(
-                "{MAX_SIGHTS} watches on what a camera shows already run, a model call every \
-                 {} s each; cancel one with watches first",
-                SIGHT_PERIOD.as_secs()
-            ));
-        }
-        let id = format!("w{}", self.next.fetch_add(1, Ordering::Relaxed));
+        let (for_s, repeat, say) = options(args);
+        let (mut running, id) = self.room(true)?;
         let what = format!("the {camera} camera showing \"{words}\"");
         let session = self.session.get().cloned();
         let (task_id, task_what) = (id.clone(), what.clone());
@@ -679,6 +652,26 @@ impl Watches {
         Ok(out)
     }
 
+    /// The running watches, with room for one more, and its id.
+    fn room(&self, sight: bool) -> Result<(MutexGuard<'_, Vec<Entry>>, String), String> {
+        let mut running = self.lock();
+        running.retain(|e| !e.task.is_finished());
+        if running.len() >= MAX_WATCHES {
+            return Err(format!(
+                "{MAX_WATCHES} watches already run; cancel one with background first"
+            ));
+        }
+        if sight && running.iter().filter(|e| e.sight).count() >= MAX_SIGHTS {
+            return Err(format!(
+                "{MAX_SIGHTS} watches on what a camera shows already run, a model call every \
+                 {} s each; cancel one with background first",
+                SIGHT_PERIOD.as_secs()
+            ));
+        }
+        let id = format!("w{}", self.next.fetch_add(1, Ordering::Relaxed));
+        Ok((running, id))
+    }
+
     /// Checks the field is a number in the topic's newest message, then asks the viewer to plot
     /// it.
     async fn plot(&self, args: &Value) -> Result<ToolOutcome, String> {
@@ -732,19 +725,30 @@ impl Watches {
         };
         Ok(out)
     }
+}
 
-    fn list(&self) -> Value {
+/// How long a watch looks, whether it goes on after firing, and the operator's note.
+fn options(args: &Value) -> (u64, bool, String) {
+    let for_s = args["for_s"]
+        .as_u64()
+        .unwrap_or(DEFAULT_FOR_S)
+        .clamp(1, MAX_FOR_S);
+    let repeat = args["repeat"].as_bool().unwrap_or(false);
+    let say = args["say"].as_str().unwrap_or_default().trim().to_owned();
+    (for_s, repeat, say)
+}
+
+impl Background for Watches {
+    fn list(&self) -> Vec<Value> {
         let mut running = self.lock();
         running.retain(|e| !e.task.is_finished());
-        Value::Array(
-            running
-                .iter()
-                .map(|e| json!({"watch": e.id, "what": e.what, "running_s": e.started.elapsed().as_secs()}))
-                .collect(),
-        )
+        running
+            .iter()
+            .map(|e| json!({"id": e.id, "kind": "watch", "what": e.what, "running_s": e.started.elapsed().as_secs()}))
+            .collect()
     }
 
-    fn cancel(&self, id: &str) -> bool {
+    fn end(&self, id: &str) -> bool {
         let mut running = self.lock();
         let before = running.len();
         running.retain(|e| {
@@ -775,12 +779,15 @@ fn watch_spec() -> ToolSpec {
          each time it comes back: rate_below (hz: the camera or the scan slowing or going \
          silent), value (field, op, value: a reading crossing a line, such as \
          pose.pose.position.x > 5), or text (contains: a log line, such as /rosout saying \
-         \"error\"). Or sees (words, camera): what a camera shows, such as \"a person at the \
+         \"error\"). Or an object appearing in the world model: {object, room}, no topic or \
+         condition, as for \"tell me when a mug appears in the bedroom\". Or sees (words, camera): what a camera shows, such as \"a person at the \
          door\", asked of a vision model every 15 s; no topic. Returns at once; the report \
          follows as a message.",
         json!({"type": "object", "properties": {
             "topic": {"type": "string", "description": "The topic, such as /scan; not for sees."},
             "condition": {"type": "string", "enum": ["rate_below", "value", "text", "sees"]},
+            "object": {"type": "string", "description": "What to wait for in the world model, such as a mug."},
+            "room": {"type": "string", "description": "With object: the room's id."},
             "words": {"type": "string", "description": "For sees: what the camera should show, as a person would say it."},
             "camera": {"type": "string", "description": "For sees: the camera, by name; the default one when left out."},
             "hz": {"type": "number", "description": "For rate_below."},
@@ -791,7 +798,7 @@ fn watch_spec() -> ToolSpec {
             "say": {"type": "string", "description": "What the report should add, such as what to do then."},
             "repeat": {"type": "boolean", "description": "true for \"each time\", \"every time\" or \"whenever\": report each time it comes back. Otherwise it reports once and ends."},
             "for_s": {"type": "integer", "minimum": 1, "maximum": MAX_FOR_S, "description": "How long to watch (1800)."}
-        }, "required": ["condition"], "additionalProperties": false}),
+        }, "additionalProperties": false}),
         Risk::Observe,
     )
 }
@@ -926,18 +933,6 @@ fn plot_spec() -> ToolSpec {
     )
 }
 
-fn watches_spec() -> ToolSpec {
-    ToolSpec::new(
-        "watches",
-        "Lists the running watches, or cancels one by id (or all).",
-        json!({"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["list", "cancel"]},
-            "watch": {"type": "string", "description": "For cancel: the id, such as w2, or all."}
-        }, "required": ["action"], "additionalProperties": false}),
-        Risk::Observe,
-    )
-}
-
 struct WatchTool {
     spec: ToolSpec,
     watches: Arc<Watches>,
@@ -957,11 +952,6 @@ impl Tool for WatchTool {
     }
 }
 
-struct WatchesTool {
-    spec: ToolSpec,
-    watches: Arc<Watches>,
-}
-
 struct PlotTool {
     spec: ToolSpec,
     watches: Arc<Watches>,
@@ -978,29 +968,6 @@ impl Tool for PlotTool {
             .plot(&args)
             .await
             .unwrap_or_else(ToolOutcome::failed)
-    }
-}
-
-#[async_trait]
-impl Tool for WatchesTool {
-    fn spec(&self) -> Cow<'_, ToolSpec> {
-        Cow::Borrowed(&self.spec)
-    }
-
-    async fn call(&self, args: Value) -> ToolOutcome {
-        match args["action"].as_str() {
-            Some("list") => ToolOutcome::ok(json!({"watches": self.watches.list()})),
-            Some("cancel") => {
-                let id = args["watch"].as_str().unwrap_or_default();
-                // Cancelling all of none is done, not a mistake.
-                if self.watches.cancel(id) || id == "all" {
-                    ToolOutcome::ok(json!({"cancelled": id}))
-                } else {
-                    ToolOutcome::failed(format!("no watch `{id}`; watches lists them"))
-                }
-            }
-            _ => ToolOutcome::failed("`action` is list or cancel"),
-        }
     }
 }
 
@@ -1250,11 +1217,8 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert!(
-            watches.list().as_array().unwrap().is_empty(),
-            "a once watch ends"
-        );
-        assert!(!watches.cancel("w9"));
+        assert!(watches.list().is_empty(), "a once watch ends");
+        assert!(!watches.end("w9"));
         let missing = watches
             .start(&json!({"topic": "/nothing", "condition": "text", "contains": "x"}))
             .await;

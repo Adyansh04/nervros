@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nervros_ros::RobotPort;
+use nervros_ros::{RobotPort, Transform};
 use serde_json::{Value, json};
 
 use crate::doctor::Check;
@@ -213,11 +213,8 @@ impl Drop for Tracked {
 
 /// An `OpenGoals` message of `open`.
 fn open_goals(open: &[(String, uuid::Uuid)]) -> Value {
-    let since = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
     json!({
-        "stamp": {"sec": since.as_secs(), "nanosec": since.subsec_nanos()},
+        "stamp": crate::stamp_now(),
         "client": crate::mission::client_id(),
         "actions": open.iter().map(|(a, _)| a).collect::<Vec<_>>(),
         "goal_ids": open.iter().map(|(_, id)| json!({"uuid": id.as_bytes()})).collect::<Vec<_>>(),
@@ -725,10 +722,7 @@ pub(crate) fn beside(
 pub(crate) fn stamped(frame: &str, x: f64, y: f64, yaw: f64) -> Value {
     json!({
         "header": {"frame_id": frame},
-        "pose": {
-            "position": {"x": x, "y": y, "z": 0.0},
-            "orientation": {"x": 0.0, "y": 0.0, "z": (yaw / 2.0).sin(), "w": (yaw / 2.0).cos()},
-        },
+        "pose": Transform::from_yaw([x, y, 0.0], yaw).to_pose(),
     })
 }
 

@@ -1,10 +1,12 @@
 //! What NervROS last saw of Nav2: whether it is up, how sure it is of where the robot is, what it
 //! is doing, and what slows it down.
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use nervros_ros::RobotPort;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -22,6 +24,8 @@ const READ_WAIT: Duration = Duration::from_millis(400);
 const FEEDBACK_FRESH: Duration = Duration::from_secs(3);
 /// How often the graph is read again for the actions Nav2 serves.
 const GRAPH_EVERY: u32 = 10;
+/// Failures of its behaviour tree kept to say why a walk recovered.
+const KEPT_FAILURES: usize = 8;
 /// Nav2's actions that move the base, by the name each runs under.
 pub(super) const MOVING: [&str; 9] = [
     "navigate_to_pose",
@@ -64,6 +68,9 @@ pub(super) struct Seen {
     pub(super) limit: Option<String>,
     /// Whether it was ever heard from.
     pub(super) heard: bool,
+    /// What failed in its behaviour tree lately: when, and which node. Left out of the line each
+    /// turn sees: a line that changes costs the prompt cache.
+    pub(super) failures: Vec<(f64, String)>,
 }
 
 impl Seen {
@@ -127,6 +134,10 @@ impl Seen {
                 |(a, p)| json!({"doing": a, "polygon": p}),
             ),
             "speed_limit": self.limit,
+            "recent_failures": self.failures.iter().map(|(at, node)| json!({
+                "node": node,
+                "seconds_ago": (crate::now_s() - at).round(),
+            })).collect::<Vec<_>>(),
         })
     }
 }
@@ -138,6 +149,45 @@ pub(super) struct Watcher {
     config: Nav2Config,
     /// The collision monitor's state topic, when it publishes one.
     state_topic: Mutex<Option<String>>,
+    /// See [`Seen::failures`].
+    failures: Arc<Mutex<VecDeque<(f64, String)>>>,
+}
+
+/// Keeps what fails in Nav2's behaviour tree, for as long as anyone holds `kept`.
+async fn keep_failures(
+    topic: String,
+    robot: Arc<dyn RobotPort>,
+    kept: Weak<Mutex<VecDeque<(f64, String)>>>,
+) {
+    let Ok(mut logs) = robot
+        .messages(&topic, "nav2_msgs/msg/BehaviorTreeLog")
+        .await
+    else {
+        return;
+    };
+    while let Some(Ok(log)) = logs.next().await {
+        let Some(kept) = kept.upgrade() else { return };
+        let mut kept = crate::lock(&kept);
+        kept.extend(failed_nodes(&log));
+        while kept.len() > KEPT_FAILURES {
+            kept.pop_front();
+        }
+    }
+}
+
+/// The nodes of a log that were at work and failed. A condition failing from idle is the tree
+/// asking a question, not something going wrong.
+fn failed_nodes(log: &Value) -> Vec<(f64, String)> {
+    log["event_log"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter(|e| e["previous_status"] == "RUNNING" && e["current_status"] == "FAILURE")
+        .filter_map(|e| {
+            let node = e["node_name"].as_str()?.to_owned();
+            Some((crate::stamp_s(&e["timestamp"]), node))
+        })
+        .collect()
 }
 
 impl Watcher {
@@ -147,7 +197,13 @@ impl Watcher {
             seen: Mutex::new(Seen::default()),
             config: config.clone(),
             state_topic: Mutex::new(None),
+            failures: Arc::default(),
         });
+        tokio::spawn(keep_failures(
+            config.name("behavior_tree_log"),
+            Arc::clone(&robot),
+            Arc::downgrade(&watcher.failures),
+        ));
         let weak = Arc::downgrade(&watcher);
         tokio::spawn(async move {
             let mut served: Vec<String> = Vec::new();
@@ -265,6 +321,7 @@ impl Watcher {
             monitor: monitor.and_then(|m| monitoring(&m)),
             limit: limit.ok().and_then(|l| limit_words(&l)),
             heard,
+            failures: crate::lock(&self.failures).iter().cloned().collect(),
         }
     }
 }
@@ -372,6 +429,20 @@ fn limit_words(limit: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_work_that_failed_counts_as_a_failure() {
+        let log = json!({"event_log": [
+            {"node_name": "ComputePathToPose", "previous_status": "RUNNING",
+             "current_status": "FAILURE", "timestamp": {"sec": 5, "nanosec": 0}},
+            {"node_name": "GoalUpdated", "previous_status": "IDLE",
+             "current_status": "FAILURE", "timestamp": {"sec": 5, "nanosec": 0}},
+            {"node_name": "FollowPath", "previous_status": "RUNNING",
+             "current_status": "SUCCESS", "timestamp": {"sec": 5, "nanosec": 0}},
+        ]});
+        assert_eq!(failed_nodes(&log), [(5.0, "ComputePathToPose".to_owned())]);
+        assert!(failed_nodes(&json!({})).is_empty());
+    }
 
     #[test]
     fn the_line_says_what_nav2_does_and_what_slows_it() {

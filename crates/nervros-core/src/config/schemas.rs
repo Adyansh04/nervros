@@ -1,5 +1,6 @@
 //! Tool argument schemas from the robot's interface files, through `rosidl-schema`.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use rosidl_schema::{FieldOverride, Interface, Overrides, Part, Registry, SearchPath, TypeName};
@@ -100,6 +101,30 @@ impl SchemaSource for RosidlSchemas {
             .map_err(|e| format!("bad type `{ros_type}`: {e}"))?;
         rosidl_schema::validate(&self.registry, &ty, rosidl_part(part), value)
             .map_err(|e| e.to_string())
+    }
+
+    fn definition(&self, ros_type: &str) -> Option<String> {
+        let ty: TypeName = ros_type.parse().ok()?;
+        let mut text = self.show(ros_type)?;
+        for used in self
+            .registry
+            .resolve(&ty)
+            .ok()?
+            .iter()
+            .filter(|u| **u != ty)
+        {
+            let Some(body) = self.show(&used.to_string()) else {
+                continue;
+            };
+            let _ = write!(text, "\n{}\nMSG: {used}\n{body}", "=".repeat(80));
+        }
+        Some(text)
+    }
+
+    fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.registry.types().map(ToString::to_string).collect();
+        names.sort();
+        names
     }
 
     fn show(&self, ros_type: &str) -> Option<String> {

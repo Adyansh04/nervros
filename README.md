@@ -181,7 +181,7 @@ Without a window:
 cargo run -p nervros-cli -- --profile profiles/example/nervros.toml chat
 cargo run -p nervros-cli -- --profile profiles/example/nervros.toml doctor
 cargo run -p nervros-cli -- --profile profiles/example/nervros.toml eval suite.toml --repeat 3
-# A model against a scripted robot: no ROS graph, nothing moves (ROS is still sourced to build).
+# A model against a scripted robot: no ROS graph, no simulator (ROS is still sourced to build).
 cargo run -p nervros-cli -- --profile scenarios/bench/nervros.toml eval scenarios/bench/suite.toml \
   --robot scenarios/robot/robot.toml --robot scenarios/bench/robot.toml
 # The live robot written as a scripted one, and a draft of its self-description.

@@ -226,7 +226,6 @@ fn seeing_tools(
         seen_by = Some(Arc::clone(&cameras));
         let eyes: Arc<dyn crate::look::Eyes> = Arc::clone(&llm) as Arc<dyn crate::look::Eyes>;
         let look_tool = Arc::new(LookTool::new(
-            look,
             Arc::clone(&cameras),
             Arc::clone(&robot),
             Arc::clone(&snapshots),
@@ -522,6 +521,9 @@ fn debug_tools(
         .unwrap_or_default();
     let watches = crate::watch::Watches::new(Arc::clone(robot), read_deny);
     watches.read_types(Arc::clone(schemas));
+    if let Some(objects) = profile.world.as_ref().and_then(|w| w.objects.clone()) {
+        watches.read_objects(objects);
+    }
     for tool in watches.tools() {
         registry.add(tool)?;
     }
@@ -784,6 +786,61 @@ fn mission_tools(
     Ok(Some(schedules))
 }
 
+/// Where what runs in the background reports.
+fn report_into(
+    session: &crate::session::SessionHandle,
+    watches: &crate::watch::Watches,
+    bags: &crate::bag::Bags,
+    schedules: Option<&Arc<crate::schedule::Schedules>>,
+) {
+    watches.attach(session.clone());
+    bags.attach(session.clone());
+    if let Some(s) = schedules {
+        s.attach(session.clone());
+    }
+}
+
+/// The tool that records topics, its files beside the robot's others.
+fn bag_tool(
+    profile: &Profile,
+    (robot, schemas): (&Arc<dyn RobotPort>, &Arc<dyn SchemaSource>),
+    ledger: &Path,
+    registry: &mut Registry,
+) -> Result<Arc<crate::bag::Bags>, StartError> {
+    let read_deny = profile
+        .ros_tools
+        .as_ref()
+        .map(|c| c.read_deny.clone())
+        .unwrap_or_default();
+    let dir = robot_file(profile, ledger, "bags")
+        .map_or_else(|| PathBuf::from("bags"), |f| f.with_extension(""));
+    let bags = crate::bag::Bags::new(Arc::clone(robot), Arc::clone(schemas), read_deny, dir);
+    registry.add(bags.tool())?;
+    Ok(bags)
+}
+
+/// The tool that lists and ends what runs in the background.
+fn background_tool(
+    watches: &Arc<crate::watch::Watches>,
+    jobs: &Arc<crate::job::Jobs>,
+    (schedules, bags): (
+        Option<&Arc<crate::schedule::Schedules>>,
+        &Arc<crate::bag::Bags>,
+    ),
+    registry: &mut Registry,
+) -> Result<(), StartError> {
+    let mut kinds: Vec<Arc<dyn crate::background::Background>> = vec![
+        Arc::clone(watches) as _,
+        Arc::clone(jobs) as _,
+        Arc::clone(bags) as _,
+    ];
+    if let Some(s) = schedules {
+        kinds.push(Arc::clone(s) as _);
+    }
+    registry.add(Arc::new(crate::background::BackgroundTool::new(kinds)))?;
+    Ok(())
+}
+
 /// The tools that start jobs the operator approves once, programs and searches, when the robot
 /// has an executor to run their missions; the kept programs.
 fn job_tools(
@@ -870,6 +927,8 @@ pub fn start_with(
     )?;
     let jobs = crate::job::Jobs::new(Arc::clone(&guard));
     let programs = job_tools(&profile, missions.as_ref(), &jobs, ledger, &mut registry)?;
+    let bags = bag_tool(&profile, (&robot, &schemas), ledger, &mut registry)?;
+    background_tool(&watches, &jobs, (schedules.as_ref(), &bags), &mut registry)?;
     check_rules(&profile, &registry)?;
     let inbox = improvement_inbox(&profile, ledger, &llm, &registry, missions.as_ref());
     let tools = registry.iter().map(|t| t.spec().name.clone()).collect();
@@ -898,10 +957,7 @@ pub fn start_with(
         m.attach(session.handle());
         m.set_arm_poses(Arc::clone(&integrations) as Arc<dyn crate::mission::ArmPoses>);
     }
-    if let Some(s) = &schedules {
-        s.attach(session.handle());
-    }
-    watches.attach(session.handle());
+    report_into(&session.handle(), &watches, &bags, schedules.as_ref());
     integrations.attach(&session.handle());
     jobs.attach(session.handle());
     incidents.attach(&session.handle());

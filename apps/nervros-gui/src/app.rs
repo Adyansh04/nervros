@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nervros_core::app::Agent;
@@ -13,6 +13,7 @@ use nervros_core::doctor::Check;
 use nervros_core::job::JobState;
 use nervros_core::mission::{Outcome, held_by};
 use nervros_core::session::{Command, Event};
+use nervros_ros::lock;
 use rerun::external::egui::{self, Color32, Frame, Key, Margin, Modifiers, RichText};
 use rerun::external::re_log_channel::LogReceiver;
 use rerun::external::re_sdk_types::blueprint::components::PanelState;
@@ -510,7 +511,7 @@ impl Gui {
     }
 
     fn live(&self) -> std::sync::MutexGuard<'_, Live> {
-        self.live.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.live)
     }
 
     fn drain_events(&mut self) {

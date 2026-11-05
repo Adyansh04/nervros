@@ -29,6 +29,12 @@ use crate::tools::Tool;
 use srdf::Srdf;
 
 const READ_WAIT: Duration = Duration::from_secs(3);
+/// How much of a straight move must be clear for it to run.
+const CLEAR_SHARE: f64 = 0.98;
+/// How finely a straight move is checked, m.
+const LINE_STEP_M: f64 = 0.01;
+/// How long the straight-line planner may take.
+const LINE_WAIT: Duration = Duration::from_secs(10);
 
 /// `[moveit]`: where MoveIt runs.
 #[derive(Debug, Clone, Deserialize)]
@@ -126,10 +132,7 @@ impl Arms {
         let Some(file) = &self.settings_file else {
             return;
         };
-        if let Err(e) = serde_json::to_vec_pretty(&now)
-            .map_err(|e| e.to_string())
-            .and_then(|text| crate::persist::write_atomic(file, &text).map_err(|e| e.to_string()))
-        {
+        if let Err(e) = crate::persist::write_json(file, &now) {
             tracing::warn!(error = %e, "the arm settings were not kept");
         }
     }
@@ -296,6 +299,48 @@ impl Arms {
             }
             Err(_) => json!({"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}),
         }
+    }
+
+    /// MoveIt's answer for the hand of `group` going straight by `along` in the planning frame:
+    /// how much of the way is clear (`fraction`), and the trajectory for it (`solution`).
+    pub(crate) async fn straight(&self, group: &str, along: [f64; 3]) -> Result<Value, String> {
+        let srdf = self.srdf().await?;
+        let planning = self.planning_frame(&srdf)?;
+        let tip = srdf
+            .tip(group)
+            .ok_or_else(|| format!("the SRDF gives {group} no tip link"))?;
+        let now = self
+            .robot
+            .transform(&planning, &tip)
+            .map_err(|e| format!("where the hand is: {e}"))?;
+        let [x, y, z] = now.translation;
+        let [qx, qy, qz, qw] = now.rotation;
+        let s = self.settings();
+        let request = json!({
+            "header": {"frame_id": planning},
+            "start_state": {"is_diff": true},
+            "group_name": group,
+            "link_name": tip,
+            "waypoints": [{
+                "position": {"x": x + along[0], "y": y + along[1], "z": z + along[2]},
+                "orientation": {"x": qx, "y": qy, "z": qz, "w": qw},
+            }],
+            "max_step": LINE_STEP_M,
+            "jump_threshold": 0.0,
+            "avoid_collisions": true,
+            "max_velocity_scaling_factor": s.scaling,
+            "max_acceleration_scaling_factor": s.scaling,
+        });
+        let service = self.config.name("compute_cartesian_path");
+        self.robot
+            .call(
+                &service,
+                "moveit_msgs/srv/GetCartesianPath",
+                request,
+                LINE_WAIT,
+            )
+            .await
+            .map_err(|e| format!("MoveIt's straight-line planner did not answer: {e}"))
     }
 
     /// The SRDF, the group `args` name, the planning frame and the group's tip link.

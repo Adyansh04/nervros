@@ -30,6 +30,7 @@ mod tests;
 mod tf;
 
 pub use config::RosToolsConfig;
+pub use params::param_value;
 
 // Limits that keep a sample, an echo or a burst of messages small and short.
 const MAX_SAMPLE: Duration = Duration::from_secs(10);
@@ -44,14 +45,26 @@ const PARAMS_MAX: usize = 80;
 // An echo shows this much of each array and string.
 const ARRAY_ITEMS: usize = 8;
 const TEXT_CHARS: usize = 120;
+// An echo asked for in full stops here, so that one big array does not fill the conversation.
+const FULL_ITEMS: usize = 2000;
+const FULL_CHARS: usize = 8000;
 /// Message types too large to read message by message: echoed, watched or plotted.
-pub(crate) const BULK_TYPES: [&str; 5] = [
+pub const BULK_TYPES: [&str; 5] = [
     "sensor_msgs/msg/Image",
     "sensor_msgs/msg/CompressedImage",
     "sensor_msgs/msg/PointCloud2",
     "nav_msgs/msg/OccupancyGrid",
     "octomap_msgs/msg/Octomap",
 ];
+
+/// Whether `name` matches one of the `patterns`, whatever the case.
+#[must_use]
+pub fn masked(patterns: &[String], name: &str) -> bool {
+    let name = name.to_lowercase();
+    patterns
+        .iter()
+        .any(|p| glob_match(&p.to_lowercase(), &name))
+}
 
 struct Ctx {
     robot: Arc<dyn RobotPort>,
@@ -63,11 +76,7 @@ struct Ctx {
 impl Ctx {
     /// Whether a parameter's value is hidden, whatever the case of its name: `apiKey` too.
     fn masked(&self, name: &str) -> bool {
-        let name = name.to_lowercase();
-        self.config
-            .param_read_deny
-            .iter()
-            .any(|p| glob_match(&p.to_lowercase(), &name))
+        masked(&self.config.param_read_deny, name)
     }
 
     fn hidden(&self, name: &str) -> bool {
@@ -127,15 +136,15 @@ impl Ctx {
         let zones = self.guard.zones()?;
         let poses = match destinations(ty, payload) {
             Destinations::Poses(poses) => poses,
-            // A mission step is checked for entering a keep-out zone, which a move from wherever the
-            // robot stands cannot be here; a slow zone refuses no move, there or here.
-            Destinations::Relative if !zones.keep_out().is_empty() => {
+            // A mission step is checked for entering a keep-out zone, which a move with no pose
+            // on the map cannot be here; a slow zone refuses no move, there or here.
+            Destinations::Unchecked if !zones.keep_out().is_empty() => {
                 return Some(ToolOutcome::refused(
-                    "with keep-out zones set, a straight move is checked against them only as a \
-                     mission step: walk with run_mission",
+                    "with keep-out zones set, a move with no pose on the map is checked against \
+                     them only as a mission step: walk with run_mission",
                 ));
             }
-            Destinations::Relative | Destinations::Elsewhere => return None,
+            Destinations::Unchecked | Destinations::Elsewhere => return None,
         };
         for stamped in poses {
             let frame = stamped["header"]["frame_id"].as_str().unwrap_or_default();
@@ -291,25 +300,34 @@ fn spec(name: &str, description: &str, parameters: Value, risk: Risk) -> ToolSpe
 
 /// A message cut down to what a model can read: long arrays and strings shortened with their size.
 fn summarize(value: &Value) -> Value {
+    shortened(value, ARRAY_ITEMS, TEXT_CHARS)
+}
+
+/// A message with its arrays cut at `items` and its strings at `chars`, saying how long they were.
+fn shortened(value: &Value, items: usize, chars: usize) -> Value {
     match value {
-        Value::Array(items) if items.len() > ARRAY_ITEMS => {
-            let mut head: Vec<Value> = items.iter().take(ARRAY_ITEMS).map(summarize).collect();
+        Value::Array(all) if all.len() > items => {
+            let mut head: Vec<Value> = all
+                .iter()
+                .take(items)
+                .map(|v| shortened(v, items, chars))
+                .collect();
             head.push(json!(format!(
                 "... {} more, {} in all",
-                items.len() - ARRAY_ITEMS,
-                items.len()
+                all.len() - items,
+                all.len()
             )));
             Value::Array(head)
         }
-        Value::Array(items) => Value::Array(items.iter().map(summarize).collect()),
+        Value::Array(all) => Value::Array(all.iter().map(|v| shortened(v, items, chars)).collect()),
         Value::Object(fields) => Value::Object(
             fields
                 .iter()
-                .map(|(k, v)| (k.clone(), summarize(v)))
+                .map(|(k, v)| (k.clone(), shortened(v, items, chars)))
                 .collect(),
         ),
-        Value::String(s) if s.chars().count() > TEXT_CHARS => {
-            let head: String = s.chars().take(TEXT_CHARS).collect();
+        Value::String(s) if s.chars().count() > chars => {
+            let head: String = s.chars().take(chars).collect();
             json!(format!("{head}... ({} characters)", s.chars().count()))
         }
         other => other.clone(),
@@ -330,18 +348,44 @@ fn pick(value: &Value, fields: &[String]) -> Value {
 }
 
 fn endpoint_json(e: &Endpoint) -> Value {
-    json!({"node": e.node, "type": e.topic_type, "reliability": e.qos.reliability,
-           "durability": e.qos.durability, "depth": e.qos.depth})
+    let mut out = json!({"node": e.node, "type": e.topic_type, "reliability": e.qos.reliability,
+                         "durability": e.qos.durability, "history": e.qos.history,
+                         "depth": e.qos.depth});
+    if !e.qos.liveliness.is_empty() {
+        out["liveliness"] = json!(e.qos.liveliness);
+    }
+    if !e.gid.is_empty() {
+        out["gid"] = json!(e.gid);
+    }
+    let limits = [
+        ("deadline_s", e.qos.deadline),
+        ("lifespan_s", e.qos.lifespan),
+        ("lease_s", e.qos.lease),
+    ];
+    for (key, limit) in limits {
+        if let Some(limit) = limit {
+            out[key] = json!(limit.as_secs_f64());
+        }
+    }
+    out
 }
 
 /// Whether a subscriber with `sub`'s `QoS` receives from a publisher with `publisher`'s: reliable
-/// asks more than best effort gives, and transient local more than volatile.
+/// asks more than best effort gives, transient local more than volatile, a deadline more than a
+/// slower one or none, and manual liveliness more than automatic.
 fn qos_matches(publisher: &Endpoint, sub: &Endpoint) -> bool {
     let reliable_ok =
         !(sub.qos.reliability == "reliable" && publisher.qos.reliability == "best_effort");
     let durable_ok =
         !(sub.qos.durability == "transient_local" && publisher.qos.durability == "volatile");
-    reliable_ok && durable_ok
+    let deadline_ok = match (sub.qos.deadline, publisher.qos.deadline) {
+        (Some(asked), Some(given)) => asked >= given,
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+    let lively_ok =
+        !(sub.qos.liveliness == "manual_by_topic" && publisher.qos.liveliness == "automatic");
+    reliable_ok && durable_ok && deadline_ok && lively_ok
 }
 
 /// A generic call, resolved and checked: what the operator approves is what goes out.

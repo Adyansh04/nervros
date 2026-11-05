@@ -83,11 +83,6 @@ pub(super) fn reshape(origin: Shape2, grip: Grip, from: [f64; 2], at: [f64; 2]) 
     shape
 }
 
-pub(super) fn in_polygon(polygon: &[[f64; 2]], [x, y]: [f64; 2]) -> bool {
-    let points: Vec<(f64, f64)> = polygon.iter().map(|&[a, b]| (a, b)).collect();
-    nervros_core::builtins::inside((x, y), &points)
-}
-
 /// The walls' angle, which canopy lays boxes along: the most common yaw, a quarter turn apart.
 pub(super) fn wall_yaw(objects: &[Object]) -> f64 {
     let quarter = std::f64::consts::FRAC_PI_2;

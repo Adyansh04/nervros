@@ -18,7 +18,7 @@ use nervros_ros::Transform;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::Arms;
+use super::{Arms, num};
 use crate::tools::{Assessment, Resource, Risk, Tool, ToolOutcome, ToolSpec};
 
 const CALL_WAIT: Duration = Duration::from_secs(5);
@@ -180,19 +180,12 @@ impl Scene {
             .as_ref()
             .map(|s| self.arms.planning_frame(s))
             .ok_or("MoveIt's SRDF is not read yet")??;
-        let half = o.yaw / 2.0;
-        let on_map = Transform {
-            translation: o.at,
-            rotation: [0.0, 0.0, half.sin(), half.cos()],
-        };
-        let pose = map_to_planning.compose(&on_map);
-        let [x, y, z] = pose.translation;
-        let [qx, qy, qz, qw] = pose.rotation;
+        let pose = map_to_planning.compose(&Transform::from_yaw(o.at, o.yaw));
         Ok(json!({
             "header": {"frame_id": planning},
             "id": id,
             "primitives": [o.shape.primitive()],
-            "primitive_poses": [{"position": {"x": x, "y": y, "z": z}, "orientation": {"x": qx, "y": qy, "z": qz, "w": qw}}],
+            "primitive_poses": [pose.to_pose()],
             "operation": ADD,
         }))
     }
@@ -227,10 +220,7 @@ impl Scene {
             return;
         };
         let all = crate::lock(&self.added).clone();
-        if let Err(e) = serde_json::to_vec_pretty(&all)
-            .map_err(|e| e.to_string())
-            .and_then(|text| crate::persist::write_atomic(file, &text).map_err(|e| e.to_string()))
-        {
+        if let Err(e) = crate::persist::write_json(file, &all) {
             tracing::warn!(error = %e, "the planning scene's obstacles were not kept");
         }
     }
@@ -548,10 +538,6 @@ fn moved(before: &Transform, now: &Transform) -> bool {
         .abs()
         .min(1.0);
     d > MOVED_M || 2.0 * dot.acos() > TURNED_RAD
-}
-
-fn num(v: &Value) -> f64 {
-    v.as_f64().unwrap_or(0.0)
 }
 
 #[cfg(test)]

@@ -66,6 +66,16 @@ async fn rooms(robot: &dyn RobotPort, topic: Option<&TopicRef>) -> Vec<Room> {
         .unwrap_or_default()
 }
 
+/// Three finite numbers written `a;b;c`, as a station's `x;y;yaw` or a target's `x;y;z`.
+#[must_use]
+pub fn triple(text: &str) -> Option<[f64; 3]> {
+    let v: Vec<f64> = text
+        .split(';')
+        .map(|p| p.trim().parse().ok().filter(|v: &f64| v.is_finite()))
+        .collect::<Option<_>>()?;
+    v.try_into().ok()
+}
+
 /// Ray casting: whether a point lies inside a polygon, its corners as `(x, y)` or `[x, y]`.
 #[must_use]
 pub fn inside<P: Copy + Into<[f64; 2]>>(point: impl Into<[f64; 2]>, polygon: &[P]) -> bool {
@@ -80,6 +90,19 @@ pub fn inside<P: Copy + Into<[f64; 2]>>(point: impl Into<[f64; 2]>, polygon: &[P
         j = i;
     }
     hit
+}
+
+/// A polygon's area by the shoelace formula, its corners in order.
+#[must_use]
+pub fn area(polygon: &[[f64; 2]]) -> f64 {
+    let n = polygon.len();
+    let twice: f64 = (0..n)
+        .map(|i| {
+            let ([x1, y1], [x2, y2]) = (polygon[i], polygon[(i + 1) % n]);
+            x1 * y2 - x2 * y1
+        })
+        .sum();
+    twice.abs() / 2.0
 }
 
 /// Whether a `geometry_msgs/Polygon` as JSON, such as a room's outline, holds the point.
@@ -333,6 +356,20 @@ impl Tool for Stop {
             Ok(r) => ToolOutcome::failed(format!("the robot refused to stop: {}", r["message"])),
             Err(e) => ToolOutcome::failed(format!("stop failed: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod triple_tests {
+    use super::triple;
+
+    #[test]
+    fn three_finite_numbers_only() {
+        assert_eq!(triple("1; -2.5;0.5"), Some([1.0, -2.5, 0.5]));
+        assert_eq!(triple("1;2"), None);
+        assert_eq!(triple("1;2;3;4"), None);
+        assert_eq!(triple("1;NaN;0"), None);
+        assert_eq!(triple("1;inf;0"), None);
     }
 }
 

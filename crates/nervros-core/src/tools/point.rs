@@ -186,8 +186,7 @@ impl PointTool {
                 entry
             })
             .collect();
-        let jpeg = nervros_ros::image::encode_jpeg(&drawn, nervros_ros::image::JPEG_QUALITY)
-            .map_err(|e| e.to_string())?;
+        let jpeg = crate::vision::jpeg(&drawn)?;
         let marks_listed = marks_json(&marks);
         let snapshot = self
             .snapshots
@@ -295,6 +294,38 @@ mod tests {
             "{}",
             out.data
         );
+    }
+
+    #[tokio::test]
+    async fn marks_are_numbered_as_look_numbers_them() {
+        use crate::look::tests::{frame, masks};
+        use nervros_ros::fake::FakeRobot;
+        let mut detections = masks(4.0);
+        let first = detections["instances"][0].clone();
+        let surer = |label: &str, score: f64| {
+            let mut one = first.clone();
+            one["label"] = json!(label);
+            one["score"] = json!(score);
+            one
+        };
+        detections["instances"] = json!([surer("low", 0.2), surer("high", 0.9), surer("mid", 0.5)]);
+        let robot: Arc<dyn RobotPort> = Arc::new(
+            FakeRobot::new()
+                .with_frame("/camera", frame(4.0))
+                .with_topic("/masks", detections),
+        );
+        let look: crate::profile::LookConfig = toml::from_str(
+            "image = \"/camera\"\nmax_marks = 2\n\
+             detections = { topic = \"/masks\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n",
+        )
+        .unwrap();
+        let cameras = Cameras::start(&look, &robot).unwrap();
+        tokio::task::yield_now().await;
+        let camera = cameras.get(None).unwrap();
+        let newest = camera.newest_soon().await.unwrap();
+        let (dets, ..) = camera.marked(robot.as_ref(), newest).await;
+        let labels: Vec<&str> = dets.instances.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["high", "mid"]);
     }
 
     #[test]

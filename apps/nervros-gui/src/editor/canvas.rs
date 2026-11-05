@@ -6,7 +6,7 @@ use rerun::external::egui::{
 };
 use serde_json::json;
 
-use super::geometry::{Shape2, in_polygon, reshape, room_centre, wall_yaw};
+use super::geometry::{Shape2, reshape, room_centre, wall_yaw};
 use super::world::{
     CHECKED, Label, OBJECT, Object, REMOVED, Room, SUSPECT, Suggestion, World, place,
 };
@@ -14,6 +14,7 @@ use super::{
     Call, Drag, Grip, HANDLE_PX, MIN_SIDE_M, Mode, Picked, ROTATE_PX, View, WorldEditor, lock,
 };
 use crate::theme;
+use nervros_core::builtins::inside;
 
 impl WorldEditor {
     fn to_screen(&self, world: &World, [x, y]: [f64; 2]) -> Pos2 {
@@ -112,7 +113,7 @@ impl WorldEditor {
         world
             .rooms
             .iter()
-            .find(|r| r.outline.len() > 2 && in_polygon(&r.outline, p))
+            .find(|r| r.outline.len() > 2 && inside(p, &r.outline))
             .or_else(|| {
                 world
                     .rooms

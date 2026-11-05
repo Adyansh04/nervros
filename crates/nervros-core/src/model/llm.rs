@@ -55,10 +55,8 @@ impl ImageInput {
     /// The encoder failed.
     pub fn jpeg(img: &image::RgbImage) -> Result<Self, String> {
         let small = nervros_ros::image::capped(img, MODEL_EDGE_PX);
-        let bytes = nervros_ros::image::encode_jpeg(&small, nervros_ros::image::JPEG_QUALITY)
-            .map_err(|e| e.to_string())?;
         Ok(Self {
-            bytes,
+            bytes: crate::vision::jpeg(&small)?,
             format: ImageFormat::Jpeg,
         })
     }

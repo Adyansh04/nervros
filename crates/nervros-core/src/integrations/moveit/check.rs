@@ -9,7 +9,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{Arms, Goal, error_words, num, point_constraints};
+use super::motion::along;
+use super::{Arms, CLEAR_SHARE, Goal, error_words, num, point_constraints};
 use crate::session::Event;
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
@@ -20,6 +21,8 @@ const PLAN_WAIT: Duration = Duration::from_secs(15);
 const DRAWN_POINTS: usize = 12;
 /// A previewed move's speed, as the robot would move it: slow.
 const PREVIEW_SCALING: f64 = 0.2;
+/// The longest straight move `HandLine` takes, m.
+const MAX_LINE_M: f64 = 0.5;
 
 /// The tool.
 pub(super) struct ArmCheck {
@@ -36,11 +39,14 @@ impl ArmCheck {
              valid: whether a named pose of the arm is clear of collisions now, the pose alone. \
              preview: whether and how the arm gets to a named pose, an object or a point: the \
              path MoveIt plans, how long it takes, drawn in the 3D view; use it for \"can the arm \
-             get there\". group is the arm, as arm_status names it, or its side.",
+             get there\". line: whether the hand can go straight by distance_m in a direction, \
+             as HandLine would: how much of the way is clear, drawn too. group is the arm, as arm_status names it, or its side.",
             json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["reach", "valid", "preview"]},
+                    "action": {"type": "string", "enum": ["reach", "valid", "preview", "line"]},
+                    "direction": {"type": "string", "enum": ["up", "down", "forward", "back", "left", "right"]},
+                    "distance_m": {"type": "number", "description": "For line: how far, up to 0.5."},
                     "group": {"type": "string", "description": "The arm: right_arm, or right"},
                     "pose": {"type": "string", "description": "A named pose of the arm, from arm_status"},
                     "object": {"type": "string", "description": "An object's id from find_objects"},
@@ -244,7 +250,9 @@ impl ArmCheck {
             .filter_map(|n| n.as_str().map(str::to_owned))
             .collect();
         let points = trajectory["points"].as_array().cloned().unwrap_or_default();
-        let duration = points.last().map_or(0.0, |p| secs(&p["time_from_start"]));
+        let duration = points
+            .last()
+            .map_or(0.0, |p| crate::stamp_s(&p["time_from_start"]));
         let drawn = self
             .draw(
                 &planning,
@@ -262,6 +270,48 @@ impl ArmCheck {
             "to": to,
             "takes_s": (duration * 10.0).round() / 10.0,
             "planning_s": (response["planning_time"].as_f64().unwrap_or(0.0) * 100.0).round() / 100.0,
+            "drawn": drawn,
+        }))
+    }
+
+    async fn line(&self, args: &Value) -> ToolOutcome {
+        let (_, group, planning, tip) = match self.arms.parts(args).await {
+            Ok(p) => p,
+            Err(why) => return ToolOutcome::failed(why),
+        };
+        let Some(metres) = args["distance_m"].as_f64().filter(|m| m.is_finite()) else {
+            return ToolOutcome::failed("line needs distance_m");
+        };
+        let direction = args["direction"].as_str().unwrap_or_default();
+        let metres = metres.clamp(0.0, MAX_LINE_M);
+        let way = match along(direction, metres) {
+            Ok(w) => w,
+            Err(why) => return ToolOutcome::failed(why),
+        };
+        let path = match self.arms.straight(&group, way).await {
+            Ok(p) => p,
+            Err(why) => return ToolOutcome::failed(why),
+        };
+        let share = path["fraction"].as_f64().unwrap_or(0.0);
+        let trajectory = &path["solution"]["joint_trajectory"];
+        let names: Vec<String> = trajectory["joint_names"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n.as_str().map(str::to_owned))
+            .collect();
+        let points = trajectory["points"].as_array().cloned().unwrap_or_default();
+        let joints = self.arms.joints().await.unwrap_or_default();
+        let label = format!("{group} {direction} {metres:.2} m");
+        let drawn = self
+            .draw(&planning, &tip, &joints, &names, &points, &label)
+            .await;
+        ToolOutcome::ok(json!({
+            "group": group,
+            "direction": direction,
+            "distance_m": metres,
+            "clear": share >= CLEAR_SHARE,
+            "clear_share": (share * 100.0).round() / 100.0,
             "drawn": drawn,
         }))
     }
@@ -330,8 +380,9 @@ impl Tool for ArmCheck {
             "reach" => self.reach(&args).await,
             "valid" => self.valid(&args).await,
             "preview" => self.preview(&args).await,
+            "line" => self.line(&args).await,
             other => ToolOutcome::failed(format!(
-                "action `{other}` is not one of reach, valid, preview"
+                "action `{other}` is not one of reach, valid, preview, line"
             )),
         }
     }
@@ -353,10 +404,6 @@ fn travel(now: &BTreeMap<String, f64>, solved: &Value) -> f64 {
         .sum()
 }
 
-fn secs(d: &Value) -> f64 {
-    num(&d["sec"]) + num(&d["nanosec"]) / 1e9
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +413,6 @@ mod tests {
         let now = BTreeMap::from([("a".to_owned(), 0.0), ("b".to_owned(), 1.0)]);
         let solved = json!({"name": ["a", "b", "c"], "position": [0.5, 0.75, 9.0]});
         assert!((travel(&now, &solved) - 0.75).abs() < 1e-9);
-        assert!((secs(&json!({"sec": 2, "nanosec": 500_000_000})) - 2.5).abs() < 1e-9);
+        assert!((crate::stamp_s(&json!({"sec": 2, "nanosec": 500_000_000})) - 2.5).abs() < 1e-9);
     }
 }

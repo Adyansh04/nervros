@@ -75,6 +75,27 @@ impl Transform {
         (self.translation[0], self.translation[1], self.yaw())
     }
 
+    /// `translation`, turned `yaw` radians about +z.
+    #[must_use]
+    pub fn from_yaw(translation: [f64; 3], yaw: f64) -> Self {
+        let half = yaw / 2.0;
+        Self {
+            translation,
+            rotation: [0.0, 0.0, half.sin(), half.cos()],
+        }
+    }
+
+    /// As a `geometry_msgs/Pose` in JSON.
+    #[must_use]
+    pub fn to_pose(&self) -> serde_json::Value {
+        let [x, y, z] = self.translation;
+        let [qx, qy, qz, qw] = self.rotation;
+        serde_json::json!({
+            "position": {"x": x, "y": y, "z": z},
+            "orientation": {"x": qx, "y": qy, "z": qz, "w": qw},
+        })
+    }
+
     /// A `geometry_msgs/Pose` as JSON; `None` when x, y or the rotation is missing. A missing z
     /// is 0: plans and goals often leave it out.
     #[must_use]

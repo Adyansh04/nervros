@@ -189,17 +189,7 @@ impl ProgramTool {
             .iter()
             .map(|p| json!({"name": p.name, "runs": p.runs, "max_minutes": p.max_minutes}))
             .collect();
-        let jobs: Vec<Value> = self
-            .jobs
-            .list()
-            .into_iter()
-            .filter(|j| j.kind == JobKind::Program)
-            .map(|j| {
-                let result = (!j.summary.is_empty()).then(|| crate::tools::from_world(&j.summary));
-                json!({"id": j.id, "title": j.name, "state": j.state, "result": result})
-            })
-            .collect();
-        ToolOutcome::ok(json!({"kept": kept, "jobs": jobs}))
+        ToolOutcome::ok(json!({"kept": kept}))
     }
 }
 
@@ -243,17 +233,16 @@ fn spec() -> ToolSpec {
              program), a short `title`, and `max_minutes` (1 to {MAX_MINUTES}, {DEFAULT_MINUTES} if left \
              out). The operator approves it once, with the skills its walk, find and run calls \
              name and its time limit; it then runs on its own, and its result comes as a report. \
-             save keeps one as `name`; list shows the kept and running ones; forget drops one; \
-             stop ends one by job `id`, a search's too, or every one without.",
+             save keeps one as `name`; list shows the kept ones; forget drops one. background \
+             lists the running ones and ends them.",
             api::REFERENCE
         ),
         json!({"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["run", "save", "list", "forget", "stop"]},
+            "action": {"type": "string", "enum": ["run", "save", "list", "forget"]},
             "source": {"type": "string", "description": "For run or save: the program."},
             "title": {"type": "string", "description": "For run: what it is for, in a few words."},
             "name": {"type": "string", "description": "For save or forget, or run instead of source: the name it is kept as."},
-            "max_minutes": {"type": "integer", "minimum": 1, "maximum": MAX_MINUTES},
-            "id": {"type": "string", "description": "For stop: the job, such as j2."}
+            "max_minutes": {"type": "integer", "minimum": 1, "maximum": MAX_MINUTES}
         }, "required": ["action"], "additionalProperties": false}),
         Risk::Manipulation,
     )
@@ -278,12 +267,11 @@ impl Tool for ProgramTool {
         };
         match args["action"].as_str() {
             Some("list") => simple(Risk::Observe, "lists the programs"),
-            Some("stop") => simple(Risk::Observe, "stops a program"),
             Some("save") => simple(Risk::Annotate, "keeps a program by name"),
             Some("forget") => simple(Risk::Annotate, "forgets a kept program"),
             Some("run") => Some(self.assess_run(args).await),
             _ => Some(Err(ToolOutcome::failed(
-                "`action` is run, save, list, forget or stop",
+                "`action` is run, save, list or forget",
             ))),
         }
     }
@@ -301,17 +289,7 @@ impl Tool for ProgramTool {
                     Err(e) => ToolOutcome::failed(e),
                 }
             }
-            Some("stop") => {
-                let id = args["id"].as_str().unwrap_or("all");
-                if self.jobs.stop(id) {
-                    ToolOutcome::ok(json!({"stopped": id}))
-                } else if id == "all" {
-                    ToolOutcome::failed("no program or search runs")
-                } else {
-                    ToolOutcome::failed(format!("no job {id} runs; list them"))
-                }
-            }
-            _ => ToolOutcome::failed("`action` is run, save, list, forget or stop"),
+            _ => ToolOutcome::failed("`action` is run, save, list or forget"),
         }
     }
 }

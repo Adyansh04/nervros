@@ -553,8 +553,9 @@ report> Mission 01a16636 (walk to bedroom R3 three times every 10 minutes, run 1
 ```
 
 The Mission tab lists the schedule with a **Cancel** button. A schedule can also wait for
-something: an object of a kind appearing, or a condition on a topic. With nothing to run, it only
-tells you: "Tell me when a mug appears in the bedroom" needs no approval.
+something to run its plan: an object of a kind appearing, or a condition on a topic. To only be told,
+ask for a watch, which needs no approval: "Tell me when a mug appears in the bedroom". "What is
+running in the background?" lists the watches, schedules and jobs, and any can be cancelled by its id.
 
 "Check the robot's health" runs the same connection check as the Doctor tab. You can ask it even
 while a mission runs.
@@ -627,6 +628,16 @@ parameters", "any errors in the logs?".
 - Nodes composed into a container are listed under it.
 - `params` gives each parameter's value with its description.
 - The read tools take `odom` for `/odom`.
+- `ros_graph` answers `ros2 topic list -v`, `topic info -v` (full QoS, and subscribers a publisher
+  cannot reach), `topic find`, `service info`, `action info` and `node info` with its actions. Its
+  `lifecycle` kind and a node's details say how managed nodes stand; changing a state is left to
+  the robot's own skills.
+- `topic_sample` also measures `delay`, how old messages are on arrival, and echoes whole arrays
+  with `full`. `interface_show` lists the interfaces and packages the agent knows.
+- `bag` records topics to an MCAP file that `ros2 bag info` and `ros2 bag play` read, from the raw
+  messages, up to an hour and 2 GB: "record the scan and the odometry for a minute". Latched topics
+  such as `/tf_static` give what they hold. It runs in the background and does not play back, since
+  that would publish on the robot's topics.
 
 Acting through ROS (a service call, an action goal, a parameter change or a publish) needs the
 profile to allow it, an absolute name, and your approval. A call or a publish may move the robot,
@@ -807,15 +818,19 @@ runs their standard motions itself where the robot's executor has no skill for t
 |---|---|---|
 | Navigation's state, a path's length and the zones it crosses, the cost at a spot | `nav_status`, `nav_check` | Nothing. A path check waits while Nav2 walks, since it would cut into Nav2's own planning |
 | The collision monitor: on or off, each polygon, a polygon's shape | `collision_monitor` | Turning on and growing are free; turning off and shrinking ask |
-| Costmaps, localization, the navigation servers, maps | `nav_admin` | Each asks, and none runs during a mission |
-| The arms: where each is, its named poses, the planners | `arm_status` | Nothing |
-| Whether a hand reaches something, whether a pose is clear, the path an arm would take | `arm_check` | Nothing; the path is drawn in the 3D view |
+| Costmaps, localization, the navigation servers, maps and route graphs | `nav_admin` | Each asks, and none runs during a mission |
+| The arms: where each is, its named poses, the planners, the controllers | `arm_status` | Nothing |
+| Whether a hand reaches something, whether a pose is clear, the path an arm would take, whether a straight move is clear | `arm_check` | Nothing; the path is drawn in the 3D view |
 | The obstacles the arms plan around, attaching an object to a hand, the octomap | `scene` | Adding is free; the rest asks |
 | How fast the arm moves NervROS runs go, the planner, poses remembered by name | `arm_settings` | Slower is free; faster and another planner ask |
 
 Plans may hold motions NervROS runs itself beside the executor's skills: a route through places
-without stopping at each (`WalkRoute`), a wait, a short straight hand move (`HandLine`), and, on a
-robot whose executor lacks them, walks, turns, arm poses and grips. The plan card marks such a
+without stopping at each (`WalkRoute`), a walk along the robot's fixed lanes (`WalkGraph`, with
+`route_server` in the profile), a wait, a short straight hand move (`HandLine`), and, on a robot
+whose executor lacks them, walks, turns, arm poses and grips. `HandTo` keeps what a hand holds as
+level as it is now, all the way. `nav_status` says what failed in Nav2's behaviour tree lately. `WalkGraph` takes the way the graph
+gives and walks through points along it with Nav2's planner between them, so it goes round what the
+graph does not know of. The plan card marks such a
 step **NervROS runs it through Nav2** (or MoveIt), its preview shows where a walk or a route goes,
 and the 3D view draws the way while it runs. Stop and Pause work as for any step: a stopped step
 ends as stopped, a paused walk stands and goes on with what was left when you resume, and an arm
@@ -834,6 +849,8 @@ what Nav2 is doing and the speed limit in force, and where each arm is.
   one of them lets go.
 - A route's places are its waypoints: one inside furniture fails the whole route, so name places
   or rooms with room to stand.
+- A route graph's lanes are what `WalkGraph` follows: a keep-out zone across one stops it before
+  it moves, while the ordinary walk plans around the zone.
 - Grip never moves a hand that holds something, or may: put the object down with a place.
 
 </details>
@@ -1042,7 +1059,7 @@ $ nervros-cli --profile nervros.toml eval eval/apartment.toml --out eval-r3
 That run covered the suite's first 44 cases.
 
 - `--only <text>` runs the cases whose ids contain it.
-- `--repeat k` runs each case k times, for pass^k.
+- `--repeat k` runs the suite k times, for pass^k; a scripted robot starts each run anew.
 - `--models a,b` compares models.
 - `nervros-cli case last --id my-case --append suite.toml` keeps a session as a new case.
 
@@ -1057,8 +1074,9 @@ and an `expect` table (`tools`, `not_tools`, `tool_said`, `skills`, `mission`, `
 </details>
 
 `--robot <file>` runs a suite against a robot that a file describes, instead of the live graph.
-Nothing moves on a scripted robot and no camera gives an image, so a run judges what the model
-says and plans; a case that measures the robot's motion cannot pass there. A model comparison
+A successful mission moves a scripted robot as its plan says, and each camera gives one fixed
+image, so a run judges what the model says, plans and sees. Nothing else in the world changes: an
+object stays where it was after a pick, and a mission takes about a second. A model comparison
 takes minutes with no simulator running, though the model server must still be up.
 
 <details>
@@ -1068,12 +1086,36 @@ The flag repeats, and a later file replaces an earlier one's entries key by key.
 the graph and the nodes each component container hosts, what each node publishes and subscribes
 to, parameters with their descriptions, topic rates and messages, frames, and fixed answers for
 services and actions. `scenarios/robot/robot.toml` has a mission executor that accepts every plan
-and finishes every mission.
+and finishes every mission. Three more sections bring it closer to a live robot:
+
+```toml
+[frames]                                  # each camera's image, relative to this file
+"/camera/color/image_raw" = "robot-frames/camera_color_image_raw.png"
+
+[replies."/world/find_objects"]           # the answer whose word the request's field holds
+field = "query"
+otherwise = { found = false }
+[replies."/world/find_objects".by]
+mug = { found = true }
+
+[motion]                                  # how a successful mission moves the robot
+action = "/executor/execute_mission"
+planner = "/compute_path_to_pose"         # answered with a straight line to the goal
+parent = "map"
+child = "base_footprint"
+walk = { skill = "WalkStraight", metres = "distance_m", direction = "direction" }
+turn = { skill = "TurnInPlace", degrees = "degrees" }
+places = { kitchen = { x = 3.0, y = 4.0 } }   # a step's argument naming one goes there
+```
+
+A step's `x;y;yaw` station argument moves the robot there too.
 
 `nervros-cli record robot.toml` writes such a file from the live robot: the graph, the
 containers, each node's topics and services, the parameters (those `param_read_deny` hides are
 written as `(hidden)`), the rates and last messages of the topics the profile names, the robot's
-pose on the map and the executor's catalog. It records no images, point clouds, maps or TF.
+pose on the map, one frame from each of the profile's cameras (in a `robot-frames` folder beside
+the file), `[motion]` from the profile's checks, places and world model, and the executor's
+catalog. It records no point clouds, maps or TF.
 
 </details>
 

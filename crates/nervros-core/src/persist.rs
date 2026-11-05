@@ -6,6 +6,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 /// Writes `bytes` to `path` whole or not at all, making its folder first.
@@ -29,6 +30,16 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// `value` as pretty JSON in `path`, whole or not at all.
+///
+/// # Errors
+///
+/// `value` cannot be serialised, or the file cannot be written; the text names the file.
+pub fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
+    let text = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
+    write_atomic(path, &text).map_err(|e| format!("saving {}: {e}", path.display()))
 }
 
 /// `path` read as JSON, or the default when there is no such file. One that cannot be read as a

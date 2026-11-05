@@ -25,13 +25,19 @@ pub(super) fn tool(ctx: Arc<Ctx>) -> Arc<dyn Tool> {
              or glob of the name. A filter sees names only: a stack's nodes rarely share one \
              (Nav2's are controller_server, planner_server, bt_navigator, amcl and the like), so \
              list them unfiltered. A component container in a node list or node details also \
-             shows the nodes it hosts. With name: details of that topic (types, publishers, \
-             subscribers, QoS and mismatches), node (what it publishes, subscribes to, serves, \
-             calls), service (type, definition, reachable) or action (type, definition).",
+             shows the nodes it hosts. type narrows a list to one interface, as ros2 topic find \
+             does; counts adds each topic's publishers and subscribers. kind lifecycle lists the \
+             managed nodes and their states. With name: details of that topic (types, publishers, \
+             subscribers, full QoS and mismatches), node (what it publishes, subscribes to, \
+             serves, calls, its action servers and clients, its lifecycle state and transitions), \
+             service (type, definition, reachable, its servers and clients) or action (type, \
+             definition, its servers and clients).",
             object(
                 json!({
-                    "kind": {"type": "string", "enum": ["topics", "services", "actions", "nodes"]},
+                    "kind": {"type": "string", "enum": ["topics", "services", "actions", "nodes", "lifecycle"]},
                     "filter": {"type": "string", "description": "Substring or glob such as /canopy/*"},
+                    "type": {"type": "string", "description": "Only this interface, or part of its name, such as sensor_msgs/msg/LaserScan"},
+                    "counts": {"type": "boolean", "description": "For topics: publishers and subscribers of each"},
                     "name": {"type": "string", "description": "A name to describe, such as /odom"},
                     "all": {"type": "boolean", "description": "Include hidden names such as parameter services"},
                 }),
@@ -50,6 +56,13 @@ struct RosGraph {
 
 /// The service every rclcpp component container offers to list what it runs.
 const LIST_NODES: &str = "composition_interfaces/srv/ListNodes";
+/// What every managed node offers to say how it stands, and what it could do next.
+const GET_STATE: &str = "lifecycle_msgs/srv/GetState";
+const GET_TRANSITIONS: &str = "lifecycle_msgs/srv/GetAvailableTransitions";
+/// The service an action server offers and an action client calls, under the action's name.
+const SEND_GOAL: &str = "/_action/send_goal";
+/// How long a look at another node's state may take.
+const STATE_WAIT: Duration = Duration::from_secs(2);
 
 impl RosGraph {
     /// The nodes `node` hosts when it is a component container; none when it is not, or does
@@ -72,10 +85,72 @@ impl RosGraph {
         )
     }
 
+    /// How a managed node stands; none for a node that is not one, or that does not answer.
+    async fn lifecycle_state(&self, graph: &GraphDetail, node: &str) -> Option<String> {
+        let service = format!("{node}/get_state");
+        if find_type(&graph.services, &service).as_deref() != Some(GET_STATE) {
+            return None;
+        }
+        let out = self
+            .ctx
+            .robot
+            .call(&service, GET_STATE, json!({}), STATE_WAIT)
+            .await
+            .ok()?;
+        out["current_state"]["label"].as_str().map(str::to_owned)
+    }
+
+    /// What a managed node could do next.
+    async fn lifecycle_transitions(&self, graph: &GraphDetail, node: &str) -> Option<Vec<String>> {
+        let service = format!("{node}/get_available_transitions");
+        find_type(&graph.services, &service).filter(|t| t == GET_TRANSITIONS)?;
+        let out = self
+            .ctx
+            .robot
+            .call(&service, GET_TRANSITIONS, json!({}), STATE_WAIT)
+            .await
+            .ok()?;
+        Some(
+            out["available_transitions"]
+                .as_array()?
+                .iter()
+                .filter_map(|t| t["transition"]["label"].as_str().map(str::to_owned))
+                .collect(),
+        )
+    }
+
+    /// The managed nodes and how they stand, like `ros2 lifecycle nodes` and `get`.
+    async fn lifecycle_nodes(&self, graph: &GraphDetail, filter: &str) -> ToolOutcome {
+        let mut items = Vec::new();
+        for (service, _) in graph
+            .services
+            .iter()
+            .filter(|(_, t)| t.first().is_some_and(|t| t == GET_STATE))
+        {
+            let Some(node) = service.strip_suffix("/get_state") else {
+                continue;
+            };
+            if !name_matches(filter, node) {
+                continue;
+            }
+            let state = self.lifecycle_state(graph, node).await;
+            items.push(json!({"name": node, "state": state}));
+        }
+        let total = items.len();
+        items.truncate(LIST_LIMIT);
+        ToolOutcome::ok(
+            json!({"kind": "lifecycle", "total": total, "shown": items.len(), "items": items}),
+        )
+    }
+
     async fn list(&self, graph: &GraphDetail, args: &Value) -> ToolOutcome {
         let kind = args["kind"].as_str().unwrap_or("topics");
         let filter = args["filter"].as_str().unwrap_or_default();
         let all = args["all"].as_bool().unwrap_or(false);
+        let of_type = args["type"].as_str().unwrap_or_default();
+        if kind == "lifecycle" {
+            return self.lifecycle_nodes(graph, filter).await;
+        }
         let items: Vec<(String, String)> = match kind {
             "topics" => graph
                 .topics
@@ -95,26 +170,28 @@ impl RosGraph {
                 .collect(),
             other => {
                 return ToolOutcome::failed(format!(
-                    "kind `{other}` is not one of topics, services, actions, nodes"
+                    "kind `{other}` is not one of topics, services, actions, nodes, lifecycle"
                 ));
             }
         };
         let matching: Vec<&(String, String)> = items
             .iter()
             .filter(|(n, _)| all || !self.ctx.hidden(n))
-            .filter(|(n, _)| {
-                filter.is_empty()
-                    || if filter.contains('*') {
-                        glob_match(filter, n)
-                    } else {
-                        n.contains(filter)
-                    }
-            })
+            .filter(|(n, _)| name_matches(filter, n))
+            .filter(|(_, t)| of_type.is_empty() || t.contains(of_type))
             .collect();
         let mut shown = Vec::new();
         for (n, t) in matching.iter().take(LIST_LIMIT) {
             shown.push(if !t.is_empty() {
-                json!({"name": n, "type": t})
+                let mut item = json!({"name": n, "type": t});
+                if kind == "topics"
+                    && args["counts"].as_bool().unwrap_or(false)
+                    && let Ok(ends) = self.ctx.robot.endpoints(n).await
+                {
+                    item["publishers"] = json!(ends.publishers.len());
+                    item["subscribers"] = json!(ends.subscribers.len());
+                }
+                item
             } else if let Some(hosts) = self.hosted(graph, n).await {
                 json!({"name": n, "hosts": hosts})
             } else {
@@ -183,7 +260,14 @@ impl RosGraph {
                     "subscribers": list(&n.subscribers),
                     "services": list(&n.services),
                     "clients": list(&n.clients),
+                    "action_servers": action_ends(&n.services),
+                    "action_clients": action_ends(&n.clients),
                 });
+                if let Some(state) = self.lifecycle_state(graph, name).await {
+                    data["lifecycle_state"] = json!(state);
+                    data["lifecycle_transitions"] =
+                        json!(self.lifecycle_transitions(graph, name).await);
+                }
                 // A container's own entities are few; the work is its components'.
                 if let Some(hosts) = self.hosted(graph, name).await {
                     data["hosts"] = json!(hosts);
@@ -198,19 +282,81 @@ impl RosGraph {
         }
     }
 
-    async fn service(&self, name: &str, ty: &str) -> ToolOutcome {
+    async fn service(&self, graph: &GraphDetail, name: &str, ty: &str) -> ToolOutcome {
         let available = self
             .ctx
             .robot
             .service_available(name, ty, Duration::from_secs(1))
             .await;
+        // Only each node knows its side of a service, so this asks every one.
+        let (mut servers, mut clients) = (Vec::new(), Vec::new());
+        let mut nodes = graph.nodes.clone();
+        nodes.dedup();
+        for node in &nodes {
+            if let Ok(n) = self.ctx.robot.node_entities(node).await {
+                let has = |list: &[(String, Vec<String>)]| list.iter().any(|(s, _)| s == name);
+                if has(&n.services) {
+                    servers.push(node.clone());
+                }
+                if has(&n.clients) {
+                    clients.push(node.clone());
+                }
+            }
+        }
         ToolOutcome::ok(json!({
             "service": name,
             "type": ty,
             "reachable": available,
+            "servers": servers,
+            "clients": clients,
             "definition": self.ctx.schemas.show(ty),
         }))
     }
+
+    async fn action(&self, name: &str, ty: &str) -> ToolOutcome {
+        // A server publishes an action's feedback, and each client subscribes to it.
+        let ends = match self
+            .ctx
+            .robot
+            .endpoints(&format!("{name}/_action/feedback"))
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => return failed(&e),
+        };
+        let nodes = |list: &[nervros_ros::Endpoint]| {
+            list.iter().map(|e| e.node.clone()).collect::<Vec<_>>()
+        };
+        ToolOutcome::ok(json!({
+            "action": name,
+            "type": ty,
+            "servers": nodes(&ends.publishers),
+            "clients": nodes(&ends.subscribers),
+            "definition": self.ctx.schemas.show(ty),
+        }))
+    }
+}
+
+/// Whether a name passes a filter: a glob with `*`, otherwise a substring, or no filter.
+fn name_matches(filter: &str, name: &str) -> bool {
+    filter.is_empty()
+        || if filter.contains('*') {
+            glob_match(filter, name)
+        } else {
+            name.contains(filter)
+        }
+}
+
+/// The actions among a node's services or clients, with their types.
+fn action_ends(services: &[(String, Vec<String>)]) -> Vec<Value> {
+    services
+        .iter()
+        .filter_map(|(name, types)| {
+            let action = name.strip_suffix(SEND_GOAL)?;
+            let ty = types.first()?.strip_suffix("_SendGoal").unwrap_or_default();
+            Some(json!({"name": action, "type": ty}))
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -242,14 +388,10 @@ impl Tool for RosGraph {
             return self.node(&graph, &name).await;
         }
         if let Some(ty) = find_type(&graph.services, &name) {
-            return self.service(&name, &ty).await;
+            return self.service(&graph, &name, &ty).await;
         }
         if let Some((_, ty)) = actions(&graph).into_iter().find(|(n, _)| *n == name) {
-            return ToolOutcome::ok(json!({
-                "action": name,
-                "type": ty,
-                "definition": self.ctx.schemas.show(&ty),
-            }));
+            return self.action(&name, &ty).await;
         }
         ToolOutcome::failed(format!(
             "`{name}` is not a topic, node, service or action in the graph"

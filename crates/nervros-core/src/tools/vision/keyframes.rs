@@ -165,8 +165,7 @@ fn difference(a: &GrayImage, b: &GrayImage) -> f64 {
 fn save(folder: &Path, rgb: &image::RgbImage, stamp_s: f64, edge: u32) -> std::io::Result<()> {
     std::fs::create_dir_all(folder)?;
     let small = nervros_ros::image::capped(rgb, edge);
-    let jpeg = nervros_ros::image::encode_jpeg(&small, nervros_ros::image::JPEG_QUALITY)
-        .map_err(std::io::Error::other)?;
+    let jpeg = crate::vision::jpeg(&small).map_err(std::io::Error::other)?;
     let name = millis(stamp_s);
     let partial = folder.join(format!("{name}.part"));
     std::fs::write(&partial, &jpeg)?;

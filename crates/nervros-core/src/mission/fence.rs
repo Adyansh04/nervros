@@ -6,21 +6,18 @@
 //! table does, leaves the pose unknown until the next walk to a place, and a straight walk from an
 //! unknown pose is left to Nav2's keepout filter, which stops it at the zone's edge.
 
-use super::catalog::{Catalog, GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, WALK_ROUTE};
+use super::catalog::{Catalog, GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, WALK_GRAPH, WALK_ROUTE};
 use super::plan::{PlannedStep, Problem, World, arg};
+use crate::builtins::triple;
 use crate::profile::PlanChecks;
 use crate::zones::Zones;
 
 /// The robot on the map: x, y and its heading in radians, when known.
 type Pose = (f64, f64, Option<f64>);
 
-fn number(step: &PlannedStep, name: &str) -> Option<f64> {
-    arg(&step.args, name)?.parse().ok()
-}
-
 /// What a walk to a place or a target heads for: a place's name, an id, or a label.
 fn target(step: &PlannedStep) -> Option<String> {
-    if step.skill == GO_TO_TARGET {
+    if step.skill == GO_TO_TARGET || step.skill == WALK_GRAPH {
         arg(&step.args, "target").map(str::to_owned)
     } else {
         step.target.clone()
@@ -30,15 +27,8 @@ fn target(step: &PlannedStep) -> Option<String> {
 /// Where a walk to a place, a pose or a target leaves the robot.
 fn destination(step: &PlannedStep, world: &World) -> Option<Pose> {
     if step.skill == GO_TO_POSE {
-        let station = arg(&step.args, "station")?;
-        let v: Vec<f64> = station
-            .split(';')
-            .map(|p| p.trim().parse().ok())
-            .collect::<Option<_>>()?;
-        return match v.as_slice() {
-            [x, y, yaw] => Some((*x, *y, Some(*yaw))),
-            _ => None,
-        };
+        let [x, y, yaw] = triple(arg(&step.args, "station")?)?;
+        return Some((x, y, Some(yaw)));
     }
     let target = target(step)?;
     if let Some(p) = world.places.iter().find(|p| p.name == target) {
@@ -111,7 +101,7 @@ pub(crate) fn check(
     let mut problems = Vec::new();
     let mut pose: Option<Pose> = start.map(|(x, y, yaw)| (x, y, Some(yaw)));
     for step in steps {
-        if [GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET].contains(&step.skill.as_str()) {
+        if [GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, WALK_GRAPH].contains(&step.skill.as_str()) {
             pose = destination(step, world);
             if let Some((x, y, _)) = pose
                 && let Some(zone) = zones.at(x, y)
@@ -155,7 +145,7 @@ pub(crate) fn check(
         }
         if let Some(walk) = checks.walk.as_ref().filter(|w| w.skill == step.skill) {
             let back = arg(&step.args, &walk.direction).is_some_and(|d| d.starts_with("back"));
-            pose = match (pose, number(step, &walk.metres)) {
+            pose = match (pose, step.number(&walk.metres)) {
                 (Some((x, y, Some(yaw))), Some(metres)) if metres > 0.0 => {
                     let along = if back { -metres } else { metres };
                     let end = (x + along * yaw.cos(), y + along * yaw.sin());
@@ -183,8 +173,9 @@ pub(crate) fn check(
         }
         if let Some(turn) = checks.turn.as_ref().filter(|t| t.skill == step.skill) {
             pose = pose.map(|(x, y, yaw)| {
-                let left =
-                    number(step, &turn.degrees).map(|d| if turn.positive_left { d } else { -d });
+                let left = step
+                    .number(&turn.degrees)
+                    .map(|d| if turn.positive_left { d } else { -d });
                 (x, y, yaw.zip(left).map(|(h, d)| h + d.to_radians()))
             });
             continue;

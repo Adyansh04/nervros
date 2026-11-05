@@ -29,6 +29,19 @@ pub mod tf;
 pub use r2r_port::{R2rConfig, R2rPort};
 
 pub use crate::image::Frame;
+
+/// Now, in seconds since the Unix epoch.
+#[must_use]
+pub fn now_s() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// A mutex's guard, poisoned or not: a panic while it was held leaves data still worth reading.
+pub fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 pub use crate::tf::Transform;
 
 /// A ROS operation that failed.
@@ -206,6 +219,14 @@ pub struct QosInfo {
     pub history: String,
     /// The queue depth for `keep_last`.
     pub depth: usize,
+    /// How often it promises or asks for a message, when it says.
+    pub deadline: Option<Duration>,
+    /// How long a message stays valid, when it says.
+    pub lifespan: Option<Duration>,
+    /// `automatic` or `manual_by_topic`.
+    pub liveliness: String,
+    /// How long it may stay silent and still count as alive, when it says.
+    pub lease: Option<Duration>,
 }
 
 /// One publisher or subscriber of a topic.
@@ -217,6 +238,8 @@ pub struct Endpoint {
     pub topic_type: String,
     /// Its `QoS`.
     pub qos: QosInfo,
+    /// Its unique id, in hexadecimal.
+    pub gid: String,
 }
 
 /// Who publishes and who subscribes to a topic.
@@ -350,6 +373,16 @@ pub trait RobotPort: Send + Sync {
         _topic: &str,
         _msg_type: &str,
     ) -> Result<BoxStream<'static, usize>, RosError> {
+        unsupported("following a topic")
+    }
+
+    /// Each message on a topic until the stream is dropped, serialized as it arrives, subscribing
+    /// as its publishers offer, so that a latched topic gives what it holds already.
+    async fn raw(
+        &self,
+        _topic: &str,
+        _msg_type: &str,
+    ) -> Result<BoxStream<'static, Vec<u8>>, RosError> {
         unsupported("following a topic")
     }
 
