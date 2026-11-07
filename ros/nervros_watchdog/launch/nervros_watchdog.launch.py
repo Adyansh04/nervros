@@ -20,11 +20,14 @@ def generate_launch_description():
                 default_value=params,
                 description="The watchdog's parameters; a robot passes its own.",
             ),
+            # Started again if it dies: without it nothing cancels NervROS's goals once it is gone.
             Node(
                 package="nervros_watchdog",
                 executable="nervros_watchdog",
                 output="screen",
                 parameters=[LaunchConfiguration("params_file")],
+                respawn=True,
+                respawn_delay=2.0,
             ),
         ]
     )

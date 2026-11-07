@@ -11,7 +11,8 @@ find_package(nervros_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 
-add_library(${PROJECT_NAME}_lib src/watchdog.cpp)
+# Internal: the node and its tests link it, nothing downstream does, so it installs nothing.
+add_library(${PROJECT_NAME}_lib STATIC src/watchdog.cpp)
 target_include_directories(${PROJECT_NAME}_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -26,11 +27,7 @@ target_link_libraries(${PROJECT_NAME}_lib PUBLIC
 add_executable(${PROJECT_NAME} src/main.cpp)
 target_link_libraries(${PROJECT_NAME} ${PROJECT_NAME}_lib)
 
-install(TARGETS ${PROJECT_NAME}_lib ${PROJECT_NAME}
-  ARCHIVE DESTINATION lib
-  LIBRARY DESTINATION lib
-  RUNTIME DESTINATION lib/${PROJECT_NAME}
-)
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
