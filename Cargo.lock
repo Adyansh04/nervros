@@ -7551,6 +7551,7 @@ dependencies = [
 name = "nervros-viz"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "nervros-core",
  "nervros-ros",
  "rerun",

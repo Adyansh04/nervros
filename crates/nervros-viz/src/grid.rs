@@ -4,6 +4,7 @@ use nervros_ros::Transform;
 use rerun::RecordingStream;
 use serde_json::Value;
 
+use crate::layers::pose;
 use crate::{SEEN, TO_SEE, WRITTEN_OFF, f32s, num, put_static};
 
 /// An occupancy grid as image bytes, top row first as images are, with `N` bytes per cell.
@@ -23,14 +24,16 @@ impl Grid {
     pub(super) fn placed(mut self, to_map: &Transform) -> Self {
         let [x, y, z] = self.corner;
         self.corner = f32s(to_map.apply([f64::from(x), f64::from(y), f64::from(z)]));
-        self.rotation = f32s(to_map.rotation);
+        let own = Transform {
+            translation: [0.0; 3],
+            rotation: self.rotation.map(f64::from),
+        };
+        self.rotation = f32s(to_map.compose(&own).rotation);
         self
     }
 }
 
 /// A `nav_msgs/msg/OccupancyGrid` as a [`Grid`], each cell's value mapped by `cell`.
-// ponytail: ignores the origin's rotation, which map servers leave at zero; rotate the grid if a
-// robot publishes a rotated one.
 pub(super) fn grid<const N: usize>(msg: &Value, cell: impl Fn(i64) -> [u8; N]) -> Option<Grid> {
     let info = &msg["info"];
     let res = num(&info["resolution"]);
@@ -54,7 +57,7 @@ pub(super) fn grid<const N: usize>(msg: &Value, cell: impl Fn(i64) -> [u8; N]) -
         size: [u32::try_from(width).ok()?, u32::try_from(height).ok()?],
         cell_m,
         corner: [x, y, 0.0],
-        rotation: [0.0, 0.0, 0.0, 1.0],
+        rotation: f32s(pose(&info["origin"]).rotation),
     })
 }
 
@@ -123,16 +126,16 @@ pub(super) fn known_extent(msg: &Value) -> Option<[f32; 4]> {
     if c0 > c1 {
         return None;
     }
-    let origin = &info["origin"]["position"];
-    let (x, y) = (num(&origin["x"]), num(&origin["y"]));
+    let origin = pose(&info["origin"]);
     #[expect(clippy::cast_precision_loss, reason = "cell counts far below 2^52")]
     let at = |cell: usize| cell as f64 * res;
-    Some(f32s([
-        x + at(c0),
-        y + at(r0),
-        x + at(c1 + 1),
-        y + at(r1 + 1),
-    ]))
+    // The box of the known cells' corners, which the origin's turn can slant.
+    let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+    for (c, r) in [(c0, r0), (c1 + 1, r0), (c0, r1 + 1), (c1 + 1, r1 + 1)] {
+        let [x, y, _] = origin.apply([at(c), at(r), 0.0]);
+        (lo, hi) = ([lo[0].min(x), lo[1].min(y)], [hi[0].max(x), hi[1].max(y)]);
+    }
+    Some(f32s([lo[0], lo[1], hi[0], hi[1]]))
 }
 
 pub(super) fn draw_map(rec: &RecordingStream, path: &str, msg: &Value) {
@@ -176,4 +179,37 @@ pub(super) fn seen_colour(seen: f64) -> rerun::Color {
         lerp(from.1, to.1, t),
         lerp(from.2, to.2, t),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn turned_grid(yaw_z: f64, yaw_w: f64) -> Value {
+        json!({"info": {"resolution": 1.0, "width": 2, "height": 1,
+            "origin": {"position": {"x": 1.0, "y": 0.0, "z": 0.0},
+                "orientation": {"x": 0.0, "y": 0.0, "z": yaw_z, "w": yaw_w}}},
+            "data": [0, 0]})
+    }
+
+    #[test]
+    fn an_origin_turn_places_the_grid_and_its_extent() {
+        let half = std::f64::consts::FRAC_1_SQRT_2;
+        let msg = turned_grid(half, half);
+        let g = grid(&msg, |_| [0u8]).expect("a grid");
+        assert!((g.rotation[2] - 0.707).abs() < 1e-2, "{:?}", g.rotation);
+        let [x0, y0, x1, y1] = known_extent(&msg).expect("an extent");
+        // Turned 90 degrees about (1, 0), the two cells run up the y axis from x = 0 to 1.
+        for (got, want) in [x0, y0, x1, y1].into_iter().zip([0.0, 0.0, 1.0, 2.0]) {
+            assert!((got - want).abs() < 1e-4, "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn an_unturned_extent_is_the_known_cells() {
+        let msg = turned_grid(0.0, 1.0);
+        assert_eq!(known_extent(&msg), Some([1.0, 0.0, 3.0, 1.0]));
+    }
 }

@@ -16,11 +16,13 @@ use crate::grid::{draw_coverage, draw_map, known_extent};
 use crate::objects::{Drawn, draw_object_names, draw_objects};
 use crate::plan::{draw_plan, draw_trail};
 use crate::rooms::draw_rooms;
-use crate::tasks::{Drawer, arm_scene, camera, draw_detections, robot_model, sample, scan};
+use crate::tasks::{
+    Drawer, arm_scene, camera, draw_detections, markers, robot_model, sample, scan,
+};
 use crate::zones::zones;
 use crate::{
-    CAMERA_PATH, CAMERA_PERIOD, Layers, MODEL_PATH, OBJECT_PALETTE, OBJECTS_PERIOD, POSE_PERIOD,
-    SLOW_PERIOD, layers, put, put_static,
+    CAMERA_PATH, CAMERA_PERIOD, Layers, MODEL_PATH, OBJECT_PALETTE, OBJECTS_PERIOD, PLAN_PATH,
+    POSE_PERIOD, SLOW_PERIOD, layers, put, put_static,
 };
 
 /// A layer as a task draws it: its name in [`Layers`] and the entity it draws under.
@@ -92,8 +94,8 @@ impl Spawner {
     }
 
     /// Every camera the profile names, each in its own view, the first in the world when the
-    /// profile gives its lens; with the detector's boxes on the frames.
-    /// Draws every camera and its detections; returns each camera's name and entity path.
+    /// profile gives its lens; with the detector's boxes on the frames. Returns each camera's name
+    /// and entity path.
     pub(super) fn cameras(&mut self, profile: &Profile) -> Vec<(String, String)> {
         let lens = profile
             .viz
@@ -106,11 +108,12 @@ impl Spawner {
             .map(LookConfig::all_cameras)
             .unwrap_or_default();
         let mut views = Vec::new();
+        let mut used = BTreeSet::new();
         for (i, (name, config)) in cameras.into_iter().enumerate() {
             let path = if i == 0 {
                 CAMERA_PATH[usize::from(lens.is_some())].to_owned()
             } else {
-                format!("/cameras/{}", layers::slug(&name))
+                format!("/cameras/{}", layers::unique_slug(&name, &mut used))
             };
             self.tasks.spawn(camera(
                 self.rec.clone(),
@@ -119,13 +122,19 @@ impl Spawner {
                 path.clone(),
                 if i == 0 { lens.clone() } else { None },
             ));
-            let boxes = self.layer("Detections", &format!("{path}/detections"), true);
-            self.watch(
-                config.detections,
-                CAMERA_PERIOD,
-                boxes,
-                Box::new(draw_detections),
-            );
+            // A layer only where there is a topic to draw, or its toggle does nothing.
+            if config.detections.is_some() {
+                let boxes = self.layer("Detections", &format!("{path}/detections"), true);
+                self.watch(
+                    config.detections,
+                    CAMERA_PERIOD,
+                    boxes,
+                    Box::new(|rec, path, msg| {
+                        draw_detections(rec, path, msg);
+                        true
+                    }),
+                );
+            }
             views.push((name, path));
         }
         views
@@ -145,6 +154,7 @@ impl Spawner {
                     if let Some(extent) = known_extent(msg) {
                         layout.map(extent);
                     }
+                    true
                 }),
             );
             let coverage = self.layer("Camera coverage", "world/coverage", true);
@@ -152,21 +162,30 @@ impl Spawner {
                 world.coverage.clone(),
                 OBJECTS_PERIOD,
                 coverage,
-                Box::new(draw_coverage),
+                Box::new(|rec, path, msg| {
+                    draw_coverage(rec, path, msg);
+                    true
+                }),
             );
             let (rooms, mut drawn) = (self.layer("Rooms", "world/rooms", true), BTreeSet::new());
             self.watch(
                 world.rooms.clone(),
                 SLOW_PERIOD,
                 rooms,
-                Box::new(move |rec, path, msg| draw_rooms(rec, path, msg, &mut drawn)),
+                Box::new(move |rec, path, msg| {
+                    draw_rooms(rec, path, msg, &mut drawn);
+                    true
+                }),
             );
             let trail = self.layer("Trail", "world/trail", true);
             self.watch(
                 world.trail.clone(),
                 SLOW_PERIOD,
                 trail,
-                Box::new(draw_trail),
+                Box::new(|rec, path, msg| {
+                    draw_trail(rec, path, msg);
+                    true
+                }),
             );
             let objects = self.layer("Objects", "world/objects", true);
             let mut drawn = Drawn::new(objects.clears());
@@ -174,7 +193,10 @@ impl Spawner {
                 world.objects.clone(),
                 OBJECTS_PERIOD,
                 objects,
-                Box::new(move |rec, path, msg| draw_objects(rec, path, msg, drawn.looks())),
+                Box::new(move |rec, path, msg| {
+                    draw_objects(rec, path, msg, drawn.looks());
+                    true
+                }),
             );
             // Off by default: forty names bury the map, and hovering a box names it.
             let names = self.layer("Object names", "world/object_names", false);
@@ -182,12 +204,24 @@ impl Spawner {
                 world.objects.clone(),
                 OBJECTS_PERIOD,
                 names,
-                Box::new(draw_object_names),
+                Box::new(|rec, path, msg| {
+                    draw_object_names(rec, path, msg);
+                    true
+                }),
             );
         }
-        let plan = self.layer("Plan", "world/plan", true);
-        let topic = profile.viz.as_ref().and_then(|v| v.plan.clone());
-        self.watch(topic, POSE_PERIOD * 5, plan, Box::new(draw_plan));
+        if let Some(topic) = profile.viz.as_ref().and_then(|v| v.plan.clone()) {
+            let plan = self.layer("Plan", PLAN_PATH, true);
+            self.watch(
+                Some(topic),
+                POSE_PERIOD * 5,
+                plan,
+                Box::new(|rec, path, msg| {
+                    draw_plan(rec, path, msg);
+                    true
+                }),
+            );
+        }
     }
 
     /// The keep-out zones, redrawn as the operator adds or removes them.
@@ -214,8 +248,12 @@ impl Spawner {
     }
 
     pub(super) fn profile_layers(&mut self, profile: &Profile) {
+        let mut used = BTreeSet::new();
         for (i, config) in profile.viz.iter().flat_map(|v| &v.layers).enumerate() {
-            let path = format!("world/layers/{}", layers::slug(&config.name));
+            let path = format!(
+                "world/layers/{}",
+                layers::unique_slug(&config.name, &mut used)
+            );
             let layer = self.layer(&config.name, &path, !config.hidden);
             if config.msg_type == "sensor_msgs/msg/LaserScan" {
                 self.tasks.spawn(scan(
@@ -232,34 +270,40 @@ impl Spawner {
                 topic: config.topic.clone(),
                 msg_type: config.msg_type.clone(),
             };
+            if config.msg_type == "visualization_msgs/msg/MarkerArray" {
+                self.tasks.spawn(markers(
+                    self.rec.clone(),
+                    Arc::clone(&self.robot),
+                    topic,
+                    OBJECTS_PERIOD,
+                    layer,
+                    (config.namespaces.clone(), profile.ros.map_frame.clone()),
+                ));
+                continue;
+            }
             let draw = profile_layer(config, i, &self.robot, &profile.ros.map_frame);
             self.watch(Some(topic), OBJECTS_PERIOD, layer, draw);
         }
     }
 }
 
-/// How a `[[viz.layer]]` grid or marker array is drawn; the scan has its own task.
+/// `frame` in the map frame: the identity for an empty frame or the map's own, else TF's.
+pub(super) fn to_map(robot: &dyn RobotPort, map: &str, frame: &str) -> Option<Transform> {
+    if frame.is_empty() || frame == map {
+        Some(Transform::IDENTITY)
+    } else {
+        robot.transform(map, frame).ok()
+    }
+}
+
+/// How a `[[viz.layer]]` grid or polygon is drawn; the scan and marker arrays have tasks of their
+/// own.
 fn profile_layer(
     config: &LayerConfig,
     index: usize,
     robot: &Arc<dyn RobotPort>,
     map: &str,
 ) -> Drawer {
-    if config.msg_type == "visualization_msgs/msg/MarkerArray" {
-        let (robot, map, namespaces) =
-            (Arc::clone(robot), map.to_owned(), config.namespaces.clone());
-        let mut drawn = BTreeSet::new();
-        return Box::new(move |rec, path, msg| {
-            let to_map = |frame: &str| {
-                if frame.is_empty() || frame == map {
-                    Some(Transform::IDENTITY)
-                } else {
-                    robot.transform(&map, frame).ok()
-                }
-            };
-            layers::draw_markers(rec, path, msg, &namespaces, &to_map, &mut drawn);
-        });
-    }
     let (r, g, b) = OBJECT_PALETTE[index % OBJECT_PALETTE.len()];
     let colour = config.color.unwrap_or([r, g, b]);
     // Above the map and coverage, one layer over the next.
@@ -269,14 +313,9 @@ fn profile_layer(
         let (robot, map) = (Arc::clone(robot), map.to_owned());
         return Box::new(move |rec, path, msg| {
             let frame = msg["header"]["frame_id"].as_str().unwrap_or_default();
-            let to_map = if frame.is_empty() || frame == map {
-                Ok(Transform::IDENTITY)
-            } else {
-                robot.transform(&map, frame)
-            };
-            if let Ok(t) = to_map {
-                layers::draw_polygon(rec, path, msg, &t, (colour, lift));
-            }
+            to_map(robot.as_ref(), &map, frame)
+                .map(|t| layers::draw_polygon(rec, path, msg, &t, (colour, lift)))
+                .is_some()
         });
     }
     let (robot, map) = (Arc::clone(robot), map.to_owned());
@@ -284,15 +323,11 @@ fn profile_layer(
     Box::new(move |rec, path, msg| {
         // A grid in another frame, as a local costmap in odom, is placed on the map by TF.
         let frame = msg["header"]["frame_id"].as_str().unwrap_or_default();
-        let to_map = if frame.is_empty() || frame == map {
-            Ok(Transform::IDENTITY)
-        } else {
-            robot.transform(&map, frame)
-        };
-        match to_map {
-            Ok(t) if costmap => layers::draw_costmap(rec, path, msg, &t, lift),
-            Ok(t) => layers::draw_occupied(rec, path, msg, &t, (colour, lift)),
-            Err(_) => {}
+        match to_map(robot.as_ref(), &map, frame) {
+            Some(t) if costmap => layers::draw_costmap(rec, path, msg, &t, lift),
+            Some(t) => layers::draw_occupied(rec, path, msg, &t, (colour, lift)),
+            None => return false,
         }
+        true
     })
 }

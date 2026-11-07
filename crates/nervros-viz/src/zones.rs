@@ -108,6 +108,9 @@ fn draw_zones(rec: &RecordingStream, path: &str, zones: &[Zone], drawn: &mut BTr
     *drawn = now;
 }
 
+/// The most hatching lines across one zone.
+const MAX_STROKES: f64 = 2000.0;
+
 /// Diagonal lines `spacing` metres apart across the polygon, clipped to it: the crossings of each
 /// line with the outline, paired in order along it, bound the stretches inside, concave or not.
 pub(super) fn hatch(polygon: &[[f64; 2]], spacing: f64) -> Vec<[[f64; 2]; 2]> {
@@ -117,7 +120,8 @@ pub(super) fn hatch(polygon: &[[f64; 2]], spacing: f64) -> Vec<[[f64; 2]; 2]> {
         (f64::INFINITY, f64::NEG_INFINITY),
         |(lo, hi), &(across, _)| (lo.min(across), hi.max(across)),
     );
-    let step = spacing * std::f64::consts::SQRT_2;
+    // At most MAX_STROKES lines, so a zone of absurd size costs no more to draw than a big room.
+    let step = (spacing * std::f64::consts::SQRT_2).max((last - first) / MAX_STROKES);
     let back =
         |across: f64, along: f64| [f64::midpoint(across, along), f64::midpoint(across, -along)];
     let mut strokes = Vec::new();
