@@ -120,11 +120,21 @@ impl Drive {
         lock(&self.link)
     }
 
-    /// Asks the executor to hand the base over, or to take it back.
+    /// Asks the executor to hand the base over, or to take it back. Taking it back stops the
+    /// commands here at once, not when the executor answers: a lost answer must not leave them
+    /// streaming.
     pub fn set(&self, on: bool) {
-        self.link().busy = true;
+        {
+            let mut l = self.link();
+            l.busy = true;
+            if !on {
+                l.on = false;
+                l.commands = None;
+            }
+        }
         let (robot, link) = (Arc::clone(&self.robot), Arc::clone(&self.link));
         let (service, topic) = (self.service.clone(), self.topic.clone());
+        // Detached: it ends with the call, which SERVICE_TIMEOUT bounds.
         self.runtime.spawn(async move {
             let commands = if on {
                 match robot.publisher(&topic, "geometry_msgs/msg/Twist").await {
@@ -160,6 +170,17 @@ impl Drive {
                 Err(e) => l.note = Some(e.to_string()),
             }
         });
+    }
+
+    /// Disarming hands the base back at once, whichever tab is shown.
+    pub fn follow_arming(&self, armed: bool) {
+        let (on, busy) = {
+            let l = self.link();
+            (l.on, l.busy)
+        };
+        if on && !busy && !armed {
+            self.set(false);
+        }
     }
 
     /// Ends driving on this side when the executor has, as after its idle limit or a stop; a
@@ -200,12 +221,15 @@ impl Drive {
 
 /// The keys held now as a command: W and S forward and back, A and D turn, Q and E sideways.
 /// Not the arrows, which the viewer takes to step its time cursor. None while a text field has
-/// the keyboard.
+/// the keyboard, or with a modifier held: Ctrl+Shift+S is the stop, and Ctrl+W no step.
 fn keys_held(ctx: &egui::Context) -> [f64; 3] {
     if ctx.egui_wants_keyboard_input() {
         return [0.0; 3];
     }
     ctx.input(|i| {
+        if i.modifiers.any() {
+            return [0.0; 3];
+        }
         let axis = |plus: Key, minus: Key| {
             f64::from(i8::from(i.key_down(plus)) - i8::from(i.key_down(minus)))
         };
@@ -369,10 +393,6 @@ fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
         let l = drive.link();
         (l.on, l.busy, l.note.clone())
     };
-    // Disarming hands the base back at once.
-    if on && !busy && !status.armed {
-        drive.set(false);
-    }
     ui.horizontal(|ui| {
         theme::section(ui, "Drive by hand");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -443,7 +463,9 @@ fn drive_section(ui: &mut egui::Ui, status: &Status, drive: &mut Drive) {
             pad(ui, "D · turn right", 2, -1.0);
             ui.end_row();
         });
-    drive.send(ui.ctx(), held);
+    if status.armed {
+        drive.send(ui.ctx(), held);
+    }
 }
 
 #[cfg(test)]

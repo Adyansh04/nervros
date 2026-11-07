@@ -186,8 +186,33 @@ fn on_close(closing: Closing, mission_running: bool) -> (bool, Closing) {
     }
 }
 
+/// The chat as the window opens: the agent's notices, then what the last session left asking.
+fn opening_chat(agent: &Agent) -> Chat {
+    let mut chat = Chat::default();
+    chat.can_pause = agent
+        .profile
+        .mission
+        .as_ref()
+        .is_some_and(|m| m.pause.is_some());
+    chat.items
+        .extend(agent.notices.iter().cloned().map(crate::chat::Item::Notice));
+    chat.items.extend(
+        agent
+            .unanswered
+            .iter()
+            .cloned()
+            .map(|u| crate::chat::Item::Unanswered(u, std::cell::Cell::new(false))),
+    );
+    chat
+}
+
 /// How long closing waits for the robot to say it stopped, past the stop's own timeout.
 const STOP_BEFORE_CLOSE: Duration = Duration::from_secs(8);
+/// How long the dock's Approve takes no click after a request switched the dock to it.
+const SETTLE: Duration = Duration::from_millis(500);
+/// The session answers a stop within 20 s whatever the robot does, and a profile without a stop
+/// tool answers none: past this, a stop still unanswered is not waited for.
+const STOP_ANSWER: Duration = Duration::from_secs(25);
 
 /// What the close dialog says, and its button for closing without a stop. With a deadman
 /// (`deadman_s`) the executor stops the mission once the window is gone, so nothing runs on.
@@ -277,11 +302,17 @@ pub struct Gui {
     tab: Tab,
     /// The tab a request to approve took the dock from, to go back to once it is answered.
     tab_before_approval: Option<Tab>,
+    /// When a request switched the dock to its Approvals tab.
+    approvals_shown: Option<std::time::Instant>,
     dock_open: bool,
     recheck: tokio::sync::mpsc::UnboundedSender<()>,
     /// Set by the viewer on the UI thread when the selection changes.
     picked: Rc<RefCell<Option<Picked>>>,
     closing: Closing,
+    /// Stops of the robot sent and not yet answered, and when the last went: the Stop button
+    /// says "Stopping" meanwhile, and closing waits for every answer.
+    stops_unanswered: u32,
+    stop_sent: Option<std::time::Instant>,
     bridge: nervros_viz::Bridge,
     /// The world editor, when the profile names one; `editing` shows it in place of the viewer.
     editor: Option<crate::editor::WorldEditor>,
@@ -376,21 +407,7 @@ impl Gui {
         viewer.add_log_receiver(feed.input);
         let live = Arc::new(Mutex::new(Live::default()));
         let recheck = watch(&agent, &live, &cc.egui_ctx);
-        let mut chat = Chat::default();
-        chat.can_pause = agent
-            .profile
-            .mission
-            .as_ref()
-            .is_some_and(|m| m.pause.is_some());
-        chat.items
-            .extend(agent.notices.iter().cloned().map(crate::chat::Item::Notice));
-        chat.items.extend(
-            agent
-                .unanswered
-                .iter()
-                .cloned()
-                .map(|u| crate::chat::Item::Unanswered(u, std::cell::Cell::new(false))),
-        );
+        let chat = opening_chat(&agent);
         let agent_snapshots = Arc::clone(&agent.snapshots);
         Ok(Self {
             viewer,
@@ -408,10 +425,13 @@ impl Gui {
             // A request to approve opens its tab; until then the plan and past missions.
             tab: Tab::Mission,
             tab_before_approval: None,
+            approvals_shown: None,
             dock_open: true,
             recheck,
             picked,
             closing: Closing::Open,
+            stops_unanswered: 0,
+            stop_sent: None,
             bridge: feed.bridge,
             editor,
             editing: false,
@@ -469,6 +489,7 @@ impl Gui {
     /// notice in the chat.
     fn pause(&self, on: bool, reason: &'static str) {
         if let Some(missions) = self.agent.missions.clone() {
+            // Detached: the pause ends with its call to the executor, which its timeout bounds.
             tokio::spawn(async move { missions.pause(on, reason).await });
         }
     }
@@ -489,7 +510,7 @@ impl Gui {
                 let deadman = self.agent.missions.as_ref().and_then(|m| m.deadman_s());
                 match close_dialog(ctx, self.closing == Closing::StopFailed, deadman) {
                     Some(CloseChoice::StopAndClose) => {
-                        self.agent.session.send(Command::StopMission);
+                        self.send(Command::StopMission);
                         self.closing = Closing::Stopping(std::time::Instant::now());
                     }
                     Some(CloseChoice::JustClose) => {
@@ -519,23 +540,44 @@ impl Gui {
             match self.events.try_recv() {
                 Ok(e) => {
                     self.chat.apply(&e);
+                    if let Event::Open { approvals, turn } = &e {
+                        self.chat.reopen(approvals, *turn);
+                        if !self.agent.missions.as_ref().is_some_and(|m| m.busy()) {
+                            self.chat.end_unheard();
+                        }
+                    }
                     self.toast(&e);
                     self.settle_fix(&e);
-                    // Closed only once the robot confirms the stop; a failed one asks again.
-                    if let (Closing::Stopping(_), Event::Stopped { ok, .. }) = (self.closing, &e) {
-                        self.closing = if *ok {
-                            Closing::Allowed
-                        } else {
-                            Closing::StopFailed
-                        };
+                    // Closed only once the robot has answered every stop sent, the last answer
+                    // deciding; a failed one asks again.
+                    if let Event::Stopped { ok, .. } = &e {
+                        self.stops_unanswered = self.stops_unanswered.saturating_sub(1);
+                        if matches!(self.closing, Closing::Stopping(_))
+                            && self.stops_unanswered == 0
+                        {
+                            self.closing = if *ok {
+                                Closing::Allowed
+                            } else {
+                                Closing::StopFailed
+                            };
+                        }
                     }
                     self.timeline.push(&e);
                     if matches!(e, Event::ApprovalRequested { .. }) && self.tab != Tab::Approvals {
                         self.tab_before_approval = Some(self.tab);
                         self.tab = Tab::Approvals;
+                        self.approvals_shown = Some(std::time::Instant::now());
                     }
                 }
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                // Missed events are asked for again: what is open now, as cards and the spinner.
+                // A missed stop answer cannot be counted, so the count starts over.
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    self.stops_unanswered = 0;
+                    self.chat.items.push(crate::chat::Item::Notice(format!(
+                        "The window missed {n} events; it asks the session what is open"
+                    )));
+                    self.agent.session.send(Command::Resync);
+                }
                 Err(_) => break,
             }
         }
@@ -632,13 +674,18 @@ impl Gui {
         self.history.push(text.to_owned());
         self.history_pos = None;
         if nervros_core::session::is_stop_word(text) {
-            self.agent.session.send(Command::StopMission);
+            self.send(Command::StopMission);
             return;
         }
         // Only on a mission that can take it: otherwise "wait" or "go on" is for the model, and a
         // plain "pause" for the executor, which says what there is to pause.
         if let Some(on) = nervros_core::session::pause_word(text)
-            && ((self.chat.can_pause && self.mission_running() && on != self.mission_paused())
+            && (self
+                .agent
+                .missions
+                .as_ref()
+                .and_then(|m| m.pause_order(text))
+                == Some(on)
                 || nervros_core::session::only_pause_word(text))
         {
             self.pause(on, "chat");
@@ -670,7 +717,7 @@ impl Gui {
     fn run(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Say(text) => self.say(text),
-            Cmd::Send(c) => self.agent.session.send(c),
+            Cmd::Send(c) => self.send(c),
             Cmd::Tab(tab) => {
                 self.tab = tab;
                 self.dock_open = true;
@@ -731,7 +778,7 @@ impl Gui {
                     if let Command::Edit { id, .. } = &c {
                         self.chat.edit_sent(*id);
                     }
-                    self.agent.session.send(c);
+                    self.send(c);
                 }
                 Action::Say(text) => self.say(&text),
                 Action::Prefill(text) => {
@@ -781,7 +828,7 @@ impl Gui {
             self.agent.session.send(Command::StopGeneration);
         }
         if stop {
-            self.agent.session.send(Command::StopMission);
+            self.send(Command::StopMission);
         }
         if let Some(n) = tab {
             self.tab = Tab::ALL[n].0;
@@ -789,7 +836,40 @@ impl Gui {
         }
     }
 
+    /// Sends `c` to the session, counting a stop of the robot until the robot answers it.
+    pub(crate) fn send(&mut self, c: Command) {
+        if matches!(c, Command::StopMission) {
+            // Stops older than the session's answer window will not be answered any more.
+            if !self.stopping() {
+                self.stops_unanswered = 0;
+            }
+            self.stops_unanswered += 1;
+            self.stop_sent = Some(std::time::Instant::now());
+        }
+        self.agent.session.send(c);
+    }
+
+    /// Whether the dock's Approve takes a click: not in the first moments after a request
+    /// switched the dock to it, when a press was aimed at the tab it showed before.
+    fn approvals_settled(&self, ctx: &egui::Context) -> bool {
+        let left = self
+            .approvals_shown
+            .map_or(Duration::ZERO, |t| SETTLE.saturating_sub(t.elapsed()));
+        if !left.is_zero() {
+            ctx.request_repaint_after(left);
+        }
+        left.is_zero()
+    }
+
+    /// A stop of the robot is on its way: sent, and not answered yet.
+    fn stopping(&self) -> bool {
+        self.stops_unanswered > 0 && self.stop_sent.is_some_and(|t| t.elapsed() < STOP_ANSWER)
+    }
+
     fn stop_label(&self) -> String {
+        if self.stopping() {
+            return "Stopping…".to_owned();
+        }
         let live = self.live();
         let held = live.executor.as_ref().and_then(|s| {
             ["left", "right"].into_iter().find_map(|hand| {
@@ -804,10 +884,14 @@ impl Gui {
 impl eframe::App for Gui {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.drain_events();
+        // The stop key first: nothing read in the frame may hold it up.
+        self.keys(ui.ctx());
+        if let Some(drive) = &self.drive {
+            drive.follow_arming(self.agent.guard.armed());
+        }
         if self.agent.tools.iter().any(|t| t == "look") {
             self.attachments.take_dropped(ui.ctx());
         }
-        self.keys(ui.ctx());
         self.guard_close(ui.ctx());
         let edge = egui::Stroke::new(1.0, theme::BORDER);
         // Exact: a panel grown by one crowded frame, as when a chip arrives before the robot's name

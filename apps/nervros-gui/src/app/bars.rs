@@ -55,7 +55,7 @@ impl Gui {
                 .corner_radius(CornerRadius::same(8))
                 .min_size(egui::vec2(0.0, 30.0));
                 if ui.add(stop).on_hover_text(STOP_HINT).clicked() {
-                    self.agent.session.send(Command::StopMission);
+                    self.send(Command::StopMission);
                 }
                 if self.mission_running()
                     && self

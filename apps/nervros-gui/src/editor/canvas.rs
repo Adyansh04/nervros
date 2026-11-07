@@ -11,7 +11,8 @@ use super::world::{
     CHECKED, Label, OBJECT, Object, REMOVED, Room, SUSPECT, Suggestion, World, place,
 };
 use super::{
-    Call, Drag, Grip, HANDLE_PX, MIN_SIDE_M, Mode, Picked, ROTATE_PX, View, WorldEditor, lock,
+    Call, Drag, Grip, HANDLE_PX, MAX_DASHED_PX, MIN_SIDE_M, Mode, Picked, ROTATE_PX, View,
+    WorldEditor, lock,
 };
 use crate::theme;
 use nervros_core::builtins::inside;
@@ -59,6 +60,10 @@ impl WorldEditor {
             world.map.height.max(1) as f32,
         );
         let scale = (rect.width() / w).min(rect.height() / h) * 0.95;
+        // A canvas not laid out yet has no size: fitted to it, the view would stay at scale 0.
+        if !(scale.is_finite() && scale > 0.0) {
+            return;
+        }
         let offset = rect.center().to_vec2() - Vec2::new(w, h) * scale / 2.0;
         self.view = Some(View { scale, offset });
     }
@@ -143,6 +148,8 @@ impl WorldEditor {
         self.merge_with = None;
         self.form.label.clear();
         self.form.name.clear();
+        // Filled again from the object once the mode ends, not left blank under its buttons.
+        self.form.of = None;
         (self.form.low, self.form.high) = (0.0, 0.8);
     }
 
@@ -193,6 +200,12 @@ impl WorldEditor {
             self.stop_mode();
             self.selected = Some(select);
         }
+        // A reload can bring another floor plan: it is fetched and fitted again.
+        if self.map_meta.as_ref().is_some_and(|m| *m != world.map) {
+            self.map = None;
+            self.map_meta = None;
+            self.view = None;
+        }
         let image = if self.map.is_none() {
             lock(&self.shared).map.take()
         } else {
@@ -200,6 +213,7 @@ impl WorldEditor {
         };
         if let Some(image) = image {
             self.map = Some(ctx.load_texture("floor-plan", image, egui::TextureOptions::NEAREST));
+            self.map_meta = Some(world.map.clone());
         }
         if self.view.is_none() && world.map.width > 0 {
             self.fit(&world, rect);
@@ -247,6 +261,7 @@ impl WorldEditor {
         let scroll = ui.input(|i| i.smooth_scroll_delta().y);
         if scroll != 0.0
             && let (Some(p), Some(v)) = (response.hover_pos(), &mut self.view)
+            && v.scale > 0.0
         {
             let scale = (v.scale * (scroll * 0.0025).exp()).clamp(0.2, 40.0);
             v.offset = p.to_vec2() - (p.to_vec2() - v.offset) * (scale / v.scale);
@@ -362,6 +377,11 @@ impl WorldEditor {
 
     fn keys(&mut self, ui: &egui::Ui, world: &World) {
         let ctx = ui.ctx().clone();
+        // Typing in the composer or a label field is text: Ctrl+Z there must not undo the world.
+        // While a request is out, the keys wait as the buttons do.
+        if ctx.egui_wants_keyboard_input() || lock(&self.shared).busy {
+            return;
+        }
         let command = Modifiers::COMMAND;
         let (save, redo, undo) = ui.input_mut(|i| {
             (
@@ -377,9 +397,6 @@ impl WorldEditor {
             self.call(&ctx, Call::Command("redo", "redone"));
         } else if undo {
             self.call(&ctx, Call::Command("undo", "undone"));
-        }
-        if ctx.egui_wants_keyboard_input() {
-            return;
         }
         let (escape, delete, check, next) = ui.input_mut(|i| {
             (
@@ -550,7 +567,13 @@ impl WorldEditor {
             let fill = Color32::from_rgba_unmultiplied(80, 130, 230, 40);
             painter.add(Shape::convex_polygon(points.clone(), fill, Stroke::NONE));
         }
-        if object.box_pinned {
+        // Dashes cost a shape each: a box far bigger than the window is drawn solid.
+        let around: f32 = points
+            .iter()
+            .zip(points.iter().cycle().skip(1))
+            .map(|(a, b)| a.distance(*b))
+            .sum();
+        if object.box_pinned && around.is_finite() && around < MAX_DASHED_PX {
             let mut closed = points.clone();
             closed.push(points[0]);
             painter.extend(Shape::dashed_line(&closed, line, 5.0, 3.0));

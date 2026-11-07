@@ -4,6 +4,7 @@
 use std::fmt::Write as _;
 
 use nervros_core::profile::PlaceConfig;
+use nervros_core::session::Command;
 use nervros_core::zones::{Rule, Zone};
 use rerun::external::egui;
 use rerun::external::egui::{Align, CornerRadius, Frame, Layout, Margin, RichText, Stroke};
@@ -330,10 +331,12 @@ pub(super) fn zones_view(ui: &mut egui::Ui, zones: &[Zone]) -> Vec<Action> {
                         .on_hover_text("Ask the agent to remove it; you approve")
                         .clicked()
                     {
-                        actions.push(Action::Say(format!(
-                            "Remove the {kind} zone \"{}\".",
-                            zone.name
-                        )));
+                        // A tool call with the name as its argument: a name in the operator's own
+                        // sentence could say more than a name.
+                        actions.push(Action::Send(Command::Run {
+                            tool: "geofence".to_owned(),
+                            args: serde_json::json!({"action": "remove", "name": zone.name}),
+                        }));
                     }
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         // The swatch is the 3D view's colour for a zone.

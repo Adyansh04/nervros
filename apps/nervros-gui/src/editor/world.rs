@@ -29,7 +29,7 @@ pub(crate) struct World {
     pub(super) unsaved: u64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub(super) struct MapMeta {
     pub(super) resolution: f64,

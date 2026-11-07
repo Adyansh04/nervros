@@ -3,11 +3,12 @@
 //! follow mode and clicks on widgets, with PNGs where the script asks and, when asked, every frame
 //! recorded for a clip.
 //!
-//! Ignored by default: it needs the robot's stack, the model and a profile.
+//! Ignored by default: it needs the robot's stack, the model and a profile. It approves what the
+//! agent asks, so it runs only with `NERVROS_GUI_EVAL_SIM=1`, which says the robot is simulated.
 //!
 //! ```bash
-//! NERVROS_PROFILE=<nervros.toml> NERVROS_GUI_EVAL_OUT=<dir> NERVROS_GUI_EVAL_SCRIPT=<file> \
-//!   cargo test -p nervros-gui live_eval -- --ignored --nocapture
+//! NERVROS_GUI_EVAL_SIM=1 NERVROS_PROFILE=<nervros.toml> NERVROS_GUI_EVAL_OUT=<dir> \
+//!   NERVROS_GUI_EVAL_SCRIPT=<file> cargo test -p nervros-gui live_eval -- --ignored --nocapture
 //! ```
 //!
 //! `NERVROS_GUI_EVAL_MODEL=<id>` talks on that model of `models.toml` alone. The run keeps the
@@ -55,6 +56,8 @@ const PER_PROMPT: Duration = Duration::from_mins(6);
 const QUIET: Duration = Duration::from_secs(5);
 /// How fast a prompt is typed, in characters a second.
 const TYPING: f64 = 24.0;
+/// How long a stop may take before the run goes on regardless.
+const STOP_WAIT: Duration = Duration::from_secs(25);
 /// How long an approval card shows before it is approved, as an operator would read it.
 const READING: Duration = Duration::from_millis(2500);
 /// How fast the pointer travels to what it clicks, in points a second, within the shortest and
@@ -141,10 +144,13 @@ impl Step {
             _ => Err(bad("on or off")),
         };
         match name {
+            // `try_from`: a negative, NaN or endless time would panic mid-run on a live robot.
             "wait" => rest
                 .parse::<f64>()
-                .map(|s| Self::Wait(Duration::from_secs_f64(s)))
-                .map_err(|_| bad("seconds")),
+                .ok()
+                .and_then(|s| Duration::try_from_secs_f64(s).ok())
+                .map(Self::Wait)
+                .ok_or_else(|| bad("seconds, 0 or more")),
             "follow" => on().map(Self::Follow),
             "edit" => on().map(Self::Edit),
             "approve" => on().map(Self::Approve),
@@ -180,13 +186,17 @@ impl Step {
                 .parse::<f64>()
                 .ok()
                 .filter(|m| *m > 0.0)
-                .map(|m| Self::Limit(Duration::from_secs_f64(m * 60.0)))
+                .and_then(|m| Duration::try_from_secs_f64(m * 60.0).ok())
+                .map(Self::Limit)
                 .ok_or_else(|| bad("minutes above 0")),
             "hold" => rest
                 .split_once(' ')
-                .and_then(|(k, secs)| Some((key(k)?.1, secs.trim().parse::<f64>().ok()?)))
-                .map(|(k, secs)| Self::Hold(k, Duration::from_secs_f64(secs)))
-                .ok_or_else(|| bad("a key and seconds")),
+                .and_then(|(k, secs)| {
+                    let secs = secs.trim().parse::<f64>().ok()?;
+                    Some((key(k)?.1, Duration::try_from_secs_f64(secs).ok()?))
+                })
+                .map(|(k, held)| Self::Hold(k, held))
+                .ok_or_else(|| bad("a key and seconds, 0 or more")),
             "focus" if !rest.is_empty() && rest != "0" => Ok(Self::Focus(rest.to_owned())),
             "record" => Ok(Self::Record),
             "scroll" => rest
@@ -730,6 +740,26 @@ impl Run<'_> {
             }
         }
         eprintln!("   not settled in {} s", self.limit.as_secs());
+        // The next prompt must not find the robot still doing this one's work.
+        self.stop_running();
+    }
+
+    /// Stops what still runs, as the stop button does, and waits for it to end.
+    fn stop_running(&mut self) {
+        let gui = self.harness.state_mut();
+        if !(gui.mission_running() || gui.job_running()) {
+            return;
+        }
+        gui.send(nervros_core::session::Command::StopMission);
+        let began = Instant::now();
+        while began.elapsed() < STOP_WAIT {
+            self.frame();
+            let gui = self.harness.state();
+            if !(gui.mission_running() || gui.job_running()) {
+                return;
+            }
+        }
+        eprintln!("   still running {} s after the stop", STOP_WAIT.as_secs());
     }
 }
 
@@ -802,6 +832,13 @@ fn a_script_reads_prompts_commands_and_settings() {
 #[test]
 #[ignore = "needs the robot's stack, the model and NERVROS_PROFILE"]
 fn live_eval() {
+    // It approves what the agent asks, and so moves the robot: on a simulator only, said so.
+    assert_eq!(
+        std::env::var("NERVROS_GUI_EVAL_SIM").as_deref(),
+        Ok("1"),
+        "live_eval drives whatever robot the profile reaches: set NERVROS_GUI_EVAL_SIM=1 to say \
+         it is a simulator"
+    );
     let profile_path = PathBuf::from(std::env::var("NERVROS_PROFILE").expect("NERVROS_PROFILE"));
     let out = PathBuf::from(
         std::env::var("NERVROS_GUI_EVAL_OUT").unwrap_or_else(|_| "gui-eval".to_owned()),
@@ -891,6 +928,7 @@ fn live_eval() {
     for step in &steps[scene..] {
         run.step(step);
     }
+    run.stop_running();
     // The end holds a moment, so the last frame is the settled window.
     run.wait(Duration::from_secs(2));
     if let Some(capture) = run.capture.take() {

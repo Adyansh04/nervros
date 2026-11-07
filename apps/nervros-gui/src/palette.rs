@@ -136,9 +136,10 @@ pub fn entries() -> Vec<Entry> {
     ]
 }
 
-/// The command a chat message names, as `/look`; none for anything else.
+/// The command a chat message is, as `/look`; none for anything else, a sentence that starts
+/// with a command's name included: "/arm the gripper is stuck" is for the agent.
 pub fn slash<'a>(entries: &'a [Entry], text: &str) -> Option<&'a Cmd> {
-    let name = text.split_whitespace().next()?;
+    let name = text.trim();
     // `/Look` is `/look` mistyped, not another command.
     entries
         .iter()
@@ -231,10 +232,8 @@ mod tests {
     #[test]
     fn a_chat_message_runs_the_command_its_slash_names() {
         let all = entries();
-        assert_eq!(
-            slash(&all, "/stop now"),
-            Some(&Cmd::Send(Command::StopMission))
-        );
+        assert_eq!(slash(&all, "/stop"), Some(&Cmd::Send(Command::StopMission)));
+        assert_eq!(slash(&all, "/arm the gripper is stuck"), None);
         assert_eq!(slash(&all, "/models"), Some(&Cmd::Tab(Tab::Agent)));
         assert_eq!(slash(&all, "/Models"), Some(&Cmd::Tab(Tab::Agent)));
         assert_eq!(slash(&all, "/nonsense"), None);

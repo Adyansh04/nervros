@@ -147,6 +147,41 @@ fn condensing_up_to_a_message_keeps_the_ones_after_it() {
     );
 }
 
+#[test]
+fn the_approval_cards_buttons_answer_their_own_request() {
+    for (button, wanted) in [("Approve", Command::Approve(7)), ("Deny", Command::Deny(7))] {
+        let mut chat = sample();
+        // Answered by the click alone: the card stays until the session says so.
+        chat.reopen(&[7], false);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&sent);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(440.0, 600.0))
+            .build_ui(move |ui| {
+                let mut actions = Vec::new();
+                chat.show(ui, Duration::from_mins(10), &mut actions);
+                seen.borrow_mut().extend(actions);
+            });
+        harness.run();
+        harness.get_by_label(button).click();
+        harness.run();
+        assert!(
+            sent.borrow()
+                .iter()
+                .any(|a| matches!(a, Action::Send(c) if *c == wanted)),
+            "{button}"
+        );
+    }
+}
+
+#[test]
+fn a_request_the_session_no_longer_has_is_not_left_answerable() {
+    let mut chat = sample();
+    assert_eq!(chat.pending().count(), 1);
+    chat.reopen(&[], false);
+    assert_eq!(chat.pending().count(), 0, "its request is gone");
+}
+
 /// A harness drawing `chat` on the panel background, cropped to what it draws.
 fn render(chat: Chat, name: &str) {
     render_with(chat, name, |_| {});
