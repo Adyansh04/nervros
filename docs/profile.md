@@ -43,7 +43,7 @@ the same guard.
 | `type` | required | `pkg/srv/Name` or `pkg/msg/Name`. |
 | `description` | generated | Replaces the generated one: "Calls `ros_name` (`type`)." and the interface file's comment for a service, "Reads the newest message on `ros_name`" for a topic. |
 | `risk` | required for a service; `observe` for a topic | `observe`, `annotate`, `world_edit`, `motion` or `manipulation`; see below. |
-| `resources` | none | `base`, `left_arm`, `right_arm`: two calls holding the same one cannot run at once. |
+| `resources` | none; all three for a `motion` or `manipulation` tool | `base`, `left_arm`, `right_arm`: two calls holding the same one cannot run at once. |
 | `timeout` | `"5s"` | Per call. |
 | `hide_fields` | none | Request fields the model neither sees nor fills, such as an embedding. |
 | `defaults` | none | Values the request starts from; the model's arguments go on top. |
@@ -114,8 +114,8 @@ models, and sends text only to models that are local or do not train on it.
 | `budgets.tool_calls` | `12` | Tool calls per turn. |
 | `budgets.wall_time` | `"90s"` | A turn is stopped after this, not counting the operator's time on approvals. Missions run outside turns. Free cloud endpoints can take 20 s a call; give them `"180s"`. |
 | `budgets.repeat_break` | `3` | The same call with the same arguments this many times in a row is refused. |
-| `hard_deny` | see below | ROS names no tool may reach; `*` matches anything. Setting it replaces the defaults. |
-| `hard_deny_types` | see below | Interface types no generic tool may call, send or publish, globbed the same way. |
+| `hard_deny` | see below | ROS names no tool may reach; `*` matches anything. Names set here are added to the defaults, which cannot be removed. |
+| `hard_deny_types` | see below | Interface types no generic tool may call, send or publish, globbed the same way and added to the defaults. |
 | `rule` | none | Rules on a tool's arguments, below. |
 
 Rules only tighten: one can refuse a call or make it ask, never let through what the guard would
@@ -143,14 +143,15 @@ around a value.
   would ask refuses instead, since a job cannot stop to ask.
 
 The default `hard_deny` covers what commands motors, velocities or controllers directly, under any
-namespace: `rt/lowcmd`, `*/lowcmd`, `*/rt/*`, `*cmd_vel*`, `*/controller_manager/*`,
-`*/set_parameters`, `*/set_parameters_atomically`, `*/joint_trajectory`,
+namespace: `rt/lowcmd`, `*/lowcmd`, `*/low_cmd`, `*/rt/*`, `*/dex3/*/cmd` (a DDS topic `rt/X` is
+the ROS topic `/X`), `*/commands`, `*/joint_commands`, `*/speed_limit`, `*cmd_vel*`,
+`*/controller_manager/*`, `*/set_parameters`, `*/set_parameters_atomically`, `*/joint_trajectory`,
 `*/follow_joint_trajectory`, `*/servo_node/*`, `*/apply_planning_scene` and `*/clear_octomap`. A
 relative name in a `[[tool]]` is checked as the node resolves it, under `/`.
 
 The default `hard_deny_types` are `geometry_msgs/msg/Twist`, `geometry_msgs/msg/TwistStamped`,
-`trajectory_msgs/msg/*`, `control_msgs/action/*`, `control_msgs/msg/JointJog`,
-`controller_manager_msgs/srv/*`, `lifecycle_msgs/srv/ChangeState` and
+`trajectory_msgs/msg/*`, `control_msgs/action/*`, `control_msgs/msg/JointJog`, `unitree_hg/msg/*`,
+`nav2_msgs/msg/SpeedLimit`, `controller_manager_msgs/srv/*`, `lifecycle_msgs/srv/ChangeState` and
 `rcl_interfaces/srv/SetParameters*` (only `param_set` sets parameters). A type written `pkg/Name`
 is checked as every kind it could be.
 
@@ -191,8 +192,8 @@ Four act tools exist only when their list names something.
 | Key | Default | |
 |---|---|---|
 | `hidden` | action internals, `/rosout`, `/parameter_events`, parameter services | Left out of listings unless `all` is asked; not a boundary. |
-| `read_deny` | none | Topics never sampled, echoed, watched, plotted, read by a playbook or used to start a schedule. |
-| `param_read_deny` | `*key*`, `*token*`, `*secret*`, `*password*` | Parameter values shown as hidden, matched on the name whatever its case: in `params`, `param_set`'s answer, a `service_call` reply, and the files `nervros-cli record` writes. |
+| `read_deny` | `/parameter_events` | Topics never sampled, echoed, watched, plotted, read by a playbook or used to start a schedule. Topics set here are added to `/parameter_events`, which carries parameter values unmasked and always stays denied. |
+| `param_read_deny` | `*key*`, `*token*`, `*secret*`, `*password*`, `*passwd*`, `*auth*`, `*credential*` | Parameter values shown as hidden, matched on the name whatever its case: in `params`, `param_set`'s answer, a `service_call` reply, and the files `nervros-cli record` writes (which also hide a URL with a login in it, and keep no camera frames in the `home` privacy mode). |
 | `service_observe` | `get_*`, `list_*`, `describe_*` | Services that only read: `service_call` runs them unarmed and unapproved. A pattern without `/` matches the last part of the name, so `get_*` covers `/map_server/get_map` but not `/arm/get_ready/execute`. |
 | `service_call` | none | Services `service_call` may call. |
 | `action_send` | none | Actions `action_goal` may reach. |
@@ -344,7 +345,7 @@ group = "World model"                     # its heading in the Layers tab; one b
 | Type | Drawn as |
 |---|---|
 | `nav_msgs/msg/OccupancyGrid` | Its occupied cells, over the map in the layer's colour. With `style = "costmap"`, a Nav2 costmap's costs: inflation from faint blue to indigo, the inscribed radius in violet, obstacles in coral, free cells clear. A grid in another frame, as a local costmap in `odom`, is placed by TF. |
-| `visualization_msgs/msg/MarkerArray` | Each marker by its type: arrows, cubes, spheres, cylinders, lines, point lists, triangle lists and text. Mesh markers are left out. |
+| `visualization_msgs/msg/MarkerArray` | Each marker by its type: arrows, cubes, spheres, cylinders, lines, point lists, triangle lists and text. Every message is taken, so markers added and deleted bit by bit add up as in RViz, and a marker's `lifetime` ends it. Mesh markers are left out. |
 | `sensor_msgs/msg/LaserScan` | Points in the map, by TF from the scan's frame. |
 | `geometry_msgs/msg/PolygonStamped` | A closed outline on the map, by TF from its frame: a collision monitor's polygon as it shows it (`visualize: true`). The Layers tab names it beside its colour. |
 
@@ -381,7 +382,7 @@ and the agent never asks first in the chat. `check_only` only checks a plan.
 | `teleop_speed` | `[0.5, 0.3, 0.8]` | Full hand-driving speed forward and sideways (m/s) and turning (rad/s); Slow in the Robot tab halves it. |
 | `define_skill`, `forget_skill` | none | The `DefineSkill` and `ForgetSkill` services: with both, the agent gets `teach_skill` and teaches the robot skills from the executor's learnable leaves; see [the executor contract](executor.md#taught-skills). |
 | `checks` | none | The skills the plan checks know; see below. |
-| `lend` | none | The `LendResources` service: an executor that holds the arms lends them for an arm move NervROS runs itself through MoveIt, and takes them back after; see [integrations](integrations.md#native-steps). |
+| `lend` | none | The `LendResources` service: an executor that holds the arms lends them for an arm move NervROS runs itself through MoveIt, and takes them back after; see [integrations](integrations.md#native-steps). Needs `heartbeat`: the executor takes the arms back from a borrower it hears no heartbeat from. |
 
 Before a plan reaches the operator, it is checked against their words: a left turn planned as a
 right one, a walk the wrong way or of another length, the other hand. Such a plan goes back to the
@@ -493,12 +494,15 @@ What the plan check refuses:
 - A mission whose straight walk passes through a zone, followed from where the robot stands. A
   walk out of a zone the robot stands in is allowed. The straight-walk check covers the skill
   `[mission.checks] walk` names.
+- A route (`WalkRoute`) with a named waypoint inside a zone. Its legs between waypoints are
+  Nav2's to plan and are not checked.
 - A plan run later, by its hash or a schedule, is checked again as it starts.
 
 Nav2 learns the zones through [`[nav2]`](#nav2): keep-out zones through `keepout_mask`, slow
 zones through `speed_zones`. Without them, Nav2 knows nothing of the zones and only the agent's own
-checks hold the keep-out zones: a walk whose route crosses one, driving by hand, and skills that
-move the base themselves are not held back, and nothing slows the robot in a slow zone.
+checks hold the keep-out zones: a walk whose path between its ends or waypoints crosses one,
+driving by hand, and skills that move the base themselves are not held back, and nothing slows the
+robot in a slow zone.
 
 The viewer draws keep-out zones in red and slow zones in amber with their speed; the World tab
 lists them, and its buttons add and remove them through the agent.

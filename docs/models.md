@@ -74,7 +74,9 @@ price = { input = 0.10, output = 0.50, cache_read = 0.01, cache_write = 0.125 }
   place. No call starts once the spend reaches `usd`; the role's chain goes on to the next model.
   A spend file that cannot be read counts as spent, and so does the budget of a process that
   could not write one. Another process's spend shows within two seconds.
-- Set `usd` below the key's credit: a call in flight is counted when it returns.
+- Set `usd` below the key's credit: a call in flight is counted when it returns. A call cut off by
+  a stop is counted by its prompt alone, as its reply's tokens are not known, and a reply that
+  carries no token count is priced on its prompt as NervROS counts it.
 
 ## Models
 
@@ -182,7 +184,8 @@ Pacific time, as the providers count them.
   streamed reply goes silent for `timeout_s`, is tried last for a minute, by that process alone,
   so its turns meanwhile go quietly to the next model.
 - A busy model (a 5xx, such as Gemini's 503 under load) is asked once more two seconds later,
-  unless part of the turn already came back.
+  unless part of the turn already came back. The last model of a chain is asked up to three more
+  times, after 2, 5 and 10 s, and the chat says so after the first.
 - When every model of a turn is held back and the first per-minute limit or 429 lifts within a
   minute, as after a burst of calls on free tiers, the turn says so and waits for it, once. Daily
   limits still end the turn at once.

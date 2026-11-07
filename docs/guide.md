@@ -241,7 +241,7 @@ A plain "stop" (or "halt", "freeze", "stop!") never waits for a model. It stops 
 robot at once, through the executor's `StopAll`. In the clip the walk had run for nine seconds:
 
 ```text
-[halted: the operator stopped the reply and the robot]
+[halted: the operator stopped the reply and asked the robot to stop]
 [the robot stopped: holding posture; hands empty]
 report> Mission 01a16604 (Walk to the office, room R4) ended: canceled after 10 s.
         It was stopped during s1 GoToPlace(place=R4) (stopped: operator).
@@ -959,8 +959,9 @@ remembers, and each model with its quota for the day.
   ("condensed 3×"). `/compact` condenses it at once, and right-clicking one of your messages
   condenses everything before it. The chat says each time.
 - A model that hits its rate limit is set aside, and one whose server is not running is tried
-  last, so the next one in its role's chain answers. A busy model is asked once more first. When
-  every model is at its limit for the minute, the turn waits for the first one to free up.
+  last, so the next one in its role's chain answers. A busy model is asked once more first, and
+  the last of a chain up to three more times. When every model is at its limit for the minute, the
+  turn waits for the first one to free up.
 - **Save this one as a test** turns the session into an eval case.
 
 ## The command line
@@ -976,7 +977,7 @@ nervros-cli --profile my.toml ask "What can you see?" --image frame.jpg
 
 | Command | Does |
 |---|---|
-| `chat` | Chats with the robot; `--say` sends a script of messages and exits, `--model <id>` talks on one model alone |
+| `chat` | Chats with the robot; `--say` sends a script of messages and exits (with `--approve --live`, on a simulator, it approves each request but the ones always asked), `--model <id>` talks on one model alone |
 | `ask` | Sends one prompt to one role's models, with any images in order (`--image` once each) |
 | `look`, `segment` | Saves the camera's marks, or the regions a prompt names, as an image |
 | `ros` | Runs one read-only ROS tool with no model: graph, topic sample, interface, TF, parameters, logs |
@@ -1045,7 +1046,7 @@ run starts in the same folder, so a suite neither finds the operator's files nor
 behind. The apartment suite in grove-g1 has 46 cases:
 
 ```text
-$ nervros-cli --profile nervros.toml eval eval/apartment.toml --out eval-r3
+$ nervros-cli --profile nervros.toml eval eval/apartment.toml --live --out eval-r3
 == look #1
    PASS in 3 s, 2 calls
 == turn-left #1
