@@ -17,7 +17,7 @@ string[] resources_held
 string holding_left
 # Object id held in the right hand; as holding_left.
 string holding_right
-# True after a stop until the next mission starts.
+# True after a stop until the next mission, lend or teleop starts.
 bool stopped
 # Short human-readable state, such as "holding posture; right hand keeps O17".
 string message

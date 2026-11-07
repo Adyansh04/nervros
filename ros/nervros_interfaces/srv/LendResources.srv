@@ -6,7 +6,9 @@
 
 # Who borrows, as its heartbeat names it.
 string client
-# base, left_arm, right_arm.
+# Any of base, left_arm, right_arm. The executor takes the arms it holds through its arm
+# controllers; the base it does not take, only marks lent, refusing missions and hand driving
+# meanwhile. A name it does not know is passed over.
 string[] resources
 # True to borrow, false to give back.
 bool lend

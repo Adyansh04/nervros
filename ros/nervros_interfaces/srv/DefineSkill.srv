@@ -1,6 +1,7 @@
 # Teach the robot a skill: checked against the catalog and the leaves a learned skill may be built
 # from (GetCatalog's `learnable`), then served in the catalog as a draft, or kept for good.
-# PascalCase, unlike any skill or leaf: PointAt, LookAround.
+# 3 to 40 letters and digits starting with a capital, such as PointAt: not a skill's name already
+# (a draft's may be taught again), a leaf's, a control node's or "Mission".
 string name
 # For the planner: what it does and when to use it.
 string description
