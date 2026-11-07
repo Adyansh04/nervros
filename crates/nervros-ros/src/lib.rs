@@ -30,7 +30,8 @@ pub use r2r_port::{R2rConfig, R2rPort};
 
 pub use crate::image::Frame;
 
-/// Now, in seconds since the Unix epoch.
+/// Now, in seconds since the Unix epoch: the wall clock. A header stamp is compared with
+/// [`RobotPort::ros_now_s`] instead, which follows a simulator's clock.
 #[must_use]
 pub fn now_s() -> f64 {
     std::time::SystemTime::now()
@@ -135,7 +136,8 @@ impl Publisher {
 /// Cancels a running goal.
 pub type CancelFn = Arc<dyn Fn() -> BoxFuture<'static, Result<(), RosError>> + Send + Sync>;
 
-/// A goal the server accepted.
+/// A goal the server accepted. Dropping it does not cancel it: a caller that may give up before
+/// its end keeps a [`Goal::canceller`] and cancels it then.
 pub struct Goal {
     /// The goal id.
     pub id: uuid::Uuid,
@@ -208,15 +210,71 @@ pub struct GraphDetail {
     pub nodes: Vec<String>,
 }
 
-/// The `QoS` an endpoint uses, as words.
+/// Whether an endpoint's messages are resent until they arrive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Reliability {
+    /// Resent until they arrive.
+    Reliable,
+    /// Sent once.
+    BestEffort,
+    /// The middleware's default, or a policy it did not say.
+    #[default]
+    SystemDefault,
+}
+
+/// Whether a late subscriber gets the messages sent before it came.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Durability {
+    /// It does: latched.
+    TransientLocal,
+    /// It does not.
+    Volatile,
+    /// The middleware's default, or a policy it did not say.
+    #[default]
+    SystemDefault,
+}
+
+/// How many messages an endpoint keeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum History {
+    /// The last `depth`.
+    KeepLast,
+    /// All of them.
+    KeepAll,
+    /// The middleware's default, or a policy it did not say.
+    #[default]
+    SystemDefault,
+}
+
+/// How an endpoint shows it is alive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Liveliness {
+    /// The middleware asserts it.
+    Automatic,
+    /// Each publish asserts it.
+    ManualByTopic,
+    /// The middleware's default, or a policy it did not say.
+    #[default]
+    SystemDefault,
+}
+
+/// The `QoS` an endpoint uses; each policy serialises as the word ROS uses for it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct QosInfo {
     /// `reliable` or `best_effort`.
-    pub reliability: String,
+    pub reliability: Reliability,
     /// `volatile` or `transient_local`.
-    pub durability: String,
+    pub durability: Durability,
     /// `keep_last` or `keep_all`.
-    pub history: String,
+    pub history: History,
     /// The queue depth for `keep_last`.
     pub depth: usize,
     /// How often it promises or asks for a message, when it says.
@@ -224,7 +282,7 @@ pub struct QosInfo {
     /// How long a message stays valid, when it says.
     pub lifespan: Option<Duration>,
     /// `automatic` or `manual_by_topic`.
-    pub liveliness: String,
+    pub liveliness: Liveliness,
     /// How long it may stay silent and still count as alive, when it says.
     pub lease: Option<Duration>,
 }
@@ -330,6 +388,20 @@ pub trait RobotPort: Send + Sync {
         self.latest(topic, msg_type, wait).await
     }
 
+    /// As [`RobotPort::latest_fresh`], shared rather than copied: a reader that polls a topic for
+    /// one field copies nothing.
+    async fn latest_fresh_shared(
+        &self,
+        topic: &str,
+        msg_type: &str,
+        wait: Duration,
+        max_age: Duration,
+    ) -> Result<Arc<Value>, RosError> {
+        self.latest_fresh(topic, msg_type, wait, max_age)
+            .await
+            .map(Arc::new)
+    }
+
     /// The newest frame of an image topic (`sensor_msgs/msg/Image`), kept up to date.
     ///
     /// # Errors
@@ -343,6 +415,13 @@ pub trait RobotPort: Send + Sync {
     ///
     /// [`RosError::NoTransform`] when no chain links the frames.
     fn transform(&self, target: &str, source: &str) -> Result<Transform, RosError>;
+
+    /// Now on the robot's ROS clock, seconds: the simulator's time under `use_sim_time`, else
+    /// the wall clock's. Header stamps, and what the world model keeps from them, are compared
+    /// with this, never with [`now_s`].
+    fn ros_now_s(&self) -> f64 {
+        now_s()
+    }
 
     /// The topics in the graph.
     async fn graph(&self) -> Result<Graph, RosError>;

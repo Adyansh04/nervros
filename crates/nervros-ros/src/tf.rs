@@ -3,8 +3,8 @@
 //! ponytail: newest-only, no interpolation in time. Enough for "where is the robot" and for placing
 //! detections; add time-indexed buffers if a caller needs a transform at a past stamp.
 
-use std::collections::HashMap;
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::{RosError, TfLink};
 
@@ -139,10 +139,37 @@ struct Link {
 #[derive(Debug, Default)]
 pub struct TfBuffer {
     links: HashMap<String, Link>,
+    /// Children whose latest transform was refused, so the warning comes once per fault.
+    refused: HashSet<String>,
 }
+
+/// A transform's rotation as a unit quaternion: a near-unit one is normalised, and one that is not
+/// finite, or far from unit length, is refused. A localiser that diverged can publish NaN, and a
+/// NaN pose reads as outside every keep-out zone.
+fn usable(transform: Transform) -> Option<Transform> {
+    let finite = transform
+        .translation
+        .iter()
+        .chain(&transform.rotation)
+        .all(|v| v.is_finite());
+    let norm = transform.rotation.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if !finite || (norm - 1.0).abs() > 0.1 {
+        return None;
+    }
+    Some(Transform {
+        translation: transform.translation,
+        rotation: transform.rotation.map(|v| v / norm),
+    })
+}
+
+/// The oldest `/tf` link a transform rests on: its child frame and its age.
+type Oldest = Option<(String, Duration)>;
 
 /// TF allows at most this many hops; a longer walk means a loop in bad data.
 const MAX_DEPTH: usize = 64;
+/// How long a child's parent holds against another publisher's: one that went quiet this long
+/// ago gives way.
+const PARENT_HOLD: Duration = Duration::from_secs(1);
 
 impl TfBuffer {
     /// Records `child`'s pose in `parent`'s frame (a `geometry_msgs/TransformStamped`).
@@ -159,15 +186,42 @@ impl TfBuffer {
         is_static: bool,
     ) {
         let strip = |f: &str| f.trim_start_matches('/').to_owned();
+        let child = strip(child);
+        let Some(transform) = usable(transform) else {
+            if self.refused.insert(child.clone()) {
+                tracing::warn!(parent, %child, "refused a transform that is not finite or not a rotation; the last good one stays");
+            }
+            return;
+        };
+        let parent = strip(parent);
+        if let Some(kept) = self.links.get(&child) {
+            // A mount on /tf_static stays: a stray /tf publisher does not move it.
+            let over_static = kept.is_static && !is_static;
+            // Two publishers giving one child two parents would flip the tree with each message:
+            // the one heard last a moment ago keeps it until it goes quiet.
+            let other_parent = kept.parent != parent && kept.at.elapsed() < PARENT_HOLD;
+            if over_static || other_parent {
+                if self.refused.insert(child.clone()) {
+                    tracing::warn!(%parent, %child, kept = %kept.parent, "refused a transform that would replace a static or another parent's link");
+                }
+                return;
+            }
+        }
+        self.refused.remove(&child);
         self.links.insert(
-            strip(child),
+            child,
             Link {
-                parent: strip(parent),
+                parent,
                 transform,
                 at: Instant::now(),
                 is_static,
             },
         );
+    }
+
+    /// Whether any link names `frame`, as its child or its parent.
+    fn knows(&self, frame: &str) -> bool {
+        self.links.contains_key(frame) || self.links.values().any(|l| l.parent == frame)
     }
 
     /// Every link, parent first, sorted by child.
@@ -187,20 +241,61 @@ impl TfBuffer {
         out
     }
 
-    /// Frames from `frame` up to its root, each with the transform root <- that frame.
-    fn chain(&self, frame: &str) -> Vec<(String, Transform)> {
-        let mut out = vec![(frame.to_owned(), Transform::IDENTITY)];
+    /// Frames from `frame` up to its root, each with the transform root <- that frame and the
+    /// oldest `/tf` link on the way there (its child and its age).
+    /// `None` for a loop, which only bad data makes.
+    fn chain(&self, frame: &str) -> Option<Vec<(String, Transform, Oldest)>> {
+        let mut out = vec![(frame.to_owned(), Transform::IDENTITY, None)];
         let mut current = frame.to_owned();
         let mut up = Transform::IDENTITY;
+        let mut oldest: Oldest = None;
         while let Some(link) = self.links.get(&current) {
-            if out.len() > MAX_DEPTH {
-                break;
+            if out.len() > MAX_DEPTH || out.iter().any(|(f, _, _)| *f == link.parent) {
+                return None;
+            }
+            let age = link.at.elapsed();
+            if !link.is_static && oldest.as_ref().is_none_or(|(_, a)| age > *a) {
+                oldest = Some((current.clone(), age));
             }
             up = link.transform.compose(&up);
             current.clone_from(&link.parent);
-            out.push((current.clone(), up));
+            out.push((current.clone(), up, oldest.clone()));
         }
-        out
+        Some(out)
+    }
+
+    /// The transform that maps points in `source` into `target`, and the oldest `/tf` link it
+    /// rests on.
+    fn resolve(&self, target: &str, source: &str) -> Result<(Transform, Oldest), RosError> {
+        let target = target.trim_start_matches('/');
+        let source = source.trim_start_matches('/');
+        let none = || RosError::NoTransform {
+            target: target.to_owned(),
+            source_frame: source.to_owned(),
+        };
+        // A frame is its own transform only when it is a frame at all.
+        if !self.knows(source) || !self.knows(target) {
+            return Err(none());
+        }
+        let (Some(from_source), Some(from_target)) = (self.chain(source), self.chain(target))
+        else {
+            return Err(none());
+        };
+        for (ancestor, ancestor_from_source, source_oldest) in &from_source {
+            if let Some((_, ancestor_from_target, target_oldest)) =
+                from_target.iter().find(|(f, _, _)| f == ancestor)
+            {
+                let oldest = match (source_oldest, target_oldest) {
+                    (Some(a), Some(b)) => Some(if a.1 >= b.1 { a } else { b }.clone()),
+                    (a, b) => a.clone().or_else(|| b.clone()),
+                };
+                return Ok((
+                    ancestor_from_target.inverse().compose(ancestor_from_source),
+                    oldest,
+                ));
+            }
+        }
+        Err(none())
     }
 
     /// The transform that maps points in `source` into `target`.
@@ -209,20 +304,31 @@ impl TfBuffer {
     ///
     /// [`RosError::NoTransform`] when the frames share no ancestor.
     pub fn lookup(&self, target: &str, source: &str) -> Result<Transform, RosError> {
-        let target = target.trim_start_matches('/');
-        let source = source.trim_start_matches('/');
-        let from_source = self.chain(source);
-        let from_target = self.chain(target);
-        for (ancestor, ancestor_from_source) in &from_source {
-            if let Some((_, ancestor_from_target)) = from_target.iter().find(|(f, _)| f == ancestor)
-            {
-                return Ok(ancestor_from_target.inverse().compose(ancestor_from_source));
-            }
+        self.resolve(target, source).map(|(transform, _)| transform)
+    }
+
+    /// As [`Self::lookup`], refusing a chain with a `/tf` link older than `max_age`: a localiser
+    /// or an odometry that stopped publishing leaves its last link standing, which would read as
+    /// a robot that stands still where it last was.
+    ///
+    /// # Errors
+    ///
+    /// [`RosError::NoTransform`] when the frames share no ancestor, [`RosError::NoData`] when a
+    /// link on the way is stale.
+    pub fn lookup_within(
+        &self,
+        target: &str,
+        source: &str,
+        max_age: Duration,
+    ) -> Result<Transform, RosError> {
+        let (transform, oldest) = self.resolve(target, source)?;
+        match oldest {
+            Some((child, age)) if age > max_age => Err(RosError::NoData(format!(
+                "TF from {source} to {target}: {child} was last published {:.1} s ago",
+                age.as_secs_f64()
+            ))),
+            _ => Ok(transform),
         }
-        Err(RosError::NoTransform {
-            target: target.to_owned(),
-            source_frame: source.to_owned(),
-        })
     }
 }
 
@@ -236,6 +342,73 @@ mod tests {
 
     fn close(a: [f64; 3], b: [f64; 3]) -> bool {
         a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9)
+    }
+
+    #[test]
+    fn a_transform_that_is_not_finite_is_refused_and_the_last_good_one_stays() {
+        let mut tf = TfBuffer::default();
+        let good = Transform {
+            translation: [1.0, 2.0, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        };
+        tf.insert("map", "base", good);
+        tf.insert(
+            "map",
+            "base",
+            Transform {
+                translation: [f64::NAN, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+        );
+        tf.insert(
+            "map",
+            "base",
+            Transform {
+                translation: [5.0, 5.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 0.0],
+            },
+        );
+        let t = tf.lookup("map", "base").unwrap();
+        assert!(close(t.translation, [1.0, 2.0, 0.0]), "{t:?}");
+    }
+
+    #[test]
+    fn a_near_unit_rotation_is_normalised() {
+        let mut tf = TfBuffer::default();
+        tf.insert(
+            "map",
+            "base",
+            Transform {
+                translation: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.05],
+            },
+        );
+        let t = tf.lookup("map", "base").unwrap();
+        assert!((t.rotation[3] - 1.0).abs() < 1e-12, "{t:?}");
+    }
+
+    #[test]
+    fn a_stale_dynamic_link_is_refused_but_a_static_one_never_ages() {
+        let mut tf = TfBuffer::default();
+        let t = Transform {
+            translation: [1.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        };
+        tf.insert_from("base", "camera", t, true);
+        tf.insert("map", "base", t);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(tf.lookup_within("base", "camera", Duration::ZERO).is_ok());
+        let err = tf
+            .lookup_within("map", "camera", Duration::ZERO)
+            .unwrap_err();
+        assert!(
+            matches!(err, RosError::NoData(ref m) if m.contains("base")),
+            "{err}"
+        );
+        assert!(
+            tf.lookup_within("map", "camera", Duration::from_secs(5))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -286,6 +459,45 @@ mod tests {
             tf.lookup("a", "d"),
             Err(RosError::NoTransform { .. })
         ));
+    }
+
+    #[test]
+    fn a_frame_nobody_publishes_is_no_frame_and_a_loop_no_transform() {
+        let mut tf = TfBuffer::default();
+        assert!(tf.lookup("ghost", "ghost").is_err());
+        tf.insert("a", "b", Transform::IDENTITY);
+        assert!(tf.lookup("b", "b").is_ok());
+        tf.insert("b", "c", Transform::IDENTITY);
+        tf.insert_from("c", "a", Transform::IDENTITY, true);
+        assert!(matches!(
+            tf.lookup("a", "c"),
+            Err(RosError::NoTransform { .. })
+        ));
+    }
+
+    #[test]
+    fn a_static_mount_and_a_parent_heard_lately_hold() {
+        let mut tf = TfBuffer::default();
+        let moved = Transform {
+            translation: [1.0, 0.0, 0.0],
+            ..Transform::IDENTITY
+        };
+        tf.insert_from("base", "camera", Transform::IDENTITY, true);
+        tf.insert("base", "camera", moved);
+        assert!(close(
+            tf.lookup("base", "camera").unwrap().apply([0.0; 3]),
+            [0.0; 3]
+        ));
+        tf.insert("odom", "base", Transform::IDENTITY);
+        tf.insert("other", "base", moved);
+        assert_eq!(
+            tf.links()
+                .iter()
+                .find(|l| l.child == "base")
+                .unwrap()
+                .parent,
+            "odom"
+        );
     }
 
     #[test]

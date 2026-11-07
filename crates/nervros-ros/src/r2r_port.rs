@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -64,8 +64,11 @@ enum Cmd {
         topic: String,
         ty: String,
         tx: watch::Sender<Option<Sample>>,
-        /// Whether the topic had no publisher, so that the `QoS` may miss a latched message.
-        reply: oneshot::Sender<Result<bool, RosError>>,
+        /// Why its messages cannot be read, once one could not.
+        undecodable: Arc<Mutex<Option<String>>>,
+        /// Whether the topic had no publisher, so that the `QoS` may miss a latched message, and
+        /// the publishers it was made for.
+        reply: oneshot::Sender<Result<(bool, Vec<String>), RosError>>,
     },
     SubscribeImage {
         topic: String,
@@ -89,8 +92,7 @@ enum Cmd {
     SubscribeRaw {
         topic: String,
         ty: String,
-        /// As its publishers offer, rather than best effort.
-        as_offered: bool,
+        hearing: Hearing,
         reply: oneshot::Sender<Result<BoxStream<'static, Vec<u8>>, RosError>>,
     },
     SubscribeSample {
@@ -101,13 +103,38 @@ enum Cmd {
     Publisher {
         topic: String,
         ty: String,
-        /// Transient local, depth 1: late subscribers get the last message.
-        latched: bool,
+        keeps: Keeps,
         reply: oneshot::Sender<r2r::Result<r2r::PublisherUntyped>>,
     },
     DestroyPublisher {
         publisher: r2r::PublisherUntyped,
     },
+}
+
+/// How a raw subscription asks for messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hearing {
+    /// Best effort, as `ros2 topic hz` subscribes: it matches every publisher.
+    Any,
+    /// As its publishers offer, so a latched topic gives what it holds already.
+    AsOffered,
+}
+
+/// What a publisher keeps for subscribers that join later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keeps {
+    /// Nothing: volatile, depth 10.
+    Nothing,
+    /// Its last message: transient local, depth 1.
+    Last,
+}
+
+/// A message that could not be converted, to or from `name`'s type.
+fn conversion(name: &str, e: impl std::fmt::Display) -> RosError {
+    RosError::Conversion {
+        name: name.to_owned(),
+        message: e.to_string(),
+    }
 }
 
 type Key = (String, String);
@@ -126,11 +153,37 @@ struct Topic {
     /// Subscribed while nothing published it, with a `QoS` that misses a latched message.
     blind: bool,
     since: Instant,
+    /// The publishers it was made for, by gid.
+    publishers: Vec<String>,
+    /// When it was last read.
+    read: Instant,
+    /// When its publishers were last compared with those it was made for.
+    checked: Instant,
+    /// Why its messages cannot be read, once one could not.
+    undecodable: Arc<Mutex<Option<String>>>,
+}
+
+/// What a read finds kept for a topic.
+enum Kept {
+    /// A subscription to read.
+    Ready(watch::Receiver<Option<Sample>>),
+    /// One that has heard nothing for a while, and the publishers it was made for.
+    Quiet(watch::Receiver<Option<Sample>>, Vec<String>),
+    /// None to use: one is made.
+    Gone,
 }
 
 /// A blind subscription that has had nothing this long is made again, with the `QoS` of the
 /// publishers that may have come since.
 const RESUBSCRIBE: Duration = Duration::from_secs(2);
+/// A subscription nobody read this long is let go: it ends with its last reader, and stops
+/// turning every message, a whole cloud or map, into JSON.
+const IDLE: Duration = Duration::from_mins(1);
+/// A kept subscription that has heard nothing this long is checked against the publishers there
+/// are now: one that restarted may offer a `QoS` it no longer matches.
+const QUIET: Duration = Duration::from_secs(5);
+/// How many messages of a latched topic a recording asks for: `/tf_static` holds many.
+const LATCHED_DEPTH: usize = 100;
 
 /// A running r2r node.
 pub struct R2rPort {
@@ -146,15 +199,73 @@ pub struct R2rPort {
     /// When the node started: until discovery has had its time, the graph may not yet list a
     /// publisher that exists.
     started: Instant,
+    /// The node's ROS clock, which follows `/clock` under `use_sim_time`.
+    clock: Arc<Mutex<r2r::Clock>>,
 }
 
 /// How long discovery takes to list the publishers already running.
 const DISCOVERY: Duration = Duration::from_secs(3);
 
+/// The oldest a `/tf` link may be for a transform built on it. Odometry and localisation publish
+/// at 10 Hz or more, so a link this old means its publisher stopped.
+const TF_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// How long a goal's cancel may take to be answered. A stop awaits it, so a wedged or dead server
+/// must not hold the stop for ever.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a publisher outlives its last message: reliable delivery needs it a moment longer.
+const PUBLISH_GRACE: Duration = Duration::from_millis(200);
+
+/// How long a goal its caller gave up on may still be accepted, and so need cancelling.
+const LATE_ACCEPT: Duration = Duration::from_mins(1);
+
+/// The node's logger, once the node is up.
+static LOGGER: OnceLock<String> = OnceLock::new();
+
+/// A warning the robot's people should see too: through the node's logger, to `/rosout`.
+fn to_rosout(text: &str) {
+    if let Some(logger) = LOGGER.get() {
+        // rcutils takes a C string: a NUL in the text would end it, and r2r would panic.
+        r2r::log_warn!(logger, "{}", text.replace('\0', " "));
+    }
+}
+
+/// Cancels a goal nobody watches any more: one accepted after its caller gave up, or handed to a
+/// caller that was gone before it took it. A failure is an error, since the goal may still run.
+async fn cancel_unwatched(goal: r2r::ActionClientGoalUntyped, action: &str) {
+    tracing::warn!(action, goal = %goal.uuid, "a goal nobody watches was accepted; cancelling");
+    to_rosout(&format!(
+        "{action}: a goal nobody watches was accepted; cancelling it"
+    ));
+    let outcome = match goal.cancel() {
+        Ok(pending) => match tokio::time::timeout(CANCEL_TIMEOUT, pending).await {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => format!("no answer in {} s", CANCEL_TIMEOUT.as_secs()),
+        },
+        Err(e) => e.to_string(),
+    };
+    tracing::error!(action, goal = %goal.uuid, %outcome, "could not cancel a goal nobody watches: it may still run");
+    to_rosout(&format!(
+        "{action}: could not cancel a goal nobody watches ({outcome}): it may still run"
+    ));
+}
+
 impl std::fmt::Debug for R2rPort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("R2rPort").finish_non_exhaustive()
     }
+}
+
+/// The most service or action clients kept, each name and type once: r2r cannot destroy one, so a
+/// model trying names without end must not grow them without end.
+const MAX_CLIENTS: usize = 256;
+
+fn too_many_clients(name: &str) -> RosError {
+    RosError::Middleware(format!(
+        "{name}: NervROS has made {MAX_CLIENTS} clients and makes no more until it restarts"
+    ))
 }
 
 fn mw(e: impl std::fmt::Display) -> RosError {
@@ -169,7 +280,10 @@ impl R2rPort {
     /// The ROS context or node could not be created.
     pub fn start(config: R2rConfig) -> Result<Self, RosError> {
         let runtime = tokio::runtime::Handle::try_current().map_err(mw)?;
+        let threaded = runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread;
         let tf = Arc::new(Mutex::new(TfBuffer::default()));
+        // Unbounded on purpose: its senders are async tasks that must never block on a send, and
+        // the spin thread takes each command as it comes.
         let (cmd_tx, cmd_rx) = std_mpsc::channel();
         let (ready_tx, ready_rx) = std_mpsc::channel();
         let tf_thread = Arc::clone(&tf);
@@ -188,7 +302,13 @@ impl R2rPort {
                 );
             })
             .map_err(mw)?;
-        ready_rx.recv().map_err(mw)??;
+        // Waiting for rcl to start must not hold a runtime worker another task needs.
+        let ready = if threaded {
+            tokio::task::block_in_place(|| ready_rx.recv())
+        } else {
+            ready_rx.recv()
+        };
+        let clock = ready.map_err(mw)??;
         Ok(Self {
             cmd: cmd_tx,
             clients: Mutex::default(),
@@ -199,6 +319,7 @@ impl R2rPort {
             stopping,
             thread: Some(thread),
             started: Instant::now(),
+            clock,
         })
     }
 
@@ -208,21 +329,29 @@ impl R2rPort {
             .map_err(|_| RosError::Middleware("the ROS node thread has stopped".to_owned()))
     }
 
+    /// Sends the command `cmd` builds round its reply channel, and waits for the answer.
+    async fn ask<T>(&self, cmd: impl FnOnce(oneshot::Sender<T>) -> Cmd) -> Result<T, RosError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(cmd(reply))?;
+        rx.await.map_err(mw)
+    }
+
     /// A publisher kept until its handle drops, each message sent as it is set.
     async fn kept_publisher(
         &self,
         topic: &str,
         ty: &str,
-        latched: bool,
+        keeps: Keeps,
     ) -> Result<Publisher, RosError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Cmd::Publisher {
-            topic: topic.to_owned(),
-            ty: ty.to_owned(),
-            latched,
-            reply,
-        })?;
-        let publisher = rx.await.map_err(mw)?.map_err(|e| type_error(ty, &e))?;
+        let publisher = self
+            .ask(|reply| Cmd::Publisher {
+                topic: topic.to_owned(),
+                ty: ty.to_owned(),
+                keeps,
+                reply,
+            })
+            .await?
+            .map_err(|e| type_error(ty, &e))?;
         let (handle, mut messages) = Publisher::channel();
         let cmd = self.cmd.clone();
         let topic = topic.to_owned();
@@ -240,6 +369,8 @@ impl R2rPort {
                     warned = true;
                 }
             }
+            // As for a one-off publish: reliable delivery of the last message needs a moment.
+            tokio::time::sleep(PUBLISH_GRACE).await;
             let _ = cmd.send(Cmd::DestroyPublisher { publisher });
         });
         Ok(handle)
@@ -250,50 +381,82 @@ impl R2rPort {
         if let Some(c) = lock(&self.clients).get(&key) {
             return Ok(Arc::clone(c));
         }
-        let (reply, rx) = oneshot::channel();
-        self.send(Cmd::Client {
-            name: name.to_owned(),
-            ty: ty.to_owned(),
-            reply,
-        })?;
-        let client = Arc::new(rx.await.map_err(mw)?.map_err(|e| type_error(ty, &e))?);
+        // rcl keeps a client for the node's life: names tried past this many are refused.
+        if lock(&self.clients).len() >= MAX_CLIENTS {
+            return Err(too_many_clients(name));
+        }
+        let client = self
+            .ask(|reply| Cmd::Client {
+                name: name.to_owned(),
+                ty: ty.to_owned(),
+                reply,
+            })
+            .await?
+            .map_err(|e| type_error(ty, &e))?;
+        let client = Arc::new(client);
         lock(&self.clients).insert(key, Arc::clone(&client));
         Ok(client)
     }
 
+    /// What is kept for reading `topic` as JSON; the topics nobody read for a while let go.
+    fn kept(&self, topic: &str, ty: &str) -> Kept {
+        let mut json = lock(&self.json);
+        json.retain(|_, t| t.read.elapsed() < IDLE);
+        let Some(t) = json.get_mut(topic).filter(|t| t.ty == ty) else {
+            return Kept::Gone;
+        };
+        let newest = t.rx.borrow().as_ref().map(|s| s.at);
+        if t.blind && newest.is_none() && t.since.elapsed() >= RESUBSCRIBE {
+            return Kept::Gone;
+        }
+        t.read = Instant::now();
+        if newest.is_none_or(|at| at.elapsed() >= QUIET) && t.checked.elapsed() >= RESUBSCRIBE {
+            t.checked = Instant::now();
+            return Kept::Quiet(t.rx.clone(), t.publishers.clone());
+        }
+        Kept::Ready(t.rx.clone())
+    }
+
     /// The subscription for reading `topic` as JSON: kept from an earlier read of the same type,
-    /// or made now, and made again when it began before anything published and still has nothing.
+    /// or made now. It is made again when it began before anything published and still has
+    /// nothing, and when it has heard nothing for a while and its publishers changed; its last
+    /// message is kept then.
     async fn subscription(
         &self,
         topic: &str,
         ty: &str,
     ) -> Result<watch::Receiver<Option<Sample>>, RosError> {
-        let kept = lock(&self.json)
-            .get(topic)
-            .filter(|t| {
-                t.ty == ty
-                    && !(t.blind && t.rx.borrow().is_none() && t.since.elapsed() >= RESUBSCRIBE)
+        let carried = match self.kept(topic, ty) {
+            Kept::Ready(rx) => return Ok(rx),
+            Kept::Quiet(rx, made_for) => match self.endpoints(topic).await {
+                Ok(now) if gids(&now.publishers) != made_for => rx.borrow().clone(),
+                _ => return Ok(rx),
+            },
+            Kept::Gone => None,
+        };
+        let (tx, rx) = watch::channel(carried);
+        let undecodable: Arc<Mutex<Option<String>>> = Arc::default();
+        let (blind, publishers) = self
+            .ask(|reply| Cmd::SubscribeJson {
+                topic: topic.to_owned(),
+                ty: ty.to_owned(),
+                tx,
+                undecodable: Arc::clone(&undecodable),
+                reply,
             })
-            .map(|t| t.rx.clone());
-        if let Some(rx) = kept {
-            return Ok(rx);
-        }
-        let (tx, rx) = watch::channel(None);
-        let (reply, made) = oneshot::channel();
-        self.send(Cmd::SubscribeJson {
-            topic: topic.to_owned(),
-            ty: ty.to_owned(),
-            tx,
-            reply,
-        })?;
-        let blind = made.await.map_err(mw)??;
+            .await??;
+        let now = Instant::now();
         lock(&self.json).insert(
             topic.to_owned(),
             Topic {
                 ty: ty.to_owned(),
                 rx: rx.clone(),
                 blind,
-                since: Instant::now(),
+                since: now,
+                publishers,
+                read: now,
+                checked: now,
+                undecodable,
             },
         );
         Ok(rx)
@@ -324,13 +487,20 @@ impl R2rPort {
             s.as_ref()
                 .is_some_and(|s| max_age.is_none_or(|max| s.at.elapsed() <= max))
         };
-        match tokio::time::timeout(wait, rx.wait_for(fresh)).await {
-            Ok(Ok(s)) => s
-                .as_ref()
-                .map(|s| Arc::clone(&s.value))
-                .ok_or_else(|| RosError::NoData(topic.to_owned())),
-            _ => Err(RosError::NoData(topic.to_owned())),
-        }
+        let answer = match tokio::time::timeout(wait, rx.wait_for(fresh)).await {
+            Ok(Ok(s)) => s.as_ref().map(|s| Arc::clone(&s.value)),
+            _ => None,
+        };
+        // Nothing came because nothing could be read: say why rather than that nothing came.
+        answer.ok_or_else(|| {
+            let why = lock(&self.json)
+                .get(topic)
+                .and_then(|t| lock(&t.undecodable).clone());
+            why.map_or_else(
+                || RosError::NoData(topic.to_owned()),
+                |message| conversion(topic, message),
+            )
+        })
     }
 
     async fn action_client(
@@ -342,13 +512,17 @@ impl R2rPort {
         if let Some(c) = lock(&self.actions).get(&key) {
             return Ok(c.clone());
         }
-        let (reply, rx) = oneshot::channel();
-        self.send(Cmd::ActionClient {
-            name: name.to_owned(),
-            ty: ty.to_owned(),
-            reply,
-        })?;
-        let client = rx.await.map_err(mw)?.map_err(|e| type_error(ty, &e))?;
+        if lock(&self.actions).len() >= MAX_CLIENTS {
+            return Err(too_many_clients(name));
+        }
+        let client = self
+            .ask(|reply| Cmd::ActionClient {
+                name: name.to_owned(),
+                ty: ty.to_owned(),
+                reply,
+            })
+            .await?
+            .map_err(|e| type_error(ty, &e))?;
         lock(&self.actions).insert(key, client.clone());
         Ok(client)
     }
@@ -392,7 +566,7 @@ fn spin(
     runtime: &tokio::runtime::Handle,
     tf: &Arc<Mutex<TfBuffer>>,
     cmds: &std_mpsc::Receiver<Cmd>,
-    ready: &std_mpsc::Sender<Result<(), RosError>>,
+    ready: &std_mpsc::Sender<Result<Arc<Mutex<r2r::Clock>>, RosError>>,
     stopping: &AtomicBool,
 ) {
     let node = r2r::Context::create()
@@ -404,10 +578,21 @@ fn spin(
             return;
         }
     };
+    let _ = LOGGER.set(node.logger().to_owned());
     if let Err(e) = listen_tf(&mut node, runtime, tf) {
         tracing::warn!(error = %e, "TF listener not started");
+        to_rosout(&format!("TF listener not started: {e}"));
     }
-    if ready.send(Ok(())).is_err() {
+    // Launched with `use_sim_time:=true`, the clock follows `/clock` as an rclcpp node's does.
+    let sim_time = matches!(
+        lock(&node.params).get("use_sim_time").map(|p| &p.value),
+        Some(r2r::ParameterValue::Bool(true))
+    );
+    if sim_time && let Err(e) = node.get_time_source().enable_sim_time(&mut node) {
+        tracing::warn!(error = %e, "simulated time not followed");
+        to_rosout(&format!("simulated time not followed: {e}"));
+    }
+    if ready.send(Ok(node.get_ros_clock())).is_err() {
         return;
     }
     while !stopping.load(Ordering::SeqCst) {
@@ -427,8 +612,11 @@ fn listen_tf(
     runtime: &tokio::runtime::Handle,
     tf: &Arc<Mutex<TfBuffer>>,
 ) -> r2r::Result<()> {
-    let dynamic = node
-        .subscribe::<r2r::tf2_msgs::msg::TFMessage>("/tf", QosProfile::default().keep_last(100))?;
+    // Best effort hears every publisher, a best-effort one as well as a reliable one.
+    let dynamic = node.subscribe::<r2r::tf2_msgs::msg::TFMessage>(
+        "/tf",
+        QosProfile::default().keep_last(100).best_effort(),
+    )?;
     let statics = node.subscribe::<r2r::tf2_msgs::msg::TFMessage>(
         "/tf_static",
         QosProfile::default()
@@ -460,8 +648,8 @@ fn listen_tf(
 }
 
 /// `QoS` that matches the topic's current publishers, as `ros2 topic echo` chooses it: reliable only
-/// if all are reliable, transient local only if all are.
-fn auto_qos(node: &r2r::Node, topic: &str, depth: usize) -> QosProfile {
+/// if all are reliable, transient local only if all are, and then `latched_depth` deep.
+fn auto_qos(node: &r2r::Node, topic: &str, depth: usize, latched_depth: usize) -> QosProfile {
     let base = QosProfile::default().keep_last(depth);
     let Ok(pubs) = node.get_publishers_info_by_topic(topic, false) else {
         return base.best_effort();
@@ -481,10 +669,17 @@ fn auto_qos(node: &r2r::Node, topic: &str, depth: usize) -> QosProfile {
         base.best_effort()
     };
     if latched {
-        q.transient_local()
+        q.transient_local().keep_last(latched_depth)
     } else {
         q.volatile()
     }
+}
+
+/// The gids of `publishers`, in order.
+fn gids(publishers: &[Endpoint]) -> Vec<String> {
+    let mut out: Vec<String> = publishers.iter().map(|p| p.gid.clone()).collect();
+    out.sort();
+    out
 }
 
 fn sorted(map: HashMap<String, Vec<String>>) -> NamesAndTypes {
@@ -505,33 +700,32 @@ fn qos_info(q: &QosProfile) -> QosInfo {
     use r2r::qos::{
         DurabilityPolicy as D, HistoryPolicy as H, LivelinessPolicy as L, ReliabilityPolicy as R,
     };
-    let word = |s: &str| s.to_owned();
     // The middleware says "none" with zero or with its very long infinity.
     let limit = |d: Duration| (!d.is_zero() && d.as_secs() < 1 << 31).then_some(d);
     QosInfo {
-        reliability: word(match q.reliability {
-            R::Reliable => "reliable",
-            R::BestEffort => "best_effort",
-            _ => "system_default",
-        }),
-        durability: word(match q.durability {
-            D::TransientLocal => "transient_local",
-            D::Volatile => "volatile",
-            _ => "system_default",
-        }),
-        history: word(match q.history {
-            H::KeepLast => "keep_last",
-            H::KeepAll => "keep_all",
-            _ => "system_default",
-        }),
+        reliability: match q.reliability {
+            R::Reliable => crate::Reliability::Reliable,
+            R::BestEffort => crate::Reliability::BestEffort,
+            _ => crate::Reliability::SystemDefault,
+        },
+        durability: match q.durability {
+            D::TransientLocal => crate::Durability::TransientLocal,
+            D::Volatile => crate::Durability::Volatile,
+            _ => crate::Durability::SystemDefault,
+        },
+        history: match q.history {
+            H::KeepLast => crate::History::KeepLast,
+            H::KeepAll => crate::History::KeepAll,
+            _ => crate::History::SystemDefault,
+        },
         depth: q.depth,
         deadline: limit(q.deadline),
         lifespan: limit(q.lifespan),
-        liveliness: word(match q.liveliness {
-            L::Automatic => "automatic",
-            L::ManualByTopic => "manual_by_topic",
-            _ => "system_default",
-        }),
+        liveliness: match q.liveliness {
+            L::Automatic => crate::Liveliness::Automatic,
+            L::ManualByTopic => crate::Liveliness::ManualByTopic,
+            _ => crate::Liveliness::SystemDefault,
+        },
         lease: limit(q.liveliness_lease_duration),
     }
 }
@@ -619,15 +813,12 @@ fn handle(node: &mut r2r::Node, runtime: &tokio::runtime::Handle, cmd: Cmd) {
         Cmd::SubscribeRaw {
             topic,
             ty,
-            as_offered,
+            hearing,
             reply,
         } => {
-            // Best effort, as `ros2 topic hz` subscribes, matches every publisher; only a
-            // subscription that asks as they offer hears what a latched topic holds already.
-            let qos = if as_offered {
-                auto_qos(node, &topic, 10)
-            } else {
-                QosProfile::sensor_data()
+            let qos = match hearing {
+                Hearing::AsOffered => auto_qos(node, &topic, 10, LATCHED_DEPTH),
+                Hearing::Any => QosProfile::sensor_data(),
             };
             let stream = node
                 .subscribe_raw(&topic, &ty, qos)
@@ -636,7 +827,7 @@ fn handle(node: &mut r2r::Node, runtime: &tokio::runtime::Handle, cmd: Cmd) {
             let _ = reply.send(stream);
         }
         Cmd::SubscribeSample { topic, ty, reply } => {
-            let qos = auto_qos(node, &topic, 10);
+            let qos = auto_qos(node, &topic, 10, 10);
             let stream = node
                 .subscribe_untyped(&topic, &ty, qos)
                 .map(futures::StreamExt::boxed)
@@ -646,17 +837,16 @@ fn handle(node: &mut r2r::Node, runtime: &tokio::runtime::Handle, cmd: Cmd) {
         Cmd::Publisher {
             topic,
             ty,
-            latched,
+            keeps,
             reply,
         } => {
             // Our own QoS, never the caller's: a raw QoS could reach a DDS topic such as rt/lowcmd.
-            let qos = if latched {
-                QosProfile::default()
+            let qos = match keeps {
+                Keeps::Last => QosProfile::default()
                     .keep_last(1)
                     .reliable()
-                    .transient_local()
-            } else {
-                QosProfile::default().keep_last(10).reliable().volatile()
+                    .transient_local(),
+                Keeps::Nothing => QosProfile::default().keep_last(10).reliable().volatile(),
             };
             let _ = reply.send(node.create_publisher_untyped(&topic, &ty, qos));
         }
@@ -675,26 +865,30 @@ fn handle(node: &mut r2r::Node, runtime: &tokio::runtime::Handle, cmd: Cmd) {
             topic,
             ty,
             tx,
+            undecodable,
             reply,
         } => {
-            let _ = reply.send(subscribe_json(node, runtime, topic, &ty, tx));
+            let _ = reply.send(subscribe_json(node, runtime, topic, &ty, (tx, undecodable)));
         }
         Cmd::SubscribeImage { topic, tx } => subscribe_image(node, runtime, &topic, tx),
     }
 }
 
-/// Subscribes to `topic` as JSON for [`R2rPort::latest`]; whether nothing published it yet.
+/// Subscribes to `topic` as JSON for [`R2rPort::latest`]; whether nothing published it yet, and
+/// the gids of what did.
 fn subscribe_json(
     node: &mut r2r::Node,
     runtime: &tokio::runtime::Handle,
     topic: String,
     ty: &str,
-    tx: watch::Sender<Option<Sample>>,
-) -> Result<bool, RosError> {
-    let blind = node
+    (tx, undecodable): (watch::Sender<Option<Sample>>, Arc<Mutex<Option<String>>>),
+) -> Result<(bool, Vec<String>), RosError> {
+    let publishers = node
         .get_publishers_info_by_topic(&topic, false)
-        .map_or(true, |p| p.is_empty());
-    let qos = auto_qos(node, &topic, 1);
+        .map(endpoints)
+        .unwrap_or_default();
+    let blind = publishers.is_empty();
+    let qos = auto_qos(node, &topic, 1, 1);
     let mut stream = node
         .subscribe_untyped(&topic, ty, qos)
         .map_err(|e| type_error(ty, &e))?;
@@ -711,14 +905,19 @@ fn subscribe_json(
                         }));
                     }
                     Some(Err(e)) => {
-                        tracing::warn!(%topic, error = %e, "could not decode a message");
+                        // Once per subscription, not at the topic's rate; a read says why.
+                        let mut kept = lock(&undecodable);
+                        if kept.is_none() {
+                            tracing::warn!(%topic, error = %e, "could not decode a message");
+                        }
+                        *kept = Some(e.to_string());
                     }
                     None => break,
                 },
             }
         }
     });
-    Ok(blind)
+    Ok((blind, gids(&publishers)))
 }
 
 /// Subscribes to an image topic for [`R2rPort::frames`]; a failure drops `tx`, which the next
@@ -729,7 +928,7 @@ fn subscribe_image(
     topic: &str,
     tx: watch::Sender<Option<Arc<Frame>>>,
 ) {
-    let qos = auto_qos(node, topic, 1);
+    let qos = auto_qos(node, topic, 1, 1);
     match node.subscribe::<r2r::sensor_msgs::msg::Image>(topic, qos) {
         Ok(mut stream) => {
             runtime.spawn(async move {
@@ -752,7 +951,10 @@ fn subscribe_image(
                 }
             });
         }
-        Err(e) => tracing::warn!(%topic, error = %e, "image subscription failed"),
+        Err(e) => {
+            tracing::warn!(%topic, error = %e, "image subscription failed");
+            to_rosout(&format!("{topic}: image subscription failed: {e}"));
+        }
     }
 }
 
@@ -788,19 +990,17 @@ impl RobotPort for R2rPort {
         request: Value,
         timeout: Duration,
     ) -> Result<Value, RosError> {
+        // One budget for finding the server and its answer: a stop sized by it must not overrun.
+        let deadline = tokio::time::Instant::now() + timeout;
         let client = self.client(service, ty).await?;
         available(r2r::Node::is_available(&*client), service, timeout).await?;
-        let pending = client.request(request).map_err(|e| RosError::Conversion {
-            name: service.to_owned(),
-            message: e.to_string(),
-        })?;
-        match tokio::time::timeout(timeout, pending).await {
+        let pending = client
+            .request(request)
+            .map_err(|e| conversion(service, e))?;
+        match tokio::time::timeout_at(deadline, pending).await {
             Err(_) => Err(RosError::Timeout(service.to_owned())),
             Ok(Err(e)) => Err(mw(e)),
-            Ok(Ok(Err(e))) => Err(RosError::Conversion {
-                name: service.to_owned(),
-                message: e.to_string(),
-            }),
+            Ok(Ok(Err(e))) => Err(conversion(service, e)),
             Ok(Ok(Ok(v))) => Ok(v),
         }
     }
@@ -812,36 +1012,55 @@ impl RobotPort for R2rPort {
         goal: Value,
         timeout: Duration,
     ) -> Result<Goal, RosError> {
+        let deadline = tokio::time::Instant::now() + timeout;
         let client = self.action_client(action, ty).await?;
         available(r2r::Node::is_available(&client), action, timeout).await?;
         let pending = client
             .send_goal_request(goal)
-            .map_err(|e| RosError::Conversion {
-                name: action.to_owned(),
-                message: e.to_string(),
-            })?;
-        // The goal is out. Should the server accept it after the caller gave up, on a timeout or
-        // a stop, nobody would watch or cancel it: the wait is a task of its own, which cancels
-        // such a goal.
+            .map_err(|e| conversion(action, e))?;
+        // The goal is out. Should the server accept it after the caller gave up (a timeout, a
+        // stop, a dropped future), nobody would watch or cancel it: the wait is a task of its own,
+        // which cancels such a goal, also one handed over but never taken.
         let (accepted_tx, accepted) = oneshot::channel();
         let name = action.to_owned();
+        // Detached on purpose: it outlives a caller that gave up, which is what it is for.
         tokio::spawn(async move {
-            if let Err(Ok((late, _, _))) = accepted_tx.send(pending.await) {
-                tracing::warn!(action = %name, goal = %late.uuid, "accepted after its caller gave up; cancelling");
-                if let Ok(cancel) = late.cancel() {
-                    let _ = cancel.await;
+            let Ok(answer) = tokio::time::timeout(LATE_ACCEPT, pending).await else {
+                tracing::error!(action = %name, "no answer to a goal after {} s: if it was accepted, it runs unwatched", LATE_ACCEPT.as_secs());
+                to_rosout(&format!(
+                    "{name}: no answer to a goal after {} s: if it was accepted, it runs unwatched",
+                    LATE_ACCEPT.as_secs()
+                ));
+                return;
+            };
+            let goal = answer.as_ref().ok().map(|(goal, _, _)| goal.clone());
+            let (taken_tx, taken) = oneshot::channel::<()>();
+            match accepted_tx.send((answer, taken_tx)) {
+                Err((Ok((late, _, _)), _)) => cancel_unwatched(late, &name).await,
+                Err(_) => {}
+                Ok(()) => {
+                    if taken.await.is_err()
+                        && let Some(goal) = goal
+                    {
+                        cancel_unwatched(goal, &name).await;
+                    }
                 }
             }
         });
-        let (handle, result, mut feedback) = match tokio::time::timeout(timeout, accepted).await {
+        let (answer, taken) = match tokio::time::timeout_at(deadline, accepted).await {
             Err(_) => return Err(RosError::Timeout(action.to_owned())),
             Ok(Err(_)) => return Err(mw("the goal's answer was lost")),
-            Ok(Ok(Err(r2r::Error::RCL_RET_ACTION_GOAL_REJECTED))) => {
+            Ok(Ok(handoff)) => handoff,
+        };
+        let (handle, result, mut feedback) = match answer {
+            Err(r2r::Error::RCL_RET_ACTION_GOAL_REJECTED) => {
                 return Err(RosError::Rejected(action.to_owned()));
             }
-            Ok(Ok(Err(e))) => return Err(mw(e)),
-            Ok(Ok(Ok(parts))) => parts,
+            Err(e) => return Err(mw(e)),
+            Ok(parts) => parts,
         };
+        // Taken: from here the returned Goal is what watches and cancels it.
+        let _ = taken.send(());
         let (fb_tx, fb_rx) = mpsc::channel(64);
         // r2r never ends a goal's feedback stream, so this ends when the goal's reader goes.
         tokio::spawn(async move {
@@ -868,19 +1087,22 @@ impl RobotPort for R2rPort {
                     status: status(s),
                     result: v,
                 }),
-                Ok((_, Err(e))) => Err(RosError::Conversion {
-                    name,
-                    message: e.to_string(),
-                }),
+                Ok((_, Err(e))) => Err(conversion(&name, e)),
                 Err(e) => Err(mw(e)),
             };
             let _ = res_tx.send(out);
         });
         let id = handle.uuid;
+        let name = action.to_owned();
         let cancel = Arc::new(move || {
             let pending = handle.cancel();
-            Box::pin(async move { pending.map_err(mw)?.await.map_err(mw) })
-                as futures::future::BoxFuture<'static, Result<(), RosError>>
+            let what = format!("cancel of {name} goal {id}");
+            Box::pin(async move {
+                match tokio::time::timeout(CANCEL_TIMEOUT, pending.map_err(mw)?).await {
+                    Ok(answer) => answer.map_err(mw),
+                    Err(_) => Err(RosError::Timeout(what)),
+                }
+            }) as futures::future::BoxFuture<'static, Result<(), RosError>>
         });
         Ok(Goal::new(id, fb_rx, res_rx, cancel))
     }
@@ -912,6 +1134,16 @@ impl RobotPort for R2rPort {
             .map(|v| Value::clone(&v))
     }
 
+    async fn latest_fresh_shared(
+        &self,
+        topic: &str,
+        ty: &str,
+        wait: Duration,
+        max_age: Duration,
+    ) -> Result<Arc<Value>, RosError> {
+        self.newest(topic, ty, wait, Some(max_age)).await
+    }
+
     fn frames(&self, topic: &str) -> Result<watch::Receiver<Option<Arc<Frame>>>, RosError> {
         // A subscription that could not be made has dropped its sender: try it again.
         if let Some(rx) = lock(&self.images)
@@ -929,14 +1161,19 @@ impl RobotPort for R2rPort {
         Ok(rx)
     }
 
+    fn ros_now_s(&self) -> f64 {
+        // A clock rcl cannot read is the wall's, which is the ROS clock without simulated time.
+        lock(&self.clock)
+            .get_now()
+            .map_or_else(|_| crate::now_s(), |d| d.as_secs_f64())
+    }
+
     fn transform(&self, target: &str, source: &str) -> Result<Transform, RosError> {
-        lock(&self.tf).lookup(target, source)
+        lock(&self.tf).lookup_within(target, source, TF_MAX_AGE)
     }
 
     async fn graph(&self) -> Result<Graph, RosError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Cmd::Graph { reply })?;
-        let map = rx.await.map_err(mw)?.map_err(mw)?;
+        let map = self.ask(|reply| Cmd::Graph { reply }).await?.map_err(mw)?;
         let mut topics: Vec<(String, Vec<String>)> = map.into_iter().collect();
         topics.sort();
         Ok(Graph { topics })
@@ -952,18 +1189,15 @@ impl RobotPort for R2rPort {
     }
 
     async fn graph_detail(&self) -> Result<GraphDetail, RosError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Cmd::GraphDetail { reply })?;
-        rx.await.map_err(mw)?
+        self.ask(|reply| Cmd::GraphDetail { reply }).await?
     }
 
     async fn endpoints(&self, topic: &str) -> Result<TopicEndpoints, RosError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Cmd::Endpoints {
+        self.ask(|reply| Cmd::Endpoints {
             topic: topic.to_owned(),
             reply,
-        })?;
-        rx.await.map_err(mw)?
+        })
+        .await?
     }
 
     async fn node_entities(&self, node: &str) -> Result<NodeEntities, RosError> {
@@ -972,35 +1206,39 @@ impl RobotPort for R2rPort {
             Some((ns, name)) => (ns.to_owned(), name.to_owned()),
             None => ("/".to_owned(), node.to_owned()),
         };
-        let (reply, rx) = oneshot::channel();
-        self.send(Cmd::NodeEntities {
+        self.ask(|reply| Cmd::NodeEntities {
             name,
             namespace,
             reply,
-        })?;
-        rx.await.map_err(mw)?
+        })
+        .await?
     }
 
     async fn arrivals(&self, topic: &str, ty: &str) -> Result<BoxStream<'static, usize>, RosError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Cmd::SubscribeRaw {
-            topic: topic.to_owned(),
-            ty: ty.to_owned(),
-            as_offered: false,
-            reply,
-        })?;
-        Ok(rx.await.map_err(mw)??.map(|bytes| bytes.len()).boxed())
+        let bytes = self
+            .ask(|reply| Cmd::SubscribeRaw {
+                topic: topic.to_owned(),
+                ty: ty.to_owned(),
+                hearing: Hearing::Any,
+                reply,
+            })
+            .await??;
+        Ok(bytes.map(|bytes| bytes.len()).boxed())
     }
 
     async fn raw(&self, topic: &str, ty: &str) -> Result<BoxStream<'static, Vec<u8>>, RosError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Cmd::SubscribeRaw {
-            topic: topic.to_owned(),
-            ty: ty.to_owned(),
-            as_offered: true,
-            reply,
-        })?;
-        Ok(rx.await.map_err(mw)??.boxed())
+        // Before discovery the graph may not list a latched topic's publishers yet, and a
+        // recording would ask it for no latched message.
+        tokio::time::sleep(DISCOVERY.saturating_sub(self.started.elapsed())).await;
+        let bytes = self
+            .ask(|reply| Cmd::SubscribeRaw {
+                topic: topic.to_owned(),
+                ty: ty.to_owned(),
+                hearing: Hearing::AsOffered,
+                reply,
+            })
+            .await??;
+        Ok(bytes.boxed())
     }
 
     async fn messages(
@@ -1008,31 +1246,25 @@ impl RobotPort for R2rPort {
         topic: &str,
         ty: &str,
     ) -> Result<BoxStream<'static, Result<Value, RosError>>, RosError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Cmd::SubscribeSample {
-            topic: topic.to_owned(),
-            ty: ty.to_owned(),
-            reply,
-        })?;
-        let name = topic.to_owned();
-        Ok(rx
-            .await
-            .map_err(mw)??
-            .map(move |m| {
-                m.map_err(|e| RosError::Conversion {
-                    name: name.clone(),
-                    message: e.to_string(),
-                })
+        let messages = self
+            .ask(|reply| Cmd::SubscribeSample {
+                topic: topic.to_owned(),
+                ty: ty.to_owned(),
+                reply,
             })
+            .await??;
+        let name = topic.to_owned();
+        Ok(messages
+            .map(move |m| m.map_err(|e| conversion(&name, e)))
             .boxed())
     }
 
     async fn publisher(&self, topic: &str, ty: &str) -> Result<Publisher, RosError> {
-        self.kept_publisher(topic, ty, false).await
+        self.kept_publisher(topic, ty, Keeps::Nothing).await
     }
 
     async fn latched_publisher(&self, topic: &str, ty: &str) -> Result<Publisher, RosError> {
-        self.kept_publisher(topic, ty, true).await
+        self.kept_publisher(topic, ty, Keeps::Last).await
     }
 
     async fn publish(
@@ -1043,14 +1275,15 @@ impl RobotPort for R2rPort {
         count: usize,
         period: Duration,
     ) -> Result<usize, RosError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Cmd::Publisher {
-            topic: topic.to_owned(),
-            ty: ty.to_owned(),
-            latched: false,
-            reply,
-        })?;
-        let publisher = rx.await.map_err(mw)?.map_err(|e| type_error(ty, &e))?;
+        let publisher = self
+            .ask(|reply| Cmd::Publisher {
+                topic: topic.to_owned(),
+                ty: ty.to_owned(),
+                keeps: Keeps::Nothing,
+                reply,
+            })
+            .await?
+            .map_err(|e| type_error(ty, &e))?;
         // Destroyed however the call ends, a stop of the turn included.
         let held = Destroy {
             cmd: &self.cmd,
@@ -1078,15 +1311,12 @@ impl RobotPort for R2rPort {
             }
             let sent = held.publisher.as_ref().map(|p| p.publish(message.clone()));
             if let Some(Err(e)) = sent {
-                result = Err(RosError::Conversion {
-                    name: topic.to_owned(),
-                    message: e.to_string(),
-                });
+                result = Err(conversion(topic, e));
                 break;
             }
         }
         // Reliable delivery needs the publisher a moment longer.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(PUBLISH_GRACE).await;
         drop(held);
         result
     }

@@ -27,6 +27,16 @@ const MESSAGE_EVERY: Duration = Duration::from_millis(100);
 /// A scripted service: request in, response out.
 pub type ServiceFn = Arc<dyn Fn(&Value) -> Result<Value, RosError> + Send + Sync>;
 
+/// What a scripted goal does as it ends.
+#[derive(Clone)]
+pub struct OnEnd(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for OnEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnEnd")
+    }
+}
+
 /// A scripted action run.
 #[derive(Debug, Clone)]
 pub struct ScriptedRun {
@@ -36,6 +46,10 @@ pub struct ScriptedRun {
     pub result: Result<GoalResult, RosError>,
     /// Time between feedback messages and before the result.
     pub step: Duration,
+    /// Runs when the goal ends as scripted, never once it was cancelled: a walk arrives then.
+    pub on_end: Option<OnEnd>,
+    /// The server refuses to cancel it, as one that cannot stop.
+    pub refuse_cancel: bool,
 }
 
 impl Default for ScriptedRun {
@@ -48,6 +62,8 @@ impl Default for ScriptedRun {
                 result: Value::Object(serde_json::Map::new()),
             }),
             step: Duration::from_millis(10),
+            on_end: None,
+            refuse_cancel: false,
         }
     }
 }
@@ -64,6 +80,12 @@ pub struct FakeRobot {
     services: HashMap<String, ServiceFn>,
     actions: HashMap<String, ActionFn>,
     topics: Mutex<HashMap<String, Value>>,
+    /// Topics whose newest message is older than any freshness asked for.
+    quiet: Mutex<std::collections::HashSet<String>>,
+    /// When each topic's newest message was set.
+    arrived: Mutex<HashMap<String, std::time::Instant>>,
+    /// Goal cancels asked for.
+    cancels: Arc<std::sync::atomic::AtomicUsize>,
     frames: HashMap<String, Arc<FrameSender>>,
     tf: Arc<Mutex<TfBuffer>>,
     latency: Duration,
@@ -74,8 +96,30 @@ pub struct FakeRobot {
     nodes: HashMap<String, NodeEntities>,
     rates: HashMap<String, (f64, usize)>,
     published: Arc<Mutex<Vec<(String, Value)>>>,
-    /// Cameras it has no frames for, when it answers them with none yet.
-    idle_frames: Option<Mutex<HashMap<String, FrameSender>>>,
+    /// Cameras it has no frames for, answered with none yet, as the real port does.
+    idle_frames: Mutex<HashMap<String, FrameSender>>,
+    /// The cameras' threads, joined when it drops.
+    cameras: Vec<std::thread::JoinHandle<()>>,
+    /// Header stamps set anew at each read, on the cameras' grid: see
+    /// [`FakeRobot::with_live_stamps`].
+    live_stamps: Option<Duration>,
+}
+
+/// `now` on a grid of `period`: cameras of one period stamp their frames alike, and a message
+/// stamped on the grid at the same time is of the frame on screen.
+fn on_grid(now: f64, period: Duration) -> f64 {
+    let p = period.as_secs_f64();
+    if p > 0.0 { (now / p).floor() * p } else { now }
+}
+
+impl Drop for FakeRobot {
+    fn drop(&mut self) {
+        // Each camera ends once its frames' sender is gone, within a period.
+        self.frames.clear();
+        for camera in self.cameras.drain(..) {
+            let _ = camera.join();
+        }
+    }
 }
 
 impl std::fmt::Debug for FakeRobot {
@@ -88,18 +132,38 @@ impl std::fmt::Debug for FakeRobot {
 }
 
 impl FakeRobot {
+    /// Refuses `ty` for `name` when its graph lists `name` with other types, as r2r refuses a type
+    /// the name does not have.
+    fn typed(&self, name: &str, ty: &str) -> Result<(), RosError> {
+        let Some(graph) = &self.graph else {
+            return Ok(());
+        };
+        // Actions are listed by their hidden topics, so an action's own name is never checked.
+        let listed: Vec<&String> = graph
+            .topics
+            .iter()
+            .chain(&graph.services)
+            .filter(|(n, _)| n == name)
+            .flat_map(|(_, types)| types)
+            .collect();
+        if listed.is_empty() || ty.is_empty() || listed.iter().any(|t| *t == ty) {
+            Ok(())
+        } else {
+            Err(RosError::UnknownType(format!(
+                "{name} is {}, not {ty}",
+                listed
+                    .iter()
+                    .map(|t| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )))
+        }
+    }
+
     /// An empty robot.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Answers a camera it has no frames for with none yet, as a live robot does before its first
-    /// image, rather than not at all.
-    #[must_use]
-    pub fn with_idle_cameras(mut self) -> Self {
-        self.idle_frames = Some(Mutex::default());
-        self
     }
 
     /// Adds a service.
@@ -158,26 +222,56 @@ impl FakeRobot {
         self
     }
 
-    /// Replaces a topic's newest message.
+    /// Replaces a topic's newest message, just arrived.
     pub fn set_topic(&self, name: &str, value: Value) {
+        lock(&self.quiet).remove(name);
+        lock(&self.arrived).insert(name.to_owned(), std::time::Instant::now());
         lock(&self.topics).insert(name.to_owned(), value);
     }
 
-    /// Adds an image topic that sends `frame` every `period`, stamped anew, as long as the robot
-    /// lives: a camera that goes quiet reads as a stopped one.
+    /// How many goal cancels were asked for.
+    #[must_use]
+    pub fn cancels(&self) -> usize {
+        self.cancels.load(Ordering::SeqCst)
+    }
+
+    /// Ages a topic's newest message past any freshness asked for, as a publisher that died
+    /// leaves it, until the topic is set again.
+    pub fn go_quiet(&self, name: &str) {
+        lock(&self.quiet).insert(name.to_owned());
+    }
+
+    /// Header stamps of the topics' messages set at each read to the newest time on the grid of
+    /// `period`, the one cameras of that period stamp their frames on: a scripted message reads
+    /// as one a live publisher keeps sending, and detections as of the frame on screen.
+    #[must_use]
+    pub fn with_live_stamps(mut self, period: Duration) -> Self {
+        self.live_stamps = Some(period);
+        self
+    }
+
+    /// Adds an image topic that sends `frame` every `period`, stamped anew on the grid of the
+    /// period, as long as the robot lives: a camera that goes quiet reads as a stopped one.
     #[must_use]
     pub fn with_camera(mut self, topic: &str, mut frame: Frame, period: Duration) -> Self {
+        frame.stamp_s = on_grid(crate::now_s(), period);
         let (tx, _) = watch::channel(Some(Arc::new(frame.clone())));
         let tx = Arc::new(tx);
         let sender = Arc::downgrade(&tx);
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(period);
-                let Some(tx) = sender.upgrade() else { return };
-                frame.stamp_s = crate::now_s();
-                tx.send_replace(Some(Arc::new(frame.clone())));
-            }
-        });
+        let camera = std::thread::Builder::new()
+            .name(format!("fake camera {topic}"))
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(period);
+                    let Some(tx) = sender.upgrade() else { return };
+                    frame.stamp_s = on_grid(crate::now_s(), period);
+                    tx.send_replace(Some(Arc::new(frame.clone())));
+                }
+            });
+        // Without its thread the camera keeps its first frame, which reads as a stopped one.
+        if let Ok(camera) = camera {
+            self.cameras.push(camera);
+        }
         self.frames.insert(topic.to_owned(), tx);
         self
     }
@@ -242,10 +336,11 @@ impl RobotPort for FakeRobot {
     async fn call(
         &self,
         service: &str,
-        _ty: &str,
+        ty: &str,
         request: Value,
         timeout: Duration,
     ) -> Result<Value, RosError> {
+        self.typed(service, ty)?;
         let f = self
             .services
             .get(service)
@@ -262,10 +357,11 @@ impl RobotPort for FakeRobot {
     async fn send_goal(
         &self,
         action: &str,
-        _ty: &str,
+        ty: &str,
         goal: Value,
         timeout: Duration,
     ) -> Result<Goal, RosError> {
+        self.typed(action, ty)?;
         let f = self
             .actions
             .get(action)
@@ -281,6 +377,10 @@ impl RobotPort for FakeRobot {
         let (res_tx, res_rx) = oneshot::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancelled);
+        // Set once the result is out: a cancel after it is refused, as a real server refuses one.
+        let ended = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&ended);
+        let refuse = run.refuse_cancel;
         tokio::spawn(async move {
             for item in run.feedback {
                 tokio::time::sleep(run.step).await;
@@ -297,35 +397,82 @@ impl RobotPort for FakeRobot {
                     result: Value::Null,
                 })
             } else {
+                if let Some(end) = &run.on_end {
+                    (end.0)();
+                }
                 run.result
             };
+            done.store(true, Ordering::SeqCst);
             let _ = res_tx.send(result);
         });
+        let cancels = Arc::clone(&self.cancels);
         let cancel = Arc::new(move || {
-            cancelled.store(true, Ordering::SeqCst);
-            Box::pin(async { Ok(()) }) as futures::future::BoxFuture<'static, Result<(), RosError>>
+            cancels.fetch_add(1, Ordering::SeqCst);
+            let answer = if refuse {
+                Err(RosError::Rejected(
+                    "the server refused the cancel".to_owned(),
+                ))
+            } else if ended.load(Ordering::SeqCst) {
+                Err(RosError::Rejected("the goal had ended".to_owned()))
+            } else {
+                cancelled.store(true, Ordering::SeqCst);
+                Ok(())
+            };
+            Box::pin(async move { answer })
+                as futures::future::BoxFuture<'static, Result<(), RosError>>
         });
         Ok(Goal::new(uuid::Uuid::new_v4(), fb_rx, res_rx, cancel))
     }
 
-    async fn latest(&self, topic: &str, _ty: &str, _wait: Duration) -> Result<Value, RosError> {
-        lock(&self.topics)
+    async fn latest(&self, topic: &str, ty: &str, _wait: Duration) -> Result<Value, RosError> {
+        self.typed(topic, ty)?;
+        let mut msg = lock(&self.topics)
             .get(topic)
             .cloned()
-            .ok_or_else(|| RosError::NoData(topic.to_owned()))
+            .ok_or_else(|| RosError::NoData(topic.to_owned()))?;
+        if let Some(period) = self.live_stamps
+            && msg["header"]["stamp"].is_object()
+        {
+            let at = on_grid(crate::now_s(), period);
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "seconds since 1970 and their fraction, both far in range"
+            )]
+            let (sec, nanosec) = (
+                at.floor() as i64,
+                ((at - at.floor()) * 1e9).round().min(999_999_999.0) as u32,
+            );
+            msg["header"]["stamp"] = serde_json::json!({"sec": sec, "nanosec": nanosec});
+        }
+        Ok(msg)
+    }
+
+    async fn latest_fresh(
+        &self,
+        topic: &str,
+        ty: &str,
+        wait: Duration,
+        max_age: Duration,
+    ) -> Result<Value, RosError> {
+        // Answered at once, as `latest` is: what a script set is all there is to wait for.
+        let stale = lock(&self.arrived)
+            .get(topic)
+            .is_some_and(|at| at.elapsed() > max_age);
+        if stale || lock(&self.quiet).contains(topic) {
+            return Err(RosError::NoData(topic.to_owned()));
+        }
+        self.latest(topic, ty, wait).await
     }
 
     fn frames(&self, topic: &str) -> Result<watch::Receiver<Option<Arc<Frame>>>, RosError> {
         if let Some(tx) = self.frames.get(topic) {
             return Ok(tx.subscribe());
         }
-        match &self.idle_frames {
-            Some(idle) => Ok(lock(idle)
-                .entry(topic.to_owned())
-                .or_insert_with(|| watch::Sender::new(None))
-                .subscribe()),
-            None => Err(RosError::NoData(topic.to_owned())),
-        }
+        Ok(lock(&self.idle_frames)
+            .entry(topic.to_owned())
+            .or_insert_with(|| watch::Sender::new(None))
+            .subscribe())
     }
 
     fn transform(&self, target: &str, source: &str) -> Result<Transform, RosError> {
@@ -537,6 +684,7 @@ mod tests {
                 result: json!({}),
             }),
             step: Duration::from_millis(5),
+            ..ScriptedRun::default()
         };
         let robot = FakeRobot::new().with_action("/go", run);
         let mut goal = robot

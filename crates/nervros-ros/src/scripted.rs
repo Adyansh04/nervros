@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::fake::{FakeRobot, ScriptedRun};
+use crate::fake::{FakeRobot, OnEnd, ScriptedRun};
 use crate::image::Frame;
 use crate::lock;
 use crate::tf::TfBuffer;
@@ -121,9 +121,13 @@ pub struct Motion {
     pub walk: Option<Walk>,
     /// The skill that turns on the spot.
     pub turn: Option<Turn>,
-    /// Where any step's argument naming one of these sends the robot.
+    /// Where a destination argument naming one of these sends the robot.
     #[serde(default)]
     pub places: BTreeMap<String, Spot>,
+    /// The arguments, by name, that send the robot to the place or `x;y;yaw` station they hold,
+    /// as `target` or `station`: an argument not named here moves nothing, whatever it says.
+    #[serde(default)]
+    pub destinations: Vec<String>,
     /// How long a mission takes, seconds.
     #[serde(default = "mission_seconds")]
     pub seconds: f64,
@@ -131,6 +135,28 @@ pub struct Motion {
 
 fn mission_seconds() -> f64 {
     1.0
+}
+
+/// Which way a walk goes, as the walk skill's direction argument says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Way {
+    Forward,
+    Backward,
+    Left,
+    Right,
+}
+
+impl Way {
+    /// The direction's word; another is no direction, and its walk moves nothing.
+    fn parse(word: &str) -> Option<Self> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "forward" => Some(Self::Forward),
+            "backward" | "back" => Some(Self::Backward),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
 }
 
 /// The skill that walks a distance, and its arguments' names.
@@ -181,7 +207,10 @@ impl Motion {
             return (x, y, yaw);
         };
         let number = |node: &roxmltree::Node, name: &str| -> Option<f64> {
-            node.attribute(name)?.parse().ok()
+            node.attribute(name)?
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
         };
         for node in doc.descendants().filter(roxmltree::Node::is_element) {
             // NervROS writes each step as a `SubTree` that names its skill.
@@ -190,12 +219,17 @@ impl Motion {
                 .unwrap_or_else(|| node.tag_name().name());
             if let Some(walk) = self.walk.as_ref().filter(|w| w.skill == skill) {
                 let metres = number(&node, &walk.metres).unwrap_or(0.0);
-                let side = walk.direction.as_deref().and_then(|d| node.attribute(d));
-                let (along, across) = match side {
-                    Some("backward" | "back") => (-metres, 0.0),
-                    Some("left") => (0.0, metres),
-                    Some("right") => (0.0, -metres),
-                    _ => (metres, 0.0),
+                // No direction is forward, the skill's own default; one it cannot read is none.
+                let way = match walk.direction.as_deref().and_then(|d| node.attribute(d)) {
+                    None => Some(Way::Forward),
+                    Some(word) => Way::parse(word),
+                };
+                let (along, across) = match way {
+                    Some(Way::Forward) => (metres, 0.0),
+                    Some(Way::Backward) => (-metres, 0.0),
+                    Some(Way::Left) => (0.0, metres),
+                    Some(Way::Right) => (0.0, -metres),
+                    None => (0.0, 0.0),
                 };
                 x += along * yaw.cos() - across * yaw.sin();
                 y += along * yaw.sin() + across * yaw.cos();
@@ -203,12 +237,16 @@ impl Motion {
                 let degrees = number(&node, &turn.degrees).unwrap_or(0.0);
                 let sign = if turn.positive_left { 1.0 } else { -1.0 };
                 yaw += sign * degrees.to_radians();
-            } else if let Some(spot) = node.attributes().find_map(|a| {
-                self.places
-                    .get(a.value())
-                    .copied()
-                    .or_else(|| station(a.value()))
-            }) {
+            } else if let Some(spot) = node
+                .attributes()
+                .filter(|a| self.destinations.iter().any(|d| d == a.name()))
+                .find_map(|a| {
+                    self.places
+                        .get(a.value())
+                        .copied()
+                        .or_else(|| station(a.value()))
+                })
+            {
                 (x, y) = (spot.x, spot.y);
                 yaw = spot.yaw.unwrap_or(yaw);
             }
@@ -237,12 +275,11 @@ impl Motion {
         let Some(stamped) = last.or_else(|| goal.get("pose")) else {
             return;
         };
-        let (at, turned) = (
-            &stamped["pose"]["position"],
-            &stamped["pose"]["orientation"],
-        );
-        let number = |v: &Value| v.as_f64().unwrap_or(0.0);
-        let yaw = 2.0 * number(&turned["z"]).atan2(turned["w"].as_f64().unwrap_or(1.0));
+        // A pose missing a field is no pose: the walk goes nowhere rather than to the origin.
+        let Some(goal_pose) = Transform::from_pose(&stamped["pose"]) else {
+            return;
+        };
+        let (x, y, yaw) = goal_pose.planar();
         let mut tf = lock(tf);
         let z = tf
             .lookup(&self.parent, &self.child)
@@ -250,7 +287,7 @@ impl Motion {
         tf.insert(
             &self.parent,
             &self.child,
-            Transform::from_yaw([number(&at["x"]), number(&at["y"]), z], yaw),
+            Transform::from_yaw([x, y, z], yaw),
         );
     }
 
@@ -274,9 +311,8 @@ impl Motion {
 fn station(value: &str) -> Option<Spot> {
     let numbers: Vec<f64> = value
         .split(';')
-        .map(|n| n.trim().parse())
-        .collect::<Result<_, _>>()
-        .ok()?;
+        .map(|n| n.trim().parse::<f64>().ok().filter(|v| v.is_finite()))
+        .collect::<Option<_>>()?;
     match numbers[..] {
         [x, y, yaw] => Some(Spot {
             x,
@@ -308,6 +344,28 @@ fn frame_of(topic: &str, file: &std::path::Path) -> Result<Frame, String> {
     })
 }
 
+/// How a scripted goal ends: `succeeded`, `aborted` or `canceled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Ended {
+    /// It did what it was asked.
+    Succeeded,
+    /// It gave up.
+    Aborted,
+    /// It was cancelled.
+    Canceled,
+}
+
+impl From<Ended> for GoalStatus {
+    fn from(ended: Ended) -> Self {
+        match ended {
+            Ended::Succeeded => Self::Succeeded,
+            Ended::Aborted => Self::Aborted,
+            Ended::Canceled => Self::Canceled,
+        }
+    }
+}
+
 /// How a goal runs.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -315,8 +373,8 @@ pub struct Run {
     /// Feedback messages, in order.
     #[serde(default)]
     pub feedback: Vec<Value>,
-    /// `succeeded`, `aborted` or `canceled`.
-    pub status: String,
+    /// How it ends.
+    pub status: Ended,
     /// The result message.
     #[serde(default)]
     pub result: Value,
@@ -448,9 +506,9 @@ fn endpoints(nodes: &BTreeMap<String, NodeFile>) -> BTreeMap<String, TopicEndpoi
             node: node.clone(),
             topic_type: ty.clone(),
             qos: QosInfo {
-                reliability: "reliable".into(),
-                durability: "volatile".into(),
-                history: "keep_last".into(),
+                reliability: crate::Reliability::Reliable,
+                durability: crate::Durability::Volatile,
+                history: crate::History::KeepLast,
                 depth: 10,
                 ..QosInfo::default()
             },
@@ -503,15 +561,27 @@ impl ScriptedRobot {
     ///
     /// # Errors
     ///
-    /// An action's status is not one of succeeded, aborted or canceled, a rate is out of reach, or
-    /// a camera's image cannot be read.
+    /// A rate is out of reach, or a camera's image cannot be read.
     pub fn build(self) -> Result<FakeRobot, String> {
-        let mut robot = FakeRobot::new().with_idle_cameras();
+        // Its messages read as a live publisher's, stamped as the frames its cameras send.
+        let mut robot = FakeRobot::new().with_live_stamps(FRAME_PERIOD);
         let mut graph = GraphDetail {
             topics: names_and_types(&self.graph.topics),
             services: names_and_types(&self.graph.services),
             nodes: self.graph.nodes.clone(),
         };
+        // What the file sets is in the graph too, untyped where `[graph]` gives no type: the ros
+        // tools look a topic or a service up there before they read it.
+        for name in self.topics.keys() {
+            if !graph.topics.iter().any(|(n, _)| n == name) {
+                graph.topics.push((name.clone(), Vec::new()));
+            }
+        }
+        for name in self.services.keys().chain(self.replies.keys()) {
+            if !graph.services.iter().any(|(n, _)| n == name) {
+                graph.services.push((name.clone(), Vec::new()));
+            }
+        }
         for (name, response) in self.services {
             robot = robot.with_service(&name, move |_| Ok(response.clone()));
         }
@@ -521,7 +591,7 @@ impl ScriptedRobot {
         for (topic, file) in &self.frames {
             robot = robot.with_camera(topic, frame_of(topic, file)?, FRAME_PERIOD);
         }
-        robot = with_actions(robot, self.actions, self.motion.as_ref())?;
+        robot = with_actions(robot, self.actions, self.motion.as_ref());
         for (name, message) in self.topics {
             robot = robot.with_topic(&name, message);
         }
@@ -586,7 +656,7 @@ fn with_actions(
     mut robot: FakeRobot,
     actions: BTreeMap<String, Run>,
     motion: Option<&Motion>,
-) -> Result<FakeRobot, String> {
+) -> FakeRobot {
     let tf = robot.tf();
     if let Some(motion) = motion.cloned() {
         for planner in [motion.planner.clone(), motion.route.clone()]
@@ -604,26 +674,29 @@ fn with_actions(
         }
         for walk in motion.walks.clone() {
             let (motion, tf) = (motion.clone(), Arc::clone(&tf));
+            // The robot arrives when the walk ends, and stays where it was if it is stopped.
             robot = robot.with_action(&walk, move |goal| {
-                motion.walk_to(&tf, goal);
-                ScriptedRun::default()
+                let (motion, tf, goal) = (motion.clone(), Arc::clone(&tf), goal.clone());
+                ScriptedRun {
+                    on_end: Some(OnEnd(Arc::new(move || motion.walk_to(&tf, &goal)))),
+                    ..ScriptedRun::default()
+                }
             });
         }
     }
     for (name, run) in actions {
-        let status = match run.status.as_str() {
-            "succeeded" => GoalStatus::Succeeded,
-            "aborted" => GoalStatus::Aborted,
-            "canceled" => GoalStatus::Canceled,
-            other => return Err(format!("{name}: no status {other}")),
-        };
+        let status = GoalStatus::from(run.status);
         let motion = motion.cloned().filter(|m| m.action == name);
         let tf = Arc::clone(&tf);
         robot = robot.with_action(&name, move |goal| {
             let mut step = ScriptedRun::default().step;
+            let mut on_end = None;
             if let Some(motion) = motion.as_ref().filter(|_| status == GoalStatus::Succeeded) {
-                motion.apply(&tf, goal);
-                step = Duration::from_secs_f64(motion.seconds.max(0.0));
+                // Moved as the mission ends, not as it starts: a stop half way leaves it put.
+                let (motion, tf, goal) = (motion.clone(), Arc::clone(&tf), goal.clone());
+                // An endless or unreadable time is the default step, not a panic.
+                step = Duration::try_from_secs_f64(motion.seconds.max(0.0)).unwrap_or(step);
+                on_end = Some(OnEnd(Arc::new(move || motion.apply(&tf, &goal))));
             }
             ScriptedRun {
                 feedback: run.feedback.clone(),
@@ -632,10 +705,12 @@ fn with_actions(
                     result: run.result.clone(),
                 }),
                 step,
+                on_end,
+                ..ScriptedRun::default()
             }
         });
     }
-    Ok(robot)
+    robot
 }
 
 /// A node's parameter services, answering from `params`; a set is refused, since the file is the
@@ -838,13 +913,21 @@ mod tests {
                 goal.result.await.unwrap().unwrap()
             }
         };
-        let pose = |x: f64| json!({"pose": {"position": {"x": x, "y": 1.0}}});
+        let at = |x: f64| json!({"pose": {"position": {"x": x, "y": 1.0}}});
+        let pose = |x: f64| {
+            let mut p = at(x);
+            p["pose"]["orientation"] = json!({"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0});
+            p
+        };
         send("/through", json!({"poses": [pose(1.0), pose(2.0)]})).await;
         assert!((robot.transform("map", "base").unwrap().planar().0 - 2.0).abs() < 1e-9);
         send("/to", json!({"pose": pose(5.0)})).await;
         assert!((robot.transform("map", "base").unwrap().planar().0 - 5.0).abs() < 1e-9);
+        // A pose without its orientation is none: the walk goes nowhere, not to the origin.
+        send("/to", json!({"pose": at(7.0)})).await;
+        assert!((robot.transform("map", "base").unwrap().planar().0 - 5.0).abs() < 1e-9);
         let route = send("/route", json!({"goal": pose(9.0)})).await;
-        assert_eq!(route.result["path"]["poses"][1], pose(9.0));
+        assert_eq!(route.result["path"]["poses"][1], at(9.0));
     }
 
     #[tokio::test]
@@ -857,7 +940,8 @@ mod tests {
                 "seconds": 0.0,
                 "walk": {"skill": "Walk", "metres": "m", "direction": "way"},
                 "turn": {"skill": "Turn", "degrees": "deg"},
-                "places": {"kitchen": {"x": 3.0, "y": 4.0}},
+                "places": {"kitchen": {"x": 3.0, "y": 4.0}, "hall": {"x": -1.0, "y": -1.0}},
+                "destinations": ["place", "station"],
             },
         }));
         let run = |tree: &'static str| {
@@ -895,6 +979,11 @@ mod tests {
         assert!(near(x, 1.5) && near(yaw, 0.5));
         let (x, y, _) = run(r#"<root><Go place="kitchen"/></root>"#).await;
         assert!(near(x, 3.0) && near(y, 4.0));
+        // A walk it cannot read, and a step that only mentions a place, move nothing.
+        let (x, y, _) = run(r#"<root><Walk m="2" way="sideways"/></root>"#).await;
+        assert!(near(x, 3.0) && near(y, 4.0));
+        let (x, y, _) = run(r#"<root><Look phrase="hall"/></root>"#).await;
+        assert!(near(x, 3.0) && near(y, 4.0), "only a destination moves it");
         let path = robot
             .send_goal(
                 "/plan",
@@ -955,6 +1044,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(frames.borrow().as_ref().unwrap().stamp_s > frame.stamp_s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scripted_message_is_stamped_as_the_frame_on_screen() {
+        let dir = std::env::temp_dir().join(format!("scripted-dets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.png");
+        image::RgbImage::new(4, 2).save(&file).unwrap();
+        let robot = robot(&json!({
+            "frames": {"/cam": file},
+            "topics": {"/dets": {"header": {"stamp": {"sec": 5}}, "detections": []}},
+        }));
+        let mut frames = robot.frames("/cam").unwrap();
+        tokio::time::timeout(FRAME_PERIOD * 4, frames.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let shown = frames.borrow().as_ref().unwrap().stamp_s;
+        let msg = robot.latest("/dets", "", Duration::ZERO).await.unwrap();
+        let stamp = &msg["header"]["stamp"];
+        let at = stamp["sec"].as_f64().unwrap() + stamp["nanosec"].as_f64().unwrap() * 1e-9;
+        // The read may fall one frame later than the frame shown.
+        let ahead = at - shown;
+        assert!(
+            ahead.abs() < 0.01 || (ahead - FRAME_PERIOD.as_secs_f64()).abs() < 0.01,
+            "{at} against {shown}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

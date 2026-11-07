@@ -36,10 +36,19 @@ impl SchemaSource for Schemas {
 }
 
 fn qos(reliability: &str, durability: &str) -> QosInfo {
+    use nervros_ros::{Durability, History, Reliability};
     QosInfo {
-        reliability: reliability.into(),
-        durability: durability.into(),
-        history: "keep_last".into(),
+        reliability: match reliability {
+            "reliable" => Reliability::Reliable,
+            "best_effort" => Reliability::BestEffort,
+            _ => Reliability::SystemDefault,
+        },
+        durability: match durability {
+            "transient_local" => Durability::TransientLocal,
+            "volatile" => Durability::Volatile,
+            _ => Durability::SystemDefault,
+        },
+        history: History::KeepLast,
         depth: 10,
         ..QosInfo::default()
     }

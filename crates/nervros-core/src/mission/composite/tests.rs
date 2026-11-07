@@ -531,6 +531,7 @@ async fn pause_and_stop_in_an_executor_stretch_go_to_the_executor() {
                 status: GoalStatus::Succeeded,
                 result: json!({"outcome": OUTCOME_SUCCESS, "outputs_json": "{}"}),
             }),
+            ..ScriptedRun::default()
         });
     let real = real_config();
     let walk = native("Walk", 0, 0.01);
@@ -614,6 +615,7 @@ async fn a_stop_while_the_executor_takes_its_stretch_cancels_the_stretch() {
                 status: GoalStatus::Succeeded,
                 result: json!({"outcome": OUTCOME_SUCCESS, "outputs_json": "{}"}),
             }),
+            ..ScriptedRun::default()
         });
     let c = Composite::new(
         Arc::new(robot),

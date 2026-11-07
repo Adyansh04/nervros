@@ -351,7 +351,7 @@ fn endpoint_json(e: &Endpoint) -> Value {
     let mut out = json!({"node": e.node, "type": e.topic_type, "reliability": e.qos.reliability,
                          "durability": e.qos.durability, "history": e.qos.history,
                          "depth": e.qos.depth});
-    if !e.qos.liveliness.is_empty() {
+    if e.qos.liveliness != nervros_ros::Liveliness::SystemDefault {
         out["liveliness"] = json!(e.qos.liveliness);
     }
     if !e.gid.is_empty() {
@@ -374,17 +374,18 @@ fn endpoint_json(e: &Endpoint) -> Value {
 /// asks more than best effort gives, transient local more than volatile, a deadline more than a
 /// slower one or none, and manual liveliness more than automatic.
 fn qos_matches(publisher: &Endpoint, sub: &Endpoint) -> bool {
-    let reliable_ok =
-        !(sub.qos.reliability == "reliable" && publisher.qos.reliability == "best_effort");
-    let durable_ok =
-        !(sub.qos.durability == "transient_local" && publisher.qos.durability == "volatile");
+    use nervros_ros::{Durability, Liveliness, Reliability};
+    let reliable_ok = !(sub.qos.reliability == Reliability::Reliable
+        && publisher.qos.reliability == Reliability::BestEffort);
+    let durable_ok = !(sub.qos.durability == Durability::TransientLocal
+        && publisher.qos.durability == Durability::Volatile);
     let deadline_ok = match (sub.qos.deadline, publisher.qos.deadline) {
         (Some(asked), Some(given)) => asked >= given,
         (Some(_), None) => false,
         (None, _) => true,
     };
-    let lively_ok =
-        !(sub.qos.liveliness == "manual_by_topic" && publisher.qos.liveliness == "automatic");
+    let lively_ok = !(sub.qos.liveliness == Liveliness::ManualByTopic
+        && publisher.qos.liveliness == Liveliness::Automatic);
     reliable_ok && durable_ok && deadline_ok && lively_ok
 }
 
