@@ -80,11 +80,14 @@ impl ActionGoal {
         let graph = self.ctx.action_type(&action).await;
         // A cancel sends no goal, so there is none to check.
         let sends = !Self::cancelling(args);
-        let p = self.ctx.checked(
-            (action, graph),
-            args,
-            ("goal", sends.then_some(SchemaPart::Goal)),
-        )?;
+        let p = self
+            .ctx
+            .checked(
+                (action, graph),
+                args,
+                ("goal", sends.then_some(SchemaPart::Goal)),
+            )
+            .map_err(|refusal| *refusal)?;
         if sends {
             if p.ty == "nervros_interfaces/action/ExecuteMission" {
                 return Err(ToolOutcome::refused(

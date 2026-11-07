@@ -63,7 +63,8 @@ impl TopicPublish {
         });
         let p = self
             .ctx
-            .checked((topic, graph), args, ("message", Some(SchemaPart::Message)))?;
+            .checked((topic, graph), args, ("message", Some(SchemaPart::Message)))
+            .map_err(|refusal| *refusal)?;
         if let Some(refused) = self.ctx.zone_refusal(&p.ty, &p.payload) {
             return Err(refused);
         }

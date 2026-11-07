@@ -106,25 +106,24 @@ impl Ctx {
 
     /// The steps every act shares once the profile lets it: the type it takes, the deny rules on
     /// its name and that type, and its payload under `key` checked against the type's `part`
-    /// (none for an act that sends no payload, as a cancel).
-    #[expect(
-        clippy::result_large_err,
-        reason = "a refusal is the tool's outcome, as every check here returns it"
-    )]
+    /// (none for an act that sends no payload, as a cancel). A refusal is boxed: it is the rare
+    /// path, and the outcome is large.
     fn checked(
         &self,
         (name, graph): (String, Result<String, ToolOutcome>),
         args: &Value,
         (key, part): (&str, Option<SchemaPart>),
-    ) -> Result<Prepared, ToolOutcome> {
+    ) -> Result<Prepared, Box<ToolOutcome>> {
         let ty = Self::resolved(&name, args["type"].as_str(), graph)?;
         if let Some(out) = self.deny_act(&name, &ty) {
-            return Err(out);
+            return Err(Box::new(out));
         }
         let payload = payload(args, key);
         if let Some(part) = part {
             self.schemas.validate(&ty, part, &payload).map_err(|why| {
-                ToolOutcome::failed(format!("the {key} does not fit {ty}: {why}"))
+                Box::new(ToolOutcome::failed(format!(
+                    "the {key} does not fit {ty}: {why}"
+                )))
             })?;
         }
         Ok(Prepared { name, ty, payload })
@@ -132,21 +131,17 @@ impl Ctx {
 
     /// The type to use for `name`: the model's only when the graph has none to compare it with.
     /// One the graph contradicts is refused, as the deny rules read the type.
-    #[expect(
-        clippy::result_large_err,
-        reason = "a refusal is the tool's outcome, as every check here returns it"
-    )]
     fn resolved(
         name: &str,
         given: Option<&str>,
         graph: Result<String, ToolOutcome>,
-    ) -> Result<String, ToolOutcome> {
+    ) -> Result<String, Box<ToolOutcome>> {
         match (given.filter(|t| !t.is_empty()), graph) {
-            (Some(given), Ok(known)) if given != known => Err(ToolOutcome::refused(format!(
-                "`{name}` is {known} in the graph, not {given}: give its own type or none"
+            (Some(given), Ok(known)) if given != known => Err(Box::new(ToolOutcome::refused(
+                format!("`{name}` is {known} in the graph, not {given}: give its own type or none"),
             ))),
             (Some(given), _) => Ok(given.to_owned()),
-            (None, graph) => graph,
+            (None, graph) => graph.map_err(Box::new),
         }
     }
 

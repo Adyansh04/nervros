@@ -78,11 +78,13 @@ impl ServiceCall {
             )));
         }
         let graph = self.ctx.service_type(&service).await;
-        self.ctx.checked(
-            (service, graph),
-            args,
-            ("request", Some(SchemaPart::Request)),
-        )
+        self.ctx
+            .checked(
+                (service, graph),
+                args,
+                ("request", Some(SchemaPart::Request)),
+            )
+            .map_err(|refusal| *refusal)
     }
 }
 
