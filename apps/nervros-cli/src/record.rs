@@ -110,6 +110,10 @@ pub(crate) async fn record(profile_path: &Path, out: &Path) -> Result<()> {
     std::fs::write(out, header + text.as_str())
         .with_context(|| format!("writing {}", out.display()))?;
     eprintln!("recorded into {}", out.display());
+    eprintln!(
+        "parameters are hidden by name and by logins in URLs only: read the file before you \
+         share it"
+    );
     Ok(())
 }
 
@@ -119,6 +123,11 @@ async fn frames(robot: &Arc<dyn RobotPort>, profile: &Profile, out: &Path) -> Re
     let Some(look) = &profile.look else {
         return Ok(json!({}));
     };
+    // Frames of a real home stay on the robot: only a simulator's are kept.
+    if profile.privacy.mode == nervros_core::providers::router::PrivacyMode::Home {
+        eprintln!("privacy mode home: no camera frames kept");
+        return Ok(json!({}));
+    }
     let folder = format!(
         "{}-frames",
         out.file_stem().unwrap_or_default().to_string_lossy()
@@ -127,8 +136,17 @@ async fn frames(robot: &Arc<dyn RobotPort>, profile: &Profile, out: &Path) -> Re
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let topics = std::iter::once(&look.image).chain(look.cameras.values().map(|c| &c.image));
     let mut files = Map::new();
+    let mut taken = BTreeSet::new();
     for topic in topics {
-        let name = format!("{}.png", topic.trim_matches('/').replace('/', "_"));
+        // `/a/b` and `/a_b` flatten alike: the second is numbered.
+        let stem = topic.trim_matches('/').replace('/', "_");
+        let mut name = format!("{stem}.png");
+        for n in 2.. {
+            if taken.insert(name.clone()) {
+                break;
+            }
+            name = format!("{stem}-{n}.png");
+        }
         match first_frame(robot, topic).await {
             Ok(image) => {
                 image
@@ -142,6 +160,16 @@ async fn frames(robot: &Arc<dyn RobotPort>, profile: &Profile, out: &Path) -> Re
     Ok(Value::Object(files))
 }
 
+/// A value that carries a login whatever its parameter is called, as a URL such as
+/// `https://user:pass@host`.
+fn has_credentials(value: &Value) -> bool {
+    value.as_str().is_some_and(|s| {
+        s.split_once("://")
+            .and_then(|(_, rest)| rest.split('/').next())
+            .is_some_and(|authority| authority.contains('@'))
+    })
+}
+
 async fn first_frame(robot: &Arc<dyn RobotPort>, topic: &str) -> Result<image::RgbImage> {
     let mut frames = robot.frames(topic)?;
     let arrived = frames.wait_for(Option::is_some);
@@ -151,6 +179,35 @@ async fn first_frame(robot: &Arc<dyn RobotPort>, topic: &str) -> Result<image::R
         .clone()
         .context("no frame")?;
     Ok(frame.to_rgb()?)
+}
+
+/// The arguments of the skills that move the base, other than the walk and the turn, from the
+/// recorded catalog: a step sends the recording to the place or station one of them holds.
+fn destinations(
+    doc: &Map<String, Value>,
+    catalog: &str,
+    checks: &nervros_core::profile::PlanChecks,
+) -> Vec<String> {
+    let skip = [
+        checks.walk.as_ref().map(|w| w.skill.as_str()),
+        checks.turn.as_ref().map(|t| t.skill.as_str()),
+    ];
+    let skills = doc
+        .get("services")
+        .and_then(|s| s.get(catalog))
+        .and_then(|c| c["catalog_json"].as_str())
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .map(|c| c["skills"].clone())
+        .unwrap_or_default();
+    let names: BTreeSet<String> = skills
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| s["risk"] == "motion" && !skip.contains(&s["name"].as_str()))
+        .flat_map(|s| s["args"].as_array().cloned().unwrap_or_default())
+        .filter_map(|a| a["name"].as_str().map(str::to_owned))
+        .collect();
+    names.into_iter().collect()
 }
 
 /// How a mission moves the recording: the profile's walk and turn skills, and where a step's
@@ -215,6 +272,7 @@ fn motion(profile: &Profile, doc: &Map<String, Value>) -> Option<Value> {
             "skill": t.skill, "degrees": t.degrees, "positive_left": t.positive_left,
         })),
         "places": places,
+        "destinations": destinations(doc, &mission.catalog, checks),
     }))
 }
 
@@ -328,10 +386,10 @@ async fn node_params(
         .unwrap_or_default();
     let mut out = Map::new();
     for (i, name) in names.iter().enumerate() {
-        let value = if nervros_core::ros_tools::masked(&masked, name) {
-            json!("(hidden)")
-        } else {
-            values.get(i).map(param_value).unwrap_or_default()
+        let value = match values.get(i).map(param_value) {
+            _ if nervros_core::ros_tools::masked(&masked, name) => json!("(hidden)"),
+            Some(v) if has_credentials(&v) => json!("(hidden)"),
+            v => v.unwrap_or_default(),
         };
         if value.is_null() {
             continue;
@@ -570,5 +628,26 @@ mod tests {
         assert_eq!(back.containers["/nav2_container"], ["/amcl"]);
         assert_eq!(back.params["/amcl"].len(), 2);
         assert!(back.build().is_ok());
+    }
+
+    #[test]
+    fn a_recording_names_the_arguments_that_send_the_base_somewhere() {
+        let catalog = json!({"skills": [
+            {"name": "GoToTarget", "risk": "motion", "args": [{"name": "target"}]},
+            {"name": "WalkStraight", "risk": "motion", "args": [{"name": "distance_m"}]},
+            {"name": "FindInView", "risk": "observe", "args": [{"name": "phrase"}]},
+        ]});
+        let mut doc = Map::new();
+        doc.insert(
+            "services".into(),
+            json!({"/x/catalog": {"catalog_json": catalog.to_string()}}),
+        );
+        let checks: nervros_core::profile::PlanChecks = toml::from_str(
+            r#"walk = { skill = "WalkStraight", metres = "distance_m", direction = "d", max_m = 2.0 }"#,
+        )
+        .unwrap();
+        assert_eq!(destinations(&doc, "/x/catalog", &checks), ["target"]);
+        assert!(has_credentials(&json!("https://me:pw@example.org/x")));
+        assert!(!has_credentials(&json!("https://example.org/a@b")));
     }
 }

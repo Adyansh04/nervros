@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use nervros_core::evalcase::{Case, Seen, Suite, Truth, judge, say};
+use nervros_core::evalcase::{Case, Said, Seen, Suite, Truth, judge, say, untestable};
 use nervros_core::profile::Profile;
 use nervros_core::providers::{ModelsConfig, ProviderKind};
 use nervros_core::session::Command;
@@ -118,7 +118,10 @@ pub(crate) async fn run(
         .iter()
         .filter(|c| options.only.as_deref().is_none_or(|o| c.id.contains(o)))
         .collect();
-    // A run that tests nothing must not pass.
+    // A case that tests nothing, or a run of none, must not pass.
+    if let Some(why) = cases.iter().find_map(|c| untestable(c)) {
+        anyhow::bail!("{why} ({})", suite_path.display());
+    }
     if cases.is_empty() {
         anyhow::bail!(
             "no case of {} to run{}",
@@ -188,11 +191,15 @@ fn scripted_robot(files: &[PathBuf]) -> Result<Arc<dyn RobotPort>> {
 
 fn save(out: &Path, provenance: &Provenance, trials: &[Trial]) -> Result<()> {
     let results = json!({"provenance": provenance, "trials": trials});
-    std::fs::write(
-        out.join("results.json"),
-        serde_json::to_string_pretty(&results)?,
+    // Whole or not at all: a run cut short keeps the results it had.
+    nervros_core::write_atomic(
+        &out.join("results.json"),
+        serde_json::to_string_pretty(&results)?.as_bytes(),
     )?;
-    std::fs::write(out.join("report.md"), report(provenance, trials))?;
+    nervros_core::write_atomic(
+        &out.join("report.md"),
+        report(provenance, trials).as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -362,6 +369,19 @@ async fn run_trial(
 }
 
 async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize) -> Result<Seen> {
+    // A Ctrl-C mid-case undoes the case's fault before it ends the run.
+    tokio::select! {
+        seen = case_run(run, case, model, trial) => seen,
+        _ = tokio::signal::ctrl_c() => {
+            if let Err(e) = shell("restore", &case.restore).await {
+                eprintln!("{e:#}");
+            }
+            anyhow::bail!("stopped by Ctrl-C during case {}", case.id)
+        }
+    }
+}
+
+async fn case_run(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize) -> Result<Seen> {
     let lane = format!("{}-{trial}", model.unwrap_or("chain"));
     let options = nervros_core::app::StartOptions {
         model: model.map(str::to_owned),
@@ -391,19 +411,40 @@ async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize)
         }
         tokio::time::sleep(INJECT_SETTLE * 2).await;
     }
-    let deadline = Instant::now() + Duration::from_secs(case.max_s);
+    // Setup has a clock of its own, and a setup that fails fails the case: its start is not
+    // the one the case was written from.
+    let setup_by = Instant::now() + SETUP_WAIT;
     for text in &case.setup {
-        let mut ignored = Seen::default();
-        say(
+        let mut setup = Seen::default();
+        let said = say(
             &agent.session,
             &mut events,
             text,
-            deadline,
+            setup_by,
             true,
-            &mut ignored,
+            &mut setup,
         )
         .await;
+        let failed = setup
+            .missions
+            .iter()
+            .find(|m| m.as_str() != "success")
+            .map(|m| format!("its mission ended {m}"))
+            .or_else(|| setup.errors.first().cloned());
+        let why = match said {
+            Said::TimedOut => Some(format!("ran past {} s", SETUP_WAIT.as_secs())),
+            Said::Closed => Some("the session ended".to_owned()),
+            Said::Finished => failed,
+        };
+        if let Some(why) = why {
+            seen.errors.push(format!("setup \"{text}\" failed: {why}"));
+            if let Err(e) = shell("restore", &case.restore).await {
+                seen.errors.push(format!("{e:#}"));
+            }
+            return Ok(seen);
+        }
     }
+    let deadline = Instant::now() + Duration::from_secs(case.max_s);
     let start = pose(run.robot, run.profile);
     let truth_start = match run.truth {
         Some(t) => truth_pose(run.robot, t).await,
@@ -411,14 +452,23 @@ async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize)
     };
     let began = Instant::now();
     for text in &case.say {
-        if say(&agent.session, &mut events, text, deadline, true, &mut seen).await
-            != nervros_core::evalcase::Said::Finished
-        {
-            seen.timed_out = true;
-            // A case over its time stops the robot rather than leave it running into the next.
-            agent.session.send(Command::StopMission);
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            break;
+        match say(&agent.session, &mut events, text, deadline, true, &mut seen).await {
+            Said::Finished => {}
+            Said::TimedOut => {
+                seen.timed_out = true;
+                // A case over its time stops the robot rather than leave it running into the
+                // next, and fails if the stop did not settle.
+                agent.session.send(Command::StopMission);
+                if let Some(why) = stop_answered(&mut events).await {
+                    seen.errors.push(why);
+                }
+                break;
+            }
+            Said::Closed => {
+                seen.errors
+                    .push("the session ended before the agent answered".to_owned());
+                break;
+            }
         }
     }
     seen.seconds = began.elapsed().as_secs_f64();
@@ -438,24 +488,60 @@ async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize)
     Ok(seen)
 }
 
+/// How long a stop may take to be answered before the case says the robot may still move.
+const STOP_WAIT: Duration = Duration::from_secs(25);
+
+/// Why the stop a case sent did not settle, once it is answered or the wait is over.
+async fn stop_answered(
+    events: &mut tokio::sync::broadcast::Receiver<nervros_core::session::Event>,
+) -> Option<String> {
+    use nervros_core::session::Event;
+    use tokio::sync::broadcast::error::RecvError;
+    let answer = tokio::time::timeout(STOP_WAIT, async {
+        loop {
+            match events.recv().await {
+                Ok(Event::Stopped { ok, detail }) => return Some((ok, detail)),
+                Err(RecvError::Closed) => return None,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    match answer {
+        Ok(Some((true, _))) => None,
+        Ok(Some((false, detail))) => Some(format!(
+            "the stop after the case's time did not settle: {detail}"
+        )),
+        _ => Some(
+            "the stop after the case's time got no answer: the robot may still be moving"
+                .to_owned(),
+        ),
+    }
+}
+
 /// How long a case with a fault waits before injecting it, and twice that after.
 const INJECT_SETTLE: Duration = Duration::from_secs(6);
+/// The longest a case's `inject` or `restore` command may run.
+const SHELL_WAIT: Duration = Duration::from_mins(2);
+/// The longest a case's setup messages may take, all together.
+const SETUP_WAIT: Duration = Duration::from_mins(5);
 
 /// Runs a case's `inject` or `restore` command with `sh -c`.
 async fn shell(what: &str, command: &str) -> Result<()> {
     if command.is_empty() {
         return Ok(());
     }
-    let line = command.to_owned();
-    let status = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&line)
-            .status()
-    })
-    .await
-    .context("running the command")?
-    .with_context(|| format!("starting the case's {what}"))?;
+    // Killed with its future: a command that hangs does not hang the suite.
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("starting the case's {what}"))?;
+    let status = tokio::time::timeout(SHELL_WAIT, child.wait())
+        .await
+        .with_context(|| format!("the case's {what} ran past {} s", SHELL_WAIT.as_secs()))?
+        .with_context(|| format!("running the case's {what}"))?;
     anyhow::ensure!(status.success(), "the case's {what} ended with {status}");
     Ok(())
 }

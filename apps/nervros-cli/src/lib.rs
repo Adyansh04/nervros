@@ -64,9 +64,14 @@ enum Command {
         /// Arm at start.
         #[arg(long)]
         arm: bool,
-        /// Approve every request; for scripted runs only.
+        /// With `--say`, approve each request but the ones the operator is always asked, which
+        /// are denied; needs `--live`.
         #[arg(long)]
         approve: bool,
+        /// Let `--approve` run on the live graph, which must be a simulator's: it moves whatever
+        /// robot it reaches.
+        #[arg(long)]
+        live: bool,
         /// Carry on a saved conversation: a `.history.json` path, or `last`.
         #[arg(long)]
         resume: Option<String>,
@@ -97,6 +102,10 @@ enum Command {
         /// graph: models compared in seconds, without a simulator (`record` writes one).
         #[arg(long)]
         robot: Vec<PathBuf>,
+        /// Run against the live graph, approving every request the model makes and arming the
+        /// agent: only on a simulator. Required when no `--robot` is given.
+        #[arg(long, conflicts_with = "robot")]
+        live: bool,
     },
     /// Print a session log as it happened: a `.ndjson` path, or `last`.
     Replay {
@@ -229,6 +238,20 @@ enum Command {
 }
 
 /// The profile at `path`.
+/// `text` with its control characters escaped, so logged or world text cannot move the cursor,
+/// colour the terminal or forge a line of its own; a newline becomes `newline`.
+fn printable(text: &str, newline: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str(newline),
+            c if c.is_control() => out.extend(c.escape_default()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn load(path: &Path) -> Result<Profile> {
     Profile::load(path).context("loading the profile")
 }
@@ -283,9 +306,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             say,
             arm,
             approve,
+            live,
             resume,
             model,
         } => {
+            refuse_unasked_approve(approve, live)?;
             robot::chat(
                 &cli.profile,
                 &nervros_core::app::state_dir(),
@@ -307,7 +332,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             models,
             out,
             robot,
+            live,
         } => {
+            refuse_unasked_live_graph(&robot, live)?;
             let out = out.unwrap_or_else(eval::default_out);
             let options = eval::Options {
                 only,
@@ -345,6 +372,32 @@ pub async fn run(cli: Cli) -> Result<()> {
         #[cfg(feature = "ros")]
         Command::Ros { tool, args } => robot::ros(&cli.profile, &tool, &args).await,
     }
+}
+
+/// Refuses `chat --approve` unless `--live` says the graph is a simulator's.
+#[cfg(feature = "ros")]
+fn refuse_unasked_approve(approve: bool, live: bool) -> Result<()> {
+    if approve && !live {
+        anyhow::bail!(
+            "--approve answers the model's requests on the live graph, which moves whatever robot \
+             it reaches. On a simulator, add --live"
+        );
+    }
+    Ok(())
+}
+
+/// Refuses an eval on the live graph unless `--live` asks for it: eval approves every request the
+/// model makes and arms the agent.
+#[cfg(feature = "ros")]
+fn refuse_unasked_live_graph(robot: &[PathBuf], live: bool) -> Result<()> {
+    if robot.is_empty() && !live {
+        anyhow::bail!(
+            "eval approves every request the model makes and arms the agent: against the live \
+             graph that moves whatever robot it reaches. Run it on a simulator with --live, or on \
+             a scripted robot with --robot"
+        );
+    }
+    Ok(())
 }
 
 fn skills(profile: &Path) -> Result<()> {
@@ -400,6 +453,11 @@ async fn models(profile: &Path, check: bool) -> Result<()> {
             .as_deref()
             .filter(|_| provider.is_openrouter())
         else {
+            // Silence would read as the free-only rule holding for it.
+            println!(
+                "{}: not checked, only OpenRouter's price list can be read",
+                provider.id
+            );
             continue;
         };
         let models: Vec<_> = llm
