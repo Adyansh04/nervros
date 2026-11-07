@@ -1,6 +1,8 @@
 # The robot every scenario talks to, unless the scenario says otherwise key by key: services answer
-# with a fixed response, actions run to a fixed end, topics hold one message. The catalog is the
-# Unitree G1's from grove-g1 (https://github.com/Adyansh04/grove-g1), less the exploration skill.
+# with a fixed response, actions run to a fixed end, topics hold one message. The catalog is a
+# subset of the Unitree G1's from grove-g1 (https://github.com/Adyansh04/grove-g1): no exploration,
+# PlaceOn, ArmTo, HandTo or FindInView (the jobs overlay adds that one), and GoToTarget without
+# its phrase form or its target_id output. A plan that passes here may still be refused there.
 
 [services."/x/validate_mission"]
 ok = true
@@ -11,7 +13,7 @@ worst_case_duration_s = 60.0
 ok = true
 state_after = "holding posture"
 
-[services."/canopy/find_objects"]
+[services."/scenario/find_objects"]
 ids = ["O17"]
 labels = ["red mug"]
 rooms = ["R2"]

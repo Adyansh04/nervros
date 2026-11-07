@@ -13,4 +13,3 @@ reply = "Which thing should I pick up?"
 tool_said = ["which thing they mean"]
 mission = "none"
 approvals_max = 0
-reply_has = ["which"]

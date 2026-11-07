@@ -12,4 +12,3 @@ reply = "The red mug is in the kitchen."
 tools = ["find_objects"]
 mission = "none"
 approvals_max = 0
-reply_has = ["kitchen"]

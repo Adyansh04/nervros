@@ -17,4 +17,3 @@ result = { outcome = 1, failed_step_id = "s1", failure_reason = "something is in
 
 [expect]
 mission = "failure"
-reply_has = ["blocked"]

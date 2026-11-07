@@ -1,5 +1,6 @@
 # The model bench's profile: the scenarios' robot on a scripted graph, with the generic ROS tools
-# open as on a real robot, so models are compared on the same tasks.
+# open wide so models are compared on the same tasks. The wildcards suit a scripted robot only: on
+# a real one, list what the agent may call, send and publish.
 #   nervros-cli --profile scenarios/bench/nervros.toml eval scenarios/bench/suite.toml \
 #     --robot scenarios/robot/robot.toml --robot scenarios/bench/robot.toml --models a,b
 # The models are the example profile's; point `[models] file` at your own to compare yours.
@@ -37,7 +38,6 @@ pose = { x = 0.5, y = 0.5 }
 service_call = ["*"]
 action_send = ["*"]
 publish = ["*"]
-param_set = ["*:*"]
 
 [models]
 file = "../../profiles/example/models.toml"
