@@ -24,6 +24,12 @@ pub fn validate(registry: &Registry, ty: &TypeName, part: Part, value: &Value) -
 }
 
 fn message_of<'a>(registry: &'a Registry, ty: &TypeName, part: Part) -> Result<&'a Message> {
+    // As the schema finds a nested type: a bare `Header` is `std_msgs/Header` there too.
+    if part == Part::Message
+        && let Some((_, message)) = registry.find_message(ty)
+    {
+        return Ok(message);
+    }
     registry
         .get(ty)
         .ok_or_else(|| Error::UnknownType {
@@ -35,6 +41,15 @@ fn message_of<'a>(registry: &'a Registry, ty: &TypeName, part: Part) -> Result<&
             ty: ty.clone(),
             part,
         })
+}
+
+/// A whole float as an integer, saturating at the ends of the range.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the cast saturates, and only whole values are asked"
+)]
+fn to_i128(f: f64) -> i128 {
+    f as i128
 }
 
 fn at(path: &str) -> String {
@@ -179,6 +194,16 @@ fn check_scalar(
                 .or_else(|| value.as_u64().map(i128::from));
             match n {
                 Some(n) if (lo..=hi).contains(&n) => Ok(()),
+                // A whole number written with a point is one, but r2r takes no float for it.
+                _ if let Some(f) = value.as_f64().filter(|f| {
+                    f.is_finite() && f.fract() == 0.0 && (lo..=hi).contains(&to_i128(*f))
+                }) =>
+                {
+                    Err(format!(
+                        "{} takes a whole number: write {f:.0}, not {value}",
+                        at(path)
+                    ))
+                }
                 _ => Err(format!(
                     "{} must be a whole number from {lo} to {hi}",
                     at(path)
@@ -281,6 +306,65 @@ mod tests {
             let err = go(&value).unwrap_err();
             assert!(err.contains(expected), "{value}: {err}");
         }
+    }
+
+    #[test]
+    fn every_integer_type_takes_its_ends_and_refuses_one_past() {
+        let mut r = Registry::default();
+        let text = "int8 a\nuint8 b\nint16 c\nuint16 d\nint32 e\nuint32 f\nint64 g\nuint64 h\n";
+        r.add_source(&"demo_msgs/msg/Ints".parse().unwrap(), text)
+            .unwrap();
+        let ty: TypeName = "demo_msgs/msg/Ints".parse().unwrap();
+        let check =
+            |field: &str, value: Value| validate(&r, &ty, Part::Message, &json!({field: value}));
+        let ends: [(&str, i128, i128); 8] = [
+            ("a", i128::from(i8::MIN), i128::from(i8::MAX)),
+            ("b", 0, i128::from(u8::MAX)),
+            ("c", i128::from(i16::MIN), i128::from(i16::MAX)),
+            ("d", 0, i128::from(u16::MAX)),
+            ("e", i128::from(i32::MIN), i128::from(i32::MAX)),
+            ("f", 0, i128::from(u32::MAX)),
+            ("g", i128::from(i64::MIN), i128::from(i64::MAX)),
+            ("h", 0, i128::from(u64::MAX)),
+        ];
+        let number =
+            |n: i128| -> Value { serde_json::from_str(&n.to_string()).unwrap_or(Value::Null) };
+        for (field, lo, hi) in ends {
+            assert!(check(field, number(lo)).is_ok(), "{field} {lo}");
+            assert!(check(field, number(hi)).is_ok(), "{field} {hi}");
+            assert!(check(field, number(lo - 1)).is_err(), "{field} {}", lo - 1);
+            assert!(check(field, number(hi + 1)).is_err(), "{field} {}", hi + 1);
+        }
+        let err = check("b", json!(5.0)).unwrap_err().to_string();
+        assert!(err.contains("write 5, not 5.0"), "{err}");
+    }
+
+    #[test]
+    fn wide_strings_count_utf16_units_and_floats_their_range_and_depth_is_bounded() {
+        let mut r = Registry::default();
+        r.add_source(
+            &"demo_msgs/msg/Text".parse().unwrap(),
+            "wstring<=2 w\nfloat32 x\n",
+        )
+        .unwrap();
+        let ty: TypeName = "demo_msgs/msg/Text".parse().unwrap();
+        let check = |value: Value| validate(&r, &ty, Part::Message, &value);
+        assert!(check(json!({"w": "é"})).is_ok(), "one unit");
+        assert!(check(json!({"w": "😀😀"})).is_err(), "four units");
+        assert!(check(json!({"x": 1.0e39})).is_err(), "beyond float32");
+        assert!(check(json!({"x": 3.0e38})).is_ok());
+        // ROS types never nest themselves; a hand-made one shows the bound holds.
+        r.add_source(&"demo_msgs/msg/Tree".parse().unwrap(), "Tree[] kids\n")
+            .unwrap();
+        let tree: TypeName = "demo_msgs/msg/Tree".parse().unwrap();
+        let mut deep = json!({"kids": []});
+        for _ in 0..=MAX_DEPTH + 1 {
+            deep = json!({"kids": [deep]});
+        }
+        let err = validate(&r, &tree, Part::Message, &deep)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nested too deep"), "{err}");
     }
 
     #[test]

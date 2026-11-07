@@ -39,6 +39,9 @@ pub struct LoadIssue {
 #[derive(Debug, Default)]
 pub struct Registry {
     interfaces: BTreeMap<TypeName, Interface>,
+    /// Every name a search path offered, read or not: a broken first copy leaves its type
+    /// missing rather than letting a later one in.
+    claimed: std::collections::BTreeSet<TypeName>,
     issues: Vec<LoadIssue>,
 }
 
@@ -237,7 +240,7 @@ impl Registry {
         remap: &[(PathBuf, PathBuf)],
     ) -> Result<()> {
         let name: TypeName = format!("{package}/{kind}/{stem}").parse()?;
-        if self.interfaces.contains_key(&name) {
+        if !self.claimed.insert(name.clone()) {
             return Ok(());
         }
         let file = resolve_path(path, remap).ok_or_else(|| unreachable_path(path))?;
@@ -254,6 +257,7 @@ impl Registry {
 /// Why `resolve_path` found nothing: a dangling symlink, or no such file.
 fn unreachable_path(path: &Path) -> Error {
     match fs::read_link(path) {
+        Ok(_) if loops(path) => Error::LinkLoop(path.to_owned()),
         Ok(target) => Error::DanglingLink {
             link: path.to_owned(),
             target,
@@ -263,6 +267,25 @@ fn unreachable_path(path: &Path) -> Error {
             source: io::ErrorKind::NotFound.into(),
         },
     }
+}
+
+/// Whether following the links from `path` comes back to one already passed.
+fn loops(path: &Path) -> bool {
+    let mut passed = std::collections::BTreeSet::new();
+    let mut current = path.to_owned();
+    for _ in 0..MAX_LINK_HOPS {
+        if !passed.insert(current.clone()) {
+            return true;
+        }
+        let Ok(target) = fs::read_link(&current) else {
+            return false;
+        };
+        current = match current.parent() {
+            Some(dir) if !target.is_absolute() => dir.join(target),
+            _ => target,
+        };
+    }
+    true
 }
 
 /// The folder's entries by name, so that loading does not depend on the file system's order.

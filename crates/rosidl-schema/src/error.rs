@@ -106,6 +106,9 @@ pub enum Error {
         /// Where it points.
         target: PathBuf,
     },
+    /// A symlink whose chain of links comes back to itself.
+    #[error("{} is a loop of symlinks", .0.display())]
+    LinkLoop(PathBuf),
     /// A source search path without a `package.xml` that names the package.
     #[error("{} is not a ROS package: no package.xml with a <name>", .0.display())]
     NotAPackage(PathBuf),

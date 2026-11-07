@@ -283,7 +283,8 @@ impl Field {
             .to_json()
     }
 
-    /// Whether this is a `uint8[]` or `byte[]` of open length: a payload, not something to fill in.
+    /// Whether this is a `uint8[]` or `byte[]` of open or bounded length: a payload, not something to
+    /// fill in.
     #[must_use]
     pub fn is_blob(&self) -> bool {
         matches!(self.ty, FieldType::U8 | FieldType::Byte)
