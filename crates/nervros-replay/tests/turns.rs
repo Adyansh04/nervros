@@ -61,8 +61,10 @@ async fn ask_for_the_mug(models: &str) -> Turn {
         }),
         invoke: Arc::new(move |args| {
             seen.lock().expect("not poisoned").push(args);
+            // An id no recording holds: the check finds it in the conversation only if the
+            // tool's answer went into it.
             Box::pin(async {
-                json!({"objects": [{"id": "O12", "label": "red mug", "room": "kitchen"}]})
+                json!({"objects": [{"id": "O4471", "label": "red mug", "room": "kitchen"}]})
             })
         }),
     }];
@@ -123,6 +125,12 @@ fn check(turn: &Turn) {
     let file = dir.path().join("turn.history.json");
     turn.history.save(&file).expect("the history saves");
     assert_eq!(History::load(&file).expect("and loads"), turn.history);
+    // The second call is built from this conversation: the tool's answer must be in it.
+    let saved = std::fs::read_to_string(&file).expect("the history reads");
+    assert!(
+        saved.contains("O4471"),
+        "the tool's answer is not in the conversation: {saved}"
+    );
 }
 
 /// The key a recording session hands out (the real one only when recording), in a file for the
