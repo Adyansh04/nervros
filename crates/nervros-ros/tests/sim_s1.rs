@@ -132,22 +132,30 @@ async fn navigate_and_cancel(port: &R2rPort, pose: &Transform) {
         .unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
     let t = Instant::now();
-    let cancel = goal.cancel().await;
-    let ended = tokio::time::timeout(Duration::from_secs(30), goal.result)
-        .await
-        .unwrap()
-        .unwrap();
-    let ended = ended.unwrap();
+    let cancel = tokio::time::timeout(Duration::from_secs(5), goal.cancel()).await;
+    assert!(
+        matches!(cancel, Ok(Ok(()))),
+        "the cancel is taken within 5 s: {cancel:?}"
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(10), goal.result).await;
+    assert!(ended.is_ok(), "a cancelled goal ends within 10 s");
+    let ended = ended.unwrap().unwrap().unwrap();
     println!(
-        "cancel {cancel:?}: ended {:?} {:.2} s later",
+        "cancel: ended {:?} {:.2} s later",
         ended.status,
         t.elapsed().as_secs_f64()
     );
-    if cancel.is_ok() {
-        assert_eq!(ended.status, GoalStatus::Canceled);
-    }
-    let [x, y, _] = port.transform("map", "base_footprint").unwrap().translation;
-    println!("robot now at ({x:.2}, {y:.2})");
+    assert_eq!(ended.status, GoalStatus::Canceled);
+    // Once cancelled, the base settles: it moves less than 5 cm over the next second.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let before = port.transform("map", "base_footprint").unwrap().translation;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let after = port.transform("map", "base_footprint").unwrap().translation;
+    let drift = (after[0] - before[0]).hypot(after[1] - before[1]);
+    assert!(
+        drift < 0.05,
+        "still moving {drift:.3} m a second after the cancel"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

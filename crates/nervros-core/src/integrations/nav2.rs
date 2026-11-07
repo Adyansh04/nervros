@@ -180,8 +180,8 @@ impl Nav2 {
             Arc::new(admin::NavAdmin::new(
                 config,
                 parts.profile,
-                robot(),
-                Arc::clone(parts.places),
+                (robot(), Arc::clone(parts.places)),
+                Some(Arc::clone(&watcher)),
             )),
         ];
         let (motions, natives) = motion::Motions::natives(
@@ -227,8 +227,8 @@ impl Integration for Nav2 {
         self.motions.attach(session);
     }
 
-    async fn stop(&self) {
-        self.goals.cancel_all().await;
+    async fn stop(&self) -> Vec<String> {
+        self.goals.cancel_all().await
     }
 }
 
@@ -259,16 +259,24 @@ pub(crate) async fn discover(config: &Nav2Config, robot: &dyn RobotPort) -> Vec<
         }),
     ];
     for (topic, what, filter) in read_by.into_iter().flatten() {
-        let read = robot
+        // Nav2's filters run inside its costmaps: a viewer reading the mask is not Nav2.
+        let costmaps: Vec<String> = robot
             .endpoints(topic)
             .await
-            .is_ok_and(|e| !e.subscribers.is_empty());
+            .map(|e| {
+                e.subscribers
+                    .into_iter()
+                    .map(|s| s.node)
+                    .filter(|n| n.contains("costmap"))
+                    .collect()
+            })
+            .unwrap_or_default();
         out.push(Check {
-            ok: read,
-            what: if read {
-                format!("{what} {topic}: Nav2 reads it")
+            ok: !costmaps.is_empty(),
+            what: if costmaps.is_empty() {
+                format!("{what} {topic}: no costmap reads it; is Nav2's {filter} filter on?")
             } else {
-                format!("{what} {topic}: nothing reads it; is Nav2's {filter} filter on?")
+                format!("{what} {topic}: Nav2 reads it in {}", costmaps.join(", "))
             },
         });
     }

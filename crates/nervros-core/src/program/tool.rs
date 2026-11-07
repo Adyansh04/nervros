@@ -43,8 +43,9 @@ impl ProgramTool {
         }
     }
 
-    /// The program a `run` means, with its title: its text, or the kept one it names.
-    fn source(&self, args: &Value) -> Result<(String, String), String> {
+    /// The program a `run` means, with its title: its text, or the kept one it names, with the
+    /// minutes it was kept with.
+    fn source(&self, args: &Value) -> Result<(String, String, Option<u64>), String> {
         let title = args["title"].as_str().unwrap_or_default().trim().to_owned();
         if let Some(source) = args["source"].as_str().filter(|s| !s.trim().is_empty()) {
             let title = if title.is_empty() {
@@ -52,11 +53,11 @@ impl ProgramTool {
             } else {
                 title
             };
-            return Ok((title, source.to_owned()));
+            return Ok((title, source.to_owned(), None));
         }
         let name = args["name"].as_str().unwrap_or_default();
         match self.store.get(name) {
-            Some(saved) => Ok((saved.name, saved.source)),
+            Some(saved) => Ok((saved.name, saved.source, Some(saved.max_minutes))),
             None if name.is_empty() => {
                 Err("`source` is the program to run, or `name` a kept one".to_owned())
             }
@@ -64,61 +65,77 @@ impl ProgramTool {
         }
     }
 
-    /// Checks a program to run and settles what the operator approves.
-    async fn assess_run(&self, args: &Value) -> Result<Assessment, ToolOutcome> {
-        let (title, source) = self.source(args).map_err(ToolOutcome::failed)?;
-        engine::compile(&source).map_err(ToolOutcome::failed)?;
-        let catalog = self.missions.catalog().await.map_err(ToolOutcome::failed)?;
-        let named = skills::named_in(&source, &callable(&catalog)).map_err(ToolOutcome::failed)?;
-        let minutes = args["max_minutes"].as_u64().unwrap_or(DEFAULT_MINUTES);
+    /// The program a `run` means, checked as the card and the run both need it: parsed, its skills
+    /// known to the robot, and its minutes those given, those it was kept with, or the default.
+    async fn prepare(&self, args: &Value) -> Result<Prepared, String> {
+        let (title, source, kept_minutes) = self.source(args)?;
+        let ast = engine::compile(&source)?;
+        let catalog = self.missions.catalog().await?;
+        let skills = callable(&catalog);
+        let named = skills::named_in(&source, &skills)?;
+        let minutes = args["max_minutes"]
+            .as_u64()
+            .or(kept_minutes)
+            .unwrap_or(DEFAULT_MINUTES);
         let envelope = Envelope::new(named, minutes);
         let unknown = envelope.unknown(&catalog);
         if !unknown.is_empty() {
-            return Err(ToolOutcome::failed(format!(
+            return Err(format!(
                 "the robot has no skill {}; its skills are {}",
                 unknown.join(", "),
                 catalog.plan_skills().join(", ")
-            )));
+            ));
         }
-        let approval = Approval::of(envelope.clone(), &catalog);
+        Ok(Prepared {
+            title,
+            source,
+            ast,
+            skills,
+            envelope,
+            catalog,
+        })
+    }
+
+    /// Checks a program to run and settles what the operator approves.
+    async fn assess_run(&self, args: &Value) -> Result<Assessment, ToolOutcome> {
+        let p = self.prepare(args).await.map_err(ToolOutcome::failed)?;
+        let approval = Approval::of(p.envelope.clone(), &p.catalog);
         let lines = crate::counted(
-            source.lines().filter(|l| !l.trim().is_empty()).count(),
+            p.source.lines().filter(|l| !l.trim().is_empty()).count(),
             "line",
         );
         Ok(Assessment {
-            risk: envelope.risk(&catalog),
+            risk: p.envelope.risk(&p.catalog),
             resources: Vec::new(),
             reason: format!(
-                "runs the program \"{title}\" ({lines}) on its own: it {}",
-                approval.text
+                "runs the program \"{}\" ({lines}) on its own: it {}",
+                p.title, approval.text
             ),
-            args: Some(json!({"action": "run", "title": title, "source": source,
-                              "max_minutes": envelope.max_minutes()})),
+            args: Some(
+                json!({"action": "run", "title": p.title, "source": p.source,
+                              "max_minutes": p.envelope.max_minutes()}),
+            ),
         })
     }
 
     async fn run(&self, args: &Value) -> ToolOutcome {
-        let (title, source) = match self.source(args) {
-            Ok(s) => s,
+        let p = match self.prepare(args).await {
+            Ok(p) => p,
             Err(e) => return ToolOutcome::failed(e),
         };
-        let ast = match engine::compile(&source) {
-            Ok(ast) => ast,
-            Err(e) => return ToolOutcome::failed(e),
-        };
-        let catalog = match self.missions.catalog().await {
-            Ok(c) => c,
-            Err(e) => return ToolOutcome::failed(e),
-        };
-        let skills = callable(&catalog);
-        let named = match skills::named_in(&source, &skills) {
-            Ok(named) => named,
-            Err(e) => return ToolOutcome::failed(e),
-        };
-        let minutes = args["max_minutes"].as_u64().unwrap_or(DEFAULT_MINUTES);
-        let approval = Approval::of(Envelope::new(named, minutes), &catalog);
+        // A run of the kept program, not new source given its title.
+        let kept = self
+            .store
+            .get(&p.title)
+            .is_some_and(|k| k.source == p.source);
+        let approval = Approval::of(p.envelope, &p.catalog);
         let moves = approval.moves;
-        let (missions, frames) = (Arc::clone(&self.missions), self.frames.clone());
+        let (missions, frames, ast, skills) = (
+            Arc::clone(&self.missions),
+            self.frames.clone(),
+            p.ast,
+            p.skills,
+        );
         let work = move |ctx: crate::job::Context| async move {
             let runtime = tokio::runtime::Handle::current();
             let robot = Arc::new(RobotHost::new(missions, ctx.clone(), runtime, frames));
@@ -138,10 +155,12 @@ impl ProgramTool {
             .await
             .map_err(|e| format!("the program's thread failed: {e}"))?
         };
-        match self.jobs.spawn(JobKind::Program, &title, approval, work) {
+        match self.jobs.spawn(JobKind::Program, &p.title, approval, work) {
             Ok(job) => {
-                if self.store.get(&title).is_some() {
-                    self.store.ran(&title);
+                if kept {
+                    let (store, title) = (Arc::clone(&self.store), p.title.clone());
+                    // Not awaited: a count lost to a slow disk only loses the count.
+                    drop(tokio::task::spawn_blocking(move || store.ran(&title)));
                 }
                 ToolOutcome {
                     status: Status::Accepted,
@@ -158,7 +177,7 @@ impl ProgramTool {
         }
     }
 
-    fn save(&self, args: &Value) -> ToolOutcome {
+    async fn save(&self, args: &Value) -> ToolOutcome {
         let name = args["name"].as_str().unwrap_or_default().trim();
         let source = args["source"].as_str().unwrap_or_default();
         if name.is_empty() || source.trim().is_empty() {
@@ -176,9 +195,12 @@ impl ProgramTool {
             saved_s: crate::now_s(),
             runs: 0,
         };
-        match self.store.save(saved) {
-            Ok(()) => ToolOutcome::ok(json!({"saved": name})),
-            Err(e) => ToolOutcome::failed(e),
+        let store = Arc::clone(&self.store);
+        // The store writes and syncs its file: off the async threads.
+        match tokio::task::spawn_blocking(move || store.save(saved)).await {
+            Ok(Ok(())) => ToolOutcome::ok(json!({"saved": name})),
+            Ok(Err(e)) => ToolOutcome::failed(e),
+            Err(e) => ToolOutcome::failed(format!("the program was not kept: {e}")),
         }
     }
 
@@ -191,6 +213,16 @@ impl ProgramTool {
             .collect();
         ToolOutcome::ok(json!({"kept": kept}))
     }
+}
+
+/// A program checked to run.
+struct Prepared {
+    title: String,
+    source: String,
+    ast: rhai::AST,
+    skills: Vec<SkillCall>,
+    envelope: Envelope,
+    catalog: Arc<Catalog>,
 }
 
 /// The skills a program may call by name, each with the arguments bare values fill.
@@ -279,14 +311,18 @@ impl Tool for ProgramTool {
     async fn call(&self, args: Value) -> ToolOutcome {
         match args["action"].as_str() {
             Some("run") => self.run(&args).await,
-            Some("save") => self.save(&args),
+            Some("save") => self.save(&args).await,
             Some("list") => self.list(),
             Some("forget") => {
-                let name = args["name"].as_str().unwrap_or_default();
-                match self.store.forget(name) {
-                    Ok(true) => ToolOutcome::ok(json!({"forgot": name})),
-                    Ok(false) => ToolOutcome::failed(format!("no program is kept as \"{name}\"")),
-                    Err(e) => ToolOutcome::failed(e),
+                let name = args["name"].as_str().unwrap_or_default().to_owned();
+                let (store, which) = (Arc::clone(&self.store), name.clone());
+                match tokio::task::spawn_blocking(move || store.forget(&which)).await {
+                    Ok(Ok(true)) => ToolOutcome::ok(json!({"forgot": name})),
+                    Ok(Ok(false)) => {
+                        ToolOutcome::failed(format!("no program is kept as \"{name}\""))
+                    }
+                    Ok(Err(e)) => ToolOutcome::failed(e),
+                    Err(e) => ToolOutcome::failed(format!("the program was not forgotten: {e}")),
                 }
             }
             _ => ToolOutcome::failed("`action` is run, save, list or forget"),

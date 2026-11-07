@@ -28,27 +28,35 @@ pub fn replay(which: &str) -> Result<()> {
     let path = session_log(which)?;
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    // Times count from the first line that has one; a line without is shown as such.
     let mut start = None;
     for line in text
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
     {
-        let ts = line["ts"].as_f64().unwrap_or(0.0);
-        let at = ts - *start.get_or_insert(ts);
+        let at = line["ts"].as_f64().map(|ts| ts - *start.get_or_insert(ts));
         if let Some(text) = describe(&line["event"]) {
-            println!("{at:7.1}s  {text}");
+            match at {
+                Some(at) => println!("{at:7.1}s  {text}"),
+                None => println!("{:>8}  {text}", "?"),
+            }
         }
     }
     Ok(())
 }
 
+/// Logged or kept text on one terminal line.
+fn flat(text: &str) -> String {
+    crate::printable(text, " ")
+}
+
 /// One logged event as a line, or nothing for the ones not worth a line.
 fn describe(e: &Value) -> Option<String> {
-    let s = |k: &str| e[k].as_str().unwrap_or_default();
-    Some(match s("kind") {
+    let s = |k: &str| flat(e[k].as_str().unwrap_or_default());
+    Some(match e["kind"].as_str().unwrap_or_default() {
         "user" => format!("you> {}", s("text")),
         "steer" => format!("you, while it worked> {}", s("text")),
-        "reply" => format!("robot> {}", s("text").replace('\n', " ")),
+        "reply" => format!("robot> {}", s("text")),
         "report" => format!("report> {}", s("text")),
         "tool_started" => format!("  > {} {}", s("tool"), e["args"]),
         "tool_finished" => format!("  < {} {} {}", s("tool"), s("status"), s("message")),
@@ -62,11 +70,11 @@ fn describe(e: &Value) -> Option<String> {
             }
         ),
         "mission_planned" => {
-            let steps: Vec<&str> = e["steps"]
+            let steps: Vec<String> = e["steps"]
                 .as_array()
                 .map_or(&[][..], Vec::as_slice)
                 .iter()
-                .filter_map(|st| st["summary"].as_str())
+                .filter_map(|st| st["summary"].as_str().map(flat))
                 .collect();
             format!("  plan: {}", steps.join(" -> "))
         }
@@ -145,19 +153,24 @@ pub fn missions(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
         let fault = if m.fault.is_empty() {
             String::new()
         } else {
-            format!(", fault: {}", m.fault)
+            format!(", fault: {}", flat(&m.fault))
+        };
+        // One still running, or one an earlier NervROS left running, has no end to measure.
+        let lasted = if m.ended > m.started {
+            format!(", {:.0} s", m.ended - m.started)
+        } else {
+            String::new()
         };
         println!(
-            "{} {} ago: {} ({}{fault}, {:.0} s)",
+            "{} {} ago: {} ({}{fault}{lasted})",
             // A version 7 id begins with its millisecond: this much tells missions apart.
             &m.id[..m.id.len().min(13)],
             nervros_core::how_long(now - m.started),
-            m.intent,
+            flat(&m.intent),
             m.outcome,
-            m.ended - m.started
         );
         if !m.request.is_empty() {
-            println!("    asked: {}", m.request);
+            println!("    asked: {}", flat(&m.request));
         }
         if id.is_some() || m.outcome != "success" {
             for st in &m.steps {
@@ -167,11 +180,14 @@ pub fn missions(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
                 let why = if st.reason.is_empty() {
                     String::new()
                 } else {
-                    format!(": {}", st.reason)
+                    format!(": {}", flat(&st.reason))
                 };
                 println!(
                     "    {} {} {} {}{time}{why}",
-                    st.id, st.skill, st.target, st.outcome
+                    flat(&st.id),
+                    flat(&st.skill),
+                    flat(&st.target),
+                    st.outcome
                 );
             }
         }
@@ -196,13 +212,13 @@ pub fn gaps(profile: &Path, limit: usize) -> Result<()> {
         let nearest = if g.nearest.is_empty() {
             String::new()
         } else {
-            format!(" (nearest: {})", g.nearest)
+            format!(" (nearest: {})", flat(&g.nearest))
         };
         println!(
             "{} ago: \"{}\": {}{nearest}",
             nervros_core::how_long(now - g.at),
-            g.request,
-            g.reason
+            flat(&g.request),
+            flat(&g.reason)
         );
     }
     Ok(())
@@ -220,20 +236,15 @@ pub fn inbox(profile_path: &Path, dismiss: Option<u32>) -> Result<()> {
     let proposals = nervros_core::mission::inbox::Inbox::read(&file);
     let ledger = open_ledger(profile_path)?;
     for p in &proposals {
-        println!("{} [{:?}]", p.line(), p.state);
+        println!("{} [{:?}]", flat(&p.line()), p.state);
         if let (Some(at), Some(ledger)) = (p.accepted_at, &ledger) {
             #[expect(clippy::cast_precision_loss, reason = "seconds since 1970")]
             let since = ledger.track_since(&p.skill, &p.target, at as f64)?;
-            let record = |t: Option<&nervros_core::mission::ledger::Track>| {
-                t.map_or_else(
-                    || "no runs".to_owned(),
-                    |t| format!("{} of {}", t.succeeded, t.runs),
-                )
-            };
+            let said = nervros_core::mission::ledger::Track::said;
             println!(
                 "    before: {}; since: {}",
-                record(p.before.as_ref()),
-                record(since.as_ref())
+                said(p.before.as_ref()),
+                said(since.as_ref())
             );
         }
     }
@@ -287,7 +298,7 @@ pub fn incidents(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
         let Some(incident) = all.iter().find(|i| i.id.eq_ignore_ascii_case(id)) else {
             bail!("no incident {id} in {}", file.display());
         };
-        print!("{}", incident.text(now));
+        print!("{}", crate::printable(&incident.text(now), "\n"));
         return Ok(());
     }
     if all.is_empty() {
@@ -298,7 +309,7 @@ pub fn incidents(profile: &Path, id: Option<&str>, limit: usize) -> Result<()> {
             "{} {} ago: {}",
             i.id,
             nervros_core::how_long(now - i.opened_s),
-            i.headline()
+            flat(&i.headline())
         );
     }
     Ok(())

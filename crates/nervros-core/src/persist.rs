@@ -15,16 +15,29 @@ use serde::de::DeserializeOwned;
 ///
 /// The folder, the temporary file or the rename failed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Each write its own temporary file: two saves of one file must not share one.
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = dir {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = beside(path, &format!("{}.tmp", std::process::id()));
-    let written = std::fs::File::create(&tmp).and_then(|mut f| {
-        f.write_all(bytes)?;
-        f.sync_all()
-    });
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let tmp = beside(path, &format!("{}.{n}.tmp", std::process::id()));
+    // Readable by its owner only: the files hold conversations, notes and pending requests.
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(bytes)?;
+            f.sync_all()
+        });
     match written.and_then(|()| std::fs::rename(&tmp, path)) {
-        Ok(()) => Ok(()),
+        // The rename is kept only once the folder that holds it is on disk.
+        Ok(()) => dir.map_or(Ok(()), |d| std::fs::File::open(d)?.sync_all()),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
@@ -50,8 +63,17 @@ pub fn read_or_default<T: DeserializeOwned + Default>(path: &Path) -> T {
     let text = match std::fs::read(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return T::default(),
+        // Moved aside as a corrupt one is: the next save would write over what it holds.
         Err(e) => {
-            tracing::warn!(file = %path.display(), error = %e, "unreadable; starting empty");
+            let aside = beside(path, "unreadable");
+            let moved = std::fs::rename(path, &aside);
+            tracing::warn!(
+                file = %path.display(),
+                error = %e,
+                kept_as = %aside.display(),
+                moved = moved.is_ok(),
+                "unreadable; starting empty"
+            );
             return T::default();
         }
     };
@@ -86,11 +108,21 @@ mod tests {
 
     #[test]
     fn a_write_replaces_the_file_whole_and_a_corrupt_file_is_kept_aside() {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deep").join("notes.json");
         write_atomic(&path, b"[1, 2]").unwrap();
         assert_eq!(read_or_default::<Vec<u32>>(&path), [1, 2]);
-        assert!(!beside(&path, &format!("{}.tmp", std::process::id())).exists());
+        let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "no temporary file is left");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         std::fs::write(&path, b"[1, 2").unwrap();
         assert!(read_or_default::<Vec<u32>>(&path).is_empty());
         assert_eq!(std::fs::read(beside(&path, "corrupt")).unwrap(), b"[1, 2");

@@ -31,4 +31,4 @@ reqwest.workspace = true
 sha2.workspace = true
 futures.workspace = true
 humantime.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal", "process"] }

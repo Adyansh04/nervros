@@ -696,8 +696,16 @@ async fn a_tool_allowed_for_the_session_stops_asking_unless_it_moves_the_robot()
         );
         let mut rx = session.subscribe();
         session.send(Command::User("go".into()));
+        // A request that cannot be allowed for the session waits for a plain yes after it.
+        let last = std::cell::Cell::new(0);
         let allow = |e: &Event| match e {
-            Event::ApprovalRequested { id, .. } => Some(Command::AllowForSession(*id)),
+            Event::ApprovalRequested { id, .. } => {
+                last.set(*id);
+                Some(Command::AllowForSession(*id))
+            }
+            Event::Notice { text } if text.contains("asked every time") => {
+                Some(Command::Approve(last.get()))
+            }
             _ => None,
         };
         let events = collect_until_finished(&mut rx, allow, &session).await;
@@ -759,8 +767,15 @@ async fn a_call_that_always_asks_is_asked_every_time_even_when_autonomous() {
     );
     let mut rx = session.subscribe();
     session.send(Command::User("go".into()));
+    let last = std::cell::Cell::new(0);
     let allow = |e: &Event| match e {
-        Event::ApprovalRequested { id, .. } => Some(Command::AllowForSession(*id)),
+        Event::ApprovalRequested { id, .. } => {
+            last.set(*id);
+            Some(Command::AllowForSession(*id))
+        }
+        Event::Notice { text } if text.contains("asked every time") => {
+            Some(Command::Approve(last.get()))
+        }
         _ => None,
     };
     let events = collect_until_finished(&mut rx, allow, &session).await;
@@ -938,6 +953,12 @@ fn a_plain_order_to_stop_is_known_and_a_sentence_about_stopping_is_not() {
         " freeze ",
         "please stop",
         "stop the robot!",
+        "emergency stop",
+        "Abort!",
+        "stop, now",
+        "stop please",
+        "E-stop",
+        "stop everything",
     ] {
         assert!(is_stop_word(word), "{word}");
     }
@@ -1021,7 +1042,18 @@ async fn a_stop_closes_what_it_cut_short_and_forgets_the_request() {
         events.extend(more_until(&mut rx, closed).await);
     }
     assert!(closed(&events), "{events:?}");
-    assert!(!pending.exists(), "a stopped request is not asked again");
+    // The file is updated off the actor, just behind the events.
+    let gone = async {
+        while pending.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), gone)
+            .await
+            .is_ok(),
+        "a stopped request is not asked again"
+    );
 }
 
 #[tokio::test]

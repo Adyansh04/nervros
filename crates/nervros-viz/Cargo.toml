@@ -12,6 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+futures.workspace = true
 nervros-core = { path = "../nervros-core" }
 nervros-ros = { path = "../nervros-ros", default-features = false }
 rerun.workspace = true

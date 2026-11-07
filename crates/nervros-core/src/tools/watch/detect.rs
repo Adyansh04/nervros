@@ -3,12 +3,12 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nervros_ros::RobotPort;
 use serde_json::Value;
 
-use super::{Condition, Looker, PERIOD, topic_of};
+use super::{Condition, Looker, PERIOD, Reading, VALUE_FRESH, topic_of};
 use crate::mission::check::named;
 use crate::profile::TopicRef;
 
@@ -17,6 +17,8 @@ const OBJECT_PERIOD: Duration = Duration::from_secs(2);
 const OBJECT_WAIT: Duration = Duration::from_secs(1);
 /// The canopy object state for an object it removed.
 const REMOVED: u64 = 2;
+/// The least time between two reports of a text watch: a burst of matching lines is one report.
+const TEXT_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// What to wait for.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +64,12 @@ impl Trigger {
         }
         let condition = Condition::parse(args)?;
         let (topic, ty) = topic_of(robot, args, read_deny, condition.reads_messages()).await?;
+        // Numbers at a sensor's rate: every message read, and no text in any of them.
+        if matches!(condition, Condition::Text(_)) && super::NUMERIC_TYPES.contains(&ty.as_str()) {
+            return Err(format!(
+                "{topic} carries {ty}, which holds no text to watch for; watch a value of it"
+            ));
+        }
         Ok(Self::Topic {
             topic,
             ty,
@@ -101,6 +109,12 @@ pub(crate) struct Detector {
     robot: Arc<dyn RobotPort>,
     source: Source,
     was: bool,
+    /// Whether the last look found nothing recent to judge.
+    silent: bool,
+    /// That the topic went quiet, until the watch has told it.
+    quiet: Option<String>,
+    /// Until when a text watch that fired stays still.
+    quiet_until: Option<Instant>,
     /// The objects seen so far; none before the first read that answered.
     known: Option<BTreeSet<String>>,
 }
@@ -144,8 +158,16 @@ impl Detector {
             robot: Arc::clone(robot),
             source,
             was: false,
+            silent: false,
+            quiet: None,
+            quiet_until: None,
             known: None,
         })
+    }
+
+    /// That the topic stopped speaking, once per silence: until it speaks again nothing is judged.
+    pub(crate) fn went_quiet(&mut self) -> Option<String> {
+        self.quiet.take()
     }
 
     /// How long a look's turn takes, its own time included.
@@ -178,13 +200,40 @@ impl Detector {
                 condition,
                 looker,
             } => {
-                let seen = looker
+                let look = looker
                     .look(self.robot.as_ref(), topic, ty, condition)
                     .await
                     .map_err(|e| format!("it cannot read {topic}: {e}"))?;
-                let fired = !self.was && seen.is_some();
-                self.was = seen.is_some();
-                Ok(seen.filter(|_| fired))
+                let silent = look == Reading::Silent;
+                if silent && !self.silent {
+                    self.quiet = Some(format!(
+                        "{topic} has said nothing in {} s, so no older value is judged until it \
+                         speaks again",
+                        VALUE_FRESH.as_secs()
+                    ));
+                }
+                self.silent = silent;
+                match look {
+                    // Silence is no news: what held before it still holds.
+                    Reading::Silent => Ok(None),
+                    Reading::Not => {
+                        self.was = false;
+                        Ok(None)
+                    }
+                    // A line said is an event, not a state: each is news, a cooldown apart.
+                    Reading::Holds(seen) if matches!(condition, Condition::Text(_)) => {
+                        self.was = true;
+                        let now = Instant::now();
+                        let fire = self.quiet_until.is_none_or(|until| now >= until);
+                        if fire {
+                            self.quiet_until = Some(now + TEXT_COOLDOWN);
+                        }
+                        Ok(fire.then_some(seen))
+                    }
+                    Reading::Holds(seen) => {
+                        Ok((!std::mem::replace(&mut self.was, true)).then_some(seen))
+                    }
+                }
             }
             Source::Object { feed, phrase, room } => {
                 // A read that went unanswered says nothing: as an empty world, it would make every
@@ -302,6 +351,74 @@ mod tests {
             Some("O5 appeared")
         );
         assert_eq!(detector.newly().await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn a_value_gone_quiet_is_told_once_and_never_judged_old() {
+        let fake = Arc::new(FakeRobot::new().with_topic("/battery", json!({"percentage": 50.0})));
+        let robot = Arc::clone(&fake) as Arc<dyn RobotPort>;
+        let condition = Condition::parse(
+            &json!({"condition": "value", "field": "percentage", "op": "<", "value": 20}),
+        )
+        .unwrap();
+        let trigger = Trigger::Topic {
+            topic: "/battery".to_owned(),
+            ty: "sensor_msgs/msg/BatteryState".to_owned(),
+            condition,
+        };
+        let mut detector = Detector::open(trigger, &robot, None).await.unwrap();
+        detector.settle().await.unwrap();
+        assert_eq!(detector.went_quiet(), None);
+        fake.set_topic("/battery", json!({"percentage": 10.0}));
+        fake.go_quiet("/battery");
+        assert_eq!(
+            detector.newly().await,
+            Ok(None),
+            "an old value fires nothing"
+        );
+        assert!(
+            detector
+                .went_quiet()
+                .is_some_and(|q| q.starts_with("/battery has said nothing")),
+        );
+        assert_eq!(detector.newly().await, Ok(None));
+        assert_eq!(detector.went_quiet(), None, "told once per silence");
+        fake.set_topic("/battery", json!({"percentage": 10.0}));
+        assert_eq!(
+            detector.newly().await.unwrap().as_deref(),
+            Some("percentage is 10.0")
+        );
+        fake.go_quiet("/battery");
+        assert_eq!(detector.newly().await, Ok(None));
+        fake.set_topic("/battery", json!({"percentage": 10.0}));
+        assert_eq!(
+            detector.newly().await,
+            Ok(None),
+            "still low after the silence: not news"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_text_said_again_fires_again_once_cooled() {
+        let fake = Arc::new(
+            FakeRobot::new().with_topic("/rosout", json!({"msg": "error: the disk is full"})),
+        );
+        let robot = Arc::clone(&fake) as Arc<dyn RobotPort>;
+        let condition =
+            Condition::parse(&json!({"condition": "text", "contains": "error"})).unwrap();
+        let trigger = Trigger::Topic {
+            topic: "/rosout".to_owned(),
+            ty: "rcl_interfaces/msg/Log".to_owned(),
+            condition,
+        };
+        let mut detector = Detector::open(trigger, &robot, None).await.unwrap();
+        assert!(detector.newly().await.unwrap().is_some());
+        assert_eq!(detector.newly().await, Ok(None), "a burst is one report");
+        detector.quiet_until = Some(Instant::now());
+        assert!(
+            detector.newly().await.unwrap().is_some(),
+            "said again after the cooldown"
+        );
     }
 
     #[tokio::test]

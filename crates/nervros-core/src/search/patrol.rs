@@ -16,7 +16,7 @@ use crate::job::{Approval, Context, Envelope, JobKind, Jobs};
 use crate::mission::MissionEnd;
 use crate::mission::catalog::GO_TO_PLACE;
 use crate::mission::check::{self, Observed};
-use crate::mission::{Missions, Outcome};
+use crate::mission::{Missions, NotRun, Outcome};
 use crate::profile::TurnSkill;
 use crate::tools::{Assessment, Risk, Status, Tool, ToolOutcome, ToolSpec};
 
@@ -46,7 +46,7 @@ impl PatrolTool {
         let spec = ToolSpec::new(
             "patrol",
             "Inspects a round of places on its own: walks to each, looks around it with a full \
-             turn on the spot, then reports what it saw in each room and what moved or went \
+             turn on the spot where the robot has one, then reports what it saw in each room and what moved or went \
              missing meanwhile: for \"check on the apartment\" or \"is everything where it \
              should be?\". The places are names from list_places, or room or object ids. Runs \
              as a job; a report follows.",
@@ -98,19 +98,31 @@ async fn patrol(
     places: &[String],
     turn: Option<&TurnSkill>,
 ) -> Result<String, String> {
-    let began = crate::now_s();
+    // Compared with the world model's stamps: ROS time, a simulator's under sim time.
+    let began = missions.robot().ros_now_s();
     let (mut visited, mut missed, mut saw) = (Vec::new(), Vec::new(), Vec::new());
     for (n, place) in places.iter().enumerate() {
         ctx.log(format!("{}. {place}", n + 1));
         let steps = json!([{"skill": GO_TO_PLACE, "args": {"place": place}}]);
-        let end = run_at(missions, ctx, place, &format!("patrol to {place}"), steps).await?;
-        if end.outcome != Outcome::Success {
-            ctx.log(format!("could not get to {place}: {}", end.reason));
-            missed.push(place.clone());
-            continue;
+        let end = run_at(missions, ctx, place, &format!("patrol to {place}"), steps)
+            .await
+            .map_err(|e| with_visited(&e, &visited))?;
+        // A place it may not walk to, as one a zone now covers, is passed over, not the round's end.
+        match end {
+            Ok(end) if end.outcome == Outcome::Success => {}
+            Ok(end) => {
+                ctx.log(format!("could not get to {place}: {}", end.reason));
+                missed.push(place.clone());
+                continue;
+            }
+            Err(refused) => {
+                ctx.log(format!("may not go to {place}: {refused}"));
+                missed.push(place.clone());
+                continue;
+            }
         }
         visited.push(place.clone());
-        let arrived = crate::now_s();
+        let arrived = missions.robot().ros_now_s();
         match turn {
             Some(turn) => look_around(missions, ctx, place, turn).await?,
             None => hold(ctx).await?,
@@ -120,6 +132,13 @@ async fn patrol(
             ctx.log(line.clone());
             saw.push(line);
         }
+    }
+    // A round that reached no place is no round done, however honestly it says so.
+    if visited.is_empty() && !missed.is_empty() {
+        return Err(format!(
+            "the patrol reached no place: could not get to {}",
+            list(&missed)
+        ));
     }
     let mut text = format!("visited {}", list(&visited));
     if turn.is_none() {
@@ -156,11 +175,12 @@ async fn run_at(
     place: &str,
     intent: &str,
     steps: Value,
-) -> Result<MissionEnd, String> {
-    let end = missions
-        .run_for_job(ctx, intent, steps)
-        .await
-        .map_err(|e| format!("the patrol could not go on: {e}"))?;
+) -> Result<Result<MissionEnd, String>, String> {
+    let end = match missions.run_for_job(ctx, intent, steps).await {
+        Ok(end) => end,
+        Err(NotRun::Refused(why)) => return Ok(Err(why)),
+        Err(NotRun::Cannot(why)) => return Err(format!("the patrol could not go on: {why}")),
+    };
     if let Some(fault) = end.fault {
         return Err(format!(
             "the patrol stopped at {place}, cut short by the robot ({}): {}",
@@ -171,7 +191,16 @@ async fn run_at(
     if end.outcome == Outcome::Canceled {
         return Err("the patrol was stopped".to_owned());
     }
-    Ok(end)
+    Ok(Ok(end))
+}
+
+/// `why` the patrol ended, with the places it had visited by then.
+fn with_visited(why: &str, visited: &[String]) -> String {
+    if visited.is_empty() {
+        why.to_owned()
+    } else {
+        format!("{why}; it had visited {}", list(visited))
+    }
 }
 
 /// The views of a full turn on the spot at `place`, each held still: a turn mid-way is no view to
@@ -188,8 +217,13 @@ async fn look_around(
         if view > 0 {
             let intent = format!("look around at {place}");
             let end = run_at(missions, ctx, place, &intent, quarter.clone()).await?;
-            if end.outcome != Outcome::Success {
-                ctx.log(format!("could not look around at {place}: {}", end.reason));
+            let why = match &end {
+                Ok(end) if end.outcome == Outcome::Success => None,
+                Ok(end) => Some(end.reason.clone()),
+                Err(refused) => Some(refused.clone()),
+            };
+            if let Some(why) = why {
+                ctx.log(format!("could not look around at {place}: {why}"));
                 return Ok(());
             }
         }
@@ -298,19 +332,42 @@ impl Tool for PatrolTool {
 
     /// Approved once with its round and its time limit.
     async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
-        Some(match round(args) {
-            Ok((places, minutes)) => Ok(Assessment {
-                risk: Risk::Motion,
-                resources: Vec::new(),
-                reason: format!(
-                    "patrols {} on its own, looking around at each, for at most {minutes} min, \
-                     then says what it saw and what changed",
-                    places.join(", ")
-                ),
-                args: Some(json!({"places": places, "max_minutes": minutes})),
-            }),
-            Err(e) => Err(ToolOutcome::failed(e)),
-        })
+        let (places, minutes) = match round(args) {
+            Ok(r) => r,
+            Err(e) => return Some(Err(ToolOutcome::failed(e))),
+        };
+        // Named wrong, a place would end the round only once the walks before it were made.
+        let unknown = self.missions.unknown_places(&places).await;
+        if !unknown.is_empty() {
+            return Some(Err(ToolOutcome::failed(format!(
+                "no place, room or object is called {}: use names from list_places, or room or \
+                 object ids",
+                unknown.join(", ")
+            ))));
+        }
+        // Said as the catalog has it: without a turn on the spot, a place gets a pause.
+        let turns = match self.missions.catalog().await {
+            Ok(c) => self
+                .missions
+                .turn_skill()
+                .is_some_and(|t| c.skill(&t.skill).is_some()),
+            Err(_) => false,
+        };
+        let how = if turns {
+            "looking around at each with a turn on the spot"
+        } else {
+            "stopping a few seconds at each, as it has no turn on the spot to look around with"
+        };
+        Some(Ok(Assessment {
+            risk: Risk::Motion,
+            resources: Vec::new(),
+            reason: format!(
+                "patrols {} on its own, {how}, for at most {minutes} min, then says what it saw \
+                 and what changed",
+                places.join(", ")
+            ),
+            args: Some(json!({"places": places, "max_minutes": minutes})),
+        }))
     }
 
     async fn call(&self, args: Value) -> ToolOutcome {

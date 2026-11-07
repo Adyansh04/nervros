@@ -27,6 +27,8 @@ const MAP_WAIT: Duration = Duration::from_secs(30);
 const FIND_WAIT: Duration = Duration::from_secs(2);
 /// The spread a set pose starts with: about half a metre and 15 degrees.
 const POSE_VARIANCE: [f64; 2] = [0.25, 0.068];
+/// The heading's spread when none was given: any way round, rad^2.
+const UNKNOWN_YAW_VARIANCE: f64 = std::f64::consts::PI * std::f64::consts::PI;
 
 /// The tool.
 pub(super) struct NavAdmin {
@@ -35,14 +37,16 @@ pub(super) struct NavAdmin {
     profile: Profile,
     robot: Arc<dyn RobotPort>,
     places: Arc<Places>,
+    /// What Nav2 does now, so localization and maps do not change under a walk.
+    watcher: Option<Arc<super::status::Watcher>>,
 }
 
 impl NavAdmin {
     pub(super) fn new(
         config: &Nav2Config,
         profile: &Profile,
-        robot: Arc<dyn RobotPort>,
-        places: Arc<Places>,
+        (robot, places): (Arc<dyn RobotPort>, Arc<Places>),
+        watcher: Option<Arc<super::status::Watcher>>,
     ) -> Self {
         let spec = ToolSpec::new(
             "nav_admin",
@@ -80,6 +84,7 @@ impl NavAdmin {
             profile: profile.clone(),
             robot,
             places,
+            watcher,
         }
     }
 
@@ -166,12 +171,18 @@ impl NavAdmin {
             Ok(s) => s,
             Err(why) => return ToolOutcome::failed(why),
         };
+        // A place, room or point without a heading leaves localization to find it: 0 is only a
+        // start, with a spread that covers every way round.
         let yaw = spot.yaw.unwrap_or(0.0);
         let at = stamped(&self.profile.ros.map_frame, spot.x, spot.y, yaw);
         let mut covariance = vec![0.0; 36];
         covariance[0] = POSE_VARIANCE[0];
         covariance[7] = POSE_VARIANCE[0];
-        covariance[35] = POSE_VARIANCE[1];
+        covariance[35] = if spot.yaw.is_some() {
+            POSE_VARIANCE[1]
+        } else {
+            UNKNOWN_YAW_VARIANCE
+        };
         let pose = json!({
             "header": at["header"],
             "pose": {"pose": at["pose"], "covariance": covariance},
@@ -188,7 +199,7 @@ impl NavAdmin {
         // A localization without the service still takes a pose on `initialpose`.
         if set.is_err() {
             let topic = self.config.name("initialpose");
-            if let Err(e) = self
+            match self
                 .robot
                 .publish(
                     &topic,
@@ -199,11 +210,18 @@ impl NavAdmin {
                 )
                 .await
             {
-                return ToolOutcome::failed(format!("localization took no pose: {e}"));
+                Ok(0) => {
+                    return ToolOutcome::failed(format!(
+                        "localization took no pose: nothing listens on {topic}"
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => return ToolOutcome::failed(format!("localization took no pose: {e}")),
             }
         }
         ToolOutcome::ok(json!({
-            "pose": {"x": spot.x, "y": spot.y, "yaw": yaw},
+            "pose": {"x": spot.x, "y": spot.y, "yaw": spot.yaw},
+            "heading": if spot.yaw.is_some() { "as given" } else { "not given: localization looks every way round" },
             "at": spot.what,
         }))
     }
@@ -229,26 +247,44 @@ impl NavAdmin {
         let Some(code) = lifecycle_code(command) else {
             return ToolOutcome::failed("navigation takes command pause, resume, reset or startup");
         };
-        let service = self
-            .config
-            .name(&format!("{}/manage_nodes", self.config.lifecycle_manager));
-        match self
+        let manager = &self.config.lifecycle_manager;
+        let service = self.config.name(&format!("{manager}/manage_nodes"));
+        let called = self
             .call_service(
                 &service,
                 "nav2_msgs/srv/ManageLifecycleNodes",
                 json!({"command": code}),
                 MAP_WAIT,
             )
+            .await;
+        // What Nav2 is now decides, whatever the call said: a manager slow to answer may have
+        // done it all the same.
+        let active = self
+            .robot
+            .call(
+                &self.config.name(&format!("{manager}/is_active")),
+                "std_srvs/srv/Trigger",
+                json!({}),
+                CALL_WAIT,
+            )
             .await
-        {
-            Ok(r) if r["success"].as_bool() == Some(true) => {
-                ToolOutcome::ok(json!({"navigation": command, "done": true}))
-            }
-            Ok(_) => ToolOutcome::failed(format!(
-                "Nav2's lifecycle manager could not {command} its servers"
-            )),
-            Err(why) => ToolOutcome::failed(why),
+            .ok()
+            .and_then(|r| r["success"].as_bool());
+        let state = match active {
+            Some(true) => "active",
+            Some(false) => "not active",
+            None => "in a state it did not say",
+        };
+        let said_done = matches!(&called, Ok(r) if r["success"].as_bool() == Some(true));
+        let wanted = matches!(command, "startup" | "resume");
+        if active.map_or(said_done, |a| a == wanted) {
+            return ToolOutcome::ok(json!({"navigation": command, "done": true, "nav2": state}));
         }
+        let why = match called {
+            Ok(_) => format!("Nav2's lifecycle manager could not {command} its servers"),
+            Err(why) => why,
+        };
+        ToolOutcome::failed(format!("{why}; Nav2 is {state} now"))
     }
 
     async fn save_map(&self, args: &Value) -> ToolOutcome {
@@ -355,7 +391,12 @@ impl NavAdmin {
             .await
         {
             Ok(r) => match r["result"].as_u64() {
-                Some(0) => ToolOutcome::ok(json!({"loaded": url})),
+                Some(0) => ToolOutcome {
+                    message: "The keep-out zones keep their coordinates: on another map, check \
+                              they still cover what they were drawn on, and set the robot's pose"
+                        .to_owned(),
+                    ..ToolOutcome::ok(json!({"loaded": url}))
+                },
                 Some(1) => ToolOutcome::failed(format!("there is no map at {url}")),
                 Some(2 | 3) => ToolOutcome::failed(format!("the map at {url} cannot be read")),
                 _ => ToolOutcome::failed(format!("the map server could not load {url}")),
@@ -384,7 +425,22 @@ impl Tool for NavAdmin {
 
     async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
         let base = vec![Resource::Base];
-        let (risk, resources, reason) = match args["action"].as_str().unwrap_or_default() {
+        let action = args["action"].as_str().unwrap_or_default();
+        // A walk another client runs would have its localization or map changed under it.
+        if matches!(
+            action,
+            "set_pose" | "relocalize" | "load_map" | "load_route_graph"
+        ) && let Some(watcher) = &self.watcher
+        {
+            let seen = watcher.now(self.robot.as_ref()).await;
+            if seen.moving() {
+                return Some(Err(ToolOutcome::refused(format!(
+                    "Nav2 is moving the base now ({}): stop it, or let it end, first",
+                    seen.running.join(", ")
+                ))));
+            }
+        }
+        let (risk, resources, reason) = match action {
             "clear_costmaps" => {
                 let names: Vec<String> = self
                     .costmaps(args)
@@ -396,7 +452,8 @@ impl Tool for NavAdmin {
                     .map_or(String::new(), |d| format!(" within {d:.1} m of the robot"));
                 (
                     Risk::WorldEdit,
-                    Vec::new(),
+                    // A walking mission holds the base: its navigation plans with these costmaps.
+                    vec![Resource::Base],
                     format!(
                         "clears Nav2's {}{around}: what its sensors saw there is gone until they \
                          see it again",
@@ -440,7 +497,8 @@ impl Tool for NavAdmin {
                 Risk::WorldEdit,
                 base,
                 format!(
-                    "switches Nav2 to the map {}: localization starts over on it",
+                    "switches Nav2 to the map {}: localization starts over on it, and the keep-out \
+                     zones stay at their coordinates, which on another map may cover other places",
                     args["url"].as_str().unwrap_or("?")
                 ),
             ),
@@ -482,7 +540,12 @@ mod tests {
         )
         .unwrap();
         let places = Places::new(&profile, None);
-        NavAdmin::new(&Nav2Config::default(), &profile, Arc::new(robot), places)
+        NavAdmin::new(
+            &Nav2Config::default(),
+            &profile,
+            (Arc::new(robot), places),
+            None,
+        )
     }
 
     #[tokio::test]

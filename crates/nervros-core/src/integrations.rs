@@ -38,7 +38,9 @@ pub trait Integration: Send + Sync + std::fmt::Debug {
     fn status(&self) -> Vec<String>;
 
     /// Cancels every goal it sent that still runs.
-    async fn stop(&self);
+    ///
+    /// Returns what may still be moving, in words: a cancel that failed or was not answered.
+    async fn stop(&self) -> Vec<String>;
 
     /// Where it reports what it draws; once the session has started.
     fn attach(&self, _session: &crate::session::SessionHandle) {}
@@ -117,6 +119,26 @@ impl Control {
 pub struct Goals {
     open: Mutex<std::collections::BTreeMap<uuid::Uuid, (String, nervros_ros::CancelFn)>>,
     changed: Arc<tokio::sync::Notify>,
+    /// When the session's loop last beat, ms since the epoch; 0 before it ever has.
+    beat: std::sync::atomic::AtomicU64,
+}
+
+/// How long the session's loop may go without a beat before the open goals are no longer sent:
+/// a wedged agent then goes quiet to the watchdog, which cancels what it left moving. Well above
+/// the loop's 200 ms beat, so a slow moment is not taken for a wedged agent.
+const BEAT_STALE_MS: u64 = 5000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+impl crate::session::Pulse for Goals {
+    fn pulse(&self) {
+        self.beat
+            .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// How often the open goals are sent again while any is open.
@@ -143,21 +165,22 @@ impl Goals {
             return goals;
         };
         let (weak, changed) = (Arc::downgrade(&goals), Arc::clone(&goals.changed));
+        // Detached: it holds the goals weakly and ends once they are dropped.
         tokio::spawn(async move {
-            let publisher = match robot
-                .latched_publisher(&topic, "nervros_interfaces/msg/OpenGoals")
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(%topic, error = %e, "no watchdog will hear of NervROS's goals");
-                    return;
-                }
+            let types = (topic.as_str(), "nervros_interfaces/msg/OpenGoals");
+            let alive = || weak.strong_count() > 0;
+            let Some(publisher) = latched_retrying(robot.as_ref(), types, alive).await else {
+                return;
             };
             while let Some(goals) = weak.upgrade() {
                 let open = goals.open();
+                // Sent only while the session's loop beats, or before it ever has.
+                let beat = goals.beat.load(std::sync::atomic::Ordering::Relaxed);
+                let alive = beat == 0 || now_ms().saturating_sub(beat) < BEAT_STALE_MS;
                 drop(goals);
-                publisher.send(open_goals(&open));
+                if alive {
+                    publisher.send(open_goals(&open));
+                }
                 if open.is_empty() {
                     changed.notified().await;
                 } else {
@@ -187,13 +210,18 @@ impl Goals {
             .collect()
     }
 
-    /// Cancels every open goal.
-    pub async fn cancel_all(&self) {
-        let cancels: Vec<nervros_ros::CancelFn> = crate::lock(&self.open)
+    /// Cancels every open goal; returns the ones whose cancel failed, as "action: why".
+    pub async fn cancel_all(&self) -> Vec<String> {
+        let cancels: Vec<(String, nervros_ros::CancelFn)> = crate::lock(&self.open)
             .values()
-            .map(|(_, c)| Arc::clone(c))
+            .map(|(action, c)| (action.clone(), Arc::clone(c)))
             .collect();
-        futures::future::join_all(cancels.iter().map(|c| c())).await;
+        let answers = futures::future::join_all(cancels.iter().map(|(_, c)| c())).await;
+        cancels
+            .iter()
+            .zip(answers)
+            .filter_map(|((action, _), answer)| answer.err().map(|e| format!("{action}: {e}")))
+            .collect()
     }
 }
 
@@ -211,6 +239,34 @@ impl Drop for Tracked {
     }
 }
 
+/// The longest pause between two tries at a latched publisher.
+const LATCHED_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// A latched publisher on `topic`, asked for again after a growing pause while `alive` holds: one
+/// failure must not leave a watchdog or a costmap filter without news for the whole session. A
+/// port that keeps no latched publishers is not asked again.
+pub(crate) async fn latched_retrying(
+    robot: &dyn RobotPort,
+    (topic, msg_type): (&str, &str),
+    alive: impl Fn() -> bool,
+) -> Option<nervros_ros::Publisher> {
+    let mut wait = Duration::from_secs(1);
+    loop {
+        match robot.latched_publisher(topic, msg_type).await {
+            Ok(publisher) => return Some(publisher),
+            Err(nervros_ros::RosError::Unsupported(_)) => return None,
+            Err(e) => {
+                tracing::warn!(%topic, error = %e, retry_s = wait.as_secs(), "a latched publisher failed; trying again");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(LATCHED_RETRY_MAX);
+                if !alive() {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 /// An `OpenGoals` message of `open`.
 fn open_goals(open: &[(String, uuid::Uuid)]) -> Value {
     json!({
@@ -221,15 +277,62 @@ fn open_goals(open: &[(String, uuid::Uuid)]) -> Value {
     })
 }
 
-/// Cancels a goal that is dropped before it ends, as when its step runs out of time.
-struct CancelOnDrop(Option<nervros_ros::CancelFn>);
+/// How long a paused goal's result is waited for, to tell a goal that ended from one cut short.
+const PAUSE_SETTLE: Duration = Duration::from_millis(500);
 
-impl Drop for CancelOnDrop {
+/// How often, and how far apart, a goal's cancel is retried before it is given up for gone.
+const CANCEL_TRIES: u32 = 10;
+const CANCEL_RETRY: Duration = Duration::from_secs(1);
+
+/// Cancels a goal, retrying, and keeps it among the open goals until a cancel is answered: a stop
+/// and the watchdog must still see a goal whose cancel failed.
+fn settle(cancel: nervros_ros::CancelFn, open: Tracked, action: String) {
+    // Detached on purpose: it outlives the step it ends.
+    tokio::spawn(async move {
+        for _ in 0..CANCEL_TRIES {
+            match cancel().await {
+                Ok(()) => {
+                    drop(open);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(%action, error = %e, "a goal's cancel failed; trying again");
+                    tokio::time::sleep(CANCEL_RETRY).await;
+                }
+            }
+        }
+        tracing::error!(%action, "a goal could not be cancelled; it is taken as gone with its server");
+        drop(open);
+    });
+}
+
+/// A goal kept among the open goals until it is known to have ended. Dropped before its end (its
+/// step ran out of time, or its result was lost), it is cancelled and settled.
+struct Unfinished(Option<(nervros_ros::CancelFn, Tracked, String)>);
+
+impl Unfinished {
+    /// The goal ended on its own, so it leaves the open goals.
+    fn ended(&mut self) {
+        self.0 = None;
+    }
+
+    /// Cancels it now. When the cancel fails, the goal stays open while the cancel is retried.
+    async fn cancel(&mut self) -> Result<(), nervros_ros::RosError> {
+        let Some((cancel, open, action)) = self.0.take() else {
+            return Ok(());
+        };
+        let answer = cancel().await;
+        if answer.is_err() {
+            settle(cancel, open, action);
+        }
+        answer
+    }
+}
+
+impl Drop for Unfinished {
     fn drop(&mut self) {
-        if let Some(cancel) = self.0.take() {
-            tokio::spawn(async move {
-                let _ = cancel().await;
-            });
+        if let Some((cancel, open, action)) = self.0.take() {
+            settle(cancel, open, action);
         }
     }
 }
@@ -271,9 +374,11 @@ pub(crate) async fn run_goal(
             .send_goal(action, action_type, goal.clone(), SEND_WAIT)
             .await
             .map_err(|e| format!("{action} did not take the goal: {e}"))?;
-        let _open = goals.track(action, &sent);
-        let cancel = sent.canceller();
-        let mut unfinished = CancelOnDrop(Some(Arc::clone(&cancel)));
+        let mut unfinished = Unfinished(Some((
+            sent.canceller(),
+            goals.track(action, &sent),
+            action.to_owned(),
+        )));
         let nervros_ros::Goal {
             mut feedback,
             result,
@@ -283,21 +388,45 @@ pub(crate) async fn run_goal(
         let mut last = Value::Null;
         let ended = loop {
             tokio::select! {
-                Some(fb) = feedback.recv() => last = fb,
+                // A goal that ended as a pause came is done: its result is read first, and a stop
+                // or a pause before the feedback, which can keep coming.
+                biased;
                 r = &mut result => break Some(r),
                 true = turns(&mut stop, true) => {
-                    let _ = cancel().await;
-                    return Err("stopped".to_owned());
+                    return Err(match unfinished.cancel().await {
+                        Ok(()) => "stopped".to_owned(),
+                        Err(e) => format!(
+                            "stopped, but the cancel of {action} was not confirmed ({e}); it is retried"
+                        ),
+                    });
                 }
                 true = turns(&mut paused, true), if again.is_some() => {
-                    let _ = cancel().await;
+                    if let Err(e) = unfinished.cancel().await {
+                        return Err(format!(
+                            "{action} could not be paused: its cancel was not confirmed ({e})"
+                        ));
+                    }
+                    // One that reached its end before the cancel is not run again on resume.
+                    if let Ok(r) = tokio::time::timeout(PAUSE_SETTLE, &mut result).await
+                        && matches!(&r, Ok(Ok(g)) if g.status == nervros_ros::GoalStatus::Succeeded)
+                    {
+                        break Some(r);
+                    }
+                    // The resumed goal is made from the last progress there is.
+                    while let Ok(fb) = feedback.try_recv() {
+                        last = fb;
+                    }
                     break None;
                 }
+                Some(fb) = feedback.recv() => last = fb,
             }
         };
-        unfinished.0 = None;
         match (ended, again) {
-            (Some(Ok(r)), _) => return r.map_err(|e| format!("{action}: {e}")),
+            (Some(Ok(r)), _) => {
+                unfinished.ended();
+                return r.map_err(|e| format!("{action}: {e}"));
+            }
+            // Its state is unknown, so the drop below cancels it and keeps it open till answered.
             (Some(Err(_)), _) => return Err(format!("{action} went away")),
             (None, Some(again)) => goal = again(&goal, &last),
             (None, None) => {}
@@ -332,6 +461,8 @@ impl Parts<'_> {
 #[derive(Debug, Default)]
 pub struct Integrations {
     all: Vec<Arc<dyn Integration>>,
+    /// Every goal NervROS's motions and tools have out, which a stop cancels.
+    goals: Arc<Goals>,
 }
 
 impl Integrations {
@@ -346,7 +477,13 @@ impl Integrations {
         if let Some(config) = &parts.profile.moveit {
             all.push(moveit::MoveIt::start(config, parts, &goals));
         }
-        Arc::new(Self { all })
+        Arc::new(Self { all, goals })
+    }
+
+    /// The goals NervROS has out, for a tool that sends goals of its own.
+    #[must_use]
+    pub fn goals(&self) -> Arc<Goals> {
+        Arc::clone(&self.goals)
     }
 
     /// Each, in a fixed order.
@@ -379,8 +516,18 @@ impl Integrations {
     }
 
     /// Cancels what each sent; they stop together.
-    pub async fn stop(&self) {
-        futures::future::join_all(self.all.iter().map(|i| i.stop())).await;
+    /// Stops what every integration sent, and every goal a tool sent; returns what may still be
+    /// moving, in words.
+    pub async fn stop(&self) -> Vec<String> {
+        let mut moving: Vec<String> = futures::future::join_all(self.all.iter().map(|i| i.stop()))
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        moving.extend(self.goals.cancel_all().await);
+        moving.sort();
+        moving.dedup();
+        moving
     }
 }
 
@@ -602,13 +749,8 @@ pub(crate) async fn locate(
     clear_m: f64,
 ) -> Result<Spot, String> {
     let text = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty());
-    let known = |name: &str| {
-        let same = |a: &str| crate::places::same_words(a, name);
-        places
-            .all()
-            .into_iter()
-            .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)))
-    };
+    let all = places.all();
+    let known = |name: &str| crate::places::find(&all, name).cloned();
     // A model gives a place's name as an object as often as not.
     let place = text("place").or_else(|| text("object").filter(|o| known(o).is_some()));
     if let Some(place) = place {
@@ -622,6 +764,11 @@ pub(crate) async fn locate(
             .ok_or_else(|| format!("`{place}` is not a known place; list_places names them"));
     }
     let world = profile.world.as_ref();
+    if text("room").is_some() && text("object").is_some() {
+        return Err("say a room or an object, not both".to_owned());
+    }
+    // A world model that does not answer is not one without the room or the object.
+    let silent = |e: nervros_ros::RosError| format!("the world model did not answer: {e}");
     if let Some(room) = text("room") {
         let Some(topic) = world.and_then(|w| w.rooms.as_ref()) else {
             return Err("this robot has no world model with rooms".to_owned());
@@ -629,7 +776,7 @@ pub(crate) async fn locate(
         let rooms = robot
             .latest(&topic.topic, &topic.msg_type, READ_WAIT)
             .await
-            .unwrap_or(Value::Null);
+            .map_err(silent)?;
         let found = rooms["rooms"].as_array().into_iter().flatten().find(|r| {
             ["id", "name", "type"].iter().any(|k| {
                 r[k].as_str()
@@ -659,8 +806,8 @@ pub(crate) async fn locate(
         let objects = robot
             .latest(&topic.topic, &topic.msg_type, READ_WAIT)
             .await
-            .unwrap_or(Value::Null);
-        return beside(&objects, id, from, clear_m);
+            .map_err(silent)?;
+        return beside(&objects, id, (from, robot.ros_now_s()), clear_m);
     }
     match (args["x"].as_f64(), args["y"].as_f64()) {
         (Some(x), Some(y)) if x.is_finite() && y.is_finite() => Ok(Spot {
@@ -673,12 +820,16 @@ pub(crate) async fn locate(
     }
 }
 
+/// The world model's state for an object it removed (`WorldObject.STATE_REMOVED`).
+const REMOVED_STATE: u64 = 2;
+
 /// The spot beside object `id` of the world model's `objects`, on the side toward `from`, about
-/// `clear_m` off its box: its own centre is occupied.
+/// `clear_m` off its box: its own centre is occupied. `now_s` is on the robot's ROS clock, as the
+/// world model's stamps are.
 pub(crate) fn beside(
     objects: &Value,
     id: &str,
-    from: Option<(f64, f64)>,
+    (from, now_s): (Option<(f64, f64)>, f64),
     clear_m: f64,
 ) -> Result<Spot, String> {
     let found = objects["objects"]
@@ -691,6 +842,11 @@ pub(crate) fn beside(
             "the world model has no object `{id}`; find_objects gives ids"
         ));
     };
+    if found["state"].as_u64() == Some(REMOVED_STATE) {
+        return Err(format!(
+            "the world model removed `{id}`: it is no longer there; find_objects gives ids"
+        ));
+    }
     let p = &found["pose"]["position"];
     let (Some(ox), Some(oy)) = (p["x"].as_f64(), p["y"].as_f64()) else {
         return Err(format!("`{id}` has no position in the world model"));
@@ -710,11 +866,19 @@ pub(crate) fn beside(
         .as_str()
         .filter(|l| !l.is_empty())
         .unwrap_or(id);
+    // Where it was when last seen: an old sighting says so.
+    let seen_s = crate::stamp_s(&found["last_seen"]);
+    let age_h = (now_s - seen_s) / 3600.0;
+    let what = if seen_s > 0.0 && age_h >= 1.0 {
+        format!("{label}, as last seen {age_h:.0} h ago")
+    } else {
+        label.to_owned()
+    };
     Ok(Spot {
         x: ox + dx / d * off,
         y: oy + dy / d * off,
         yaw: Some((-dy).atan2(-dx)),
-        what: label.to_owned(),
+        what,
     })
 }
 
@@ -751,7 +915,123 @@ mod tests {
         fn status(&self) -> Vec<String> {
             vec![self.0.to_owned()]
         }
-        async fn stop(&self) {}
+        async fn stop(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    /// A goal that runs until it is cancelled, and the controls a mission gives it.
+    fn endless() -> (
+        Arc<nervros_ros::fake::FakeRobot>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::sync::watch::Sender<bool>,
+        Control,
+    ) {
+        let robot = Arc::new(
+            nervros_ros::fake::FakeRobot::new().with_action("/move", |_| {
+                nervros_ros::fake::ScriptedRun {
+                    feedback: vec![json!({"left": 1.0}); 2000],
+                    step: std::time::Duration::from_millis(20),
+                    ..nervros_ros::fake::ScriptedRun::default()
+                }
+            }),
+        );
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let (pause, pause_rx) = tokio::sync::watch::channel(false);
+        let ctl = Control {
+            stop: stop_rx,
+            paused: pause_rx,
+        };
+        (robot, stop, pause, ctl)
+    }
+
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_cancels_the_goal_it_finds_running() {
+        let (robot, stop, _pause, ctl) = endless();
+        let goals = Arc::new(Goals::default());
+        let port = Arc::clone(&robot) as Arc<dyn RobotPort>;
+        let tracked = Arc::clone(&goals);
+        let run = tokio::spawn(async move {
+            run_goal(
+                port.as_ref(),
+                &tracked,
+                ("/move", "x/action/Move"),
+                json!({}),
+                &ctl,
+                None,
+            )
+            .await
+        });
+        settle().await;
+        assert_eq!(goals.open().len(), 1, "tracked while it runs");
+        stop.send(true).unwrap();
+        assert_eq!(run.await.unwrap().unwrap_err(), "stopped");
+        assert_eq!(robot.cancels(), 1);
+        assert!(goals.open().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pause_cancels_the_goal_and_a_resume_sends_it_again() {
+        let (robot, stop, pause, ctl) = endless();
+        let goals = Arc::new(Goals::default());
+        let port = Arc::clone(&robot) as Arc<dyn RobotPort>;
+        let run = tokio::spawn({
+            let goals = Arc::clone(&goals);
+            async move {
+                let again: Again<'_> = &|goal: &Value, _last: &Value| goal.clone();
+                run_goal(
+                    port.as_ref(),
+                    &goals,
+                    ("/move", "x/action/Move"),
+                    json!({}),
+                    &ctl,
+                    Some(again),
+                )
+                .await
+            }
+        });
+        settle().await;
+        pause.send(true).unwrap();
+        settle().await;
+        assert_eq!(robot.cancels(), 1, "paused: its goal cancelled");
+        assert_eq!(robot.calls().len(), 1, "and none sent while paused");
+        pause.send(false).unwrap();
+        settle().await;
+        assert_eq!(robot.calls().len(), 2, "resumed: sent again");
+        stop.send(true).unwrap();
+        assert_eq!(run.await.unwrap().unwrap_err(), "stopped");
+        assert_eq!(robot.cancels(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancel_all_cancels_every_goal_out() {
+        let (robot, _stop, _pause, ctl) = endless();
+        let goals = Arc::new(Goals::default());
+        let port = Arc::clone(&robot) as Arc<dyn RobotPort>;
+        let tracked = Arc::clone(&goals);
+        let run = tokio::spawn(async move {
+            run_goal(
+                port.as_ref(),
+                &tracked,
+                ("/move", "x/action/Move"),
+                json!({}),
+                &ctl,
+                None,
+            )
+            .await
+        });
+        settle().await;
+        assert!(
+            goals.cancel_all().await.is_empty(),
+            "every cancel confirmed"
+        );
+        assert_eq!(robot.cancels(), 1);
+        let ended = run.await.unwrap().unwrap();
+        assert_eq!(ended.status, nervros_ros::GoalStatus::Canceled);
     }
 
     #[tokio::test]
@@ -850,6 +1130,7 @@ mod tests {
         assert_eq!(quiet.text(), "");
         let some = Integrations {
             all: vec![Arc::new(Says("Nav2: idle")), Arc::new(Says(""))],
+            ..Integrations::default()
         };
         assert_eq!(some.text(), "\n\nThe robot's stacks now:\n- Nav2: idle");
     }

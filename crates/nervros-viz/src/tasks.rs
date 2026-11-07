@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use nervros_core::profile::TopicRef;
 use nervros_ros::image::encode_jpeg;
 use nervros_ros::{RobotPort, Transform};
@@ -12,11 +13,12 @@ use rerun::RecordingStream;
 use serde_json::{Value, json};
 use tokio::time::{MissedTickBehavior, interval};
 
+use crate::layers::Markers;
 use crate::objects::object_colour;
-use crate::spawner::Layer;
+use crate::spawner::{Layer, to_map};
 use crate::{
-    CAMERA_PERIOD, CAMERA_QUALITY, FOLLOW_PATH, MODEL_PATH, OBJECTS_PERIOD, POSE_PERIOD,
-    ROBOT_FRAME, ROBOT_MARK, SCAN_PERIOD, TOPIC_WAIT, f32s, layers, put, put_static,
+    CAMERA_PERIOD, CAMERA_QUALITY, FOLLOW_PATH, LOST_MARK, MODEL_PATH, POSE_PERIOD, ROBOT_FRAME,
+    ROBOT_MARK, SCAN_PERIOD, SLOW_PERIOD, TOPIC_WAIT, f32s, layers, put, put_static,
 };
 
 /// A laser scan as points in the map, redrawn as scans arrive.
@@ -30,7 +32,7 @@ pub(super) async fn scan(
 ) {
     let mut tick = interval(SCAN_PERIOD);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let (mut last, mut drawn) = (Value::Null, false);
+    let (mut last, mut drawn): (Option<Arc<Value>>, bool) = (None, false);
     loop {
         tick.tick().await;
         if !layer.shown() {
@@ -46,8 +48,8 @@ pub(super) async fn scan(
         else {
             continue;
         };
-        let stamp = msg["header"]["stamp"].clone();
-        if drawn && stamp == last {
+        // The pointer, not the stamp: a driver or a paused sim clock may leave the stamp alone.
+        if drawn && last.as_ref().is_some_and(|l| Arc::ptr_eq(l, &msg)) {
             continue;
         }
         let frame = msg["header"]["frame_id"].as_str().unwrap_or_default();
@@ -61,7 +63,7 @@ pub(super) async fn scan(
                 .with_radii([0.025])
                 .with_colors([rerun::Color::from_rgb(r, g, b)]),
         );
-        (last, drawn) = (stamp, true);
+        (last, drawn) = (Some(msg), true);
     }
 }
 
@@ -74,12 +76,15 @@ pub(super) async fn arm_scene(
 ) {
     // `PlanningSceneComponents`: the world's object names and geometry.
     const WORLD_OBJECTS: u64 = 8 | 16;
-    let mut tick = interval(OBJECTS_PERIOD);
+    // Each call serialises every collision object through `move_group`: a slow period.
+    let mut tick = interval(SLOW_PERIOD);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut drawn = BTreeSet::new();
+    let mut last: Option<Vec<Value>> = None;
     loop {
         tick.tick().await;
         if !layer.shown() {
+            last = None;
             if !drawn.is_empty() {
                 layer.clear(&rec);
                 drawn.clear();
@@ -100,13 +105,18 @@ pub(super) async fn arm_scene(
         let objects = scene["scene"]["world"]["collision_objects"]
             .as_array()
             .map_or(&[][..], Vec::as_slice);
-        layers::draw_scene(
+        if last.as_deref() == Some(objects) {
+            continue;
+        }
+        let placed = layers::draw_scene(
             &rec,
             &layer.path,
             objects,
             |frame| robot.transform(&map, frame).ok(),
             &mut drawn,
         );
+        // A scene with an object not yet placed is drawn again at the next call.
+        last = placed.then(|| objects.to_vec());
     }
 }
 
@@ -148,19 +158,7 @@ pub(super) async fn pose(
 ) {
     // A ring on the floor and an arrow the way it faces, in one bright colour: in a view framed
     // on the whole map the model alone is a few pixels tall.
-    let ring: Vec<[f32; 3]> = (0u8..=48)
-        .map(|i| {
-            let a = f32::from(i) * std::f32::consts::TAU / 48.0;
-            [0.45 * a.cos(), 0.45 * a.sin(), 0.02]
-        })
-        .collect();
-    put_static(
-        &rec,
-        "world/robot/marker",
-        &rerun::LineStrips3D::new([ring])
-            .with_radii([0.025])
-            .with_colors([ROBOT_MARK]),
-    );
+    mark(&rec, ROBOT_MARK);
     // Rerun orbits a tracked entity at 1.5 times the sphere around its region of interest, which
     // for points is their mean +- 2 sigma, twice the span of two: these give about 5.6 m around
     // the robot's middle.
@@ -171,22 +169,25 @@ pub(super) async fn pose(
             .with_radii([0.0])
             .with_colors([[0, 0, 0, 0]]),
     );
-    put_static(
-        &rec,
-        "world/robot/heading",
-        &rerun::Arrows3D::from_vectors([[0.75, 0.0, 0.0]])
-            .with_origins([[0.0, 0.0, 0.02]])
-            .with_radii([0.04])
-            .with_colors([ROBOT_MARK]),
-    );
     let mut tick = interval(POSE_PERIOD);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last: Option<Transform> = None;
+    let mut adrift = false;
     loop {
         tick.tick().await;
+        // The port refuses a chain with a link gone stale: the robot drawn is where it was, so
+        // its mark goes grey until it is placed again.
         let Ok(t) = robot.transform(&map, &base) else {
+            if !adrift {
+                adrift = true;
+                mark(&rec, LOST_MARK);
+            }
             continue;
         };
+        if adrift {
+            adrift = false;
+            mark(&rec, ROBOT_MARK);
+        }
         if last.as_ref().is_some_and(|l| !moved(l, &t)) {
             continue;
         }
@@ -200,6 +201,31 @@ pub(super) async fn pose(
         );
         last = Some(t);
     }
+}
+
+/// The robot's ring and heading arrow, in `colour`.
+fn mark(rec: &RecordingStream, colour: [u8; 3]) {
+    let ring: Vec<[f32; 3]> = (0u8..=48)
+        .map(|i| {
+            let a = f32::from(i) * std::f32::consts::TAU / 48.0;
+            [0.45 * a.cos(), 0.45 * a.sin(), 0.02]
+        })
+        .collect();
+    put_static(
+        rec,
+        "world/robot/marker",
+        &rerun::LineStrips3D::new([ring])
+            .with_radii([0.025])
+            .with_colors([colour]),
+    );
+    put_static(
+        rec,
+        "world/robot/heading",
+        &rerun::Arrows3D::from_vectors([[0.75, 0.0, 0.0]])
+            .with_origins([[0.0, 0.0, 0.02]])
+            .with_radii([0.04])
+            .with_colors([colour]),
+    );
 }
 
 /// A frame of the robot's model that TF moves: the model's root under the robot's pose, or a joint
@@ -248,8 +274,8 @@ pub(super) fn load_model(
     Ok(std::iter::once(root).chain(joints).collect())
 }
 
-/// The robot's model, posed from TF as often as the robot's pose is drawn.
-/// The robot's model, posed by TF; hidden, it is cleared, and loaded again when shown.
+/// The robot's model, posed by TF as often as the robot's pose is drawn; hidden, it is cleared,
+/// and loaded again when shown, after a failed load too.
 pub(super) async fn robot_model(
     rec: RecordingStream,
     robot: Arc<dyn RobotPort>,
@@ -258,15 +284,20 @@ pub(super) async fn robot_model(
     layer: Layer,
 ) {
     let mut frames: Option<Vec<ModelFrame>> = None;
+    let mut failed = false;
     let mut last = Vec::new();
     let mut tick = interval(POSE_PERIOD);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
         if !layer.shown() {
+            failed = false;
             if frames.take().is_some() {
                 layer.clear(&rec);
             }
+            continue;
+        }
+        if failed {
             continue;
         }
         let model = if let Some(model) = &frames {
@@ -280,7 +311,8 @@ pub(super) async fn robot_model(
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, "the viewer shows no robot model");
-                    return;
+                    failed = true;
+                    continue;
                 }
                 Err(_) => return,
             }
@@ -325,27 +357,40 @@ pub(super) async fn camera(
     path: String,
     lens: Option<(TopicRef, String)>,
 ) {
-    let rx = match robot.frames(&topic) {
-        Ok(rx) => rx,
-        Err(e) => {
-            tracing::warn!(error = %e, topic, "the viewer shows no camera");
-            return;
-        }
-    };
     let path = path.as_str();
     let mut tick = interval(CAMERA_PERIOD);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut last_stamp = f64::NAN;
+    let (mut rx, mut warned) = (None, false);
+    let mut last = None;
+    let mut lens_at: Option<tokio::time::Instant> = None;
     let mut pinhole_drawn = false;
     loop {
         tick.tick().await;
-        let Some(frame) = rx.borrow().clone() else {
+        // A port that could not subscribe drops the sender; asking again retries the subscription.
+        if rx
+            .as_ref()
+            .is_none_or(|r: &tokio::sync::watch::Receiver<_>| r.has_changed().is_err())
+        {
+            match robot.frames(&topic) {
+                Ok(new) => rx = Some(new),
+                Err(e) => {
+                    if !std::mem::replace(&mut warned, true) {
+                        tracing::warn!(error = %e, topic, "the viewer shows no camera");
+                    }
+                    rx = None;
+                    continue;
+                }
+            }
+        }
+        let Some(frame) = rx.as_ref().and_then(|r| r.borrow().clone()) else {
             continue;
         };
-        if frame.stamp_s.total_cmp(&last_stamp).is_eq() {
+        warned = false;
+        // The pointer, not the stamp: a driver or a paused sim clock may leave the stamp alone.
+        if last.as_ref().is_some_and(|l| Arc::ptr_eq(l, &frame)) {
             continue;
         }
-        last_stamp = frame.stamp_s;
+        last = Some(Arc::clone(&frame));
         if let Some((info, base)) = &lens {
             // Where the camera is on the robot, which a waist or head joint can change.
             if let Ok(t) = robot.transform(base, &frame.frame_id) {
@@ -358,12 +403,15 @@ pub(super) async fn camera(
                     ),
                 );
             }
-            if !pinhole_drawn
-                && let Ok(msg) = robot.latest(&info.topic, &info.msg_type, TOPIC_WAIT).await
-                && let Some(pinhole) = pinhole(&msg)
-            {
-                put_static(&rec, path, &pinhole);
-                pinhole_drawn = true;
+            // On its own slow timer: a silent `camera_info` costs a wait, not one per frame.
+            if !pinhole_drawn && lens_at.is_none_or(|t| t.elapsed() >= SLOW_PERIOD) {
+                lens_at = Some(tokio::time::Instant::now());
+                if let Ok(msg) = robot.latest(&info.topic, &info.msg_type, TOPIC_WAIT).await
+                    && let Some(pinhole) = pinhole(&msg)
+                {
+                    put_static(&rec, path, &pinhole);
+                    pinhole_drawn = true;
+                }
             }
         }
         let jpeg = tokio::task::spawn_blocking(move || {
@@ -401,7 +449,11 @@ pub(super) fn pinhole(msg: &Value) -> Option<rerun::Pinhole> {
 }
 
 /// Draws one topic's message under the layer's entity path; objects keep state between calls.
-pub(super) type Drawer = Box<dyn FnMut(&RecordingStream, &str, &Value) + Send>;
+/// False when it could not, as with no transform yet for the message's frame.
+pub(super) type Drawer = Box<dyn FnMut(&RecordingStream, &str, &Value) -> bool + Send>;
+
+/// How many of a topic's own gaps between messages pass before it reads as gone quiet.
+const QUIET_GAPS: u32 = 4;
 
 /// Polls a topic and redraws when its message changed, or clears the layer while it is hidden.
 pub(super) async fn sample(
@@ -415,6 +467,8 @@ pub(super) async fn sample(
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last: Option<Arc<Value>> = None;
+    // The newest message heard, when it came and the gap before it: a latched one has no gap.
+    let mut heard: Option<(Arc<Value>, tokio::time::Instant, Option<Duration>)> = None;
     loop {
         tick.tick().await;
         if !layer.shown() {
@@ -429,19 +483,122 @@ pub(super) async fn sample(
         else {
             continue;
         };
-        // The same message is the same pointer, a map included: compared whole only when a new
-        // one arrived, and drawn only when it differs.
-        let same = last
-            .as_ref()
-            .is_some_and(|l| Arc::ptr_eq(l, &msg) || **l == *msg);
-        if !same {
-            draw(&rec, &layer.path, &msg);
+        if heard.as_ref().is_none_or(|(h, ..)| !Arc::ptr_eq(h, &msg)) {
+            let now = tokio::time::Instant::now();
+            let gap = heard.as_ref().map(|(_, at, _)| now - *at);
+            heard = Some((Arc::clone(&msg), now, gap));
+        } else if let Some((_, at, Some(gap))) = &heard
+            && at.elapsed() > *gap * QUIET_GAPS
+        {
+            // A topic that came every `gap` and has stopped is not drawn as if it were live.
+            if last.take().is_some() {
+                layer.clear(&rec);
+            }
+            continue;
         }
-        last = Some(msg);
+        // The same message is the same pointer, a map included: compared whole only when a new
+        // one arrived, and drawn only when it differs. One not drawn is tried again. The compare
+        // and the drawing walk every cell of a large map, so they run off the runtime.
+        if last.as_ref().is_some_and(|l| Arc::ptr_eq(l, &msg)) {
+            continue;
+        }
+        let (rec, path, new, old) = (
+            rec.clone(),
+            layer.path.clone(),
+            Arc::clone(&msg),
+            last.clone(),
+        );
+        let job = tokio::task::spawn_blocking(move || {
+            let drawn = old.is_some_and(|o| *o == *new) || draw(&rec, &path, &new);
+            (draw, drawn)
+        })
+        .await;
+        let Ok((back, drawn)) = job else {
+            return;
+        };
+        draw = back;
+        if drawn {
+            last = Some(msg);
+        }
     }
 }
 
-/// The agent's replies and tool calls as a text log, and its marked images.
+/// Follows a marker topic message by message, since markers add and delete by increments and a
+/// sampled topic loses what came between two samples; draws what it holds at most every
+/// `period` while the layer is shown, and ends each marker's lifetime.
+pub(super) async fn markers(
+    rec: RecordingStream,
+    robot: Arc<dyn RobotPort>,
+    topic: TopicRef,
+    period: Duration,
+    layer: Layer,
+    (namespaces, map): (Vec<String>, String),
+) {
+    let mut model = Markers::default();
+    let mut tick = interval(period);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut messages = None;
+    let (mut changed, mut shown) = (false, false);
+    loop {
+        if messages.is_none() {
+            messages = robot.messages(&topic.topic, &topic.msg_type).await.ok();
+        }
+        let got = tokio::select! {
+            got = async {
+                match messages.as_mut() {
+                    Some(m) => m.next().await,
+                    None => std::future::pending().await,
+                }
+            } => Some(got),
+            _ = tick.tick() => None,
+        };
+        match got {
+            Some(Some(Ok(msg))) => {
+                model.take(&layer.path, &msg, &namespaces, std::time::Instant::now());
+                changed = true;
+                continue;
+            }
+            Some(Some(Err(_))) => continue,
+            // The subscription ended: made again after the next tick, not at once.
+            Some(None) => {
+                messages = None;
+                tick.tick().await;
+            }
+            None => {}
+        }
+        changed |= model.expire(std::time::Instant::now());
+        if !layer.shown() {
+            if shown {
+                layer.clear(&rec);
+                model.cleared();
+                shown = false;
+            }
+            continue;
+        }
+        if !shown {
+            shown = true;
+            changed = true;
+        }
+        if !changed {
+            continue;
+        }
+        let (r, place_robot, place_map) = (rec.clone(), Arc::clone(&robot), map.clone());
+        let job = tokio::task::spawn_blocking(move || {
+            let mut model = model;
+            let place = |frame: &str| to_map(place_robot.as_ref(), &place_map, frame);
+            let placed = model.draw(&r, &place);
+            (model, placed)
+        })
+        .await;
+        let Ok((back, placed)) = job else {
+            return;
+        };
+        model = back;
+        // A frame TF could not place yet is tried again at the next tick.
+        changed = !placed;
+    }
+}
+
 /// Draws one number from a topic's messages over `for_s` seconds; `source` is the topic, its
 /// type and the field.
 pub(super) fn plot(

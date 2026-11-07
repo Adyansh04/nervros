@@ -51,11 +51,17 @@ const CAMERA_PATH: [&str; 2] = ["/camera", "/world/robot/camera"];
 /// Where the robot's model goes, under the robot's pose.
 const MODEL_PATH: &str = "world/robot/model";
 
-/// The plan awaiting approval or running: its walks and where each step ends.
+/// The path the navigation stack follows, which the Plan layer shows and hides.
 const PLAN_PATH: &str = "world/plan";
+
+/// The plan awaiting approval or running: its walks and where each step ends. Apart from
+/// [`PLAN_PATH`], so hiding the Plan layer leaves the route an approval card asks about.
+const PREVIEW_PATH: &str = "world/preview";
 
 /// The robot's ring and heading arrow.
 const ROBOT_MARK: [u8; 3] = [80, 170, 255];
+/// The same, while the robot cannot be placed on the map.
+const LOST_MARK: [u8; 3] = [128, 128, 128];
 
 /// What the 3D view tracks to follow the robot: two unseen points around it, whose span sets how
 /// far back the viewer orbits.
@@ -408,5 +414,11 @@ mod tests {
             .map(|[a, b]| (b[0] - a[0]).hypot(b[1] - a[1]))
             .sum();
         assert!((length - 12.0).abs() < 1.5, "{length}");
+    }
+
+    #[test]
+    fn a_zone_of_absurd_size_is_hatched_with_a_bounded_number_of_lines() {
+        let huge = [[0.0, 0.0], [1e8, 0.0], [1e8, 1e8], [0.0, 1e8]];
+        assert!(hatch(&huge, 0.25).len() <= 2000);
     }
 }

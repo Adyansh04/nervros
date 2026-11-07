@@ -1,7 +1,7 @@
 //! What a mission's end means for the skills taught: a draft that just worked is kept, and a kept
 //! one that keeps failing is forgotten.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -20,7 +20,8 @@ impl Missions {
         self: &Arc<Self>,
         compiled: &Compiled,
         outcome: Outcome,
-        failed_step: &str,
+        (failed_step, failed): (&str, &[String]),
+        ran: &BTreeMap<String, Value>,
     ) {
         // A stop is the operator's, not the skill's failure.
         if self.config.define_skill.is_none() || outcome == Outcome::Canceled {
@@ -38,23 +39,44 @@ impl Missions {
             .collect();
         for name in taught {
             let draft = catalog.skill(name).is_some_and(|s| s.learned == "draft");
-            if draft && outcome == Outcome::Success {
-                self.keep_draft(name).await;
+            // A mission that went on past the draft's own failure, as `optional` lets it, does
+            // not prove the draft.
+            let own_failed = compiled
+                .steps
+                .iter()
+                .any(|s| s.skill == name && failed.contains(&s.id));
+            if draft && outcome == Outcome::Success && !own_failed {
+                if let Some(ran) = ran.get(name) {
+                    self.keep_draft(name, ran).await;
+                } else {
+                    // Its definition was this NervROS's memory, which a restart lost.
+                    self.emit(Event::Notice {
+                        text: format!(
+                            "{name} worked, but it was taught before NervROS restarted, so it \
+                             cannot be kept from here: teach it again to keep it"
+                        ),
+                    });
+                }
             } else if !draft
                 && compiled
                     .steps
                     .iter()
                     .any(|s| s.id == failed_step && s.skill == name)
             {
-                self.maybe_forget(name).await;
+                let since_s = catalog.skill(name).map_or(0.0, |s| s.taught_s);
+                self.maybe_forget(name, since_s).await;
             }
         }
     }
 
-    /// Keeps a draft for good: the executor gets the same definition again, to keep on disk.
-    async fn keep_draft(&self, name: &str) {
-        let Some(mut request) = self.drafts.take(name) else {
-            // Taught before this session began: nothing here knows its definition to keep.
+    /// Keeps a draft for good: the executor gets the definition that ran again, to keep on disk.
+    async fn keep_draft(&self, name: &str, ran: &Value) {
+        let Some(mut request) = self.drafts.take_if(name, ran) else {
+            self.emit(Event::Notice {
+                text: format!(
+                    "{name} worked, but was taught again or forgotten since, so it is not kept"
+                ),
+            });
             return;
         };
         request["keep"] = Value::Bool(true);
@@ -68,13 +90,15 @@ impl Missions {
         self.emit(Event::Notice { text });
     }
 
-    /// Forgets a kept taught skill once it has failed more often than not in its latest runs.
-    async fn maybe_forget(&self, name: &str) {
+    /// Forgets a kept taught skill once it has failed more often than not in its latest runs
+    /// since it was taught or kept at `since_s`: a body taught again under the name is judged on
+    /// its own runs.
+    async fn maybe_forget(&self, name: &str, since_s: f64) {
         let Some(ledger) = self.ledger().cloned() else {
             return;
         };
         let skill = name.to_owned();
-        let runs = tokio::task::spawn_blocking(move || ledger.skill_runs(&skill))
+        let runs = tokio::task::spawn_blocking(move || ledger.skill_runs(&skill, since_s))
             .await
             .ok()
             .and_then(Result::ok);

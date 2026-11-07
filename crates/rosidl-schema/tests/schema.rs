@@ -98,8 +98,14 @@ fn bool_float_and_string_types_map_to_their_json_types() {
     assert_eq!(prop(&s, "c"), &json!({"type": "number"}));
     assert_eq!(prop(&s, "d"), &json!({"type": "string"}));
     assert_eq!(prop(&s, "e"), &json!({"type": "string"}));
-    assert_eq!(prop(&s, "f"), &json!({"type": "string", "maxLength": 8}));
-    assert_eq!(prop(&s, "g"), &json!({"type": "string", "maxLength": 9}));
+    assert_eq!(
+        prop(&s, "f"),
+        &json!({"type": "string", "maxLength": 8, "description": "at most 8 bytes"})
+    );
+    assert_eq!(
+        prop(&s, "g"),
+        &json!({"type": "string", "maxLength": 9, "description": "at most 9 UTF-16 units"})
+    );
 }
 
 #[test]
@@ -185,13 +191,18 @@ fn a_constant_prefix_gives_the_field_an_enum() {
 
 #[test]
 fn the_prefix_rule_needs_the_same_type() {
-    let s = msg_schema("\nuint8 ARM_LEFT=1\nstring arm\nstring MODE_A=ab\nstring<=4 mode\n");
+    let s = msg_schema(
+        "\nuint8 ARM_LEFT=1\nuint8 ARM_RIGHT=2\nstring arm\nstring MODE_A=ab\nstring MODE_B=cd\nstring<=4 mode\n",
+    );
     assert!(prop(&s, "arm").get("enum").is_none());
     assert_eq!(
         prop(&s, "mode")["enum"],
-        json!(["ab"]),
+        json!(["ab", "cd"]),
         "a string bound does not matter"
     );
+    // One constant is a value of note, as ListParameters' DEPTH_RECURSIVE, not the only choice.
+    let s = msg_schema("\nuint64 DEPTH_RECURSIVE=0\nuint64 depth\n");
+    assert!(prop(&s, "depth").get("enum").is_none());
 }
 
 #[test]

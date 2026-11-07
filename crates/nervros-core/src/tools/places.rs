@@ -78,7 +78,32 @@ impl Places {
                 place.name
             ));
         }
+        if ![place.pose.x, place.pose.y, place.pose.yaw]
+            .iter()
+            .all(|v| v.is_finite())
+        {
+            return Err("where the robot stands is not a number, so no place is kept".to_owned());
+        }
         let mut tagged = self.lock();
+        // An alias another place answers to would take that place's walks.
+        let taken = place.aliases.iter().find_map(|alias| {
+            self.fixed
+                .iter()
+                .chain(tagged.iter())
+                .filter(|p| p.name != place.name)
+                .find(|p| {
+                    crate::places::same_words(alias, &p.name)
+                        || p.aliases
+                            .iter()
+                            .any(|a| crate::places::same_words(alias, a))
+                })
+                .map(|p| (alias, p.name.clone()))
+        });
+        if let Some((alias, other)) = taken {
+            return Err(format!(
+                "`{alias}` already names the place `{other}`: pick another alias"
+            ));
+        }
         let mut next = tagged.clone();
         next.retain(|p| p.name != place.name);
         next.push(place);
@@ -118,6 +143,14 @@ pub fn room_label(room: &serde_json::Value) -> Option<&str> {
     });
     let kind = room["type"].as_str().filter(|t| !t.is_empty());
     if placeholder { kind.or(name) } else { name }
+}
+
+/// The place among `places` called `name`, by its name or an alias, as every lookup finds one.
+pub(crate) fn find<'p>(places: &'p [PlaceConfig], name: &str) -> Option<&'p PlaceConfig> {
+    let same = |a: &str| same_words(a, name);
+    places
+        .iter()
+        .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)))
 }
 
 /// Two names for one thing: "living room" and canopy's `living_room`, in any case.

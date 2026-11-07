@@ -23,8 +23,12 @@ use world::floor_plan;
 
 /// How often the world is read again, for edits made elsewhere (the agent, the web page).
 const POLL: Duration = Duration::from_secs(2);
+/// How long a crop that could not be fetched waits before it is asked for again.
+const CROP_RETRY: Duration = Duration::from_secs(10);
 const HANDLE_PX: f32 = 7.0;
 const ROTATE_PX: f32 = 26.0;
+/// The longest outline a pinned box is drawn dashed along, in pixels.
+const MAX_DASHED_PX: f32 = 20_000.0;
 
 /// A box's smallest side, in metres, as the web page keeps it.
 const MIN_SIDE_M: f64 = 0.05;
@@ -78,6 +82,13 @@ struct View {
     offset: Vec2,
 }
 
+/// An object's crop, as far as it has been fetched.
+enum Crop {
+    Fetching,
+    Failed(Instant),
+    Got(Arc<egui::ColorImage>),
+}
+
 /// What the requests running on the runtime hand back.
 #[derive(Default)]
 struct Shared {
@@ -85,7 +96,8 @@ struct Shared {
     /// often.
     world: Option<Arc<World>>,
     map: Option<egui::ColorImage>,
-    crops: HashMap<u64, Option<Arc<egui::ColorImage>>>,
+    /// Each object's crop, with how many times it had been seen when it was asked for.
+    crops: HashMap<u64, (u64, Crop)>,
     status: Option<(String, bool)>,
     busy: bool,
     select: Option<Picked>,
@@ -137,7 +149,9 @@ pub(crate) struct WorldEditor {
     runtime: tokio::runtime::Handle,
     shared: Arc<Mutex<Shared>>,
     map: Option<egui::TextureHandle>,
-    crops: HashMap<u64, egui::TextureHandle>,
+    /// The floor plan the texture shows: a reload that brings another is fetched again.
+    map_meta: Option<world::MapMeta>,
+    crops: HashMap<u64, (u64, egui::TextureHandle)>,
     view: Option<View>,
     selected: Option<Picked>,
     mode: Mode,
@@ -146,6 +160,8 @@ pub(crate) struct WorldEditor {
     drawn: Option<Shape2>,
     merge_with: Option<u64>,
     confirm_delete: bool,
+    /// Reload was clicked with edits not saved: it asks before dropping them.
+    confirm_reload: bool,
     confirm_phantoms: bool,
     form: Form,
     last_poll: Option<Instant>,
@@ -166,6 +182,7 @@ impl WorldEditor {
             runtime,
             shared: Arc::default(),
             map: None,
+            map_meta: None,
             crops: HashMap::new(),
             view: None,
             selected: None,
@@ -175,6 +192,7 @@ impl WorldEditor {
             drawn: None,
             merge_with: None,
             confirm_delete: false,
+            confirm_reload: false,
             confirm_phantoms: false,
             form: Form::default(),
             last_poll: None,
@@ -216,6 +234,7 @@ impl WorldEditor {
         );
         let want_map = self.map.is_none() && lock(&self.shared).map.is_none();
         let asked = lock(&self.shared).sent;
+        // Detached: it ends with its requests, which the client bounds.
         self.runtime.spawn(async move {
             let world = client.world().await;
             let map = if want_map {
@@ -259,7 +278,19 @@ impl WorldEditor {
             s.sent += 1;
             s.sent
         };
+        // A newer request owns the flag; this one clears it only while it is the newest.
+        let done = crate::Reset::new(
+            Arc::clone(&self.shared),
+            move |s: &mut Shared| {
+                if s.sent == mine {
+                    s.busy = false;
+                }
+            },
+            ctx.clone(),
+        );
+        // Detached: it ends with its requests, which the client bounds.
         self.runtime.spawn(async move {
+            let _done = done;
             let answer = match call {
                 Call::Edit(op, message) => client.edit(&op).await.map(|e| {
                     let select = e.created.first().map(|id| Picked::Object(*id));
@@ -307,6 +338,9 @@ impl WorldEditor {
                     }
                     Err(why) => s.status = Some((format!("{message}, but {why}"), true)),
                 },
+                // An older answer's world is stale, but its trouble, as a save the world model
+                // did not take, still stands.
+                Ok((message, _, _, true)) => s.status = Some((message, true)),
                 Ok(_) => {}
                 Err(e) => s.status = Some((e.to_string(), true)),
             }
@@ -319,40 +353,48 @@ impl WorldEditor {
         self.call(ctx, Call::Edit(op, message));
     }
 
-    /// The camera's view of an object, fetched once.
-    fn crop(&mut self, ctx: &egui::Context, id: u64) -> Option<egui::TextureHandle> {
-        if let Some(t) = self.crops.get(&id) {
+    /// The camera's view of an object, fetched again once the object has been `seen` again; a
+    /// failed fetch is tried again after [`CROP_RETRY`]. The last one shows meanwhile.
+    fn crop(&mut self, ctx: &egui::Context, id: u64, seen: u64) -> Option<egui::TextureHandle> {
+        if let Some((at, t)) = self.crops.get(&id)
+            && *at == seen
+        {
             return Some(t.clone());
         }
-        let cached = lock(&self.shared).crops.get(&id).cloned();
-        match cached {
-            Some(Some(pixels)) => {
-                let texture =
-                    ctx.load_texture(format!("crop-{id}"), pixels, egui::TextureOptions::LINEAR);
-                self.crops.insert(id, texture.clone());
-                Some(texture)
-            }
-            Some(None) => None,
-            None => {
-                lock(&self.shared).crops.insert(id, None);
-                let (client, shared, ctx) = (
-                    Arc::clone(&self.client),
-                    Arc::clone(&self.shared),
-                    ctx.clone(),
-                );
-                self.runtime.spawn(async move {
-                    let image = client
-                        .crop(id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|b| crate::chat::decode(&b));
-                    lock(&shared).crops.insert(id, image.map(Arc::new));
-                    ctx.request_repaint();
-                });
-                None
-            }
+        let (got, fetch) = match lock(&self.shared).crops.get(&id) {
+            Some((at, Crop::Got(pixels))) if *at == seen => (Some(Arc::clone(pixels)), false),
+            Some((at, Crop::Fetching)) if *at == seen => (None, false),
+            Some((at, Crop::Failed(when))) if *at == seen => (None, when.elapsed() >= CROP_RETRY),
+            _ => (None, true),
+        };
+        if let Some(pixels) = got {
+            let texture =
+                ctx.load_texture(format!("crop-{id}"), pixels, egui::TextureOptions::LINEAR);
+            self.crops.insert(id, (seen, texture.clone()));
+            return Some(texture);
         }
+        if fetch {
+            lock(&self.shared).crops.insert(id, (seen, Crop::Fetching));
+            let (client, shared, ctx) = (
+                Arc::clone(&self.client),
+                Arc::clone(&self.shared),
+                ctx.clone(),
+            );
+            // Detached: it ends with its request, which the client bounds.
+            self.runtime.spawn(async move {
+                let image = client
+                    .crop(id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|b| crate::chat::decode(&b));
+                let crop =
+                    image.map_or_else(|| Crop::Failed(Instant::now()), |i| Crop::Got(Arc::new(i)));
+                lock(&shared).crops.insert(id, (seen, crop));
+                ctx.request_repaint();
+            });
+        }
+        self.crops.get(&id).map(|(_, t)| t.clone())
     }
 }
 
@@ -464,10 +506,20 @@ mod tests {
         let square = vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]];
         assert!(inside([1.0, 1.0], &square));
         assert!(!inside([5.0, 1.0], &square));
-        let objects = [0.1, 0.1 + std::f64::consts::FRAC_PI_2, 0.4].map(|yaw| Object {
+        let object = |yaw, shown| Object {
             yaw,
+            shown,
             ..Object::default()
-        });
+        };
+        let quarter = std::f64::consts::FRAC_PI_2;
+        let mut objects = vec![
+            object(0.1, true),
+            object(0.1 + quarter, true),
+            object(0.4, true),
+        ];
+        assert!((wall_yaw(&objects) - 0.1).abs() < 0.02);
+        // Ones not shown, as removed ones, do not count, and a tie takes the smaller angle.
+        objects.extend([object(0.4, false), object(0.4, false), object(0.4, true)]);
         assert!((wall_yaw(&objects) - 0.1).abs() < 0.02);
     }
 }

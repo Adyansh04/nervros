@@ -114,6 +114,11 @@ impl Approval {
     pub fn reason(&self) -> &str {
         &self.reason
     }
+
+    /// An edit of it is being checked: approving now would approve a plan about to change.
+    pub fn checking(&self) -> bool {
+        self.checking
+    }
 }
 
 /// One entry in the conversation.
@@ -309,6 +314,62 @@ impl Chat {
         self.items.push(Item::User { text, turn });
     }
 
+    /// Ends a plan card still running once NervROS runs no mission: its end was missed.
+    pub fn end_unheard(&mut self) {
+        if let Some(p) = self.plan_mut(PlanCard::running) {
+            p.finished = Some((
+                Outcome::Error,
+                String::new(),
+                "its end was missed; NervROS runs no mission now".to_owned(),
+                0.0,
+            ));
+        }
+    }
+
+    /// A camera snapshot, as an image in the chat or a notice that it could not be read.
+    fn snapshot(&mut self, event: &Event) {
+        let Event::Snapshot {
+            id,
+            jpeg,
+            width,
+            height,
+            marks,
+            stamp_s,
+        } = event
+        else {
+            return;
+        };
+        match decode(jpeg) {
+            Some(pixels) => self.items.push(Item::Image {
+                id: id.clone(),
+                pixels: RefCell::new(Some(Arc::new(pixels))),
+                texture: OnceCell::new(),
+                marks: marks.clone(),
+                at: taken_at(*stamp_s),
+            }),
+            None => self.items.push(Item::Notice(format!(
+                "Snapshot {id} ({width}×{height}) could not be decoded"
+            ))),
+        }
+    }
+
+    /// After missed events: a card whose request is gone is answered, and a turn that ended
+    /// unheard stops spinning.
+    pub fn reopen(&mut self, approvals: &[u64], turn: bool) {
+        for item in &mut self.items {
+            if let Item::Approval(a) = item
+                && a.answer.is_none()
+                && !approvals.contains(&a.id)
+            {
+                a.answer = Some(false);
+                a.not_approved = Some(NotApproved::Unanswered);
+            }
+        }
+        if !turn {
+            self.turn = None;
+        }
+    }
+
     /// The pending approvals, oldest first.
     pub fn pending(&self) -> impl Iterator<Item = &Approval> {
         self.items.iter().filter_map(|i| match i {
@@ -330,25 +391,7 @@ impl Chat {
                     model: model.clone(),
                 });
             }
-            Event::Snapshot {
-                id,
-                jpeg,
-                width,
-                height,
-                marks,
-                stamp_s,
-            } => match decode(jpeg) {
-                Some(pixels) => self.items.push(Item::Image {
-                    id: id.clone(),
-                    pixels: RefCell::new(Some(Arc::new(pixels))),
-                    texture: OnceCell::new(),
-                    marks: marks.clone(),
-                    at: taken_at(*stamp_s),
-                }),
-                None => self.items.push(Item::Notice(format!(
-                    "Snapshot {id} ({width}×{height}) could not be decoded"
-                ))),
-            },
+            Event::Snapshot { .. } => self.snapshot(event),
             Event::Armed { armed } => self.items.push(Item::Notice(if *armed {
                 "Armed: the agent may now act".to_owned()
             } else {
@@ -404,7 +447,11 @@ impl Chat {
             }
             // The viewer draws a plot, and the tool's card already says what; the Doctor tab
             // lists an incident, and a toast says it opened.
-            Event::Plot { .. } | Event::Drawn { .. } | Event::Incident { .. } => {}
+            // `Open` is answered by the window, from what the session says: see `reopen`.
+            Event::Plot { .. }
+            | Event::Drawn { .. }
+            | Event::Incident { .. }
+            | Event::Open { .. } => {}
             Event::ModelCall {
                 input_tokens,
                 cached_tokens,
@@ -479,6 +526,7 @@ impl Chat {
                 args,
                 reason,
                 can_allow,
+                always_asks: _,
             } => self.items.push(Item::Approval(Approval {
                 id: *id,
                 tool: tool.clone(),
@@ -749,6 +797,22 @@ impl Chat {
         })
     }
 
+    /// What a pending approval would run, for a view beside the chat: a plan's steps one per
+    /// line, or the call's arguments.
+    pub fn details(&self, a: &Approval) -> String {
+        if let Some(p) = self.plan_for(a) {
+            return p
+                .steps
+                .iter()
+                .map(|s| format!("{} {}", s.id, s.summary))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        a.args["source"]
+            .as_str()
+            .map_or_else(|| view::pretty(&a.args), str::to_owned)
+    }
+
     /// The plan an approval of `run_mission` refers to.
     fn plan_for(&self, a: &Approval) -> Option<&PlanCard> {
         let hash = a.args["hash"].as_str()?;
@@ -766,22 +830,25 @@ impl Chat {
         })
     }
 
-    /// The newest plan, for the dock.
+    /// The plan for the dock: the newest whose mission runs, else the newest. A plan checked
+    /// while a mission runs must not hide the one moving the robot, with its Stop and Pause.
     pub fn latest_plan(&self) -> Option<&PlanCard> {
-        let in_chat = self
-            .items
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(at, i)| match i {
-                Item::Plan(p) => Some((at, p)),
-                _ => None,
-            });
-        match (in_chat, &self.job_plan) {
-            (Some((at, p)), Some((job_at, job))) => Some(if *job_at > at { job } else { p }),
-            (None, Some((_, job))) => Some(job),
-            (in_chat, None) => in_chat.map(|(_, p)| p),
-        }
+        // The job's plan first: on a tie of places the chat's wins, as the last of the maxima.
+        let plans = || {
+            self.job_plan
+                .as_ref()
+                .map(|(at, p)| (*at, p))
+                .into_iter()
+                .chain(self.items.iter().enumerate().filter_map(|(at, i)| match i {
+                    Item::Plan(p) => Some((at, p)),
+                    _ => None,
+                }))
+        };
+        plans()
+            .filter(|(_, p)| p.running())
+            .max_by_key(|(at, _)| *at)
+            .or_else(|| plans().max_by_key(|(at, _)| *at))
+            .map(|(_, p)| p)
     }
 
     /// Draws the conversation; clicks are appended to `actions`.

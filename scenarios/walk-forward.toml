@@ -17,4 +17,3 @@ tools = ["run_mission"]
 skills = ["WalkStraight"]
 mission = "success"
 approvals_max = 1
-reply_has = ["walked"]

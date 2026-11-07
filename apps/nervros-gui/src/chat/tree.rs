@@ -336,21 +336,26 @@ fn arguments(s: &PlannedStep) -> String {
         .join("  ·  ")
 }
 
-/// The wrappers the plan put round the step, and how it went before.
-fn badges(ui: &mut egui::Ui, s: &PlannedStep) {
-    let mut items: Vec<(String, Color32)> = vec![(
-        format!("at most {}", duration_words(s.timeout_s)),
-        theme::FAINT,
-    )];
+/// The wrappers the plan put round the step: its time limit, its tries, whether its failure is
+/// passed over, and whether the planner added it.
+pub(super) fn wrappers(s: &PlannedStep) -> Vec<String> {
+    let mut items = vec![format!("at most {}", duration_words(s.timeout_s))];
     if s.retries > 0 {
-        items.push((format!("{} tries", s.retries + 1), theme::FAINT));
+        items.push(format!("{} tries", s.retries + 1));
     }
     if s.optional {
-        items.push(("optional".to_owned(), theme::FAINT));
+        items.push("optional".to_owned());
     }
     if s.added {
-        items.push(("added by the planner".to_owned(), theme::FAINT));
+        items.push("added by the planner".to_owned());
     }
+    items
+}
+
+/// The wrappers the plan put round the step, and how it went before.
+fn badges(ui: &mut egui::Ui, s: &PlannedStep) {
+    let mut items: Vec<(String, Color32)> =
+        wrappers(s).into_iter().map(|w| (w, theme::FAINT)).collect();
     if let Some(track) = &s.track {
         let colour = if track.succeeded * 4 < track.runs * 3 {
             theme::WARN

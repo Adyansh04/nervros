@@ -49,6 +49,7 @@ pub(crate) fn sample() -> Chat {
         args: serde_json::json!({"place": "kitchen"}),
         reason: "moves the base".to_owned(),
         can_allow: false,
+        always_asks: false,
     });
     chat.apply(&Event::TurnFinished { turn: 1 });
     chat
@@ -144,6 +145,41 @@ fn condensing_up_to_a_message_keeps_the_ones_after_it() {
         "{:?}",
         sent.borrow().len()
     );
+}
+
+#[test]
+fn the_approval_cards_buttons_answer_their_own_request() {
+    for (button, wanted) in [("Approve", Command::Approve(7)), ("Deny", Command::Deny(7))] {
+        let mut chat = sample();
+        // Answered by the click alone: the card stays until the session says so.
+        chat.reopen(&[7], false);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&sent);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(440.0, 600.0))
+            .build_ui(move |ui| {
+                let mut actions = Vec::new();
+                chat.show(ui, Duration::from_mins(10), &mut actions);
+                seen.borrow_mut().extend(actions);
+            });
+        harness.run();
+        harness.get_by_label(button).click();
+        harness.run();
+        assert!(
+            sent.borrow()
+                .iter()
+                .any(|a| matches!(a, Action::Send(c) if *c == wanted)),
+            "{button}"
+        );
+    }
+}
+
+#[test]
+fn a_request_the_session_no_longer_has_is_not_left_answerable() {
+    let mut chat = sample();
+    assert_eq!(chat.pending().count(), 1);
+    chat.reopen(&[], false);
+    assert_eq!(chat.pending().count(), 0, "its request is gone");
 }
 
 /// A harness drawing `chat` on the panel background, cropped to what it draws.
@@ -242,6 +278,7 @@ fn doubtful_plan() -> Chat {
         args: serde_json::json!({"hash": "5be0c1d9f2a4"}),
         reason: "runs it".to_owned(),
         can_allow: false,
+        always_asks: false,
     });
     chat
 }
@@ -430,6 +467,7 @@ fn snapshot_unanswered_and_allow() {
         args: serde_json::json!({"node": "/controller_server", "name": "max_vel_x", "value": 0.3}),
         reason: "`set_parameter` acts on the robot".to_owned(),
         can_allow: true,
+        always_asks: false,
     });
     render(chat, "chat_unanswered");
 }
@@ -717,6 +755,7 @@ fn snapshot_mission() {
         args: serde_json::json!({"hash": "a91f3c2e"}),
         reason: "`run_mission` acts on the robot".to_owned(),
         can_allow: false,
+        always_asks: false,
     });
     chat.apply(&Event::ApprovalResolved {
         id: 3,
@@ -828,6 +867,7 @@ fn snapshot_plan_with_records_and_a_preview_warning() {
         args: serde_json::json!({"hash": "7c01d2aa9e3b"}),
         reason: "`run_mission` acts on the robot".to_owned(),
         can_allow: false,
+        always_asks: false,
     });
     render(chat, "chat_plan_records");
 }
@@ -871,6 +911,7 @@ fn snapshot_plan_with_native_steps() {
         args: serde_json::json!({"hash": "5e2b90c1d4a7"}),
         reason: "`run_mission` acts on the robot".to_owned(),
         can_allow: false,
+        always_asks: false,
     });
     render(chat, "chat_plan_native");
 }

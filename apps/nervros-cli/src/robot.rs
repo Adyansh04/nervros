@@ -92,7 +92,7 @@ pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<(
         Arc::new(RosidlSchemas::load(&profile).context("loading the interfaces")?);
     let guard = Arc::new(Guard::new(profile.policy.clone()));
     let config = profile.ros_tools.clone().unwrap_or_default();
-    let tools = nervros_core::ros_tools::tools(&config, &robot, &schemas, &guard);
+    let tools = nervros_core::ros_tools::tools(&config, &robot, (&schemas, &guard), None);
     let names: Vec<String> = tools.iter().map(|t| t.spec().name.clone()).collect();
     let tool = tools
         .iter()
@@ -146,7 +146,7 @@ pub(crate) struct ChatOptions {
     pub(crate) say: Vec<String>,
     /// Arm at start.
     pub(crate) arm: bool,
-    /// Approve every request (scripted runs only).
+    /// Approve each request but the ones always asked (scripted runs on a simulator only).
     pub(crate) approve: bool,
     /// A saved conversation to carry on: a path, or `last`.
     pub(crate) resume: Option<String>,
@@ -259,10 +259,17 @@ fn print_background(e: &Event) {
     }
 }
 
+/// Text from the model, a tool or the world made safe to print: control characters shown as
+/// escapes, so it cannot move the cursor or recolour the terminal, and each further line indented
+/// under the first, so it cannot pass for a line of the CLI's own.
+fn safe(text: &str) -> String {
+    crate::printable(text, "\n        ")
+}
+
 fn print_event(e: &Event, logs: &Path) {
     match e {
-        Event::Reply { text, model, .. } => println!("robot> {text}\n        [{model}]"),
-        Event::Steer { text, .. } => println!("you, while it works> {text}"),
+        Event::Reply { text, model, .. } => println!("robot> {}\n        [{model}]", safe(text)),
+        Event::Steer { text, .. } => println!("you, while it works> {}", safe(text)),
         Event::ToolStarted { tool, args, .. } => println!("  > {tool} {args}"),
         Event::ToolFinished {
             tool,
@@ -274,7 +281,7 @@ fn print_event(e: &Event, logs: &Path) {
             let note = if message.is_empty() {
                 String::new()
             } else {
-                format!(": {message}")
+                format!(": {}", safe(message))
             };
             println!("  < {tool} {status} in {ms} ms{note}");
         }
@@ -292,6 +299,7 @@ fn print_event(e: &Event, logs: &Path) {
             args,
             reason,
             can_allow,
+            always_asks: _,
         } => {
             let allow = if *can_allow {
                 format!(", /allow {id} for the session,")
@@ -299,11 +307,16 @@ fn print_event(e: &Event, logs: &Path) {
                 String::new()
             };
             println!(
-                "  ? approve #{id}: {tool} {args} ({reason}); answer /yes {id}{allow} or /no {id}"
+                "  ? approve #{id}: {tool} {args} ({}); answer /yes {id}{allow} or /no {id}",
+                safe(reason)
             );
         }
-        Event::ApprovalEdited { id, reason, .. } => println!("  approval #{id} edited: {reason}"),
-        Event::EditRejected { id, message } => println!("  edit of #{id} refused: {message}"),
+        Event::ApprovalEdited { id, reason, .. } => {
+            println!("  approval #{id} edited: {}", safe(reason));
+        }
+        Event::EditRejected { id, message } => {
+            println!("  edit of #{id} refused: {}", safe(message));
+        }
         Event::ApprovalResolved {
             id, not_approved, ..
         } => match not_approved {
@@ -311,14 +324,14 @@ fn print_event(e: &Event, logs: &Path) {
             Some(why) => println!("  approval #{id}: no ({why:?})"),
         },
         Event::Armed { armed } => println!("  [{}]", if *armed { "armed" } else { "disarmed" }),
-        Event::Halted { reason } => println!("  [halted: {reason}]"),
-        Event::Stopped { ok: true, detail } => println!("  [the robot stopped: {detail}]"),
+        Event::Halted { reason } => println!("  [halted: {}]", safe(reason)),
+        Event::Stopped { ok: true, detail } => println!("  [the robot stopped: {}]", safe(detail)),
         Event::Stopped { ok: false, detail } => {
-            println!("  ! the robot did not confirm the stop: {detail}");
+            println!("  ! the robot did not confirm the stop: {}", safe(detail));
         }
-        Event::Notice { text } => println!("  [{text}]"),
-        Event::Error { text, .. } => println!("  [error: {text}]"),
-        Event::Report { text, .. } => println!("report> {text}"),
+        Event::Notice { text } => println!("  [{}]", safe(text)),
+        Event::Error { text, .. } => println!("  [error: {}]", safe(text)),
+        Event::Report { text, .. } => println!("report> {}", safe(text)),
         Event::MissionPlanned { .. }
         | Event::MissionPreview { .. }
         | Event::MissionStarted { .. }
@@ -337,7 +350,8 @@ fn print_event(e: &Event, logs: &Path) {
         | Event::Plot { .. }
         | Event::Context { .. }
         | Event::ModelCall { .. }
-        | Event::ReplyDelta { .. } => {}
+        | Event::ReplyDelta { .. }
+        | Event::Open { .. } => {}
         Event::Restored { exchanges } => {
             println!(
                 "  [carrying on an earlier conversation: {} messages]",
@@ -364,6 +378,15 @@ fn newest_history(logs: &Path) -> Option<std::path::PathBuf> {
         .map(|e| e.path())
         .filter(|p| p.to_string_lossy().ends_with(".history.json"))
         .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+}
+
+/// How to answer a request, for `/yes`, `/allow` or `/no` typed without its number: as chat text
+/// it would reach the model while the operator thinks they answered.
+fn bad_answer(line: &str) -> Option<&'static str> {
+    let line = line.trim();
+    let word = line.split_whitespace().next()?;
+    (matches!(word, "/yes" | "/allow" | "/no") && line[word.len()..].trim().parse::<u64>().is_err())
+        .then_some("answer with the request's number, as /yes 3, /allow 3 or /no 3")
 }
 
 fn parse_line(line: &str) -> Option<SessionCommand> {
@@ -411,11 +434,13 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
             )
         }
     };
+    // The robot's lock is held as long as this session runs.
     let nervros_core::app::LoggedSession {
         agent,
         mut events,
         log_path,
         blobs,
+        lock: _robot,
         ..
     } = nervros_core::app::start_logged(profile_path, state, resume, options.model.clone())
         .context("starting the agent")?;
@@ -445,8 +470,15 @@ pub(crate) async fn chat(profile_path: &Path, state: &Path, options: ChatOptions
     interactive(&agent, events, blobs).await
 }
 
+/// A `--say` message's exchange ends by then at the latest, so a lost end event cannot hold the
+/// run for good.
+const SAY_LIMIT: std::time::Duration = std::time::Duration::from_mins(30);
+/// After events went by unread, the end may have been among them: the exchange then ends at this
+/// much silence.
+const SAY_QUIET_AFTER_LOSS: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Sends each message in turn and waits for its turn, the missions it starts and their reports;
-/// approves every request when `approve`.
+/// approves each request when `approve`, but denies one the operator is asked every time.
 async fn say_all(
     agent: &nervros_core::app::Agent,
     events: &mut tokio::sync::broadcast::Receiver<Event>,
@@ -467,22 +499,49 @@ async fn say_all(
         }
         agent.session.send(SessionCommand::User(text.clone()));
         let mut exchange = nervros_core::evalcase::Exchange::default();
+        let deadline = tokio::time::Instant::now() + SAY_LIMIT;
+        let mut lost = false;
         loop {
-            let e = match events.recv().await {
-                Ok(e) => e,
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let wait = if lost {
+                left.min(SAY_QUIET_AFTER_LOSS)
+            } else {
+                left
+            };
+            let e = match tokio::time::timeout(wait, events.recv()).await {
+                Ok(Ok(e)) => e,
                 // A slow terminal fell behind; the session goes on.
-                Err(RecvError::Lagged(n)) => {
-                    println!("  [{n} events went by unprinted]");
+                Ok(Err(RecvError::Lagged(n))) => {
+                    println!("  [{n} events went by unprinted; the end may have been among them]");
+                    lost = true;
                     continue;
                 }
-                Err(RecvError::Closed) => anyhow::bail!("the session ended"),
+                Ok(Err(RecvError::Closed)) => bail!("the session ended"),
+                Err(_) if lost => {
+                    println!("  [nothing more since the lost events: going on]");
+                    break;
+                }
+                Err(_) => {
+                    println!(
+                        "  ! no end after {} min: going on",
+                        SAY_LIMIT.as_secs() / 60
+                    );
+                    break;
+                }
             };
-            if let Event::ApprovalRequested { id, .. } = &e
+            print_event(&e, blobs);
+            if let Event::ApprovalRequested {
+                id, always_asks, ..
+            } = &e
                 && approve
             {
-                agent.session.send(SessionCommand::Approve(*id));
+                if *always_asks {
+                    println!("  [#{id} is asked of the operator every time: --approve says no]");
+                    agent.session.send(SessionCommand::Deny(*id));
+                } else {
+                    agent.session.send(SessionCommand::Approve(*id));
+                }
             }
-            print_event(&e, blobs);
             if exchange.over(&text, &e) {
                 break;
             }
@@ -508,7 +567,19 @@ async fn interactive(
         }
     });
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    loop {
+        // Ctrl-C, a closed terminal or a kill end the chat as /quit does, through the stop below.
+        let line = tokio::select! {
+            line = lines.next_line() => match line? {
+                Some(line) => line,
+                None => break,
+            },
+            _ = tokio::signal::ctrl_c() => break,
+            _ = hangup.recv() => break,
+            _ = terminate.recv() => break,
+        };
         if line.trim() == "/quit" {
             break;
         }
@@ -524,15 +595,20 @@ async fn interactive(
             });
             continue;
         }
-        // Pause words act only on a mission that can take them; otherwise they are the model's.
-        if let Some((missions, on)) = agent
-            .missions
-            .as_ref()
-            .and_then(|m| Some((m, m.pause_order(&line)?)))
-        {
+        // As in the window: pause words act on a mission that can take them, and a lone "pause"
+        // or "resume" is always the executor's to answer, never the model's.
+        if let Some((missions, on)) = agent.missions.as_ref().and_then(|m| {
+            let alone = nervros_core::session::pause_word(&line)
+                .filter(|_| nervros_core::session::only_pause_word(&line));
+            Some((m, m.pause_order(&line).or(alone)?))
+        }) {
             // Off the loop, so a `stop` typed while the executor is slow to answer is read at once.
             let missions = Arc::clone(missions);
             tokio::spawn(async move { missions.pause(on, "chat").await });
+            continue;
+        }
+        if let Some(usage) = bad_answer(&line) {
+            eprintln!("{usage}");
             continue;
         }
         if let Some(cmd) = parse_line(&line) {
@@ -540,7 +616,37 @@ async fn interactive(
         }
     }
     printer.abort();
+    stop_on_exit(agent).await;
     Ok(())
+}
+
+/// Stops what NervROS has running as the stop word does, since nothing watches it once the chat
+/// ends, and says how that went.
+async fn stop_on_exit(agent: &nervros_core::app::Agent) {
+    let running = agent.missions.as_ref().is_some_and(|m| m.busy())
+        || !agent.integrations.goals().open().is_empty();
+    if !running {
+        return;
+    }
+    let mut events = agent.session.subscribe();
+    agent.session.send(SessionCommand::StopMission);
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+        loop {
+            match events.recv().await {
+                Ok(Event::Stopped { ok, detail }) => return Some((ok, detail)),
+                Err(RecvError::Closed) => return None,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    match stopped {
+        Ok(Some((true, detail))) => println!("stopped on leaving: {detail}"),
+        Ok(Some((false, detail))) => {
+            println!("the stop on leaving did not settle ({detail}): stop the robot itself");
+        }
+        _ => println!("the stop on leaving got no answer: stop the robot itself"),
+    }
 }
 
 pub(crate) async fn doctor(profile_path: &Path) -> Result<()> {
@@ -595,4 +701,33 @@ pub(crate) async fn whoami(profile_path: &Path, only_facts: bool) -> Result<()> 
         path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionCommand, bad_answer, parse_line, safe};
+
+    #[test]
+    fn a_line_is_an_order_an_answer_or_words_for_the_agent() {
+        assert_eq!(parse_line("/yes 3"), Some(SessionCommand::Approve(3)));
+        assert_eq!(parse_line("/no 4"), Some(SessionCommand::Deny(4)));
+        assert_eq!(parse_line("stop"), Some(SessionCommand::StopMission));
+        assert_eq!(parse_line("  "), None);
+        assert_eq!(
+            parse_line("walk to the kitchen"),
+            Some(SessionCommand::User("walk to the kitchen".to_owned()))
+        );
+        assert!(bad_answer("/yes").is_some(), "no number: not sent as chat");
+        assert!(bad_answer("/no three").is_some());
+        assert!(bad_answer("/yes 3").is_none());
+        assert!(bad_answer("yes please").is_none());
+    }
+
+    #[test]
+    fn printed_text_cannot_forge_a_line_or_drive_the_terminal() {
+        assert_eq!(
+            safe("done\n  approval #3: yes\u{1b}[2K"),
+            "done\n          approval #3: yes\\u{1b}[2K"
+        );
+    }
 }

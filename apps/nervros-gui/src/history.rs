@@ -63,13 +63,8 @@ fn again(m: &MissionRecord) -> Value {
     json!({"intent": m.intent, "steps": steps})
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "seconds since 1970, positive and far below u64::MAX"
-)]
 fn ago(at_s: f64) -> String {
-    crate::sessions::ago(at_s.max(0.0) as u64)
+    nervros_core::ago(nervros_core::now_s() - at_s)
 }
 
 /// The three lists, or nothing when the robot keeps no ledger.
@@ -87,12 +82,7 @@ pub fn show(
         ui.warning_label(format!("The mission ledger cannot be read: {e}"));
     }
     missions(ui, &history.missions, actions);
-    if let Some(name) = templates(ui, &history.templates, actions) {
-        if let Err(e) = ledger.forget_template(&name) {
-            history.error = Some(e.to_string());
-        }
-        history.stale();
-    }
+    templates(ui, &history.templates, actions);
     gaps(ui, &history.gaps);
 }
 
@@ -134,13 +124,16 @@ fn missions(ui: &mut egui::Ui, list: &[MissionRecord], actions: &mut Vec<Action>
         };
         let header = if running {
             format!("{} · running · {}", m.intent, ago(m.started))
-        } else {
+        } else if m.ended > m.started {
             format!(
                 "{} · {how} · {} · {:.0} s",
                 m.intent,
                 ago(m.started),
                 m.ended - m.started
             )
+        } else {
+            // Cut short when an earlier NervROS stopped: its end was never kept.
+            format!("{} · {how} · {}", m.intent, ago(m.started))
         };
         let id = ui.make_persistent_id(("mission", &m.id));
         let label = RichText::new(header).size(13.0).color(colour);
@@ -178,7 +171,7 @@ fn missions(ui: &mut egui::Ui, list: &[MissionRecord], actions: &mut Vec<Action>
 }
 
 /// The saved plans; the name of one to forget, when asked.
-fn templates(ui: &mut egui::Ui, list: &[Template], actions: &mut Vec<Action>) -> Option<String> {
+fn templates(ui: &mut egui::Ui, list: &[Template], actions: &mut Vec<Action>) {
     heading(ui, "Saved plans");
     if list.is_empty() {
         ui.label(
@@ -186,9 +179,8 @@ fn templates(ui: &mut egui::Ui, list: &[Template], actions: &mut Vec<Action>) ->
                 .small()
                 .color(theme::DIM),
         );
-        return None;
+        return;
     }
-    let mut forget = None;
     for plan in list {
         let runs = match plan.runs {
             0 => "never run".to_owned(),
@@ -198,11 +190,15 @@ fn templates(ui: &mut egui::Ui, list: &[Template], actions: &mut Vec<Action>) ->
         theme::row(
             ui,
             |ui| {
+                // As the operator's call, so the guard and the log see it as any other.
                 if ui
                     .add(ReButton::new("Forget").small().secondary())
                     .clicked()
                 {
-                    forget = Some(plan.name.clone());
+                    actions.push(Action::Send(Command::Run {
+                        tool: "plans".to_owned(),
+                        args: json!({"action": "forget", "name": plan.name}),
+                    }));
                 }
                 if ui
                     .add(ReButton::new("Run").small().secondary())
@@ -223,7 +219,6 @@ fn templates(ui: &mut egui::Ui, list: &[Template], actions: &mut Vec<Action>) ->
             },
         );
     }
-    forget
 }
 
 fn gaps(ui: &mut egui::Ui, list: &[Gap]) {

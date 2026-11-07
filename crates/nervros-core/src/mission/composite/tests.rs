@@ -57,7 +57,11 @@ fn native(name: &'static str, fails: u32, secs: f64) -> Arc<Counting> {
 }
 
 fn composite(natives: Vec<Arc<dyn NativeSkill>>) -> Composite {
-    Composite::new(Arc::new(FakeRobot::new()), None, natives)
+    Composite::new(
+        Arc::new(FakeRobot::new().with_topic("/x/robot_state", free_state())),
+        None,
+        natives,
+    )
 }
 
 const TREE: &str = r#"<root BTCPP_format="4" main_tree_to_execute="Mission">
@@ -103,6 +107,11 @@ fn what_a_step_handed_on_fills_the_later_ones_and_unknown_keys_go_as_literals() 
     );
 }
 
+/// The executor's `RobotState` when nothing runs, which a mission with native steps waits for.
+fn free_state() -> Value {
+    json!({"mission_id": "", "teleop": false, "can_move": true, "paused": false})
+}
+
 /// The `[mission]` config of an executor under `/x`.
 fn real_config() -> MissionConfig {
     serde_json::from_value(json!({
@@ -126,6 +135,7 @@ async fn a_stretch_is_checked_with_its_own_hand_ons_and_earlier_ones_as_literals
     let checked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let seen = Arc::clone(&checked);
     let robot = FakeRobot::new()
+        .with_topic("/x/robot_state", free_state())
         .with_service("/x/get_catalog", |_| Ok(pick_and_place_catalog()))
         .with_service("/x/validate_mission", move |r| {
             seen.lock()
@@ -167,7 +177,7 @@ async fn a_stretch_is_checked_with_its_own_hand_ons_and_earlier_ones_as_literals
 async fn without_the_executors_catalog_no_step_runs_as_a_native() {
     let walk = native("Walk", 0, 0.01);
     let c = Composite::new(
-        Arc::new(FakeRobot::new()),
+        Arc::new(FakeRobot::new().with_topic("/x/robot_state", free_state())),
         Some(real_config()),
         vec![walk.clone()],
     );
@@ -353,6 +363,7 @@ async fn a_mixed_plan_sends_its_executor_stretch_with_what_the_natives_handed_on
     let catalog = json!({"catalog_version": "v1", "skills": [{"name": "Pick", "template": "Pick",
         "max_duration_s": 30.0, "args": [{"name": "item"}], "outputs": [{"name": "got"}]}]});
     let robot = FakeRobot::new()
+        .with_topic("/x/robot_state", free_state())
         .with_service("/x/get_catalog", move |_| {
             Ok(json!({"catalog_json": catalog.to_string()}))
         })
@@ -401,6 +412,7 @@ fn with_executor(
     let catalog = json!({"catalog_version": "v1", "skills": [{"name": "Pick", "template": "Pick",
         "max_duration_s": 30.0, "args": [{"name": "item"}]}]});
     let robot = FakeRobot::new()
+        .with_topic("/x/robot_state", free_state())
         .with_service("/x/get_catalog", move |_| {
             Ok(json!({"catalog_json": catalog.to_string()}))
         })
@@ -417,6 +429,109 @@ fn with_executor(
         });
     let real = real_config();
     (Composite::new(Arc::new(robot), Some(real), natives), sent)
+}
+
+#[tokio::test]
+async fn a_native_walk_borrows_the_base_from_the_executor_and_gives_it_back() {
+    let lends = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let (asked, kept) = (
+        Arc::clone(&lends),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let refuse = Arc::clone(&kept);
+    let catalog = json!({"catalog_version": "v1", "skills": []});
+    let robot = FakeRobot::new()
+        .with_topic("/x/robot_state", free_state())
+        .with_service("/x/get_catalog", move |_| {
+            Ok(json!({"catalog_json": catalog.to_string()}))
+        })
+        .with_service("/x/lend", move |r| {
+            asked.lock().unwrap().push(r.clone());
+            let granted = !(r["lend"] == true && refuse.load(Ordering::SeqCst));
+            Ok(json!({"granted": granted, "reason": "the robot can no longer walk"}))
+        });
+    let mut real = real_config();
+    real.lend = Some("/x/lend".to_owned());
+    let walk = native("Walk", 0, 0.01);
+    let c = Composite::new(Arc::new(robot), Some(real), vec![walk.clone()]);
+    let tree = r#"<root BTCPP_format="4" main_tree_to_execute="Mission">
+  <BehaviorTree ID="Mission">
+    <Sequence name="mission">
+      <SubTree ID="Walk" name="s1_Walk" how="slowly" said="{s1_said}"/>
+    </Sequence>
+  </BehaviorTree>
+</root>"#;
+    let (result, _) = run(&c, tree).await;
+    assert_eq!(result["outcome"], 0, "{result}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let asked: Vec<(Value, Value)> = lends
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| (r["lend"].clone(), r["resources"].clone()))
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            (json!(true), json!(["base"])),
+            (json!(false), json!(["base"]))
+        ],
+        "borrowed for the walk, and given back"
+    );
+    kept.store(true, Ordering::SeqCst);
+    let (result, _) = run(&c, tree).await;
+    assert_eq!(result["outcome"], OUTCOME_FAILURE, "{result}");
+    assert!(
+        result["failure_reason"]
+            .as_str()
+            .unwrap()
+            .contains("kept the base"),
+        "{result}"
+    );
+    assert_eq!(
+        walk.runs.load(Ordering::SeqCst),
+        1,
+        "no walk without the base"
+    );
+}
+
+#[tokio::test]
+async fn a_plan_runs_only_on_the_catalog_it_was_approved_against() {
+    let walk = native("Walk", 0, 0.01);
+    let (c, sent) = with_executor(json!({"outcome": 0, "outputs_json": "{}"}), vec![walk]);
+    let merged = c.call(CATALOG, "", json!({}), CALL_WAIT).await.unwrap();
+    let approved = merged["catalog_version"].as_str().unwrap().to_owned();
+    let tree = r#"<root BTCPP_format="4" main_tree_to_execute="Mission">
+  <BehaviorTree ID="Mission">
+    <Sequence name="mission">
+      <SubTree ID="Pick" name="s1_Pick" item="cup"/>
+    </Sequence>
+  </BehaviorTree>
+</root>"#;
+    let stale = c
+        .send_goal(
+            EXECUTE,
+            EXECUTE_TYPE,
+            json!({"mission_id": "m8", "tree_xml": tree, "catalog_version": "older"}),
+            CALL_WAIT,
+        )
+        .await;
+    assert!(
+        stale.is_err_and(|e| e.to_string().contains("skills changed")),
+        "a plan approved against other skills does not run"
+    );
+    assert!(sent.lock().unwrap().is_empty());
+    let goal = c
+        .send_goal(
+            EXECUTE,
+            EXECUTE_TYPE,
+            json!({"mission_id": "m9", "tree_xml": tree, "catalog_version": approved}),
+            CALL_WAIT,
+        )
+        .await
+        .unwrap();
+    let _ = goal.result.await;
+    assert_eq!(sent.lock().unwrap().len(), 1, "the executor got it");
 }
 
 #[tokio::test]
@@ -439,6 +554,93 @@ async fn a_failed_executor_stretch_ends_the_mission_there() {
     assert_eq!(result["failure_reason"], "the grasp slipped");
     assert_eq!(sent.lock().unwrap().len(), 1);
     assert_eq!(walk.runs.load(Ordering::SeqCst), 1, "s3 never ran");
+}
+
+#[tokio::test]
+async fn a_stretch_the_executor_did_not_take_is_no_failure_of_the_plan() {
+    let robot = FakeRobot::new()
+        .with_topic("/x/robot_state", free_state())
+        .with_service("/x/get_catalog", |_| {
+            Ok(
+                json!({"catalog_json": json!({"catalog_version": "v1", "skills": [
+                {"name": "Pick", "template": "Pick", "max_duration_s": 30.0,
+                 "args": [{"name": "item"}]}]}).to_string()}),
+            )
+        });
+    let c = Composite::new(
+        Arc::new(robot),
+        Some(real_config()),
+        vec![native("Walk", 0, 0.01)],
+    );
+    let tree = r#"<root BTCPP_format="4" main_tree_to_execute="Mission">
+  <BehaviorTree ID="Mission">
+    <Sequence name="mission">
+      <SubTree ID="Walk" name="s1_Walk" how="slowly" said="{s1_said}"/>
+      <SubTree ID="Pick" name="s2_Pick" item="{s1_said}"/>
+    </Sequence>
+  </BehaviorTree>
+</root>"#;
+    let goal = c
+        .send_goal(
+            EXECUTE,
+            EXECUTE_TYPE,
+            json!({"mission_id": "m1", "tree_xml": tree}),
+            CALL_WAIT,
+        )
+        .await
+        .unwrap();
+    let ended = goal.result.await.unwrap();
+    assert!(
+        matches!(&ended, Err(RosError::Rejected(why)) if why.contains("did not take its steps")),
+        "{ended:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_native_step_stops_when_the_executor_hands_the_base_to_teleop() {
+    let fake = Arc::new(
+        FakeRobot::new()
+            .with_topic("/x/robot_state", free_state())
+            .with_service("/x/get_catalog", |_| {
+                Ok(
+                    json!({"catalog_json": json!({"catalog_version": "v1", "skills": []})
+                    .to_string()}),
+                )
+            }),
+    );
+    let c = Composite::new(
+        Arc::clone(&fake) as Arc<dyn RobotPort>,
+        Some(real_config()),
+        vec![native("Walk", 0, 30.0)],
+    );
+    let tree = r#"<root BTCPP_format="4" main_tree_to_execute="Mission">
+  <BehaviorTree ID="Mission">
+    <Sequence name="mission">
+      <SubTree ID="Walk" name="s1_Walk" how="slowly" said="{s1_said}"/>
+    </Sequence>
+  </BehaviorTree>
+</root>"#;
+    let goal = c
+        .send_goal(
+            EXECUTE,
+            EXECUTE_TYPE,
+            json!({"mission_id": "m1", "tree_xml": tree}),
+            CALL_WAIT,
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut teleop = free_state();
+    teleop["teleop"] = json!(true);
+    fake.set_topic("/x/robot_state", teleop);
+    let ended = goal.result.await.unwrap().unwrap().result;
+    assert_eq!(ended["outcome"], OUTCOME_CANCELED, "{ended}");
+    assert!(
+        ended["failure_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("driven by hand")),
+        "{ended}"
+    );
 }
 
 #[tokio::test]
@@ -509,6 +711,7 @@ async fn pause_and_stop_in_an_executor_stretch_go_to_the_executor() {
     let catalog = json!({"catalog_version": "v1", "skills": [{"name": "Pick", "template": "Pick",
         "max_duration_s": 30.0, "args": [{"name": "item"}]}]});
     let robot = FakeRobot::new()
+        .with_topic("/x/robot_state", free_state())
         .with_service("/x/get_catalog", move |_| {
             Ok(json!({"catalog_json": catalog.to_string()}))
         })
@@ -531,6 +734,7 @@ async fn pause_and_stop_in_an_executor_stretch_go_to_the_executor() {
                 status: GoalStatus::Succeeded,
                 result: json!({"outcome": OUTCOME_SUCCESS, "outputs_json": "{}"}),
             }),
+            ..ScriptedRun::default()
         });
     let real = real_config();
     let walk = native("Walk", 0, 0.01);
@@ -576,10 +780,12 @@ async fn pause_and_stop_in_an_executor_stretch_go_to_the_executor() {
 async fn a_mission_of_executor_skills_alone_is_paused_by_the_executor() {
     let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let log = Arc::clone(&asked);
-    let robot = FakeRobot::new().with_service("/x/pause_mission", move |r| {
-        log.lock().unwrap().push(format!("pause {}", r["pause"]));
-        Ok(json!({"ok": true, "message": "paused"}))
-    });
+    let robot = FakeRobot::new()
+        .with_topic("/x/robot_state", free_state())
+        .with_service("/x/pause_mission", move |r| {
+            log.lock().unwrap().push(format!("pause {}", r["pause"]));
+            Ok(json!({"ok": true, "message": "paused"}))
+        });
     let real = real_config();
     // The executor runs such a mission without the composite, so nothing runs here.
     let c = Composite::new(Arc::new(robot), Some(real), Vec::new());
@@ -601,6 +807,7 @@ async fn a_stop_while_the_executor_takes_its_stretch_cancels_the_stretch() {
     use nervros_ros::fake::ScriptedRun;
     use nervros_ros::{GoalResult, GoalStatus};
     let robot = FakeRobot::new()
+        .with_topic("/x/robot_state", free_state())
         .with_latency(Duration::from_millis(200))
         .with_service("/x/get_catalog", |_| Ok(pick_and_place_catalog()))
         .with_service("/x/stop_all", |_| {
@@ -614,6 +821,7 @@ async fn a_stop_while_the_executor_takes_its_stretch_cancels_the_stretch() {
                 status: GoalStatus::Succeeded,
                 result: json!({"outcome": OUTCOME_SUCCESS, "outputs_json": "{}"}),
             }),
+            ..ScriptedRun::default()
         });
     let c = Composite::new(
         Arc::new(robot),

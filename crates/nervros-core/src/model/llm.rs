@@ -31,7 +31,8 @@ pub(crate) use history::REPORT_MARK;
 pub use history::{History, RESERVE_TOKENS, tokens_of};
 pub use roles::summarise;
 pub use turn::{
-    AgentSource, CallCost, LoopTool, OnCall, OnDelta, ToolFuture, TurnSetup, chat, fixed_cost,
+    AgentSource, CallCost, LoopTool, OnCall, OnDelta, ToolFuture, TurnSetup, chat,
+    definition_chars, fixed_cost, fixed_tokens,
 };
 
 /// The longest side of a frame a vision model gets: enough to read a label across a room, and

@@ -93,14 +93,13 @@ pub(super) fn room_for(
         .candidates(Role::Routine, need)
         .first()
         .and_then(|m| source.context(m))?;
-    let schemas: usize = registry
-        .iter()
-        .map(|t| {
+    let fixed = llm::fixed_tokens(
+        &preamble(shared),
+        registry.iter().map(|t| {
             let spec = t.spec();
-            spec.name.len() + spec.description.len() + spec.parameters.to_string().len()
-        })
-        .sum();
-    let fixed = llm::tokens_of(preamble(shared).len() + schemas);
+            llm::definition_chars(&spec.name, &spec.description, &spec.parameters)
+        }),
+    );
     Some(window.saturating_sub(fixed + llm::RESERVE_TOKENS))
 }
 

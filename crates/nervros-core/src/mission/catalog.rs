@@ -63,6 +63,11 @@ pub struct LearnableLeaf {
     pub values: BTreeMap<String, Vec<String>>,
 }
 
+/// A skill whose catalog entry does not say counts as idempotent, as before the field existed.
+const fn idempotent_unless_said() -> bool {
+    true
+}
+
 /// One skill: a behaviour-tree macro in the executor's library.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Skill {
@@ -88,6 +93,10 @@ pub struct Skill {
     pub resources: Vec<String>,
     /// Its own timeout; a step may ask for less, never more.
     pub max_duration_s: f64,
+    /// Whether running it twice does no more than running it once. One that is not (a straight
+    /// walk, a turn, a pick) may not be retried: a retry would repeat what it already did.
+    #[serde(default = "idempotent_unless_said")]
+    pub idempotent: bool,
     /// The `SubTree` ID in the executor's library.
     pub template: String,
     /// For a skill an agent taught: `draft` until a mission with it succeeds, then `kept`.
@@ -96,6 +105,9 @@ pub struct Skill {
     /// For a taught skill: the operator's request it was taught for.
     #[serde(default)]
     pub taught_for: String,
+    /// For a taught skill: when it was last taught or kept, in seconds since 1970.
+    #[serde(default)]
+    pub taught_s: f64,
     /// The stack NervROS runs it through itself, such as Nav2, where the robot's executor has no
     /// skill of the name; empty for the executor's own.
     #[serde(default)]
@@ -114,6 +126,9 @@ pub struct Arg {
     /// text. A `world_id` with `phrase` also takes plain words the world model searches for.
     #[serde(default)]
     pub format: String,
+    /// What a `world_id` names: `object`, `room`, or empty for either.
+    #[serde(default)]
+    pub names: String,
     /// For the model.
     #[serde(default)]
     pub description: String,

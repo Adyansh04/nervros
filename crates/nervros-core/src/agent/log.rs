@@ -34,8 +34,14 @@ pub fn spawn(
         loop {
             let event = match events.recv().await {
                 Ok(e) => e,
+                // Said in the file too, with `seq` moved on as far: a gap is seen, not hidden.
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(missed = n, "the log fell behind");
+                    seq += n;
+                    let line = json!({"seq": seq, "ts": crate::now_s(), "lagged": n});
+                    if let Err(e) = writeln!(file, "{line}") {
+                        tracing::warn!(error = %e, "could not write the log");
+                    }
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,

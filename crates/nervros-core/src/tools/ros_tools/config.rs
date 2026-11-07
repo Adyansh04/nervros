@@ -9,8 +9,9 @@ pub struct RosToolsConfig {
     /// Names left out of listings unless asked for; a convenience, not a boundary.
     #[serde(default = "d_hidden")]
     pub hidden: Vec<String>,
-    /// Topics never sampled or echoed.
-    #[serde(default)]
+    /// Topics never sampled or echoed. `/parameter_events`, which carries every parameter's new
+    /// value with no mask, is always among them; a profile's topics are added to it.
+    #[serde(default = "d_read_deny", deserialize_with = "with_d_read_deny")]
     pub read_deny: Vec<String>,
     /// Parameter names whose values are masked.
     #[serde(default = "d_param_read_deny")]
@@ -34,6 +35,16 @@ pub struct RosToolsConfig {
     pub param_set: Vec<String>,
 }
 
+fn d_read_deny() -> Vec<String> {
+    vec!["/parameter_events".to_owned()]
+}
+
+fn with_d_read_deny<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let mut all = d_read_deny();
+    all.extend(<Vec<String> as serde::Deserialize>::deserialize(d)?);
+    Ok(all)
+}
+
 fn d_hidden() -> Vec<String> {
     [
         "*/_action/*",
@@ -52,9 +63,17 @@ fn d_hidden() -> Vec<String> {
 }
 
 fn d_param_read_deny() -> Vec<String> {
-    ["*key*", "*token*", "*secret*", "*password*"]
-        .map(str::to_owned)
-        .to_vec()
+    [
+        "*key*",
+        "*token*",
+        "*secret*",
+        "*password*",
+        "*passwd*",
+        "*auth*",
+        "*credential*",
+    ]
+    .map(str::to_owned)
+    .to_vec()
 }
 
 fn d_service_observe() -> Vec<String> {
@@ -67,7 +86,7 @@ impl Default for RosToolsConfig {
     fn default() -> Self {
         Self {
             hidden: d_hidden(),
-            read_deny: Vec::new(),
+            read_deny: d_read_deny(),
             param_read_deny: d_param_read_deny(),
             service_observe: d_service_observe(),
             service_call: Vec::new(),

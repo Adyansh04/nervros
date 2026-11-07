@@ -19,10 +19,10 @@ const IK_WAIT: Duration = Duration::from_secs(5);
 const PLAN_WAIT: Duration = Duration::from_secs(15);
 /// How much of a preview's trajectory is drawn: this many points along it.
 const DRAWN_POINTS: usize = 12;
-/// A previewed move's speed, as the robot would move it: slow.
-const PREVIEW_SCALING: f64 = 0.2;
 /// The longest straight move `HandLine` takes, m.
-const MAX_LINE_M: f64 = 0.5;
+pub(super) const MAX_LINE_M: f64 = 0.5;
+/// The shortest straight hand move: one shorter would succeed without moving.
+pub(super) const MIN_LINE_M: f64 = 0.01;
 
 /// The tool.
 pub(super) struct ArmCheck {
@@ -72,6 +72,10 @@ impl ArmCheck {
             Err(why) => return ToolOutcome::failed(why),
         };
         let joints = self.arms.joints().await.unwrap_or_default();
+        let orientation = match self.arms.tip_orientation(&planning, &tip) {
+            Ok(o) => o,
+            Err(why) => return ToolOutcome::failed(why),
+        };
         let request = json!({"ik_request": {
             "group_name": group,
             "robot_state": Arms::robot_state(&joints),
@@ -81,7 +85,7 @@ impl ArmCheck {
                 "header": {"frame_id": planning},
                 "pose": {
                     "position": {"x": at[0], "y": at[1], "z": at[2]},
-                    "orientation": self.arms.tip_orientation(&planning, &tip),
+                    "orientation": orientation,
                 },
             },
             "timeout": {"sec": 1, "nanosec": 0},
@@ -181,43 +185,41 @@ impl ArmCheck {
             Err(why) => return ToolOutcome::failed(why),
         };
         let joints = self.arms.joints().await.unwrap_or_default();
-        let (constraints, to) = match &goal {
+        // Only a point keeps the hand turned as it is; a named pose needs no turn.
+        let turned = match self.arms.tip_orientation(&planning, &tip) {
+            Ok(o) => o,
+            Err(why) if matches!(goal, Goal::Point(..)) => return ToolOutcome::failed(why),
+            Err(_) => Value::Null,
+        };
+        // As the move itself plans: its planner, scaling and time, and a hand that may hold
+        // something kept level.
+        let (constraints, path, to) = match &goal {
             Goal::Pose(name, at) => (
                 json!({"joint_constraints": at.iter().map(|(j, v)| json!({
                     "joint_name": j, "position": v,
                     "tolerance_above": 0.01, "tolerance_below": 0.01, "weight": 1.0,
                 })).collect::<Vec<_>>()}),
+                None,
                 format!("`{name}`"),
             ),
             Goal::Point(at, what) => (
-                point_constraints(
-                    &planning,
-                    &tip,
-                    *at,
-                    &self.arms.tip_orientation(&planning, &tip),
-                ),
+                point_constraints(&planning, &tip, *at, &turned),
+                self.arms.hand_path(&group, &planning, &tip, &turned).await,
                 what.clone(),
             ),
         };
-        let request = json!({"motion_plan_request": {
-            "group_name": group,
-            "start_state": Arms::robot_state(&joints),
-            "goal_constraints": [constraints],
-            "num_planning_attempts": 1,
-            "allowed_planning_time": 5.0,
-            "max_velocity_scaling_factor": PREVIEW_SCALING,
-            "max_acceleration_scaling_factor": PREVIEW_SCALING,
-        }});
+        let request = json!({"motion_plan_request": self.arms.plan_request(
+            &group,
+            &constraints,
+            path,
+            &Arms::robot_state(&joints),
+        )});
+        let wait = plan_wait(&request);
         let service = self.arms.config.name("plan_kinematic_path");
         let planned = match self
             .arms
             .robot
-            .call(
-                &service,
-                "moveit_msgs/srv/GetMotionPlan",
-                request,
-                PLAN_WAIT,
-            )
+            .call(&service, "moveit_msgs/srv/GetMotionPlan", request, wait)
             .await
         {
             Ok(p) => p,
@@ -279,11 +281,15 @@ impl ArmCheck {
             Ok(p) => p,
             Err(why) => return ToolOutcome::failed(why),
         };
-        let Some(metres) = args["distance_m"].as_f64().filter(|m| m.is_finite()) else {
-            return ToolOutcome::failed("line needs distance_m");
+        let Some(metres) = args["distance_m"]
+            .as_f64()
+            .filter(|m| (MIN_LINE_M..=MAX_LINE_M).contains(m))
+        else {
+            return ToolOutcome::failed(format!(
+                "line needs distance_m from {MIN_LINE_M} to {MAX_LINE_M} m"
+            ));
         };
         let direction = args["direction"].as_str().unwrap_or_default();
-        let metres = metres.clamp(0.0, MAX_LINE_M);
         let way = match along(direction, metres) {
             Ok(w) => w,
             Err(why) => return ToolOutcome::failed(why),
@@ -367,6 +373,16 @@ impl ArmCheck {
         });
         true
     }
+}
+
+/// How long a plan may take to come back: the planner's own time and a margin for the scene,
+/// as a held hand plans longer.
+fn plan_wait(request: &Value) -> Duration {
+    let planning_s = request["motion_plan_request"]["allowed_planning_time"]
+        .as_f64()
+        .unwrap_or(0.0)
+        .clamp(0.0, 600.0);
+    PLAN_WAIT.max(Duration::from_secs_f64(planning_s + 5.0))
 }
 
 #[async_trait]

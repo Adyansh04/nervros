@@ -201,8 +201,19 @@ impl Exchange {
     }
 }
 
+/// How a message's exchange ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Said {
+    /// Its turn, missions and reports are over.
+    Finished,
+    /// The deadline passed first.
+    TimedOut,
+    /// The session ended: an agent that died answered nothing, which is no pass.
+    Closed,
+}
+
 /// Sends one message and waits for its turn, the missions it starts and their reports, granting
-/// each approval asked when `approve`, else denying it; `true` when `deadline` passed first.
+/// each approval asked when `approve`, else denying it.
 pub async fn say(
     session: &Session,
     events: &mut broadcast::Receiver<Event>,
@@ -210,19 +221,23 @@ pub async fn say(
     deadline: Instant,
     approve: bool,
     seen: &mut Seen,
-) -> bool {
+) -> Said {
     session.send(Command::User(text.to_owned()));
     let mut exchange = Exchange::default();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         let e = match tokio::time::timeout(left, events.recv()).await {
-            Err(_) => return true,
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Closed)) => return false,
+            Err(_) => return Said::TimedOut,
+            // Missed events may have held what the case is judged on.
+            Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                seen.errors.push(format!("the eval missed {n} events"));
+                continue;
+            }
+            Ok(Err(broadcast::error::RecvError::Closed)) => return Said::Closed,
             Ok(Ok(e)) => e,
         };
         if exchange.over(text, &e) {
-            return false;
+            return Said::Finished;
         }
         match e {
             Event::ApprovalRequested { id, .. } => {
@@ -270,6 +285,20 @@ pub async fn say(
     }
 }
 
+/// Why `case` tests nothing, if it does not: no message to send, or nothing it expects.
+#[must_use]
+pub fn untestable(case: &Case) -> Option<String> {
+    if case.say.iter().all(|s| s.trim().is_empty()) {
+        return Some(format!("case {} says nothing to the agent", case.id));
+    }
+    (case.expect == Expect::default()).then(|| {
+        format!(
+            "case {} expects nothing, so it would pass whatever happened",
+            case.id
+        )
+    })
+}
+
 /// What `seen` did not do of what `expect` says, a line each; none when the case passed. Travel
 /// is judged on the simulator's truth when there is one.
 #[must_use]
@@ -305,7 +334,12 @@ pub fn judge(expect: &Expect, seen: &Seen) -> Vec<String> {
         }
     }
     for s in &expect.skills {
-        if !seen.skills.iter().any(|k| k.starts_with(s.as_str())) {
+        // The skill's own name: `Pick` is not `PickObject`.
+        if !seen
+            .skills
+            .iter()
+            .any(|k| k.split('(').next() == Some(s.as_str()))
+        {
             problems.push(format!(
                 "no {s} in any plan (plans: {})",
                 seen.skills.join(", ")
@@ -317,8 +351,11 @@ pub fn judge(expect: &Expect, seen: &Seen) -> Vec<String> {
         (Some(want), None) if want != "none" => {
             problems.push(format!("no mission ({want} wanted)"));
         }
-        (Some(want), Some(got)) if want != "none" && want != got => {
-            problems.push(format!("mission {got}, {want} wanted"));
+        // Every mission, not the last alone: one that failed before a retry is a failure too.
+        (Some(want), Some(_)) if want != "none" => {
+            for got in seen.missions.iter().filter(|m| m.as_str() != want) {
+                problems.push(format!("mission {got}, {want} wanted"));
+            }
         }
         _ => {}
     }

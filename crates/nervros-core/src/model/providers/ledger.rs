@@ -9,6 +9,9 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+/// The longest a model is parked for, in seconds: a day's quota comes back within it.
+const PARK_MOST_S: u64 = 24 * 3600;
+
 /// Which midnight a daily quota resets at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetZone {
@@ -104,6 +107,73 @@ pub struct Ledger {
     set: BTreeSet<String>,
 }
 
+/// What a save adds to the quota file, taken from a [`Ledger`] so the file is written without
+/// holding it.
+#[derive(Debug, Default)]
+pub struct Unsaved {
+    path: Option<PathBuf>,
+    added: BTreeMap<String, DayCount>,
+    set: BTreeMap<String, DayCount>,
+    parked: BTreeMap<String, u64>,
+}
+
+/// What the quota file holds after a save.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Saved {
+    days: BTreeMap<String, DayCount>,
+    #[serde(rename = "parked_until")]
+    parked: BTreeMap<String, u64>,
+}
+
+impl Unsaved {
+    /// Adds this to the quota file under an exclusive lock on a file beside it, which every
+    /// NervROS process takes, so two cannot lose each other's counts; what the file holds then.
+    /// Blocking: an async caller runs it through `spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// The lock, the read or the write failed.
+    pub fn write(&self) -> std::io::Result<Option<Saved>> {
+        let Some(path) = &self.path else {
+            return Ok(None);
+        };
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let mut name = path.as_os_str().to_owned();
+        name.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(PathBuf::from(name))?;
+        lock.lock()?;
+        let mut saved: Saved = crate::persist::read_or_default(path);
+        for (key, mine) in &self.added {
+            add_count(&mut saved.days, key, mine);
+        }
+        for (key, mine) in &self.set {
+            saved.days.insert(key.clone(), mine.clone());
+        }
+        for (model, until) in &self.parked {
+            let entry = saved.parked.entry(model.clone()).or_default();
+            *entry = (*entry).max(*until);
+        }
+        crate::persist::write_json(path, &saved).map_err(std::io::Error::other)?;
+        lock.unlock()?;
+        Ok(Some(saved))
+    }
+}
+
+/// Adds `mine` to the count under `key`: a count of a later day replaces an older one.
+fn add_count(days: &mut BTreeMap<String, DayCount>, key: &str, mine: &DayCount) {
+    let entry = days.entry(key.to_owned()).or_default();
+    if entry.day == mine.day {
+        entry.count = entry.count.saturating_add(mine.count);
+    } else if entry.day < mine.day {
+        *entry = mine.clone();
+    }
+}
+
 /// Why a model cannot take a request now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refused {
@@ -141,39 +211,67 @@ impl Ledger {
         ledger
     }
 
+    /// Takes what the next save adds to the file: the counts made since the last save, the
+    /// counts set from a provider's own figure, and the parks.
+    pub fn unsaved(&mut self) -> Unsaved {
+        let set = std::mem::take(&mut self.set)
+            .into_iter()
+            .filter_map(|key| self.days.get(&key).cloned().map(|count| (key, count)))
+            .collect();
+        Unsaved {
+            path: self.path.clone(),
+            added: std::mem::take(&mut self.unsaved),
+            set,
+            parked: self.parked_until.clone(),
+        }
+    }
+
+    /// Takes in what a save left in the file, which holds other processes' counts and parks too,
+    /// with what was counted here since the save began.
+    pub fn absorb(&mut self, saved: Saved) {
+        let mut days = saved.days;
+        for (key, mine) in &self.unsaved {
+            add_count(&mut days, key, mine);
+        }
+        for key in &self.set {
+            if let Some(mine) = self.days.get(key) {
+                days.insert(key.clone(), mine.clone());
+            }
+        }
+        self.days = days;
+        for (model, until) in saved.parked {
+            let entry = self.parked_until.entry(model).or_default();
+            *entry = (*entry).max(until);
+        }
+    }
+
+    /// Puts back what a save could not write, for the next one.
+    pub fn restore(&mut self, unsaved: Unsaved) {
+        for (key, count) in &unsaved.added {
+            add_count(&mut self.unsaved, key, count);
+        }
+        self.set.extend(unsaved.set.into_keys());
+    }
+
     /// Writes the ledger back to its file, if it has one, taking in first what another process
     /// saved there since: its counts and ours add up, and the later of two parks stands.
     ///
     /// # Errors
     ///
-    /// A write failure.
+    /// A write failure; what it could not write waits for the next save.
     pub fn save(&mut self) -> std::io::Result<()> {
-        let Some(path) = self.path.clone() else {
-            return Ok(());
-        };
-        let disk: Self = crate::persist::read_or_default(&path);
-        let mut days = disk.days;
-        for (key, mine) in std::mem::take(&mut self.unsaved) {
-            let entry = days.entry(key).or_default();
-            if entry.day == mine.day {
-                entry.count = entry.count.saturating_add(mine.count);
-            } else if entry.day < mine.day {
-                *entry = mine;
+        let unsaved = self.unsaved();
+        match unsaved.write() {
+            Ok(Some(saved)) => {
+                self.absorb(saved);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => {
+                self.restore(unsaved);
+                Err(e)
             }
         }
-        for key in std::mem::take(&mut self.set) {
-            if let Some(mine) = self.days.get(&key) {
-                days.insert(key, mine.clone());
-            }
-        }
-        let mut parked = disk.parked_until;
-        for (model, until) in &self.parked_until {
-            let entry = parked.entry(model.clone()).or_default();
-            *entry = (*entry).max(*until);
-        }
-        self.days = days;
-        self.parked_until = parked;
-        crate::persist::write_json(&path, self).map_err(std::io::Error::other)
     }
 
     /// Requests counted today under `key` (a model id or a pool name).
@@ -200,8 +298,10 @@ impl Ledger {
         zone: ResetZone,
     ) -> Result<(), Refused> {
         let t = crate::unix_secs(now);
+        // A park longer than any quota's day was set under a wrong clock: it no longer holds.
         if let Some(&until) = self.parked_until.get(model)
             && until > t
+            && until - t <= PARK_MOST_S
         {
             return Err(Refused::Parked(until));
         }
@@ -463,5 +563,22 @@ mod tests {
         );
         std::fs::write(&path, "{\"days\": {").unwrap();
         assert_eq!(Ledger::load(&path).used_today("p", t, ResetZone::Utc), 0);
+    }
+
+    #[test]
+    fn counts_a_failed_save_could_not_write_go_with_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the quota file's folder goes makes the write fail.
+        let blocker = dir.path().join("sub");
+        let path = blocker.join("quota.json");
+        let t = at(86_400 * 7);
+        std::fs::write(&blocker, "").unwrap();
+        let mut ledger = Ledger::load(&path);
+        ledger.record("m", Some("p"), t, ResetZone::Utc);
+        assert!(ledger.save().is_err());
+        std::fs::remove_file(&blocker).unwrap();
+        ledger.record("m", Some("p"), t, ResetZone::Utc);
+        ledger.save().unwrap();
+        assert_eq!(Ledger::load(&path).used_today("p", t, ResetZone::Utc), 2);
     }
 }

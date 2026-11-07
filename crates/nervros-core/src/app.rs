@@ -109,6 +109,9 @@ pub enum StartError {
     /// The session log.
     #[error("opening the session log: {0}")]
     Log(std::io::Error),
+    /// Another NervROS runs this robot.
+    #[error("{0}")]
+    Busy(String),
 }
 
 /// Where the quota ledger and session logs live: `$XDG_STATE_HOME/nervros`, else
@@ -319,6 +322,7 @@ fn robot_tools(
     profile: &Profile,
     robot: &Arc<dyn RobotPort>,
     (schemas, guard): (&Arc<dyn SchemaSource>, &Arc<Guard>),
+    goals: Arc<crate::integrations::Goals>,
     registry: &mut Registry,
 ) -> Result<(), StartError> {
     registry.add(Arc::new(RobotState::new(
@@ -327,7 +331,7 @@ fn robot_tools(
         Arc::clone(guard),
     )))?;
     if let Some(config) = &profile.ros_tools {
-        for tool in crate::ros_tools::tools(config, robot, schemas, guard) {
+        for tool in crate::ros_tools::tools(config, robot, (schemas, guard), Some(goals)) {
             registry.add(tool)?;
         }
     }
@@ -579,6 +583,8 @@ pub struct LoggedSession {
     pub blobs: PathBuf,
     /// The log's writer, which ends with the session.
     pub log: tokio::task::JoinHandle<()>,
+    /// This NervROS's hold on the robot, given up when dropped: keep it for the session's life.
+    pub lock: std::fs::File,
 }
 
 /// Starts a session on the profile's robot, with the quota ledger, conversation and log under
@@ -595,9 +601,16 @@ pub fn start_logged(
     resume: Option<crate::llm::History>,
     model: Option<String>,
 ) -> Result<LoggedSession, StartError> {
-    let robot = connect(&Profile::load(profile_path)?)?;
+    let profile = Profile::load(profile_path)?;
+    let lock = take_robot(state, &profile.robot.name)?;
+    let robot = connect(&profile)?;
     let logs = state.join("logs");
-    let name = format!("session-{}", crate::unix_secs(std::time::SystemTime::now()));
+    // Two sessions in one second, as a window and a CLI, keep logs of their own.
+    let name = format!(
+        "session-{}-{}",
+        crate::unix_secs(std::time::SystemTime::now()),
+        std::process::id()
+    );
     let files = StartOptions {
         history: Some(logs.join(format!("{name}.history.json"))),
         resume,
@@ -614,7 +627,30 @@ pub fn start_logged(
         log_path,
         blobs: logs.join(name),
         log,
+        lock,
     })
+}
+
+/// This NervROS's hold on `robot`: a second agent on it would share its files, settle the
+/// first's mission as one left running, and command the robot beside it.
+#[cfg(feature = "rcl")]
+fn take_robot(state: &Path, robot: &str) -> Result<std::fs::File, StartError> {
+    std::fs::create_dir_all(state).map_err(StartError::Log)?;
+    let path = state.join(format!("{robot}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(StartError::Log)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(StartError::Busy(format!(
+            "another NervROS runs {robot} already: close it first (it holds {})",
+            path.display()
+        ))),
+        Err(std::fs::TryLockError::Error(e)) => Err(StartError::Log(e)),
+    }
 }
 
 /// Starts an agent with a fresh conversation that is not saved. Must run inside a tokio runtime.
@@ -903,9 +939,10 @@ pub fn start_with(
     let stack_parts = (ledger, &places, &guard);
     let (zones, integrations, port) =
         zone_and_stack_tools(&profile, &robot, stack_parts, &mut registry)?;
-    robot_tools(&profile, &robot, (&schemas, &guard), &mut registry)?;
+    let goals = integrations.goals();
+    robot_tools(&profile, &robot, (&schemas, &guard), goals, &mut registry)?;
     let (watches, incidents) = debug_tools(&profile, (&robot, &schemas), ledger, &mut registry)?;
-    let mcp = mcp_tools(&profile, models.privacy, &mut registry)?;
+    let mcp = mcp_tools(&profile, models.privacy, &mut registry);
     let skills = skill_tools(&profile, &mut registry)?;
     let (memory, stop) = memory_and_stop(&profile, &port, (ledger, &integrations), &mut registry)?;
     let missions = missions(
@@ -1019,8 +1056,29 @@ fn session_config(
                     .map(|g| Arc::clone(g) as Arc<dyn crate::memory::Notes>),
             )
             .collect(),
-        pulse: missions.map(|m| Arc::clone(m) as Arc<dyn crate::session::Pulse>),
+        pulse: Some(Arc::new(Pulses(
+            missions
+                .map(|m| Arc::clone(m) as Arc<dyn crate::session::Pulse>)
+                .into_iter()
+                .chain(std::iter::once(
+                    integrations.goals() as Arc<dyn crate::session::Pulse>
+                ))
+                .collect(),
+        ))),
         ..SessionConfig::default()
+    }
+}
+
+/// Everything the session's loop proves alive by its beat: the executor's deadman, and the open
+/// goals a watchdog hears of.
+#[derive(Debug)]
+struct Pulses(Vec<Arc<dyn crate::session::Pulse>>);
+
+impl crate::session::Pulse for Pulses {
+    fn pulse(&self) {
+        for p in &self.0 {
+            p.pulse();
+        }
     }
 }
 
@@ -1071,21 +1129,29 @@ fn mcp_tools(
     profile: &Profile,
     privacy: PrivacyMode,
     registry: &mut Registry,
-) -> Result<Vec<crate::doctor::Check>, StartError> {
+) -> Vec<crate::doctor::Check> {
     if profile.mcp_servers.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let home = privacy == PrivacyMode::Home;
     // Start-up is not async; the runtime it runs in has threads to spare for this one wait.
-    let (servers, checks) = tokio::task::block_in_place(|| {
+    let (servers, mut checks) = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(crate::mcp::connect_all(profile, home))
     });
     for server in &servers {
         for tool in server.tools() {
-            registry.add(tool)?;
+            // A name the registry refuses loses that tool, as any other MCP failure does, not
+            // the whole start.
+            let name = tool.spec().name.clone();
+            if let Err(e) = registry.add(tool) {
+                checks.push(crate::doctor::Check {
+                    ok: false,
+                    what: format!("MCP tool {name} left out: {e}"),
+                });
+            }
         }
     }
-    Ok(checks)
+    checks
 }
 
 #[cfg(test)]

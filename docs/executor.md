@@ -131,7 +131,8 @@ whether the balance controller is active, with some hysteresis, and says why in 
   a hand holds something.
 - A pick that is cut off may have closed the hand before it stopped. The executor then does not
   know what that hand holds: `holding_<arm>` stays empty, `message` says "<arm> hand unknown",
-  and the hand counts as full until a place with it succeeds. The planner treats it as full.
+  and the hand counts as full until a place with it succeeds, or until the executor finds the arms
+  free of any grip. The planner treats it as full, and a goal's `holding` check as not known.
 
 ## A mission
 
@@ -190,7 +191,8 @@ whether the balance controller is active, with some hysteresis, and says why in 
 - **Arguments.**
   - `type` is `world_id` when the value must be an id in the world model, which the planner checks
     against the live one, and `string` otherwise. A name ending in `_id` with no `type` counts as a
-    `world_id`.
+    `world_id`. `names: "object"` or `names: "room"` on a `world_id` says which of the two it
+    takes; without it, either.
   - `enum` lists the only values allowed. A single value fills the argument when a plan leaves it
     out, ahead of any `default_from`.
   - `default_from: "label(<arg>)"` lets the planner fill the value with the world model's label for
@@ -219,7 +221,8 @@ whether the balance controller is active, with some hysteresis, and says why in 
   It follows the plan from the robot's current state. It adds a walk before a step that needs
   the robot near a known object, forgets where the robot is after a skill that takes the base
   unless it is `still()`, and rejects a step whose hand is wrong, with the fix spelled out. Other
-  predicates are the executor's to check.
+  predicates are advisory: the executor stores and lists them but checks none, and only the
+  macros' own conditions guard a step.
 - **Navigation.** An executor that has `GoToPose(station)`, where the station is `x;y;yaw` in
   the map frame, or `GoToTarget(target)`, a room or object id, lets plans write
   `GoToPlace(place)`. The planner picks the macro from what the place is. The model never names

@@ -33,7 +33,7 @@ pose = { x = 0.5, y = 0.5 }
 [[tool]]
 name = "find_objects"
 kind = "service"
-ros_name = "/canopy/find_objects"
+ros_name = "/scenario/find_objects"
 type = "scenario_msgs/srv/FindObjects"
 risk = "observe"
 description = "Finds objects in the world model by what they are: ids, labels and rooms."

@@ -151,9 +151,14 @@ impl Missions {
             let n = self.run_failures.fetch_add(1, Ordering::SeqCst) + 1;
             let failed = compiled.steps.iter().find(|s| s.id == step);
             let what = failed.map_or_else(String::new, |s| format!(" {}", s.summary));
-            let _ = write!(report, " Failed at {step}{what}: {reason}.");
+            // With no step named, the failure is the mission's as a whole.
+            if step.is_empty() {
+                let _ = write!(report, " Failed: {reason}.");
+            } else {
+                let _ = write!(report, " Failed at {step}{what}: {reason}.");
+            }
             if let Some(line) =
-                failed.and_then(|s| check::last_seen(s, evidence.seen, crate::now_s()))
+                failed.and_then(|s| check::last_seen(s, evidence.seen, self.robot().ros_now_s()))
             {
                 let _ = write!(report, " The world model: {line}.");
             }

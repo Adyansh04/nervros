@@ -11,8 +11,9 @@ use tokio::sync::oneshot;
 use super::calls::Approved;
 use super::event::{Event, NotApproved};
 use super::{Shared, millis};
+use crate::guard::RuleAction;
 use crate::lock;
-use crate::tools::{Lane, Risk, Tool};
+use crate::tools::{Lane, Risk, Tool, ToolOutcome};
 
 /// A request the operator had not answered when its session ended.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,6 +82,15 @@ struct Asking<'a> {
     not_approved: Option<NotApproved>,
 }
 
+/// What "Allow for session" covers: the tool, and its action where it has several, since one
+/// tool's actions differ in what they risk (clearing a costmap, and switching Nav2 off).
+pub(super) fn allowance(name: &str, args: &Value) -> String {
+    match args.get("action").and_then(Value::as_str) {
+        Some(action) => format!("{name}:{action}"),
+        None => name.to_owned(),
+    }
+}
+
 impl Drop for Asking<'_> {
     fn drop(&mut self) {
         lock(&self.shared.approvals).remove(&self.id);
@@ -108,8 +118,8 @@ impl Shared {
         risk: Risk,
         mut approved: Approved,
     ) -> Result<Approved, NotApproved> {
-        let can_allow =
-            !matches!(risk, Risk::Motion | Risk::Manipulation) && !tool.always_asks(&approved.args);
+        let always_asks = tool.always_asks(&approved.args);
+        let can_allow = !matches!(risk, Risk::Motion | Risk::Manipulation) && !always_asks;
         let acts = risk.lane() == Lane::Act;
         let id = self.next_approval.fetch_add(1, Ordering::Relaxed) + 1;
         let mut asking = Asking {
@@ -125,6 +135,7 @@ impl Shared {
             args: approved.args.clone(),
             reason: reason.clone(),
             can_allow,
+            always_asks,
         });
         let asked = Instant::now();
         let mut early = None;
@@ -135,27 +146,28 @@ impl Shared {
             };
             match answer {
                 Ok(Ok(Answer::Approve)) => break Ok(()),
+                // Not allowed for the session, so not this time either: it waits for a yes or a no.
+                Ok(Ok(Answer::AllowForSession)) if !can_allow => {
+                    self.emit(Event::Notice {
+                        text: asked_every_time(name, acts),
+                    });
+                    rx = self.listen(id, acts);
+                }
                 Ok(Ok(Answer::AllowForSession)) => {
-                    let text = if can_allow {
-                        lock(&self.allowed).insert(name.to_owned());
-                        format!(
-                            "`{name}` runs without asking for the rest of this session, except \
+                    let scope = allowance(name, &approved.args);
+                    lock(&self.allowed).insert(scope.clone());
+                    self.emit(Event::Notice {
+                        text: format!(
+                            "`{scope}` runs without asking for the rest of this session, except \
                              what moves the robot"
-                        )
-                    } else if acts {
-                        format!("`{name}` moves the robot, so it still asks every time")
-                    } else {
-                        format!(
-                            "`{name}` widens where the robot may go, so it still asks every time"
-                        )
-                    };
-                    self.emit(Event::Notice { text });
+                        ),
+                    });
                     break Ok(());
                 }
                 Ok(Ok(Answer::Edit(edited))) => {
                     // Waiting again before the check, so a stop during it still lands.
                     rx = self.listen(id, acts);
-                    let passed = match tool.assess_operator(edited).await {
+                    let passed = match self.check_edit(tool, name, edited).await {
                         Some(Ok(a)) => {
                             if let Some(args) = a.args {
                                 approved.args = args;
@@ -187,7 +199,9 @@ impl Shared {
                     // An approval sent during the check was for the plan before it, so it does
                     // not approve an edit nobody has seen; a denial or a newer edit stands.
                     match rx.try_recv() {
-                        Ok(Answer::Approve) if passed => rx = self.listen(id, acts),
+                        Ok(Answer::Approve | Answer::AllowForSession) if passed => {
+                            rx = self.listen(id, acts);
+                        }
                         Ok(answer) => early = Some(answer),
                         Err(_) => {}
                     }
@@ -207,6 +221,41 @@ impl Shared {
     }
 
     /// Keeps approval `id` where the next session finds it if this one ends first.
+    /// The tool's check of an operator's edit, refused as well when the profile's rules forbid it:
+    /// they hold for an edit as for the call it replaces.
+    async fn check_edit(
+        &self,
+        tool: &Arc<dyn Tool>,
+        name: &str,
+        edited: Value,
+    ) -> Option<Result<crate::tools::Assessment, ToolOutcome>> {
+        let mut checked = tool.assess_operator(edited).await;
+        if let Some(Ok(a)) = &checked
+            && let Some(why) = self.denied_edit(tool, name, a.args.as_ref())
+        {
+            checked = Some(Err(ToolOutcome::refused(why)));
+        }
+        checked
+    }
+
+    /// Why the profile's rules refuse an edit, whose arguments are `edited` as the tool settled
+    /// them: a plan edited to pick up what a `deny` rule forbids is refused like the plan itself.
+    fn denied_edit(
+        &self,
+        tool: &Arc<dyn Tool>,
+        name: &str,
+        edited: Option<&Value>,
+    ) -> Option<String> {
+        let edited = edited?;
+        let deny = |args: &Value| {
+            self.guard
+                .rule(name, args)
+                .filter(|r| r.then == RuleAction::Deny)
+                .map(|r| r.reason.clone())
+        };
+        deny(edited).or_else(|| tool.rule_view(edited).and_then(|view| deny(&view)))
+    }
+
     fn keep_waiting(&self, id: u64, tool: &Arc<dyn Tool>, name: &str, reason: &str, args: &Value) {
         if self.config.pending_file.is_none() {
             return;
@@ -271,5 +320,16 @@ impl Shared {
         for id in acting {
             self.answer(id, Answer::Disarm);
         }
+    }
+}
+
+/// Why "allow for the session" does not answer a request: it is asked every time.
+fn asked_every_time(name: &str, acts: bool) -> String {
+    if acts {
+        format!("`{name}` moves the robot, so it is asked every time: approve or deny it")
+    } else {
+        format!(
+            "`{name}` widens where the robot may go, so it is asked every time: approve or deny it"
+        )
     }
 }

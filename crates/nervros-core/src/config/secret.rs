@@ -44,6 +44,21 @@ pub enum SecretError {
     Empty(String),
 }
 
+/// Says so when a key file can be read by more than its owner: a key is as safe as its file.
+fn warn_if_shared(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            tracing::warn!(file = %path.display(), "the key file can be read by others: chmod 600 it");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 impl KeySource {
     /// Reads the key.
     ///
@@ -58,6 +73,7 @@ impl KeySource {
                     path: path.clone(),
                     source,
                 })?;
+                warn_if_shared(&path);
                 (text, path.display().to_string())
             }
             Self::Env { env } => {

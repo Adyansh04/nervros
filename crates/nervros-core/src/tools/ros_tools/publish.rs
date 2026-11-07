@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{
-    Ctx, MAX_PUBLISH, MAX_PUBLISH_HZ, Prepared, count, failed, name_arg, object, payload, spec,
+    Ctx, MAX_PUBLISH, MAX_PUBLISH_HZ, Prepared, count, failed, name_arg, object, spec, with_type,
 };
 use crate::guard::glob_match;
 use crate::tools::{Assessment, Resource, Risk, SchemaPart, Tool, ToolOutcome, ToolSpec};
@@ -56,30 +56,19 @@ impl TopicPublish {
                 "the profile does not let this agent publish on `{topic}`"
             )));
         }
-        let ty = match args["type"].as_str().filter(|t| !t.is_empty()) {
-            Some(t) => t.to_owned(),
-            None => self.ctx.topic_type(&topic).await.map_err(|_| {
-                ToolOutcome::failed(format!(
-                    "`{topic}` is not in the graph yet; give its type, such as std_msgs/msg/String"
-                ))
-            })?,
-        };
-        if let Some(out) = self.ctx.deny_act(&topic, &ty) {
-            return Err(out);
-        }
-        let message = payload(args, "message");
-        self.ctx
-            .schemas
-            .validate(&ty, SchemaPart::Message, &message)
-            .map_err(|why| ToolOutcome::failed(format!("the message does not fit {ty}: {why}")))?;
-        if let Some(refused) = self.ctx.zone_refusal(&ty, &message) {
+        let graph = self.ctx.topic_type(&topic).await.map_err(|_| {
+            ToolOutcome::failed(format!(
+                "`{topic}` is not in the graph yet; give its type, such as std_msgs/msg/String"
+            ))
+        });
+        let p = self
+            .ctx
+            .checked((topic, graph), args, ("message", Some(SchemaPart::Message)))
+            .map_err(|refusal| *refusal)?;
+        if let Some(refused) = self.ctx.zone_refusal(&p.ty, &p.payload) {
             return Err(refused);
         }
-        Ok(Prepared {
-            name: topic,
-            ty,
-            payload: message,
-        })
+        Ok(p)
     }
 }
 
@@ -94,7 +83,7 @@ impl Tool for TopicPublish {
         Some(self.prepare(args).await.map(|p| Assessment {
             risk: Risk::Motion,
             resources: Resource::ALL.to_vec(),
-            args: None,
+            args: Some(with_type(args, &p.ty)),
             reason: format!(
                 "publishes {} on {} ({}) {}",
                 p.payload,

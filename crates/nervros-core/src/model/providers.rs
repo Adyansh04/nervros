@@ -83,9 +83,10 @@ impl ProviderConfig {
     /// Whether it is OpenRouter, whose model ids say whether a model is free.
     #[must_use]
     pub fn is_openrouter(&self) -> bool {
+        // Any spelling of its host: the free-only rule must not hang on letter case.
         self.base_url
             .as_deref()
-            .is_some_and(|url| url.contains("openrouter.ai"))
+            .is_some_and(|url| url.to_ascii_lowercase().contains("openrouter.ai"))
     }
 }
 

@@ -54,13 +54,36 @@ impl WorldEditor {
                     .on_hover_text("Read the saved world again, dropping edits not saved")
                     .clicked()
                 {
+                    // Edits not saved, the agent's too, would go with one click.
+                    if world.unsaved > 0 {
+                        self.confirm_reload = true;
+                    } else {
+                        self.call(
+                            &ctx,
+                            Call::Command("reload", "read the world from disk again"),
+                        );
+                    }
+                }
+            });
+        });
+        if self.confirm_reload {
+            ui.label(format!(
+                "Drop {} edits not saved, and read the saved world again?",
+                world.unsaved
+            ));
+            ui.horizontal(|ui| {
+                if ui.add(ReButton::new("Reload").small().primary()).clicked() {
+                    self.confirm_reload = false;
                     self.call(
                         &ctx,
                         Call::Command("reload", "read the world from disk again"),
                     );
                 }
+                if ui.add(ReButton::new("Keep them").small().ghost()).clicked() {
+                    self.confirm_reload = false;
+                }
             });
-        });
+        }
         if let Some((text, error)) = status {
             let colour = if error { REMOVED } else { theme::DIM };
             ui.label(RichText::new(text).small().color(colour));
@@ -184,7 +207,7 @@ impl WorldEditor {
             }
         });
         if object.crop
-            && let Some(texture) = self.crop(&ctx, id)
+            && let Some(texture) = self.crop(&ctx, id, object.observations)
         {
             let size = texture.size_vec2();
             let width = size.x.min(ui.available_width()).min(300.0);
@@ -216,7 +239,13 @@ impl WorldEditor {
         let (ctx, id) = (ui.ctx().clone(), object.id);
         text_field(ui, "What it is", &mut self.form.label, &world.labels);
         ui.horizontal(|ui| {
-            if ui.add(ReButton::new("Set label").small()).clicked() {
+            // An empty label would put the object back to the detector's votes: that has its
+            // own button.
+            let label_given = !self.form.label.trim().is_empty();
+            if ui
+                .add_enabled(label_given, ReButton::new("Set label").small())
+                .clicked()
+            {
                 let label = self.form.label.trim().to_owned();
                 let op = json!({"op": "label", "id": id, "label": label});
                 self.edit(&ctx, op, format!("O{id} is now {label}"));
@@ -228,7 +257,13 @@ impl WorldEditor {
             }
         });
         text_field(ui, "Name", &mut self.form.name, &[]);
-        if ui.add(ReButton::new("Set name").small()).clicked() {
+        if ui
+            .add_enabled(
+                !self.form.name.trim().is_empty(),
+                ReButton::new("Set name").small(),
+            )
+            .clicked()
+        {
             let op = json!({"op": "name", "id": id, "name": self.form.name.trim()});
             self.edit(&ctx, op, format!("O{id} named"));
         }

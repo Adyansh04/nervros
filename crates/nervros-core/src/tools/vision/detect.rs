@@ -31,14 +31,22 @@ fn f64_at(v: &Value, path: &str) -> f64 {
     v.pointer(path).and_then(Value::as_f64).unwrap_or(0.0)
 }
 
+/// The widest frame a camera gives, px: a detector's box past it is taken to its edge, so
+/// drawing and cropping one never runs for billions of pixels or overflows.
+const MAX_FRAME_PX: u32 = 16_384;
+
 fn px(v: f64) -> u32 {
-    // Pixel coordinates from JSON: clamped to the u32 range, rounded.
+    // Pixel coordinates from JSON, NaN as 0, rounded.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "clamped"
     )]
-    let out = v.clamp(0.0, f64::from(u32::MAX)).round() as u32;
+    let out = if v.is_nan() {
+        0
+    } else {
+        v.clamp(0.0, f64::from(MAX_FRAME_PX)).round() as u32
+    };
     out
 }
 

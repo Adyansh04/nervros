@@ -9,7 +9,7 @@
 use super::catalog::{Catalog, GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, WALK_GRAPH, WALK_ROUTE};
 use super::plan::{PlannedStep, Problem, World, arg};
 use crate::builtins::triple;
-use crate::profile::PlanChecks;
+use crate::profile::{PlanChecks, WalkSkill};
 use crate::zones::Zones;
 
 /// The robot on the map: x, y and its heading in radians, when known.
@@ -31,15 +31,12 @@ fn destination(step: &PlannedStep, world: &World) -> Option<Pose> {
         return Some((x, y, Some(yaw)));
     }
     let target = target(step)?;
-    if let Some(p) = world.places.iter().find(|p| p.name == target) {
-        return Some((p.pose.x, p.pose.y, Some(p.pose.yaw)));
+    // Resolved as the walk resolves it: a place by any of its names, a room by its id or name.
+    if let Some(pose) = waypoint(&target, world) {
+        return Some(pose);
     }
-    // A room or an object: the robot stops near it, facing it, its heading unknown here.
-    let thing = world
-        .rooms
-        .iter()
-        .chain(&world.objects)
-        .find(|t| t.id == target)?;
+    // An object: the robot stops near it, facing it, its heading unknown here.
+    let thing = world.objects.iter().find(|t| t.id == target)?;
     thing.xy.map(|(x, y)| (x, y, None))
 }
 
@@ -77,16 +74,107 @@ fn route(
 
 /// Where a route passes `name`: a place, or a room's centre.
 fn waypoint(name: &str, world: &World) -> Option<Pose> {
-    let same = |a: &str| crate::places::same_words(a, name);
-    let place = world
-        .places
-        .iter()
-        .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)));
-    if let Some(p) = place {
+    if let Some(p) = crate::places::find(&world.places, name) {
         return Some((p.pose.x, p.pose.y, Some(p.pose.yaw)));
     }
+    let same = |a: &str| crate::places::same_words(a, name);
     let room = world.rooms.iter().find(|r| r.id == name || same(&r.name))?;
     room.xy.map(|(x, y)| (x, y, None))
+}
+
+/// Where a straight walk ends, refusing one that would enter a keep-out zone or that starts too
+/// blind to tell.
+fn straight(
+    step: &PlannedStep,
+    walk: &WalkSkill,
+    pose: Option<Pose>,
+    zones: &Zones,
+    problems: &mut Vec<Problem>,
+) -> Option<Pose> {
+    let back = arg(&step.args, &walk.direction).is_some_and(|d| d.starts_with("back"));
+    match (pose, step.number(&walk.metres)) {
+        (Some((x, y, Some(yaw))), Some(metres)) if metres > 0.0 => {
+            let along = if back { -metres } else { metres };
+            let end = (x + along * yaw.cos(), y + along * yaw.sin());
+            if let Some((zone, d)) = zones.crossed((x, y), end) {
+                let why = if zone.contains(x, y) && zone.contains(end.0, end.1) {
+                    format!(
+                        "{} stays inside the keep-out zone `{}`, where the robot stands: \
+                         walk it out",
+                        step.summary, zone.name
+                    )
+                } else {
+                    format!(
+                        "{} would enter the keep-out zone `{}` after {d:.1} m: walk less, \
+                         or around it",
+                        step.summary, zone.name
+                    )
+                };
+                problems.push(Problem::new(&step.id, &walk.metres, why));
+            }
+            Some((end.0, end.1, Some(yaw)))
+        }
+        (start, Some(metres)) if metres > 0.0 => {
+            if let Some(why) = blind_walk(start, metres, zones) {
+                problems.push(Problem::new(
+                    &step.id,
+                    &walk.metres,
+                    format!("{} {why}", step.summary),
+                ));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Why a straight walk of `metres` from a start known only in part may enter a keep-out zone:
+/// with the robot's place unknown any zone may be in reach, with only its heading unknown one
+/// within `metres` of it.
+fn blind_walk(start: Option<Pose>, metres: f64, zones: &Zones) -> Option<String> {
+    let keep_out = zones.keep_out();
+    if keep_out.is_empty() {
+        return None;
+    }
+    let Some((x, y, _)) = start else {
+        return Some(
+            "starts where the robot's place on the map is unknown, so it cannot be checked \
+             against the keep-out zones: walk to a place first"
+                .to_owned(),
+        );
+    };
+    keep_out
+        .iter()
+        .find(|z| {
+            z.contains(x, y) || edges(&z.polygon).any(|(a, b)| to_segment((x, y), a, b) <= metres)
+        })
+        .map(|z| {
+            format!(
+                "starts facing a way the plan cannot tell, within {metres:.1} m of the keep-out \
+                 zone `{}`: walk to a place with a heading first",
+                z.name
+            )
+        })
+}
+
+/// A polygon's edges, the last closing it.
+fn edges(polygon: &[[f64; 2]]) -> impl Iterator<Item = ([f64; 2], [f64; 2])> + '_ {
+    polygon
+        .iter()
+        .zip(polygon.iter().cycle().skip(1))
+        .map(|(a, b)| (*a, *b))
+}
+
+/// How far `(px, py)` is from the segment `a` to `b`, in metres.
+fn to_segment((px, py): (f64, f64), [ax, ay]: [f64; 2], [bx, by]: [f64; 2]) -> f64 {
+    let (dx, dy) = (bx - ax, by - ay);
+    let length2 = dx * dx + dy * dy;
+    let t = if length2 > 0.0 {
+        (((px - ax) * dx + (py - ay) * dy) / length2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (px - ax - t * dx).hypot(py - ay - t * dy)
 }
 
 /// Every step of `steps` that would take the robot into a zone, from `start` (x, y, heading).
@@ -100,7 +188,17 @@ pub(crate) fn check(
 ) -> Vec<Problem> {
     let mut problems = Vec::new();
     let mut pose: Option<Pose> = start.map(|(x, y, yaw)| (x, y, Some(yaw)));
+    // An optional step that failed left the robot where it was: after one that moves the base,
+    // where the robot stands is not known.
+    let mut uncertain = false;
     for step in steps {
+        if std::mem::take(&mut uncertain) {
+            pose = None;
+        }
+        uncertain = step.optional
+            && catalog
+                .skill(&step.skill)
+                .is_some_and(|s| s.resources.iter().any(|r| r == "base"));
         if [GO_TO_PLACE, GO_TO_POSE, GO_TO_TARGET, WALK_GRAPH].contains(&step.skill.as_str()) {
             pose = destination(step, world);
             if let Some((x, y, _)) = pose
@@ -144,31 +242,7 @@ pub(crate) fn check(
             continue;
         }
         if let Some(walk) = checks.walk.as_ref().filter(|w| w.skill == step.skill) {
-            let back = arg(&step.args, &walk.direction).is_some_and(|d| d.starts_with("back"));
-            pose = match (pose, step.number(&walk.metres)) {
-                (Some((x, y, Some(yaw))), Some(metres)) if metres > 0.0 => {
-                    let along = if back { -metres } else { metres };
-                    let end = (x + along * yaw.cos(), y + along * yaw.sin());
-                    if let Some((zone, d)) = zones.crossed((x, y), end) {
-                        let why = if zone.contains(x, y) && zone.contains(end.0, end.1) {
-                            format!(
-                                "{} stays inside the keep-out zone `{}`, where the robot stands: \
-                                 walk it out",
-                                step.summary, zone.name
-                            )
-                        } else {
-                            format!(
-                                "{} would enter the keep-out zone `{}` after {d:.1} m: walk less, \
-                                 or around it",
-                                step.summary, zone.name
-                            )
-                        };
-                        problems.push(Problem::new(&step.id, &walk.metres, why));
-                    }
-                    Some((end.0, end.1, Some(yaw)))
-                }
-                _ => None,
-            };
+            pose = straight(step, walk, pose, zones, &mut problems);
             continue;
         }
         if let Some(turn) = checks.turn.as_ref().filter(|t| t.skill == step.skill) {
@@ -308,6 +382,52 @@ mod tests {
         );
         let fine = [step("s1", WALK_ROUTE, &[("places", "dock")], None)];
         assert!(check(&fine, None, &world, &catalog(), &checks(), &zones()).is_empty());
+    }
+
+    #[test]
+    fn a_walk_to_a_place_by_another_of_its_names_is_fenced_too() {
+        let mut world = world();
+        world.places.push(PlaceConfig {
+            name: "landing".into(),
+            aliases: vec!["top of the stairs".into()],
+            frame: "map".into(),
+            pose: PlacePose {
+                x: 2.5,
+                y: 0.0,
+                yaw: 0.0,
+            },
+            near: Vec::new(),
+        });
+        let walk = [step(
+            "s1",
+            WALK_GRAPH,
+            &[("target", "Top of the stairs")],
+            None,
+        )];
+        let problems = check(&walk, None, &world, &catalog(), &checks(), &zones());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].message.contains("`stairs`"),
+            "{}",
+            problems[0].message
+        );
+    }
+
+    #[test]
+    fn a_straight_walk_from_nowhere_known_is_refused_while_zones_are_set() {
+        let walk = [step(
+            "s1",
+            "WalkStraight",
+            &[("direction", "forward"), ("distance_m", "1.5")],
+            None,
+        )];
+        let problems = check(&walk, None, &world(), &catalog(), &checks(), &zones());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].message.contains("unknown"),
+            "{}",
+            problems[0].message
+        );
     }
 
     #[test]

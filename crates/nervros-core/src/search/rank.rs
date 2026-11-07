@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::priors::{room_type, rooms_for};
 use crate::builtins::holds;
-use crate::mission::check::{how_long, named};
+use crate::mission::check::named;
 use crate::profile::PlaceConfig;
 use crate::text;
 
@@ -84,7 +84,7 @@ fn ago(at: f64, now_s: f64) -> String {
     if at <= 0.0 {
         "some time ago".to_owned()
     } else {
-        format!("{} ago", how_long((now_s - at).max(0.0)))
+        crate::ago(now_s - at)
     }
 }
 
@@ -104,8 +104,7 @@ pub(super) fn bare(words: &str) -> String {
 /// The word the world model's labels hold a thing by: the last of `phrase`, without a plural
 /// `s`, so "red mugs" is looked up under every label holding "mug".
 pub(super) fn label_word(phrase: &str) -> &str {
-    let last = phrase.split_whitespace().last().unwrap_or(phrase);
-    last.strip_suffix('s').unwrap_or(last)
+    crate::mission::check::singular(phrase.split_whitespace().last().unwrap_or(phrase))
 }
 
 /// Whether an object is the thing: its label or name holds the words, or, less surely, the
@@ -115,7 +114,7 @@ fn matches(o: &Value, words: &str) -> Option<bool> {
         return Some(true);
     }
     let head = words.split_whitespace().last()?;
-    named(o, head.trim_end_matches('s')).then_some(false)
+    named(o, crate::mission::check::singular(head)).then_some(false)
 }
 
 /// Each object the world model has under these words, where it stood.
@@ -137,6 +136,9 @@ fn sightings(seen: &Seen<'_>) -> Vec<Lookout> {
             } else {
                 format!("a {name}")
             };
+            // Only a sighting that still stands outranks every room; one looked at since and
+            // not found, or long gone, ranks with them.
+            let live = !matches!(o["state"].as_u64(), Some(1 | 2));
             let (weight, why) = match o["state"].as_u64() {
                 Some(1) => (
                     0.5,
@@ -160,7 +162,7 @@ fn sightings(seen: &Seen<'_>) -> Vec<Lookout> {
                 target: text(o, "id").to_owned(),
                 why,
                 room: text(o, "room_id").to_owned(),
-                score: 1.0 + sure * weight * fresh(at, seen.now_s),
+                score: f64::from(u8::from(live)) + sure * weight * fresh(at, seen.now_s),
                 xy: p["x"].as_f64().zip(p["y"].as_f64()),
             }
         })
@@ -312,6 +314,26 @@ mod tests {
     }
 
     #[test]
+    fn a_sighting_not_found_since_ranks_with_the_rooms_not_above_them() {
+        let objects = json!({"objects": [
+            {"id": "O1", "label": "mug", "room_id": "R3", "state": 1,
+             "pose": {"position": {"x": 2.0, "y": 0.0}}, "last_seen": {"sec": NOW - 86_400.0}}]});
+        let rooms = rooms();
+        let seen = Seen {
+            words: "mug",
+            objects: &objects,
+            rooms: &rooms,
+            events: &[],
+            robot: Some((0.0, 0.0)),
+            now_s: NOW,
+            places: &[],
+        };
+        let order = order(&seen);
+        let at = |t: &str| order.iter().position(|o| o == t);
+        assert!(at("R1") < at("O1") && at("R2") < at("O1"), "{order:?}");
+    }
+
+    #[test]
     fn with_no_sighting_the_usual_rooms_come_first_the_least_seen_most() {
         let objects = json!({"objects": []});
         let rooms = rooms();
@@ -362,7 +384,7 @@ mod tests {
             (ranked[0].target.as_str(), ranked[1].target.as_str()),
             ("O2", "O1")
         );
-        assert_eq!(ranked[1].why, "a mug was seen there 0 s ago");
+        assert_eq!(ranked[1].why, "a mug was seen there just now");
         assert_eq!(bare("The keys"), "keys");
         assert_eq!(
             [
@@ -370,7 +392,13 @@ mod tests {
                 label_word("keys"),
                 label_word("glass")
             ],
-            ["mug", "key", "glas"]
+            ["mug", "key", "glass"]
+        );
+        let keyboard = json!({"label": "keyboard", "name": ""});
+        assert_eq!(matches(&keyboard, "keys"), None, "keys are not a keyboard");
+        assert_eq!(
+            matches(&json!({"label": "mug", "name": ""}), "red mugs"),
+            Some(false)
         );
     }
 

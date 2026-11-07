@@ -4,7 +4,7 @@ use nervros_core::mission::preview::PreviewStep;
 use rerun::RecordingStream;
 use serde_json::Value;
 
-use crate::{PLAN_PATH, f32s, put, put_static, xyz};
+use crate::{PREVIEW_PATH, f32s, put, put_static, xyz};
 
 /// The path the navigation stack is following, from a `nav_msgs/msg/Path`.
 pub(super) fn draw_plan(rec: &RecordingStream, path: &str, msg: &Value) {
@@ -31,7 +31,7 @@ pub(super) fn draw_plan(rec: &RecordingStream, path: &str, msg: &Value) {
 pub(super) fn draw_preview(rec: &RecordingStream, steps: &[PreviewStep]) {
     const LIFT: f32 = 0.06;
     let colour = rerun::Color::from_rgb(255, 196, 64);
-    put(rec, PLAN_PATH, &rerun::Clear::recursive());
+    put(rec, PREVIEW_PATH, &rerun::Clear::recursive());
     let paths: Vec<Vec<[f32; 3]>> = steps
         .iter()
         .filter(|s| s.path.len() > 1)
@@ -48,7 +48,7 @@ pub(super) fn draw_preview(rec: &RecordingStream, steps: &[PreviewStep]) {
     if !paths.is_empty() {
         put(
             rec,
-            &format!("{PLAN_PATH}/paths"),
+            &format!("{PREVIEW_PATH}/paths"),
             &rerun::LineStrips3D::new(paths)
                 .with_radii([0.04])
                 .with_colors([colour]),
@@ -61,7 +61,7 @@ pub(super) fn draw_preview(rec: &RecordingStream, steps: &[PreviewStep]) {
     if !ends.is_empty() {
         put(
             rec,
-            &format!("{PLAN_PATH}/ends"),
+            &format!("{PREVIEW_PATH}/ends"),
             &rerun::Arrows3D::from_vectors(
                 ends.iter()
                     .map(|(_, [_, _, yaw])| [0.4 * yaw.cos(), 0.4 * yaw.sin(), 0.0]),

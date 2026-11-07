@@ -58,6 +58,9 @@ pub(crate) fn level_word(n: u64) -> &'static str {
     }
 }
 
+/// The most log messages one look reads: far above a stack's lines over the longest window.
+const LOG_SAMPLE_CAP: usize = 20_000;
+
 #[async_trait]
 impl Tool for LogTail {
     fn spec(&self) -> Cow<'_, ToolSpec> {
@@ -75,10 +78,12 @@ impl Tool for LogTail {
         let window = seconds(&args, "seconds", 2.0, MAX_SAMPLE);
         let max = count(&args, "max", 30, 100);
         // /rosout keeps recent history for late subscribers, so this sees the last few seconds too.
+        // To the end of the window: a busy stack logs past any small cap, and the newest lines are
+        // the ones asked for.
         let logs = match self
             .ctx
             .robot
-            .sample_messages("/rosout", "rcl_interfaces/msg/Log", 500, window)
+            .sample_messages("/rosout", "rcl_interfaces/msg/Log", LOG_SAMPLE_CAP, window)
             .await
         {
             Ok(l) => l,
@@ -95,10 +100,12 @@ impl Tool for LogTail {
                     .chars()
                     .take(300)
                     .collect();
+                // What a node logs can quote the world: fenced as its words, not the operator's.
                 format!(
-                    "[{}] {}: {text}",
+                    "[{}] {}: {}",
                     level_word(l["level"].as_u64().unwrap_or(0)),
-                    l["name"].as_str().unwrap_or("?")
+                    l["name"].as_str().unwrap_or("?"),
+                    crate::tools::from_world(&text)
                 )
             })
             .collect();

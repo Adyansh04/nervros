@@ -10,11 +10,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nervros_ros::{Endpoint, GraphDetail, RobotPort, RosError};
+use nervros_ros::{
+    Durability, Endpoint, GraphDetail, Liveliness, Reliability, RobotPort, RosError,
+};
 use serde_json::{Map, Value, json};
 
 use crate::guard::{Guard, canonical_ros_name, glob_match};
-use crate::tools::{Risk, SchemaSource, Tool, ToolOutcome, ToolSpec};
+use crate::tools::{Risk, SchemaPart, SchemaSource, Tool, ToolOutcome, ToolSpec};
 
 mod action;
 mod config;
@@ -71,7 +73,15 @@ struct Ctx {
     schemas: Arc<dyn SchemaSource>,
     guard: Arc<Guard>,
     config: RosToolsConfig,
+    /// Where a goal sent here is kept while it runs, so a stop and the watchdog see it.
+    goals: Option<Arc<crate::integrations::Goals>>,
+    /// The graph as last read, and when: an act's check runs at its approval and again at its
+    /// call, a moment apart.
+    seen: std::sync::Mutex<Option<(std::time::Instant, GraphDetail)>>,
 }
+
+/// How long a graph read stands for the next check.
+const GRAPH_FRESH: Duration = Duration::from_secs(2);
 
 impl Ctx {
     /// Whether a parameter's value is hidden, whatever the case of its name: `apiKey` too.
@@ -84,7 +94,55 @@ impl Ctx {
     }
 
     async fn graph(&self) -> Result<GraphDetail, ToolOutcome> {
-        self.robot.graph_detail().await.map_err(|e| failed(&e))
+        if let Some((at, graph)) = crate::lock(&self.seen).as_ref()
+            && at.elapsed() < GRAPH_FRESH
+        {
+            return Ok(graph.clone());
+        }
+        let graph = self.robot.graph_detail().await.map_err(|e| failed(&e))?;
+        *crate::lock(&self.seen) = Some((std::time::Instant::now(), graph.clone()));
+        Ok(graph)
+    }
+
+    /// The steps every act shares once the profile lets it: the type it takes, the deny rules on
+    /// its name and that type, and its payload under `key` checked against the type's `part`
+    /// (none for an act that sends no payload, as a cancel). A refusal is boxed: it is the rare
+    /// path, and the outcome is large.
+    fn checked(
+        &self,
+        (name, graph): (String, Result<String, ToolOutcome>),
+        args: &Value,
+        (key, part): (&str, Option<SchemaPart>),
+    ) -> Result<Prepared, Box<ToolOutcome>> {
+        let ty = Self::resolved(&name, args["type"].as_str(), graph)?;
+        if let Some(out) = self.deny_act(&name, &ty) {
+            return Err(Box::new(out));
+        }
+        let payload = payload(args, key);
+        if let Some(part) = part {
+            self.schemas.validate(&ty, part, &payload).map_err(|why| {
+                Box::new(ToolOutcome::failed(format!(
+                    "the {key} does not fit {ty}: {why}"
+                )))
+            })?;
+        }
+        Ok(Prepared { name, ty, payload })
+    }
+
+    /// The type to use for `name`: the model's only when the graph has none to compare it with.
+    /// One the graph contradicts is refused, as the deny rules read the type.
+    fn resolved(
+        name: &str,
+        given: Option<&str>,
+        graph: Result<String, ToolOutcome>,
+    ) -> Result<String, Box<ToolOutcome>> {
+        match (given.filter(|t| !t.is_empty()), graph) {
+            (Some(given), Ok(known)) if given != known => Err(Box::new(ToolOutcome::refused(
+                format!("`{name}` is {known} in the graph, not {given}: give its own type or none"),
+            ))),
+            (Some(given), _) => Ok(given.to_owned()),
+            (None, graph) => graph.map_err(Box::new),
+        }
     }
 
     /// The type a topic carries now, or why there is none.
@@ -146,8 +204,16 @@ impl Ctx {
             }
             Destinations::Unchecked | Destinations::Elsewhere => return None,
         };
+        // A path's poses may leave their frame to the path's own header.
+        let path_frame = payload["path"]["header"]["frame_id"]
+            .as_str()
+            .unwrap_or_default();
+        let mut points = Vec::with_capacity(poses.len());
         for stamped in poses {
-            let frame = stamped["header"]["frame_id"].as_str().unwrap_or_default();
+            let frame = match stamped["header"]["frame_id"].as_str().unwrap_or_default() {
+                "" => path_frame,
+                own => own,
+            };
             let p = &stamped["pose"]["position"];
             // A field left out goes as 0 on the wire, so it is checked as 0.
             let at = [
@@ -176,6 +242,16 @@ impl Ctx {
                     at[0], at[1], zone.name
                 )));
             }
+            points.push((at[0], at[1]));
+        }
+        // A followed path is driven pose to pose as given: no planner goes round a zone between.
+        if ty == "nav2_msgs/action/FollowPath"
+            && let Some((zone, _)) = points.windows(2).find_map(|w| zones.crossed(w[0], w[1]))
+        {
+            return Some(ToolOutcome::refused(format!(
+                "the path crosses the keep-out zone `{}`: the robot may not go through it",
+                zone.name
+            )));
         }
         None
     }
@@ -279,6 +355,14 @@ fn read_name(raw: &str) -> Result<String, String> {
     }
 }
 
+/// `args` with the type an act resolved: the approved call, and the rules that read it, see the
+/// type the call is made with.
+fn with_type(args: &Value, ty: &str) -> Value {
+    let mut args = args.clone();
+    args["type"] = json!(ty);
+    args
+}
+
 fn seconds(args: &Value, key: &str, default: f64, max: Duration) -> Duration {
     let s = args[key].as_f64().unwrap_or(default);
     Duration::from_secs_f64(s.clamp(0.1, max.as_secs_f64()))
@@ -298,9 +382,26 @@ fn spec(name: &str, description: &str, parameters: Value, risk: Risk) -> ToolSpe
     spec
 }
 
-/// A message cut down to what a model can read: long arrays and strings shortened with their size.
+/// Fields that carry free text a node may have taken from the world, such as a sign read aloud
+/// or a speech result: fenced as the world's wherever a message holds them.
+const FREE_TEXT: [&str; 8] = [
+    "data",
+    "msg",
+    "text",
+    "message",
+    "description",
+    "label",
+    "caption",
+    "transcript",
+];
+
+/// A message cut down to what a model can read: long arrays and strings shortened with their size,
+/// and free text fenced as the world's.
 fn summarize(value: &Value) -> Value {
-    shortened(value, ARRAY_ITEMS, TEXT_CHARS)
+    let mut out = shortened(value, ARRAY_ITEMS, TEXT_CHARS);
+    let keys: Vec<String> = FREE_TEXT.iter().map(|k| (*k).to_owned()).collect();
+    crate::tools::mark_world_text(&mut out, &keys);
+    out
 }
 
 /// A message with its arrays cut at `items` and its strings at `chars`, saying how long they were.
@@ -351,7 +452,7 @@ fn endpoint_json(e: &Endpoint) -> Value {
     let mut out = json!({"node": e.node, "type": e.topic_type, "reliability": e.qos.reliability,
                          "durability": e.qos.durability, "history": e.qos.history,
                          "depth": e.qos.depth});
-    if !e.qos.liveliness.is_empty() {
+    if e.qos.liveliness != nervros_ros::Liveliness::SystemDefault {
         out["liveliness"] = json!(e.qos.liveliness);
     }
     if !e.gid.is_empty() {
@@ -374,17 +475,17 @@ fn endpoint_json(e: &Endpoint) -> Value {
 /// asks more than best effort gives, transient local more than volatile, a deadline more than a
 /// slower one or none, and manual liveliness more than automatic.
 fn qos_matches(publisher: &Endpoint, sub: &Endpoint) -> bool {
-    let reliable_ok =
-        !(sub.qos.reliability == "reliable" && publisher.qos.reliability == "best_effort");
-    let durable_ok =
-        !(sub.qos.durability == "transient_local" && publisher.qos.durability == "volatile");
+    let reliable_ok = !(sub.qos.reliability == Reliability::Reliable
+        && publisher.qos.reliability == Reliability::BestEffort);
+    let durable_ok = !(sub.qos.durability == Durability::TransientLocal
+        && publisher.qos.durability == Durability::Volatile);
     let deadline_ok = match (sub.qos.deadline, publisher.qos.deadline) {
         (Some(asked), Some(given)) => asked >= given,
         (Some(_), None) => false,
         (None, _) => true,
     };
-    let lively_ok =
-        !(sub.qos.liveliness == "manual_by_topic" && publisher.qos.liveliness == "automatic");
+    let lively_ok = !(sub.qos.liveliness == Liveliness::ManualByTopic
+        && publisher.qos.liveliness == Liveliness::Automatic);
     reliable_ok && durable_ok && deadline_ok && lively_ok
 }
 
@@ -408,14 +509,16 @@ fn payload(args: &Value, key: &str) -> Value {
 pub fn tools(
     config: &RosToolsConfig,
     robot: &Arc<dyn RobotPort>,
-    schemas: &Arc<dyn SchemaSource>,
-    guard: &Arc<Guard>,
+    (schemas, guard): (&Arc<dyn SchemaSource>, &Arc<Guard>),
+    goals: Option<Arc<crate::integrations::Goals>>,
 ) -> Vec<Arc<dyn Tool>> {
     let ctx = Arc::new(Ctx {
         robot: Arc::clone(robot),
         schemas: Arc::clone(schemas),
         guard: Arc::clone(guard),
         config: config.clone(),
+        goals,
+        seen: std::sync::Mutex::new(None),
     });
     let mut out = vec![
         graph::tool(Arc::clone(&ctx)),

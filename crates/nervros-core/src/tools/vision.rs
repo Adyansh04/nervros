@@ -18,6 +18,23 @@ pub use marks::draw_marks;
 pub(crate) use marks::{PALETTE, badge, close_up, marks_json, tint};
 pub use snapshot::{Snapshot, SnapshotStore};
 
+/// `frame` as RGB and as the JPEG a model reads, made off the async threads that serve a stop.
+///
+/// # Errors
+///
+/// The frame could not be read, or the encoder failed.
+pub(crate) async fn rgb_for_model(
+    frame: std::sync::Arc<nervros_ros::image::Frame>,
+) -> Result<(image::RgbImage, crate::llm::ImageInput), String> {
+    tokio::task::spawn_blocking(move || {
+        let img = frame.to_rgb().map_err(|e| e.to_string())?;
+        let image = crate::llm::ImageInput::jpeg(&img)?;
+        Ok((img, image))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// `img` as a JPEG at the quality every kept or sent frame uses.
 ///
 /// # Errors

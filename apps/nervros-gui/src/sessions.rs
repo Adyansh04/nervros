@@ -156,13 +156,8 @@ fn slug(text: &str) -> String {
 /// "5 min ago", "3 h ago", "2 days ago", from seconds since the Unix epoch.
 pub fn ago(stamp: u64) -> String {
     let now = nervros_core::unix_secs(SystemTime::now());
-    let mins = now.saturating_sub(stamp) / 60;
-    match mins {
-        0 => "just now".to_owned(),
-        1..60 => format!("{mins} min ago"),
-        60..1440 => format!("{} h ago", mins / 60),
-        _ => format!("{} days ago", mins / 1440),
-    }
+    let seconds = u32::try_from(now.saturating_sub(stamp)).unwrap_or(u32::MAX);
+    nervros_core::ago(f64::from(seconds))
 }
 
 #[cfg(test)]

@@ -9,28 +9,29 @@
 [[case]]
 id = "count-mugs"
 say = ["Count the mugs in every room."]
-expect = { mission = "none", reply_has_all = ["kitchen", "office"] }
+expect = { mission = "none", reply_has_all = ["kitchen", "office", "1"] }
 
 [[case]]
 id = "count-mugs-question"
 say = ["How many mugs are there in each room?"]
-expect = { mission = "none", reply_has_all = ["kitchen", "office"] }
+expect = { mission = "none", reply_has_all = ["kitchen", "office", "1"] }
 
 [[case]]
 id = "count-mugs-casual"
 say = ["can u tell me how many mugs each room has"]
-expect = { mission = "none", reply_has_all = ["kitchen", "office"] }
+expect = { mission = "none", reply_has_all = ["kitchen", "office", "1"] }
 
-# Two chairs in the living room, one each in the kitchen and the office.
+# Two chairs in the living room, one each in the kitchen and the office: the living room, by any of
+# its names, and its count.
 [[case]]
 id = "most-chairs"
 say = ["Which room has the most chairs?"]
-expect = { mission = "none", reply_has = ["living room", "living_room", "R1", "room A"] }
+expect = { mission = "none", reply_has = ["living room", "living_room", "R1", "room A"], reply_has_all = ["2"] }
 
 [[case]]
 id = "most-chairs-count"
 say = ["Count the chairs per room and tell me which room has the most."]
-expect = { mission = "none", reply_has = ["living room", "living_room", "R1", "room A"] }
+expect = { mission = "none", reply_has = ["living room", "living_room", "R1", "room A"], reply_has_all = ["2"] }
 
 # A loop that walks and looks: one approval for all of it.
 [[case]]
@@ -47,7 +48,7 @@ expect = { approvals_max = 1, mission = "success" }
 [[case]]
 id = "find-keys"
 say = ["Find my keys."]
-expect = { tools = ["search"], approvals_max = 1, mission = "success", reply_has = ["found", "Found"] }
+expect = { tools = ["search"], approvals_max = 1, mission = "success", reply_has = ["found"], reply_lacks = ["not found", "didn't find", "did not find", "couldn't find", "could not find"] }
 
 [[case]]
 id = "find-keys-polite"

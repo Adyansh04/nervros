@@ -50,6 +50,9 @@ struct Shared {
     repeated: Mutex<(String, u32)>,
     /// What the operator said during the running turn, for its next tool result.
     steer: Mutex<Vec<String>>,
+    /// What of it the model attempt under way has read: said again to the next model when the
+    /// attempt fails and the turn falls back.
+    steer_heard: Mutex<Vec<String>>,
     /// What the robot noticed since the operator last spoke, for their next message.
     notes: Mutex<Vec<String>>,
     calls: AtomicU64,
@@ -67,6 +70,9 @@ struct Shared {
     to_save: Option<tokio::sync::watch::Sender<Option<History>>>,
     /// The model whose reasoning the history holds: the one that answered the last turn.
     answered_by: Mutex<Option<String>>,
+    /// The running turn's request and what it has done, while it runs: a turn cut off by a stop
+    /// or its time limit leaves them here for the history.
+    working: Mutex<Option<(String, Arc<turn::TurnFlags>)>>,
     config: SessionConfig,
 }
 
@@ -165,6 +171,8 @@ impl Session {
         stop: Option<Arc<dyn Tool>>,
         config: SessionConfig,
     ) -> Self {
+        // Unbounded on purpose: a stop must never wait for room behind other commands, and every
+        // sender is paced by a person or a mission's end.
         let (tx, rx) = mpsc::unbounded_channel();
         let to_save = config.history_file.clone().map(writer);
         // A streamed reply sends an event per piece; a slow reader falls behind only past this.
@@ -178,6 +186,7 @@ impl Session {
             denied: Mutex::default(),
             repeated: Mutex::default(),
             steer: Mutex::default(),
+            steer_heard: Mutex::default(),
             notes: Mutex::default(),
             waited_ms: AtomicU64::new(0),
             allowed: Mutex::default(),
@@ -186,6 +195,7 @@ impl Session {
             stop,
             to_save,
             answered_by: Mutex::default(),
+            working: Mutex::default(),
             config,
         });
         tokio::spawn(actor(rx, shared, source, registry));

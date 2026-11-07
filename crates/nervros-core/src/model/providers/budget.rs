@@ -89,8 +89,12 @@ struct Seen {
     at: Option<Instant>,
     /// Charged here and not yet in the file.
     pending: f64,
-    /// A charge could not be written: the budget counts as spent from then on.
+    /// Charges a write failed to add, added with the next write or when the budget is dropped.
+    unsaved: f64,
+    /// A charge could not be written: the budget counts as spent until one is.
     lost: bool,
+    /// A reading of the file is on its way.
+    reading: bool,
 }
 
 /// A budget and its spend file.
@@ -127,12 +131,24 @@ impl Budget {
         if seen.lost {
             return self.usd;
         }
-        if seen.at.is_none_or(|at| at.elapsed() >= REREAD) {
-            seen.usd = read(&self.path).unwrap_or_else(|e| {
-                tracing::warn!(file = %self.path.display(), error = %e, "the spend file is unreadable");
-                self.usd
-            });
-            seen.at = Some(Instant::now());
+        let stale = seen.at.is_some_and(|at| at.elapsed() >= REREAD);
+        match tokio::runtime::Handle::try_current() {
+            // Read again off the async threads; the last reading stands meanwhile.
+            Ok(runtime) if stale && !seen.reading => {
+                seen.reading = true;
+                let (path, seen, budget) = (self.path.clone(), Arc::clone(&self.seen), self.usd);
+                drop(runtime.spawn_blocking(move || {
+                    let usd = read_or_spent(&path, budget);
+                    let mut seen = crate::lock(&seen);
+                    (seen.usd, seen.at, seen.reading) = (usd, Some(Instant::now()), false);
+                }));
+            }
+            // The first reading is waited for: no call starts on a spend not yet known.
+            _ if seen.at.is_none() || (stale && !seen.reading) => {
+                seen.usd = read_or_spent(&self.path, self.usd);
+                seen.at = Some(Instant::now());
+            }
+            _ => {}
         }
         seen.usd + seen.pending
     }
@@ -155,16 +171,19 @@ impl Budget {
             model.to_owned(),
         );
         let write = move || {
-            let added = add(&path, usd);
+            let owed = usd + std::mem::take(&mut crate::lock(&seen).unsaved);
+            let added = add(&path, owed);
             let mut seen = crate::lock(&seen);
             seen.pending = (seen.pending - usd).max(0.0);
             match added {
                 Ok(spent) => {
                     seen.usd = spent;
                     seen.at = Some(Instant::now());
+                    seen.lost = false;
                     tracing::info!(model = %model, call_usd = usd, spent_usd = spent, budget_usd = budget, "spend");
                 }
                 Err(e) => {
+                    seen.unsaved += owed;
                     seen.lost = true;
                     tracing::warn!(model = %model, file = %path.display(), error = %e, "could not count the spend; the budget now reads as spent");
                 }
@@ -181,6 +200,27 @@ impl Budget {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+impl Drop for Budget {
+    /// Charges no write could add go to the file one last time, or a restart would spend them
+    /// again. A write still on its way finishes first: the runtime waits for blocking tasks.
+    fn drop(&mut self) {
+        let unsaved = std::mem::take(&mut crate::lock(&self.seen).unsaved);
+        if unsaved > 0.0
+            && let Err(e) = add(&self.path, unsaved)
+        {
+            tracing::error!(file = %self.path.display(), lost_usd = unsaved, error = %e, "spend not counted");
+        }
+    }
+}
+
+/// The spend in `path`, or the whole budget when it cannot be read.
+fn read_or_spent(path: &Path, budget: f64) -> f64 {
+    read(path).unwrap_or_else(|e| {
+        tracing::warn!(file = %path.display(), error = %e, "the spend file is unreadable");
+        budget
+    })
 }
 
 /// `path` with `suffix` added to its name.
@@ -280,6 +320,36 @@ mod tests {
         assert!(
             (budget.spent() - 0.4).abs() < 1e-9,
             "read again only once its reading is old"
+        );
+    }
+
+    #[test]
+    fn a_charge_no_write_could_add_is_added_later_and_never_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the spend file's folder goes makes every write fail.
+        let blocker = dir.path().join("sub");
+        let config = BudgetConfig {
+            usd: 1.0,
+            spent_file: blocker.join("spend.json"),
+        };
+        std::fs::write(&blocker, "").unwrap();
+        let budget = Budget::new(&config);
+        budget.charge(0.2, "m");
+        assert!(!budget.allows(), "a charge not counted reads as spent");
+        std::fs::remove_file(&blocker).unwrap();
+        budget.charge(0.1, "m");
+        assert!(budget.allows());
+        assert!((read(&config.spent_file).unwrap() - 0.3).abs() < 1e-9);
+
+        std::fs::remove_dir_all(&blocker).unwrap();
+        std::fs::write(&blocker, "").unwrap();
+        let budget = Budget::new(&config);
+        budget.charge(0.2, "m");
+        std::fs::remove_file(&blocker).unwrap();
+        drop(budget);
+        assert!(
+            (read(&config.spent_file).unwrap() - 0.2).abs() < 1e-9,
+            "added when dropped"
         );
     }
 

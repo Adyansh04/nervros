@@ -1,12 +1,16 @@
 # Describe the skills this robot offers to missions.
 ---
-# JSON: skills with their args (type, format, enum, min and max, default_from, narrowed), the
-# outputs they hand on, requires, effects, resources, idempotent, risk, max_duration_s, and the
-# template: the ID of the skill's macro SubTree.
+# JSON: catalog_version, learnable (the leaves a taught skill may be built from), and skills, each
+# with its name, description, args (type, names, format, enum, min and max, default_from,
+# narrowed), the outputs it hands on, requires, effects, resources, idempotent, risk,
+# max_duration_s, learned and taught_for for a taught one, and the template: the ID of the skill's
+# macro SubTree.
 string catalog_json
 # BehaviorTree.CPP's TreeNodesModel XML: the leaves' models, then a SubTree entry for each skill's
 # macro. A mission may use only those SubTrees and the plain control nodes, never a leaf.
 string tree_nodes_model_xml
 string bt_cpp_version
-# Changes whenever the catalog or the node model changes.
+# Changes whenever the catalog or the node model changes. It is the version of whoever answers:
+# a composite in front of the executor answers its own, which the executor's DefineSkill and
+# ForgetSkill replies do not carry.
 string catalog_version

@@ -28,6 +28,20 @@ impl Drafts {
     fn take(&self, name: &str) -> Option<Value> {
         lock(&self.0).remove(name)
     }
+
+    /// Every draft's definition as it stands, for a mission to keep the one it ran.
+    pub(crate) fn snapshot(&self) -> BTreeMap<String, Value> {
+        lock(&self.0).clone()
+    }
+
+    /// The draft `name`, only while its definition is still `ran`: one defined again since the
+    /// mission started was never proved.
+    fn take_if(&self, name: &str, ran: &Value) -> Option<Value> {
+        let mut drafts = lock(&self.0);
+        (drafts.get(name) == Some(ran))
+            .then(|| drafts.remove(name))
+            .flatten()
+    }
 }
 
 /// The `teach_skill` tool, when the profile names the executor's `DefineSkill` and

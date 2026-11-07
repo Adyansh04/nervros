@@ -5,6 +5,17 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 use nervros_core::mcp::{self, Lock, McpServer, Pin};
+use nervros_core::tools::visible;
+
+/// Asks `question` on the terminal: only "y" or "yes" approves, and no answer is a no.
+fn confirmed(question: &str) -> Result<bool> {
+    use std::io::Write as _;
+    print!("  {question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
 
 /// Lists every server's named tools with their pins, or pins one server's tools.
 pub async fn run(
@@ -55,10 +66,29 @@ pub async fn run(
             println!("  {} ({mark})", listed.name);
             let chosen = tools.is_empty() || tools.contains(&listed.name);
             if pinning.is_some() && chosen && listed.pin != Pin::Approved {
+                // What changed is read beside what was approved, every hidden mark spelt out.
+                if listed.pin == Pin::Changed
+                    && let Some(old) = lock
+                        .0
+                        .get(&config.id)
+                        .and_then(|tools| tools.get(&listed.name))
+                {
+                    println!(
+                        "  approved before:\n{}",
+                        visible(&serde_json::to_string_pretty(&old.definition)?)
+                    );
+                    println!("  now:");
+                }
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&mcp::canonical(&listed.definition))?
+                    visible(&serde_json::to_string_pretty(&mcp::canonical(
+                        &listed.definition
+                    ))?)
                 );
+                if !confirmed(&format!("approve {} as above?", listed.name))? {
+                    println!("  {} left unapproved", listed.name);
+                    continue;
+                }
                 lock.pin(&config.id, &listed.definition);
                 println!("  approved {} as above", listed.name);
             }

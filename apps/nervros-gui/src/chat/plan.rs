@@ -56,6 +56,9 @@ fn steps_table(ui: &mut egui::Ui, p: &PlanCard) {
                 if let Some(note) = preview_note {
                     summary.on_hover_text(note);
                 }
+                // What is approved with the step: a retried pick or an ignored failure shows here.
+                let wrappers = super::tree::wrappers(s).join(" · ");
+                ui.label(RichText::new(wrappers).small().color(theme::FAINT));
                 track_label(ui, s);
                 if !s.native.is_empty() {
                     let text = format!("NervROS runs it through {}", s.native);

@@ -64,7 +64,7 @@ pub(super) fn draw_rooms(
         };
         put_static(
             rec,
-            &format!("{path}/{id}"),
+            &format!("{path}/{}", crate::layers::path_part(id)),
             &rerun::LineStrips3D::new([strip])
                 .with_labels([label])
                 .with_colors([room_seen.map_or(rerun::Color::from_rgb(200, 200, 210), seen_colour)])
@@ -73,7 +73,11 @@ pub(super) fn draw_rooms(
         now.insert(id.to_owned());
     }
     for gone in drawn.difference(&now) {
-        put_static(rec, &format!("{path}/{gone}"), &rerun::Clear::flat());
+        put_static(
+            rec,
+            &format!("{path}/{}", crate::layers::path_part(gone)),
+            &rerun::Clear::flat(),
+        );
     }
     #[expect(clippy::cast_precision_loss, reason = "a handful of rooms")]
     put(

@@ -107,7 +107,7 @@ fn scan(text: &str) -> Vec<Found> {
             .and_then(|(a, b)| {
                 rest[a + 1..b]
                     .split(',')
-                    .map(|n| n.trim().parse().ok())
+                    .map(|n| n.trim().parse::<f64>().ok().filter(|v| v.is_finite()))
                     .collect()
             });
         if let Some(&[y0, x0, y1, x1]) = numbers.as_deref() {
@@ -297,7 +297,7 @@ enum View {
 
 pub(crate) fn inside(region: &Instance, x: u32, y: u32) -> bool {
     let (bx, by, bw, bh) = region.bbox;
-    if x < bx || y < by || x >= bx + bw || y >= by + bh {
+    if x < bx || y < by || x >= bx.saturating_add(bw) || y >= by.saturating_add(bh) {
         return false;
     }
     region
@@ -474,7 +474,7 @@ impl SegmentTool {
             .enumerate()
             .map(|(i, r)| {
                 let (x, y, w, h) = r.bbox;
-                let mut entry = json!({"mark": i + 1, "label": r.label, "box": [x, y, w, h],
+                let mut entry = json!({"mark": i + 1, "label": crate::tools::world_label(&r.label), "box": [x, y, w, h],
                     "area_pct": area_pct(r, img.width(), img.height())});
                 if r.score > 0.0 {
                     entry["score"] = json!((f64::from(r.score) * 100.0).round() / 100.0);
@@ -507,8 +507,7 @@ impl SegmentTool {
             .as_ref()
             .ok_or("no vision model is set up to segment")?;
         let frame = camera.newest_soon().await?;
-        let img = frame.to_rgb().map_err(|e| e.to_string())?;
-        let image = ImageInput::jpeg(&img)?;
+        let (img, image) = crate::vision::rgb_for_model(Arc::clone(&frame)).await?;
         let (answer, model) = outliner.outline(&outline_prompt(prompt), image).await?;
         tracing::debug!(%model, %answer, "segment outlines");
         let regions = parse_outlines(&answer, img.width(), img.height())?;
@@ -740,7 +739,7 @@ mod tests {
         let out = segment.call(json!({"prompt": "the floor"})).await;
         assert_eq!(out.status, Status::Succeeded, "{}", out.message);
         assert_eq!(out.data["by"], "fake-gemini");
-        assert_eq!(out.data["regions"][0]["label"], "floor");
+        assert_eq!(out.data["regions"][0]["label"], "<world>floor</world>");
         assert_eq!(out.data["regions"][0]["box"], json!([0, 24, 64, 24]));
         assert!((out.data["regions"][0]["area_pct"].as_f64().unwrap() - 50.0).abs() < 0.1);
         assert_eq!(&out.images[0].jpeg[..2], &[0xFF, 0xD8]);

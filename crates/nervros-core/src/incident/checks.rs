@@ -11,7 +11,7 @@ use super::recorder::Recording;
 use super::trigger::names_node;
 use crate::watch;
 
-/// The longest a check may take: a rate needs its window, a topic its first message.
+/// The longest a check may take past what its sampling takes: a topic needs its first message.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(6);
 /// How long a pose's topic is waited on.
 const POSE_WAIT: Duration = Duration::from_secs(2);
@@ -61,7 +61,12 @@ pub(crate) async fn run(test: &Test, probe: &Probe<'_>) -> Result<Seen, String> 
             // "the robot fell" read as ruled out.
             let (held, saw) = watch::observe(probe.robot, topic, ty, condition)
                 .await?
-                .ok_or_else(|| format!("{topic} has said nothing"))?;
+                .ok_or_else(|| {
+                    format!(
+                        "{topic} has said nothing in {} s",
+                        watch::VALUE_FRESH.as_secs()
+                    )
+                })?;
             Ok(seen(held, saw))
         }
         Test::Log {
@@ -91,16 +96,23 @@ pub(crate) async fn run(test: &Test, probe: &Probe<'_>) -> Result<Seen, String> 
             let graph = probe.graph.ok_or("the graph could not be read")?;
             Ok(duplicated(&graph.nodes, name))
         }
-        Test::TfMissing { target, source } => Ok(match probe.robot.transform(target, source) {
-            Ok(t) => seen(
-                false,
-                format!(
-                    "{target} to {source} is at ({:.2}, {:.2})",
-                    t.translation[0], t.translation[1]
+        Test::TfMissing { target, source } => {
+            // Nothing heard yet rules nothing in: just after connecting the buffer is empty.
+            if probe.robot.tf_links().is_empty() {
+                return Err("no transforms have come yet".to_owned());
+            }
+            // The port's lookup refuses a chain with a link gone stale, as a dead localizer's.
+            Ok(match probe.robot.transform(target, source) {
+                Ok(t) => seen(
+                    false,
+                    format!(
+                        "{target} to {source} is at ({:.2}, {:.2})",
+                        t.translation[0], t.translation[1]
+                    ),
                 ),
-            ),
-            Err(_) => seen(true, format!("nothing links {target} to {source}")),
-        }),
+                Err(e) => seen(true, format!("nothing links {target} to {source} now: {e}")),
+            })
+        }
         Test::PoseGap {
             target,
             source,
@@ -181,9 +193,17 @@ async fn pose_gap(
     let Ok(tf) = robot.transform(target, source) else {
         return Err(format!("nothing links {target} to {source} yet"));
     };
-    let msg = match robot.latest(topic, ty, POSE_WAIT).await {
+    let msg = match robot
+        .latest_fresh(topic, ty, POSE_WAIT, watch::VALUE_FRESH)
+        .await
+    {
         Ok(m) => m,
-        Err(RosError::NoData(_)) => return Err(format!("{topic} has said nothing")),
+        Err(RosError::NoData(_)) => {
+            return Err(format!(
+                "{topic} has said nothing in {} s",
+                watch::VALUE_FRESH.as_secs()
+            ));
+        }
         Err(e) => return Err(e.to_string()),
     };
     let pose = if field.is_empty() {
@@ -228,6 +248,14 @@ pub(crate) struct Judged {
     pub evidence: Vec<String>,
 }
 
+/// How long `test` may take: a slow rate is counted over a window longer than a check's time.
+fn time_for(test: &Test) -> Duration {
+    match test {
+        Test::Topic { condition, .. } => CHECK_TIMEOUT + condition.sampling(),
+        _ => CHECK_TIMEOUT,
+    }
+}
+
 /// A check's name for the report: its own, or what it tests.
 fn label(check: &Check, test: &Test) -> String {
     if !check.name.is_empty() {
@@ -248,7 +276,7 @@ pub(crate) async fn judge(book: &Loaded, probe: &Probe<'_>) -> Judged {
     let results = futures::future::join_all(
         book.tests
             .iter()
-            .map(|t| tokio::time::timeout(CHECK_TIMEOUT, run(t, probe))),
+            .map(|t| tokio::time::timeout(time_for(t), run(t, probe))),
     )
     .await;
     let mut held = Vec::new();

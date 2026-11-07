@@ -210,9 +210,14 @@ impl LookTool {
         let snapshot = self.snapshots.get(id).ok_or_else(|| {
             format!("no image {id} is kept any more; look again, or ask for it again")
         })?;
-        let img = image::load_from_memory(&snapshot.image.jpeg)
-            .map_err(|e| e.to_string())?
-            .to_rgb8();
+        // Decoded off the threads that serve the stop.
+        let jpeg = snapshot.image.jpeg.clone();
+        let img = tokio::task::spawn_blocking(move || {
+            image::load_from_memory(&jpeg).map(|i| i.to_rgb8())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
         let mut data = json!({"snapshot": id, "marks": marks_json(&snapshot.marks)});
         let seen = match mark {
             Some(n) => {

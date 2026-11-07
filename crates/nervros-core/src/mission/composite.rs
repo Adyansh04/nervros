@@ -36,7 +36,16 @@ const PAUSE: &str = "/nervros/composite/pause_mission";
 const STATE: &str = "/nervros/composite/robot_state";
 const PREVIEW: &str = "/nervros/composite/preview_mission";
 const EXECUTE_TYPE: &str = "nervros_interfaces/action/ExecuteMission";
+const STATE_TYPE: &str = "nervros_interfaces/msg/RobotState";
 const CALL_WAIT: Duration = Duration::from_secs(10);
+const LEND_TYPE: &str = "nervros_interfaces/srv/LendResources";
+/// Where the merged catalog says which version of the executor's own it was made from.
+const EXECUTOR_VERSION: &str = "executor_catalog_version";
+/// The longest a native step may stay paused before its mission ends, as the executor's own
+/// `max_pause_s` ends one of its missions.
+const MAX_PAUSE: Duration = Duration::from_mins(10);
+/// Lent for the step's runs and this much more, for a pause the deadline moves on by.
+const LEND_MARGIN_S: f64 = 60.0;
 /// How often a native step's progress goes out while it runs.
 const TICK: Duration = Duration::from_secs(1);
 /// `NodeEvent` statuses.
@@ -188,7 +197,7 @@ fn fill(xml: &str, outputs: &Map<String, Value>) -> String {
             .map_or_else(|| value.to_string(), str::to_owned);
         out = out.replace(
             &format!("=\"{{{key}}}\""),
-            &format!("=\"{}\"", escape(&text)),
+            &format!("=\"{}\"", super::plan::xml_attr(&text)),
         );
     }
     out
@@ -230,13 +239,6 @@ fn arg_problem(arg: &Value, value: &str) -> Option<String> {
             .then(|| "must be x;y;yaw".to_owned()),
         _ => None,
     }
-}
-
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// The mission the composite runs.
@@ -321,14 +323,15 @@ impl Composite {
                 }
             }
         }
-        let version = sha(&format!(
-            "{}{}",
-            catalog["catalog_version"].as_str().unwrap_or_default(),
-            added.join(",")
-        ));
+        let own = catalog["catalog_version"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let version = sha(&format!("{own}{}", added.join(",")));
         catalog["catalog_version"] = json!(version[..12]);
         reply["catalog_json"] = json!(catalog.to_string());
         reply["catalog_version"] = json!(version[..12]);
+        reply[EXECUTOR_VERSION] = json!(own);
         Ok(reply)
     }
 
@@ -572,14 +575,12 @@ impl Composite {
         let on = request["pause"].as_bool().unwrap_or(false);
         // A step NervROS runs pauses here. The executor pauses its own stretch, and a mission of
         // its skills alone, which goes to it straight and leaves nothing running here.
-        let here = match crate::lock(&self.running).as_ref() {
-            Some(r) if r.executor.is_none() => {
-                r.paused.send_replace(on);
-                Some(true)
-            }
-            Some(_) => Some(false),
-            None => None,
-        };
+        // Recorded here in every case: the next stretch or native step must hold or go as the
+        // operator last asked, whichever ran when they asked.
+        let here = crate::lock(&self.running).as_ref().map(|r| {
+            r.paused.send_replace(on);
+            r.executor.is_none()
+        });
         if here == Some(true) {
             return Ok(json!({"ok": true, "message": if on { "paused" } else { "resumed" }}));
         }
@@ -603,16 +604,20 @@ impl Composite {
     /// executor.
     async fn state(&self, wait: Duration, max_age: Duration) -> Result<Value, RosError> {
         let real = match &self.real {
-            Some(real) => Some(
-                self.inner
-                    .latest_fresh(
-                        &real.state,
-                        "nervros_interfaces/msg/RobotState",
-                        wait,
-                        max_age,
-                    )
-                    .await?,
-            ),
+            Some(real) => match self
+                .inner
+                .latest_fresh(&real.state, STATE_TYPE, wait, max_age)
+                .await
+            {
+                Ok(state) => Some(state),
+                // While a mission runs here, its own record says so: a native step that still
+                // moves must not be declared lost because the executor's state went stale.
+                Err(e) if crate::lock(&self.running).is_some() => {
+                    tracing::warn!(error = %e, "the executor's state is stale; answering from the mission running here");
+                    None
+                }
+                Err(e) => return Err(e),
+            },
             None => None,
         };
         let mut state = real.unwrap_or_else(|| {
@@ -633,7 +638,29 @@ impl Composite {
         Ok(state)
     }
 
+    /// `goal` with the executor's own catalog version in place of the merged one it was approved
+    /// against, once that is still the catalog's: a skill taught again since would run a body
+    /// nobody approved.
+    async fn approved(&self, mut goal: Value) -> Result<Value, RosError> {
+        let Some(wanted) = goal["catalog_version"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+        else {
+            return Ok(goal);
+        };
+        let now = self.catalog().await?;
+        if now["catalog_version"].as_str() != Some(wanted.as_str()) {
+            return Err(RosError::Rejected(
+                "the robot's skills changed since this plan was approved: plan it again".to_owned(),
+            ));
+        }
+        goal["catalog_version"] = now[EXECUTOR_VERSION].clone();
+        Ok(goal)
+    }
+
     async fn execute(&self, goal: Value, timeout: Duration) -> Result<Goal, RosError> {
+        let goal = self.approved(goal).await?;
         let tree = goal["tree_xml"].as_str().unwrap_or_default();
         let steps = parse(tree).map_err(RosError::Rejected)?;
         let natives = self.natives_in(&steps).await?;
@@ -647,6 +674,23 @@ impl Composite {
                 .inner
                 .send_goal(&real.execute, EXECUTE_TYPE, goal, timeout)
                 .await;
+        }
+        if let Some(real) = &self.real {
+            // The executor turns away a mission while it runs another, is driven by hand, or the
+            // robot cannot move; a native step would not ask it, and would drive beside them.
+            let state = self
+                .inner
+                .latest_fresh(&real.state, STATE_TYPE, CALL_WAIT, Duration::from_secs(3))
+                .await
+                .map_err(|e| {
+                    RosError::Rejected(format!(
+                        "the executor's state cannot be read ({e}), so whether the robot is free \
+                         is unknown"
+                    ))
+                })?;
+            if let Some(why) = executor_busy(&state) {
+                return Err(RosError::Rejected(why));
+            }
         }
         let id = goal["mission_id"].as_str().unwrap_or_default().to_owned();
         let (stop, stop_rx) = watch::channel(false);
@@ -685,12 +729,14 @@ impl Composite {
         tokio::spawn(async move {
             let result = run.all(plan).await;
             *crate::lock(&running) = None;
-            let status = match result["outcome"].as_u64() {
-                Some(0) => GoalStatus::Succeeded,
-                Some(2) => GoalStatus::Canceled,
-                _ => GoalStatus::Aborted,
-            };
-            let _ = result_tx.send(Ok(GoalResult { status, result }));
+            let _ = result_tx.send(result.map(|result| {
+                let status = match result["outcome"].as_u64() {
+                    Some(0) => GoalStatus::Succeeded,
+                    Some(2) => GoalStatus::Canceled,
+                    _ => GoalStatus::Aborted,
+                };
+                GoalResult { status, result }
+            }));
         });
         let cancel_stop = stop;
         let cancel: CancelFn = Arc::new(move || {
@@ -704,6 +750,14 @@ impl Composite {
             cancel,
         ))
     }
+}
+
+/// `e`, once the stretch that ended with it is cancelled: with no result, it may still run.
+async fn cancel_lost(cancel: &CancelFn, e: RosError) -> RosError {
+    if !matches!(tokio::time::timeout(CALL_WAIT, cancel()).await, Ok(Ok(()))) {
+        tracing::warn!(error = %e, "the executor's stretch with no result was not cancelled");
+    }
+    e
 }
 
 /// The stretch's elements, each `{key}` a step outside it hands on made a literal: the executor
@@ -748,6 +802,31 @@ fn diagnostics(message: &str) -> String {
 }
 
 /// One mission the composite runs.
+/// The base a native walk borrowed, given back when it drops: however the step ends, a stop and
+/// a timeout included.
+struct LentBase {
+    robot: Arc<dyn RobotPort>,
+    service: String,
+    back: Value,
+}
+
+impl Drop for LentBase {
+    fn drop(&mut self) {
+        let (robot, service, back) = (
+            Arc::clone(&self.robot),
+            std::mem::take(&mut self.service),
+            self.back.take(),
+        );
+        // Detached: the step has ended, and the executor takes the base back by itself once
+        // NervROS's heartbeat or the lend's limit runs out.
+        tokio::spawn(async move {
+            if let Err(e) = robot.call(&service, LEND_TYPE, back, CALL_WAIT).await {
+                tracing::warn!(error = %e, "the base was not given back");
+            }
+        });
+    }
+}
+
 struct Run {
     inner: Arc<dyn RobotPort>,
     real: Option<MissionConfig>,
@@ -788,8 +867,12 @@ impl Run {
         })
     }
 
-    /// Runs the plan stretch by stretch; the result in `ExecuteMission`'s shape.
-    async fn all(&self, plan: Vec<(TreeStep, Option<Arc<dyn NativeSkill>>)>) -> Value {
+    /// Runs the plan stretch by stretch; the result in `ExecuteMission`'s shape, or an error when
+    /// the executor did not take a stretch or gave no result for it.
+    async fn all(
+        &self,
+        plan: Vec<(TreeStep, Option<Arc<dyn NativeSkill>>)>,
+    ) -> Result<Value, RosError> {
         let mut outputs = Map::new();
         let mut stretch: Vec<TreeStep> = Vec::new();
         for (step, native) in plan {
@@ -800,38 +883,75 @@ impl Run {
             if !stretch.is_empty()
                 && let Some(failed) = self
                     .executor(&std::mem::take(&mut stretch), &mut outputs)
-                    .await
+                    .await?
             {
-                return failed;
+                return Ok(failed);
             }
             if let Some(failed) = self.native(&step, &native, &mut outputs).await {
-                return failed;
+                return Ok(failed);
             }
         }
         if !stretch.is_empty()
-            && let Some(failed) = self.executor(&stretch, &mut outputs).await
+            && let Some(failed) = self.executor(&stretch, &mut outputs).await?
         {
-            return failed;
+            return Ok(failed);
         }
-        self.result(OUTCOME_SUCCESS, "", "", &outputs)
+        Ok(self.result(OUTCOME_SUCCESS, "", "", &outputs))
     }
 
-    /// A stretch of executor steps as a mission of their own; its result when it did not succeed.
+    /// Waits while the operator holds the mission paused: a pause taken while a step ran here
+    /// holds the next stretch too, which goes to the executor only once resumed or stopped.
+    async fn wait_out_pause(&self) {
+        let (mut paused, mut stopping) = (self.ctl.paused.clone(), self.ctl.stop.clone());
+        while *paused.borrow() && !self.ctl.stopped() {
+            tokio::select! {
+                changed = paused.changed() => if changed.is_err() { break },
+                changed = stopping.changed() => if changed.is_err() { break },
+            }
+        }
+    }
+
+    /// Hands the executor a pause that came while its stretch was being sent, which stayed here.
+    async fn forward_pause(&self, real: &MissionConfig) {
+        if *self.ctl.paused.borrow()
+            && let Some(service) = &real.pause
+            && let Err(e) = self
+                .inner
+                .call(
+                    service,
+                    "nervros_interfaces/srv/PauseMission",
+                    json!({"pause": true}),
+                    CALL_WAIT,
+                )
+                .await
+        {
+            tracing::warn!(error = %e, "the executor was not told of a pause that came as it started");
+        }
+    }
+
+    /// A stretch of executor steps as a mission of their own; its result when it did not succeed,
+    /// or an error when the executor did not take it or gave no result for it.
     async fn executor(
         &self,
         steps: &[TreeStep],
         outputs: &mut Map<String, Value>,
-    ) -> Option<Value> {
+    ) -> Result<Option<Value>, RosError> {
         let Some(real) = &self.real else {
-            return Some(self.result(OUTCOME_REJECTED, "", "this robot has no executor", outputs));
+            return Ok(Some(self.result(
+                OUTCOME_REJECTED,
+                "",
+                "this robot has no executor",
+                outputs,
+            )));
         };
+        self.wait_out_pause().await;
         if self.ctl.stopped() {
-            return Some(self.result(
+            return Ok(Some(self.result(
                 OUTCOME_CANCELED,
                 "",
                 "stopped: before the executor's steps",
                 outputs,
-            ));
+            )));
         }
         let elements: Vec<String> = steps.iter().map(|s| fill(&s.xml, outputs)).collect();
         let tree = tree_of(&elements);
@@ -843,21 +963,14 @@ impl Run {
             .inner
             .send_goal(&real.execute, EXECUTE_TYPE, goal, CALL_WAIT)
             .await;
-        let goal = match sent {
-            Ok(g) => g,
-            Err(e) => {
-                return Some(self.result(
-                    OUTCOME_FAILURE,
-                    &steps[0].name,
-                    &format!("the executor did not take its steps: {e}"),
-                    outputs,
-                ));
-            }
-        };
+        // Not the plan's failure: nothing of the stretch ran.
+        let goal = sent
+            .map_err(|e| RosError::Rejected(format!("the executor did not take its steps: {e}")))?;
         if let Some(r) = crate::lock(&self.running).as_mut() {
             r.executor = Some(goal.canceller());
             r.step.clear();
         }
+        self.forward_pause(real).await;
         let offset = self.elapsed();
         let cancel = goal.canceller();
         let Goal {
@@ -878,7 +991,8 @@ impl Run {
                 // At once for a stop that came while the goal was being sent.
                 true = crate::integrations::turns(&mut stop, true), if !cancelled => {
                     cancelled = true;
-                    let _ = cancel().await;
+                    // Bounded: a cancel nobody answers must not hold the loop that reads the result.
+                    let _ = tokio::time::timeout(CALL_WAIT, cancel()).await;
                 }
             }
         };
@@ -891,9 +1005,17 @@ impl Run {
         if let Some(r) = crate::lock(&self.running).as_mut() {
             r.executor = None;
         }
+        let done = match done {
+            Ok(Ok(done)) => done,
+            Ok(Err(e)) => return Err(cancel_lost(&cancel, e).await),
+            Err(_) => {
+                let e = RosError::Middleware("the executor dropped the mission".to_owned());
+                return Err(cancel_lost(&cancel, e).await);
+            }
+        };
         let ended = match self.ended(done, &steps[0].name, outputs) {
             Ok(ended) => ended,
-            Err(mission) => return Some(mission),
+            Err(mission) => return Ok(Some(mission)),
         };
         if let Ok(Value::Object(handed)) =
             serde_json::from_str(ended["outputs_json"].as_str().unwrap_or("{}"))
@@ -901,38 +1023,29 @@ impl Run {
             outputs.extend(handed);
         }
         if ended["outcome"].as_u64() == Some(u64::from(OUTCOME_SUCCESS)) {
-            return None;
+            return Ok(None);
         }
         let mut failed = ended;
         failed["elapsed_s"] = json!(self.elapsed());
         failed["outputs_json"] = json!(Value::Object(outputs.clone()).to_string());
-        Some(failed)
+        Ok(Some(failed))
     }
 
     /// The executor's result for its stretch, or the mission's when it gave none: a goal cancelled
     /// under a stop can come back without the executor's own result.
     fn ended(
         &self,
-        done: Result<Result<GoalResult, RosError>, oneshot::error::RecvError>,
+        done: GoalResult,
         first: &str,
         outputs: &Map<String, Value>,
     ) -> Result<Value, Value> {
-        match done {
-            Ok(Ok(r)) if r.status == GoalStatus::Canceled && r.result["outcome"].is_null() => {
-                let why = crate::lock(&self.running)
-                    .as_ref()
-                    .map_or_else(String::new, |r| r.stopped_for.clone());
-                Err(self.result(OUTCOME_CANCELED, first, &format!("stopped: {why}"), outputs))
-            }
-            Ok(Ok(r)) => Ok(r.result),
-            Ok(Err(e)) => Err(self.result(OUTCOME_FAILURE, first, &e.to_string(), outputs)),
-            Err(_) => Err(self.result(
-                OUTCOME_FAILURE,
-                first,
-                "the executor dropped the mission",
-                outputs,
-            )),
+        if done.status == GoalStatus::Canceled && done.result["outcome"].is_null() {
+            let why = crate::lock(&self.running)
+                .as_ref()
+                .map_or_else(String::new, |r| r.stopped_for.clone());
+            return Err(self.result(OUTCOME_CANCELED, first, &format!("stopped: {why}"), outputs));
         }
+        Ok(done.result)
     }
 
     /// A native step, with its wrappers; its result when the mission ends on it.
@@ -977,6 +1090,10 @@ impl Run {
         }
         let limit = Duration::from_secs_f64(skill["max_duration_s"].as_f64().unwrap_or(60.0));
         let timeout = step.timeout.map_or(limit, |t| t.min(limit));
+        let _base = match self.lend_base(&skill, timeout * step.attempts.max(1)).await {
+            Ok(lent) => lent,
+            Err(why) => return Some(self.result(OUTCOME_FAILURE, &step.name, &why, outputs)),
+        };
         let mut last = String::new();
         let mut timed_out = false;
         for attempt in 0..step.attempts.max(1) {
@@ -1021,6 +1138,41 @@ impl Run {
         Some(self.result(outcome, &step.name, &last, outputs))
     }
 
+    /// The base, borrowed from the executor for a native step that moves it, when the executor
+    /// lends: it then refuses teleop and a mission of its own, and ends the lend once the robot
+    /// can no longer walk. Given back when the guard drops.
+    async fn lend_base(&self, skill: &Value, runs: Duration) -> Result<Option<LentBase>, String> {
+        let walks = skill["resources"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "base"));
+        let Some(service) = self.real.as_ref().and_then(|r| r.lend.clone()) else {
+            return Ok(None);
+        };
+        if !walks {
+            return Ok(None);
+        }
+        let ask = |lend: bool| {
+            json!({"client": crate::mission::client_id(), "resources": ["base"], "lend": lend,
+                   "max_s": runs.as_secs_f64() + LEND_MARGIN_S})
+        };
+        let lent = self
+            .inner
+            .call(&service, LEND_TYPE, ask(true), CALL_WAIT)
+            .await
+            .map_err(|e| format!("the executor did not lend the base: {e}"))?;
+        if lent["granted"].as_bool() != Some(true) {
+            return Err(format!(
+                "the executor kept the base: {}",
+                lent["reason"].as_str().unwrap_or("no reason given")
+            ));
+        }
+        Ok(Some(LentBase {
+            robot: Arc::clone(&self.inner),
+            service,
+            back: ask(false),
+        }))
+    }
+
     /// One run of a native step within `timeout`, which a pause does not count against: the
     /// deadline moves on by it. `Err` when it ran out.
     async fn attempt(
@@ -1039,9 +1191,20 @@ impl Run {
         let mut tick = tokio::time::interval(TICK);
         tick.tick().await;
         loop {
+            let too_long = paused_at.map_or_else(tokio::time::Instant::now, |at| at + MAX_PAUSE);
             tokio::select! {
                 r = &mut run => return Ok(r),
                 () = &mut deadline, if paused_at.is_none() => return Err(()),
+                // As the executor ends a mission paused too long: a forgotten pause would hold
+                // every resource and refuse every other plan.
+                () = tokio::time::sleep_until(too_long), if paused_at.is_some() => {
+                    let why = format!("paused longer than {} s", MAX_PAUSE.as_secs());
+                    if let Some(r) = crate::lock(&self.running).as_mut() {
+                        r.stopped_for.clone_from(&why);
+                        r.stop.send_replace(true);
+                    }
+                    return Ok(Err(why));
+                }
                 true = crate::integrations::turns(&mut paused, paused_at.is_none()) => {
                     match paused_at.take() {
                         Some(at) => {
@@ -1051,8 +1214,39 @@ impl Run {
                         None => paused_at = Some(tokio::time::Instant::now()),
                     }
                 }
-                _ = tick.tick() => self.still(&step.name).await,
+                _ = tick.tick() => {
+                    self.still(&step.name).await;
+                    self.stop_unless_free().await;
+                }
             }
+        }
+    }
+
+    /// Stops the mission once the executor says nothing else may move the robot: a step run here
+    /// is no mission of the executor's, so its teleop refusal and fall checks do not cover it.
+    async fn stop_unless_free(&self) {
+        let Some(real) = &self.real else {
+            return;
+        };
+        let Ok(mut state) = self
+            .inner
+            .latest_fresh(&real.state, STATE_TYPE, TICK, Duration::from_secs(3))
+            .await
+        else {
+            return;
+        };
+        // A state sent before this mission's own stretch ended can still name it.
+        if state["mission_id"] == self.goal["mission_id"] {
+            state["mission_id"] = json!("");
+        }
+        let Some(why) = executor_busy(&state) else {
+            return;
+        };
+        if let Some(r) = crate::lock(&self.running).as_mut()
+            && !*r.stop.borrow()
+        {
+            r.stopped_for = why;
+            r.stop.send_replace(true);
         }
     }
 
@@ -1220,6 +1414,23 @@ impl RobotPort for Composite {
     fn tf_links(&self) -> Vec<TfLink> {
         self.inner.tf_links()
     }
+}
+
+/// Why the executor's `RobotState` says nothing else may move the robot now: a mission of its own,
+/// teleop, or a robot that cannot move.
+fn executor_busy(state: &Value) -> Option<String> {
+    let mission = state["mission_id"].as_str().unwrap_or_default();
+    if !mission.is_empty() {
+        return Some(format!("the executor runs mission {mission}"));
+    }
+    if state["teleop"].as_bool().unwrap_or(false) {
+        return Some("the base is being driven by hand".to_owned());
+    }
+    if !state["can_move"].as_bool().unwrap_or(true) {
+        let why = state["cannot_move_reason"].as_str().unwrap_or_default();
+        return Some(format!("the robot cannot move: {why}"));
+    }
+    None
 }
 
 #[cfg(test)]

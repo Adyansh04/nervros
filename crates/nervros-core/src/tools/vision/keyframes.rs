@@ -101,7 +101,9 @@ async fn keep(config: KeyframesConfig, cameras: Arc<Cameras>, dir: PathBuf) {
                 if before.is_some_and(|b| same_view(&b, &thumb)) {
                     return Ok(None);
                 }
-                save(&folder, &rgb, frame.stamp_s, edge).map_err(|e| e.to_string())?;
+                // Named by the wall clock, as prune and `when` read it: a camera's stamps may be
+                // sim time or a replay's.
+                save(&folder, &rgb, crate::now_s(), edge).map_err(|e| e.to_string())?;
                 Ok::<_, String>(Some((frame.stamp_s, thumb)))
             })
             .await
@@ -138,7 +140,8 @@ pub(crate) fn same_view(a: &GrayImage, b: &GrayImage) -> bool {
 
 /// A frame's grey thumbnail, which a change of view shows in and noise does not.
 pub(crate) fn thumbnail(rgb: &image::RgbImage) -> GrayImage {
-    let grey = image::DynamicImage::ImageRgb8(rgb.clone()).to_luma8();
+    // Grey straight from the frame: no copy of its RGB on the way.
+    let grey: GrayImage = image::imageops::grayscale(rgb);
     image::imageops::resize(
         &grey,
         THUMB.0,
@@ -160,16 +163,22 @@ fn difference(a: &GrayImage, b: &GrayImage) -> f64 {
     mean
 }
 
-/// Writes `rgb` as `<folder>/<ms>.jpg`, its longest side cut to `edge` px: whole when it shows
-/// up, by a rename, but not synced to disk, as a frame lost to a crash costs nothing.
-fn save(folder: &Path, rgb: &image::RgbImage, stamp_s: f64, edge: u32) -> std::io::Result<()> {
+/// Writes `rgb` as `<folder>/<ms>.jpg`, `ms` the wall-clock time `saved_s`, its longest side cut
+/// to `edge` px: whole when it shows up, by a rename, but not synced to disk, as a frame lost to
+/// a crash costs nothing.
+fn save(folder: &Path, rgb: &image::RgbImage, saved_s: f64, edge: u32) -> std::io::Result<()> {
     std::fs::create_dir_all(folder)?;
     let small = nervros_ros::image::capped(rgb, edge);
     let jpeg = crate::vision::jpeg(&small).map_err(std::io::Error::other)?;
-    let name = millis(stamp_s);
+    let name = millis(saved_s);
     let partial = folder.join(format!("{name}.part"));
-    std::fs::write(&partial, &jpeg)?;
-    std::fs::rename(&partial, folder.join(format!("{name}.jpg")))
+    let written = std::fs::write(&partial, &jpeg)
+        .and_then(|()| std::fs::rename(&partial, folder.join(format!("{name}.jpg"))));
+    // A partial frame would never be listed, counted or pruned.
+    if written.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    written
 }
 
 /// Removes the frames older than `keep_h`, then the oldest until all fit in `max_mb`.
@@ -177,6 +186,14 @@ fn prune(dir: &Path, now_ms: u64, keep_h: f64, max_mb: u64) {
     let oldest = now_ms.saturating_sub(millis(keep_h * 3600.0));
     let mut kept: Vec<(Keyframe, u64)> = Vec::new();
     for camera in cameras_in(dir) {
+        // A partial frame a crash left behind is never listed: gone once a minute old, past any
+        // write still on its way.
+        for partial in partials_of(dir, &camera)
+            .into_iter()
+            .filter(|p| p.at_ms.saturating_add(60_000) < now_ms)
+        {
+            let _ = std::fs::remove_file(&partial.path);
+        }
         for k in frames_of(dir, &camera) {
             if k.at_ms < oldest {
                 let _ = std::fs::remove_file(&k.path);
@@ -214,6 +231,16 @@ fn cameras_in(dir: &Path) -> Vec<String> {
 
 /// A camera's kept frames, in no order.
 fn frames_of(dir: &Path, camera: &str) -> Vec<Keyframe> {
+    files_of(dir, camera, "jpg")
+}
+
+/// A camera's partial frames, a write's leftovers, in no order.
+fn partials_of(dir: &Path, camera: &str) -> Vec<Keyframe> {
+    files_of(dir, camera, "part")
+}
+
+/// A camera's `<ms>.<extension>` files, in no order.
+fn files_of(dir: &Path, camera: &str, extension: &str) -> Vec<Keyframe> {
     std::fs::read_dir(dir.join(camera))
         .map(|entries| {
             entries
@@ -221,7 +248,7 @@ fn frames_of(dir: &Path, camera: &str) -> Vec<Keyframe> {
                 .filter_map(|e| {
                     let path = e.path();
                     let at_ms = path.file_stem()?.to_str()?.parse().ok()?;
-                    (path.extension()? == "jpg").then(|| Keyframe {
+                    (path.extension()? == extension).then(|| Keyframe {
                         camera: camera.to_owned(),
                         at_ms,
                         path,
@@ -297,11 +324,15 @@ mod tests {
             1,
             "a flicker is not"
         );
+        let before_ms = millis(crate::now_s());
         fake.set_frame("/camera", frame(12.0, 200));
         assert!(count(2).await, "a changed view is");
-        let later = keyframes.between(Some("main"), 11_500, 13_000);
-        assert_eq!(later.len(), 1);
-        assert_eq!(later[0].at_ms, 12_000);
+        let later = keyframes.between(Some("main"), before_ms, u64::MAX);
+        assert_eq!(
+            later.len(),
+            1,
+            "named by when it was kept, not by its stamp"
+        );
         assert!(keyframes.between(Some("other"), 0, u64::MAX).is_empty());
     }
 

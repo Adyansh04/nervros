@@ -24,10 +24,14 @@ const MAX_LOGS: usize = 2000;
 const MAX_MARKS: usize = 500;
 /// A log line's text past this is cut.
 const LINE_CHARS: usize = 400;
+/// The most of a logger name kept.
+const NODE_CHARS: usize = 80;
 /// How often the graph is read for nodes that came or went.
 const NODES_EVERY: Duration = Duration::from_secs(5);
 /// How often a watched topic's rate is taken.
 const RATE_EVERY: Duration = Duration::from_secs(1);
+/// How long a subscription that failed or ended waits before it is made again.
+const RESUBSCRIBE: Duration = Duration::from_secs(5);
 /// More nodes than this coming or going at once is one mark, not one each.
 const NODES_NAMED: usize = 4;
 
@@ -89,6 +93,7 @@ impl Recorder {
     pub fn start(
         robot: &Arc<dyn RobotPort>,
         config: &IncidentConfig,
+        read_deny: &[String],
         opened: mpsc::UnboundedSender<Trigger>,
     ) -> Arc<Self> {
         let me = Arc::new(Self {
@@ -99,14 +104,15 @@ impl Recorder {
             tasks: Mutex::default(),
         });
         let weak = Arc::downgrade(&me);
-        let mut tasks = vec![
-            tokio::spawn(follow_logs(Arc::clone(robot), weak.clone())),
-            tokio::spawn(follow_nodes(
-                Arc::clone(robot),
-                weak.clone(),
-                config.nodes.clone(),
-            )),
-        ];
+        let mut tasks = vec![tokio::spawn(follow_nodes(
+            Arc::clone(robot),
+            weak.clone(),
+            config.nodes.clone(),
+        ))];
+        // A profile that keeps /rosout from being read keeps it from the recorder too.
+        if crate::watch::readable("/rosout", read_deny).is_ok() {
+            tasks.push(tokio::spawn(follow_logs(Arc::clone(robot), weak.clone())));
+        }
         for watched in &config.watch {
             tasks.push(tokio::spawn(follow_rate(
                 Arc::clone(robot),
@@ -215,7 +221,14 @@ pub(crate) fn line_of(msg: &serde_json::Value, arrived: f64) -> Option<LogLine> 
     (level >= 30).then(|| LogLine {
         t: stamped.unwrap_or(arrived),
         level,
-        node: msg["name"].as_str().unwrap_or("?").to_owned(),
+        // A logger name is the node's to choose: only what a ROS name may hold goes on.
+        node: msg["name"]
+            .as_str()
+            .unwrap_or("?")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'))
+            .take(NODE_CHARS)
+            .collect(),
         text: msg["msg"]
             .as_str()
             .unwrap_or_default()
@@ -225,15 +238,49 @@ pub(crate) fn line_of(msg: &serde_json::Value, arrived: f64) -> Option<LogLine> 
     })
 }
 
-async fn follow_logs(robot: Arc<dyn RobotPort>, me: Weak<Recorder>) {
-    let mut stream = match robot.messages("/rosout", "rcl_interfaces/msg/Log").await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "the flight recorder cannot follow /rosout");
-            return;
+/// `subscribe`, made again until it answers while the recorder lives; none once it is gone.
+async fn until_subscribed<T, F, Fut>(me: &Weak<Recorder>, what: &str, mut subscribe: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, nervros_ros::RosError>>,
+{
+    let mut warned = false;
+    while me.strong_count() > 0 {
+        match subscribe().await {
+            Ok(s) => return Some(s),
+            Err(e) => {
+                if !warned {
+                    tracing::warn!(error = %e, %what, "the flight recorder cannot follow it yet; it tries again");
+                    warned = true;
+                }
+                tokio::time::sleep(RESUBSCRIBE).await;
+            }
         }
-    };
+    }
+    None
+}
+
+async fn follow_logs(robot: Arc<dyn RobotPort>, me: Weak<Recorder>) {
     let mut bursts = ErrorBursts::default();
+    // A subscription that fails, or ends, is made again while the recorder lives.
+    while let Some(mut stream) = until_subscribed(&me, "/rosout", || {
+        robot.messages("/rosout", "rcl_interfaces/msg/Log")
+    })
+    .await
+    {
+        follow_log_lines(&mut stream, &me, &mut bursts).await;
+        tokio::time::sleep(RESUBSCRIBE).await;
+    }
+}
+
+async fn follow_log_lines(
+    stream: &mut futures::stream::BoxStream<
+        'static,
+        Result<serde_json::Value, nervros_ros::RosError>,
+    >,
+    me: &Weak<Recorder>,
+    bursts: &mut ErrorBursts,
+) {
     while let Some(msg) = stream.next().await {
         let Ok(msg) = msg else { continue };
         let now = crate::now_s();
@@ -309,12 +356,9 @@ async fn follow_rate(
     me: Weak<Recorder>,
     watched: crate::profile::WatchedTopic,
 ) {
-    let mut arrivals = match robot.arrivals(&watched.topic, &watched.msg_type).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(topic = %watched.topic, error = %e, "the flight recorder cannot follow it");
-            return;
-        }
+    let subscribe = || robot.arrivals(&watched.topic, &watched.msg_type);
+    let Some(mut arrivals) = until_subscribed(&me, &watched.topic, subscribe).await else {
+        return;
     };
     let name = if watched.name.is_empty() {
         watched.topic.clone()
@@ -330,7 +374,11 @@ async fn follow_rate(
         tokio::select! {
             got = arrivals.next() => match got {
                 Some(_) => count += 1,
-                None => return,
+                // Its subscription ended: made again, while the count goes on.
+                None => match until_subscribed(&me, &watched.topic, subscribe).await {
+                    Some(again) => arrivals = again,
+                    None => return,
+                },
             },
             _ = tick.tick() => {
                 let hz = f64::from(count) / since.elapsed().as_secs_f64().max(1e-3);
@@ -431,7 +479,7 @@ mod tests {
     async fn a_failed_mission_is_marked_and_opens_an_incident() {
         let robot: Arc<dyn RobotPort> = Arc::new(nervros_ros::fake::FakeRobot::new());
         let (tx, mut opened) = mpsc::unbounded_channel();
-        let recorder = Recorder::start(&robot, &config(), tx);
+        let recorder = Recorder::start(&robot, &config(), &[], tx);
         let (events, rx) = broadcast::channel(16);
         recorder.follow(rx);
         events

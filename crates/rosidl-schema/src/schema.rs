@@ -68,7 +68,8 @@ pub struct FieldOverride {
 /// Nested messages go into `$defs` and are referenced with `$ref`, except where an override reaches
 /// into them, which gets its own inline copy. Every object is closed with
 /// `additionalProperties: false`, and nothing is `required` unless an override says so. The
-/// `uint8[]` and `byte[]` fields of open length are left out unless an override keeps them.
+/// `uint8[]` and `byte[]` fields of open or bounded length are left out unless an override keeps
+/// them.
 ///
 /// # Errors
 /// - [`Error::UnknownType`] when `ty`, or a message it contains, is not in the registry.
@@ -350,13 +351,19 @@ fn primitive_schema(ty: &FieldType, over: Option<&FieldOverride>) -> Map<String,
         // The caller builds nested messages.
         FieldType::Nested(_) => {}
         integer => {
-            let (mut lo, mut hi) = integer.integer_range().unwrap_or((0, 0));
-            if let Some(min) = over.and_then(|o| o.min) {
-                lo = lo.max(to_int(min.ceil()));
-            }
-            if let Some(max) = over.and_then(|o| o.max) {
-                hi = hi.min(to_int(max.floor()));
-            }
+            let (type_lo, type_hi) = integer.integer_range().unwrap_or((0, 0));
+            let lo = over
+                .and_then(|o| o.min)
+                .map_or(type_lo, |min| type_lo.max(to_int(min.ceil())));
+            let hi = over
+                .and_then(|o| o.max)
+                .map_or(type_hi, |max| type_hi.min(to_int(max.floor())));
+            // Bounds that leave no value would make the field unfillable: the type's stand.
+            let (lo, hi) = if lo <= hi {
+                (lo, hi)
+            } else {
+                (type_lo, type_hi)
+            };
             set("type", Value::String("integer".to_owned()));
             set("minimum", json_int(lo).unwrap_or_default());
             set("maximum", json_int(hi).unwrap_or_default());
@@ -374,25 +381,54 @@ fn to_int(x: f64) -> i128 {
     x as i128
 }
 
-/// The values of the constants `X_*` of the same type as the field `x`.
+/// The values of the constants `X_*` of the same type as the field `x`, when they read as its
+/// choices: two or more, none meant for a longer field such as `x_y`, and not bit flags, which
+/// combine. Otherwise the description's list of constants says what there is.
 fn constant_choices(message: &Message, field: &Field) -> Option<Vec<Value>> {
     let prefix = format!("{}_", field.name.to_uppercase());
-    let values: Vec<Value> = message
+    let longer: Vec<String> = message
+        .fields
+        .iter()
+        .map(|f| format!("{}_", f.name.to_uppercase()))
+        .filter(|p| p.len() > prefix.len() && p.starts_with(&prefix))
+        .collect();
+    let mine: Vec<&Constant> = message
         .constants
         .iter()
         .filter(|c| c.name.starts_with(&prefix) && c.ty.same_kind(&field.ty))
-        .filter_map(Constant::json_value)
         .collect();
-    (!values.is_empty()).then_some(values)
+    if mine.len() < 2
+        || mine
+            .iter()
+            .any(|c| longer.iter().any(|p| c.name.starts_with(p)))
+    {
+        return None;
+    }
+    let values: Vec<Value> = mine.into_iter().filter_map(Constant::json_value).collect();
+    let flags = values.len() >= 3
+        && values
+            .iter()
+            .all(|v| v.as_u64().is_some_and(u64::is_power_of_two));
+    (!flags).then_some(values)
 }
 
 fn field_description(field: &Field) -> Option<String> {
     let doc = field.doc.as_deref().filter(|d| !d.is_empty());
-    match (doc, field.unit.as_deref()) {
+    let described = match (doc, field.unit.as_deref()) {
         (Some(doc), Some(unit)) => Some(format!("{doc} [{unit}]")),
         (Some(doc), None) => Some(doc.to_owned()),
         (None, Some(unit)) => Some(format!("[{unit}]")),
         (None, None) => None,
+    };
+    // maxLength counts characters, ROS counts bytes: a bounded string says which it means.
+    let bound = match &field.ty {
+        FieldType::String(Some(n)) => Some(format!("at most {n} bytes")),
+        FieldType::WString(Some(n)) => Some(format!("at most {n} UTF-16 units")),
+        _ => None,
+    };
+    match (described, bound) {
+        (Some(d), Some(b)) => Some(format!("{d} ({b})")),
+        (d, b) => d.or(b),
     }
 }
 

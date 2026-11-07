@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use super::budget::{Budget, Tokens};
@@ -50,7 +50,7 @@ pub enum Skip {
 #[derive(Debug)]
 pub struct Router {
     config: ModelsConfig,
-    ledger: Mutex<Ledger>,
+    ledger: Arc<Mutex<Ledger>>,
     privacy: PrivacyMode,
     /// Per provider id, for the providers that have one.
     budgets: HashMap<String, Budget>,
@@ -67,7 +67,7 @@ impl Router {
             .collect();
         Self {
             config,
-            ledger: Mutex::new(ledger),
+            ledger: Arc::new(Mutex::new(ledger)),
             privacy,
             budgets,
         }
@@ -94,6 +94,43 @@ impl Router {
     fn ledger(&self) -> MutexGuard<'_, Ledger> {
         // A panic while holding the lock leaves counts that are still valid numbers.
         crate::lock(&self.ledger)
+    }
+
+    /// Saves the ledger off the async threads when there is a runtime, as a request must not wait
+    /// on the disk; the counts stand in memory meanwhile, and one the write lost goes with the
+    /// next.
+    fn save_soon(&self) {
+        let ledger = Arc::clone(&self.ledger);
+        let save = move || {
+            let unsaved = crate::lock(&ledger).unsaved();
+            let written = unsaved.write();
+            let mut ledger = crate::lock(&ledger);
+            match written {
+                Ok(Some(saved)) => ledger.absorb(saved),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not save the quota ledger");
+                    ledger.restore(unsaved);
+                }
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(save)),
+            Err(_) => save(),
+        }
+    }
+
+    /// The reset zone of a model, or of a pool's models.
+    fn zone_of(&self, key: &str) -> ResetZone {
+        self.config
+            .model(key)
+            .or_else(|| {
+                self.config
+                    .models
+                    .iter()
+                    .find(|m| m.limits.pool.as_deref() == Some(key))
+            })
+            .map_or(ResetZone::Utc, |m| self.zone(m))
     }
 
     fn zone(&self, model: &ModelConfig) -> ResetZone {
@@ -197,12 +234,12 @@ impl Router {
         };
         self.within_budget(model)?;
         let zone = self.zone(model);
-        let mut ledger = self.ledger();
-        ledger.check(&model.id, &model.limits, self.pool_of(model), now, zone)?;
-        ledger.record(&model.id, model.limits.pool.as_deref(), now, zone);
-        if let Err(e) = ledger.save() {
-            tracing::warn!(model = %model.id, error = %e, "could not save the quota ledger");
+        {
+            let mut ledger = self.ledger();
+            ledger.check(&model.id, &model.limits, self.pool_of(model), now, zone)?;
+            ledger.record(&model.id, model.limits.pool.as_deref(), now, zone);
         }
+        self.save_soon();
         Ok(())
     }
 
@@ -231,26 +268,12 @@ impl Router {
 
     /// Parks a model for `for_how_long`, at most until its provider's next daily reset; persists
     /// the ledger.
-    ///
-    /// # Errors
-    ///
-    /// A failure to write the ledger file.
-    pub fn park(
-        &self,
-        model_id: &str,
-        now: SystemTime,
-        for_how_long: Duration,
-    ) -> std::io::Result<()> {
+    pub fn park(&self, model_id: &str, now: SystemTime, for_how_long: Duration) {
         // A spent daily quota comes back at the provider's midnight, whatever its Retry-After said:
         // Gemini's ran to UTC midnight, 17 hours past its own Pacific reset.
-        let zone = self
-            .config
-            .model(model_id)
-            .map_or(ResetZone::Utc, |m| self.zone(m));
-        let for_how_long = for_how_long.min(until_next_day(now, zone));
-        let mut ledger = self.ledger();
-        ledger.park(model_id, now, for_how_long);
-        ledger.save()
+        let for_how_long = for_how_long.min(until_next_day(now, self.zone_of(model_id)));
+        self.ledger().park(model_id, now, for_how_long);
+        self.save_soon();
     }
 
     /// Tries a model whose server did not answer last for `for_how_long`, in this process only.
@@ -285,18 +308,16 @@ impl Router {
     ///
     /// A failure to write the ledger file.
     pub fn set_pool_used(&self, pool: &str, used: u32, now: SystemTime) -> std::io::Result<()> {
+        let zone = self.zone_of(pool);
         let mut ledger = self.ledger();
-        ledger.set_pool_used(pool, used, now, ResetZone::Utc);
+        ledger.set_pool_used(pool, used, now, zone);
         ledger.save()
     }
 
     /// Requests counted today for a model or pool.
     #[must_use]
     pub fn used_today(&self, key: &str, now: SystemTime) -> u32 {
-        let zone = self
-            .config
-            .model(key)
-            .map_or(ResetZone::Utc, |m| self.zone(m));
+        let zone = self.zone_of(key);
         self.ledger().used_today(key, now, zone)
     }
 }
@@ -503,7 +524,7 @@ mod tests {
     fn a_parked_model_is_skipped_until_its_time() {
         let r = router(PrivacyMode::Sim);
         let now = SystemTime::now();
-        r.park("big", now, Duration::from_mins(1)).unwrap();
+        r.park("big", now, Duration::from_mins(1));
         let (take, _) = r.candidates(Role::Routine, Need::default(), now);
         assert_eq!(ids(&take), ["text", "local9b"]);
         let later = now + Duration::from_secs(61);
@@ -516,7 +537,7 @@ mod tests {
         let r = router(PrivacyMode::Sim);
         let now = SystemTime::now();
         assert_eq!(r.ready_in(Role::Routine, Need::default(), now), None);
-        r.park("big", now, Duration::from_secs(30)).unwrap();
+        r.park("big", now, Duration::from_secs(30));
         r.set_aside("text", now, Duration::from_secs(10));
         let (take, _) = r.candidates(Role::Routine, Need::default(), now);
         assert_eq!(
@@ -538,7 +559,7 @@ mod tests {
     fn a_park_ends_at_the_providers_midnight_whatever_it_asked() {
         let r = router(PrivacyMode::Sim);
         let late = std::time::UNIX_EPOCH + Duration::from_hours(20_000 * 24 + 23);
-        r.park("big", late, Duration::from_hours(20)).unwrap();
+        r.park("big", late, Duration::from_hours(20));
         let (take, _) = r.candidates(Role::Routine, Need::default(), late);
         assert_eq!(ids(&take), ["text", "local9b"]);
         let past_midnight = late + Duration::from_secs(3601);

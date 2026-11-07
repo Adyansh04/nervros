@@ -223,7 +223,7 @@ fn leaf(
                 "{at}: {{{arg}}} is a world-model id, and {name}'s {port} takes none{to}"
             ));
         }
-        let _ = write!(xml, " {port}=\"{}\"", escape(&text));
+        let _ = write!(xml, " {port}=\"{}\"", crate::mission::plan::xml_attr(&text));
     }
     xml.push_str("/>");
     for group in &known.one_of {
@@ -309,14 +309,6 @@ fn collect(v: &Value, learnable: &Learnable, out: &mut Vec<WorldLiteral>) {
             _ => {}
         }
     }
-}
-
-/// Text as an XML attribute value holds it.
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 #[cfg(test)]
@@ -435,6 +427,9 @@ mod tests {
             {"retry": 2, "do": {"leaf": "MoveHand", "arm": "{arm}", "mode": "reach"}}
         ]});
         assert!((least_s(&body, &learnable()) - (MOVE_S + 2.0 + 2.0 * MOVE_S)).abs() < 1e-9);
-        assert_eq!(escape("a<\"b\">&"), "a&lt;&quot;b&quot;&gt;&amp;");
+        assert_eq!(
+            crate::mission::plan::xml_attr("a<\"b\">&"),
+            "a&lt;&quot;b&quot;&gt;&amp;"
+        );
     }
 }

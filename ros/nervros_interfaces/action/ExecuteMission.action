@@ -16,6 +16,10 @@ float32 max_duration_s
 float32 heartbeat_timeout_s
 # The `client` of the heartbeats that keep this mission alive; another client's do not.
 string heartbeat_client
+# GetCatalog's catalog_version when the plan was approved. The executor rejects the mission when
+# its skills have changed since, as a skill taught again would run a body nobody approved. Empty
+# skips the check, for a script with no plan behind it.
+string catalog_version
 
 uint8 MODE_EXECUTE=0
 uint8 MODE_VALIDATE=1
@@ -29,6 +33,7 @@ uint8 OUTCOME_CANCELED=2
 uint8 OUTCOME_TIMEOUT=3
 uint8 OUTCOME_REJECTED=4
 uint8 OUTCOME_ERROR=5
+# How the mission ended: one of the OUTCOME_ values above.
 uint8 outcome
 # Path of the leaf that failed last before the tree failed, or of the Timeout that ran out.
 # After a cancel, a stop, the watchdog or a shutdown: the name of the step that was running.
@@ -55,6 +60,11 @@ uint8 CAUSE_NO_SERVER=4
 uint8 CAUSE_TELEOP=5
 # Another mission was running.
 uint8 CAUSE_BUSY=6
+# The executor ended it for a reason of its own: its tree or its start threw, or a pause outlasted
+# its limit.
+uint8 CAUSE_EXECUTOR=7
+# Why it ended when the plan was no test of itself: one of the CAUSE_ values above, or 0 when the
+# plan's own step decided the outcome.
 uint8 cause
 # Wall time from goal acceptance to the result.
 float32 elapsed_s

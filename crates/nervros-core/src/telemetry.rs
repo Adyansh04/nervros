@@ -32,9 +32,11 @@ impl Drop for Telemetry {
 
 /// Installs the process's tracing: once, at start.
 pub fn init() -> Telemetry {
+    // Warnings show unless RUST_LOG says otherwise: they say what was left out or not undone.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     let logs = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_filter(EnvFilter::from_default_env());
+        .with_filter(filter);
     let registry = tracing_subscriber::registry().with(logs);
     #[cfg(feature = "otlp")]
     match otlp::provider() {
@@ -78,6 +80,8 @@ pub(crate) fn content() -> bool {
 /// The span of work that outlives the turn that started it, such as a mission: a trace of its own,
 /// linked to the turn's. `kind` names it in a trace viewer; record `nervros.outcome` at its end.
 pub(crate) fn job(kind: &'static str, id: &str, what: &str) -> tracing::Span {
+    // What a job is for is the operator's words or the world's, kept out as message content is.
+    let what = if content() { what } else { "" };
     let span = tracing::info_span!(
         parent: None,
         "nervros.job",

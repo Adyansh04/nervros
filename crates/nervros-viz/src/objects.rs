@@ -14,7 +14,8 @@ pub(super) fn object_colour(label: &str, alpha: u8) -> rerun::Color {
     let hash = label.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
     });
-    let (r, g, b) = OBJECT_PALETTE[usize::try_from(hash % 8).unwrap_or(0)];
+    let slots = u64::try_from(OBJECT_PALETTE.len()).unwrap_or(1);
+    let (r, g, b) = OBJECT_PALETTE[usize::try_from(hash % slots).unwrap_or(0)];
     rerun::Color::from_unmultiplied_rgba(r, g, b, alpha)
 }
 
@@ -109,7 +110,7 @@ pub(super) fn draw_objects(
         };
         put_static(
             rec,
-            &format!("{path}/{id}"),
+            &format!("{path}/{}", layers::path_part(id)),
             &rerun::Boxes3D::from_centers_and_half_sizes(
                 [f32s(pose.translation)],
                 [xyz(&o["size"]).map(|v| v / 2.0)],
@@ -121,7 +122,11 @@ pub(super) fn draw_objects(
         );
     }
     for gone in drawn.keys().filter(|id| !now.contains_key(*id)) {
-        put_static(rec, &format!("{path}/{gone}"), &rerun::Clear::flat());
+        put_static(
+            rec,
+            &format!("{path}/{}", layers::path_part(gone)),
+            &rerun::Clear::flat(),
+        );
     }
     #[expect(clippy::cast_precision_loss, reason = "far fewer objects than 2^52")]
     put(

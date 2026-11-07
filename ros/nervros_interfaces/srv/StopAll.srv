@@ -4,6 +4,7 @@
 # Why the stop was asked for, such as "button", "chat" or "watchdog".
 string reason
 ---
+# True when every goal was cancelled and has ended and the posture holds.
 bool ok
 string message
 # The robot's state after the stop, such as "holding posture; right hand keeps O17".

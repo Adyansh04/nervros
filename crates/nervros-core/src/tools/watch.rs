@@ -31,6 +31,9 @@ pub(crate) use detect::{Detector, Trigger};
 
 /// How often a value or a message is looked at.
 const PERIOD: Duration = Duration::from_millis(500);
+/// The oldest value a look judges: what a publisher said before it went quiet is not its state
+/// now. Two periods of a topic at 0.13 Hz; state topics speak faster.
+pub(crate) const VALUE_FRESH: Duration = Duration::from_secs(15);
 /// The shortest window a rate is measured over; a slow rate gets the two periods it needs.
 const RATE_WINDOW: Duration = Duration::from_secs(2);
 const MAX_RATE_WINDOW: Duration = Duration::from_secs(30);
@@ -69,6 +72,14 @@ impl Condition {
     /// than only counting them.
     pub(crate) fn reads_messages(&self) -> bool {
         !matches!(self, Self::RateBelow(_))
+    }
+
+    /// How long one look takes at the least: a rate is counted over its window.
+    pub(crate) fn sampling(&self) -> Duration {
+        match self {
+            Self::RateBelow(hz) => rate_window(*hz),
+            Self::Value { .. } | Self::Text(_) => Duration::ZERO,
+        }
     }
 
     pub(crate) fn parse(args: &Value) -> Result<Self, String> {
@@ -223,29 +234,24 @@ fn compare(found: &Value, op: &str, wanted: &Value) -> bool {
     }
 }
 
-/// One look: `Some(what was seen)` when the condition holds.
+/// What one look at a topic found.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Reading {
+    /// The condition holds: what was seen.
+    Holds(String),
+    /// It does not.
+    Not,
+    /// A value's topic said nothing within [`VALUE_FRESH`]: there is nothing to judge.
+    Silent,
+}
+
+/// One look, whichever way it went: whether the condition holds and what was seen, or `None`
+/// when a value's topic has said nothing within [`VALUE_FRESH`].
 ///
 /// # Errors
 ///
 /// The topic cannot be read at all, such as a type this build does not know: a look that could
 /// not subscribe says so, rather than reading as silence.
-pub(crate) async fn holds(
-    robot: &dyn RobotPort,
-    topic: &str,
-    ty: &str,
-    condition: &Condition,
-) -> Result<Option<String>, String> {
-    Ok(observe(robot, topic, ty, condition)
-        .await?
-        .and_then(|(held, seen)| held.then_some(seen)))
-}
-
-/// One look, whichever way it went: whether the condition holds and what was seen, or `None`
-/// when a value's topic has said nothing yet.
-///
-/// # Errors
-///
-/// As [`holds`].
 pub(crate) async fn observe(
     robot: &dyn RobotPort,
     topic: &str,
@@ -268,7 +274,10 @@ pub(crate) async fn observe(
             op,
             value,
         } => {
-            let msg = match robot.latest(topic, ty, PERIOD).await {
+            let msg = match robot
+                .latest_fresh_shared(topic, ty, PERIOD, VALUE_FRESH)
+                .await
+            {
                 Ok(msg) => msg,
                 Err(RosError::NoData(_)) => return Ok(None),
                 Err(e) => return Err(e.to_string()),
@@ -292,18 +301,52 @@ pub(crate) async fn observe(
     }
 }
 
-/// A rate is measured over two of its periods, within bounds.
+/// A rate is measured over two of its periods, within bounds. A rate too small to have a period
+/// a `Duration` can hold (or none at all) takes the longest window: converting it would panic.
 fn rate_window(hz: f64) -> Duration {
-    RATE_WINDOW.max(Duration::from_secs_f64(2.0 / hz).min(MAX_RATE_WINDOW))
+    let period = 2.0 / hz;
+    if !period.is_finite() || period <= 0.0 {
+        return MAX_RATE_WINDOW;
+    }
+    RATE_WINDOW.max(Duration::from_secs_f64(
+        period.min(MAX_RATE_WINDOW.as_secs_f64()),
+    ))
 }
 
-/// What `message` said, when it says `text`.
+/// Sensor types of numbers only, read at a high rate: a text watch on one could never fire.
+pub(crate) const NUMERIC_TYPES: [&str; 8] = [
+    "sensor_msgs/msg/LaserScan",
+    "sensor_msgs/msg/Imu",
+    "sensor_msgs/msg/JointState",
+    "nav_msgs/msg/Odometry",
+    "geometry_msgs/msg/Twist",
+    "geometry_msgs/msg/TwistStamped",
+    "geometry_msgs/msg/PoseStamped",
+    "tf2_msgs/msg/TFMessage",
+];
+
+/// What `message` said, when one of its texts says `text`: its keys and its JSON's quoting are
+/// not what it said.
 fn said(message: &Value, text: &str) -> Option<String> {
-    let body = message.to_string();
-    body.to_lowercase().contains(text).then(|| {
-        let excerpt: String = body.chars().take(200).collect();
-        format!("it said {excerpt}")
+    let mut texts = Vec::new();
+    strings(message, &mut texts);
+    texts.into_iter().find_map(|body| {
+        let lower = body.to_lowercase();
+        let at = lower[..lower.find(text)?].chars().count();
+        // Around the match, and fenced: what a topic says is data, never the operator's words.
+        let excerpt: String = body.chars().skip(at.saturating_sub(80)).take(200).collect();
+        Some(format!("it said {}", crate::tools::from_world(&excerpt)))
     })
+}
+
+/// Every string in `value`, depth first.
+fn strings<'v>(value: &'v Value, out: &mut Vec<&'v str>) {
+    match value {
+        Value::String(s) => out.push(s),
+        Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
+        Value::Object(fields) => fields.values().for_each(|v| strings(v, out)),
+        _ => {}
+    }
 }
 
 /// What a watch looks through. A rate or text watch keeps one subscription for its whole life:
@@ -332,14 +375,14 @@ impl Looker {
         .map_err(|e| e.to_string())
     }
 
-    /// One look: `Some(what was seen)` when the condition holds.
+    /// One look.
     async fn look(
         &mut self,
         robot: &dyn RobotPort,
         topic: &str,
         ty: &str,
         condition: &Condition,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Reading, String> {
         const ENDED: &str = "its subscription ended";
         match (self, condition) {
             (Self::Arrivals(sizes), Condition::RateBelow(hz)) => {
@@ -354,7 +397,11 @@ impl Looker {
                     }
                 }
                 let rate = f64::from(count) / window.as_secs_f64();
-                Ok((rate < *hz).then(|| format!("{rate:.1} Hz")))
+                Ok(if rate < *hz {
+                    Reading::Holds(format!("{rate:.1} Hz"))
+                } else {
+                    Reading::Not
+                })
             }
             (Self::Messages(messages), Condition::Text(text)) => {
                 let end = tokio::time::Instant::now() + RATE_WINDOW;
@@ -362,15 +409,19 @@ impl Looker {
                     match tokio::time::timeout_at(end, messages.next()).await {
                         Ok(Some(m)) => {
                             if let Some(seen) = said(&m.map_err(|e| e.to_string())?, text) {
-                                return Ok(Some(seen));
+                                return Ok(Reading::Holds(seen));
                             }
                         }
                         Ok(None) => return Err(ENDED.to_owned()),
-                        Err(_) => return Ok(None),
+                        Err(_) => return Ok(Reading::Not),
                     }
                 }
             }
-            _ => holds(robot, topic, ty, condition).await,
+            _ => Ok(match observe(robot, topic, ty, condition).await? {
+                None => Reading::Silent,
+                Some((true, seen)) => Reading::Holds(seen),
+                Some((false, _)) => Reading::Not,
+            }),
         }
     }
 }
@@ -529,6 +580,7 @@ impl Watches {
         let task = tokio::spawn(
             async move {
                 let deadline = Instant::now() + Duration::from_secs(for_s);
+                let mut fired_any = false;
                 while Instant::now() < deadline {
                     let looked = Instant::now();
                     let tell = |report: String| {
@@ -543,6 +595,7 @@ impl Watches {
                             if !repeat {
                                 return;
                             }
+                            fired_any = true;
                         }
                         // Watching what cannot be read would report silence for hours.
                         Err(e) => {
@@ -550,9 +603,17 @@ impl Watches {
                             return;
                         }
                     }
+                    if let Some(quiet) = detector.went_quiet() {
+                        tell(format!("Watch {task_id} ({task_what}): {quiet}."));
+                    }
                     // Rate and text looks span a window already; a value look, or a failed one,
                     // does not.
                     tokio::time::sleep(detector.period().saturating_sub(looked.elapsed())).await;
+                }
+                if let Some(s) = &session {
+                    s.send(Command::Report(ran_out(
+                        &task_id, &task_what, for_s, fired_any,
+                    )));
                 }
             }
             .instrument(span),
@@ -596,7 +657,7 @@ impl Watches {
         let task = tokio::spawn(
             async move {
                 let deadline = Instant::now() + Duration::from_secs(for_s);
-                let (mut yes_before, mut fired) = (false, false);
+                let (mut yes_before, mut fired, mut fired_any) = (false, false, false);
                 let mut last = None;
                 while Instant::now() < deadline {
                     let looked = Instant::now();
@@ -624,7 +685,7 @@ impl Watches {
                             if !repeat {
                                 return;
                             }
-                            fired = true;
+                            (fired, fired_any) = (true, true);
                         }
                         Look::Yes(_) => yes_before = true,
                         // Gone from view: the next time it shows is news again.
@@ -632,6 +693,11 @@ impl Watches {
                         Look::Same => {}
                     }
                     tokio::time::sleep(SIGHT_PERIOD.saturating_sub(looked.elapsed())).await;
+                }
+                if let Some(s) = &session {
+                    s.send(Command::Report(ran_out(
+                        &task_id, &task_what, for_s, fired_any,
+                    )));
                 }
             }
             .instrument(span),
@@ -796,7 +862,7 @@ fn watch_spec() -> ToolSpec {
             "value": {"description": "For value: what to compare with."},
             "contains": {"type": "string", "description": "For text: words of the message as the log words them, in any case; plain text, not a pattern. log_tail shows how a node words its lines."},
             "say": {"type": "string", "description": "What the report should add, such as what to do then."},
-            "repeat": {"type": "boolean", "description": "true for \"each time\", \"every time\" or \"whenever\": report each time it comes back. Otherwise it reports once and ends."},
+            "repeat": {"type": "boolean", "description": "true for \"each time\", \"every time\" or \"whenever\": report each time it comes back, and a text each time it is said again, 10 s apart at least. Otherwise it reports once and ends."},
             "for_s": {"type": "integer", "minimum": 1, "maximum": MAX_FOR_S, "description": "How long to watch (1800)."}
         }, "additionalProperties": false}),
         Risk::Observe,
@@ -817,6 +883,16 @@ enum Look {
 struct Asked {
     view: image::GrayImage,
     yes: bool,
+}
+
+/// What the model is told when a watch's time is up, so its silence is not taken for a watch
+/// still looking.
+fn ran_out(id: &str, what: &str, for_s: u64, fired: bool) -> String {
+    if fired {
+        format!("Watch {id} ({what}) ended after its {for_s} s.")
+    } else {
+        format!("Watch {id} ({what}) ended after {for_s} s without firing.")
+    }
 }
 
 /// A fired watch's report: what it saw, what became of it (a model not told guesses), and the
@@ -974,6 +1050,14 @@ impl Tool for PlotTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tiny_or_broken_rate_takes_the_longest_window_instead_of_panicking() {
+        for hz in [1e-300, 0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(rate_window(hz) <= MAX_RATE_WINDOW, "{hz}");
+        }
+        assert_eq!(rate_window(1e-300), MAX_RATE_WINDOW);
+    }
     use nervros_ros::fake::FakeRobot;
 
     /// Answers every look the same way.
@@ -1314,14 +1398,15 @@ mod tests {
     #[tokio::test]
     async fn a_text_watch_finds_a_log_line() {
         let robot = FakeRobot::new().with_topic("/rosout", json!({"msg": "Lidar ERROR: timeout"}));
-        let seen = holds(
+        let seen = observe(
             &robot,
             "/rosout",
             "rcl_interfaces/msg/Log",
             &Condition::Text("error".into()),
         )
         .await;
-        assert!(seen.unwrap().unwrap().contains("Lidar ERROR"));
+        let (held, line) = seen.unwrap().unwrap();
+        assert!(held && line.contains("Lidar ERROR"), "{line}");
     }
 
     #[test]

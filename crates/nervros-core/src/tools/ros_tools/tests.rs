@@ -1,5 +1,5 @@
 use nervros_ros::fake::FakeRobot;
-use nervros_ros::{NodeEntities, QosInfo, TopicEndpoints};
+use nervros_ros::{Durability, NodeEntities, QosInfo, Reliability, TopicEndpoints};
 
 use super::*;
 use crate::guard::Policy;
@@ -35,11 +35,11 @@ impl SchemaSource for Schemas {
     }
 }
 
-fn qos(reliability: &str, durability: &str) -> QosInfo {
+fn qos(reliability: Reliability, durability: Durability) -> QosInfo {
     QosInfo {
-        reliability: reliability.into(),
-        durability: durability.into(),
-        history: "keep_last".into(),
+        reliability,
+        durability,
+        history: nervros_ros::History::KeepLast,
         depth: 10,
         ..QosInfo::default()
     }
@@ -71,13 +71,13 @@ fn robot() -> FakeRobot {
     let reliable_sub = Endpoint {
         node: "/viewer".into(),
         topic_type: "std_msgs/msg/String".into(),
-        qos: qos("reliable", "volatile"),
+        qos: qos(Reliability::Reliable, Durability::Volatile),
         gid: String::new(),
     };
     let lossy_pub = Endpoint {
         node: "/talker".into(),
         topic_type: "std_msgs/msg/String".into(),
-        qos: qos("best_effort", "volatile"),
+        qos: qos(Reliability::BestEffort, Durability::Volatile),
         gid: "ab".into(),
     };
     FakeRobot::new()
@@ -154,7 +154,7 @@ fn all_tools(
     let schemas: Arc<dyn SchemaSource> = Arc::new(Schemas);
     let guard = Arc::new(Guard::new(Policy::default()));
     guard.set_armed(armed);
-    let tools = tools(config, &robot, &schemas, &guard);
+    let tools = tools(config, &robot, (&schemas, &guard), None);
     (fake, tools, guard)
 }
 
@@ -241,7 +241,7 @@ async fn a_container_in_a_node_list_names_the_nodes_it_hosts() {
     let robot: Arc<dyn RobotPort> = Arc::new(fake);
     let schemas: Arc<dyn SchemaSource> = Arc::new(Schemas);
     let guard = Arc::new(Guard::new(Policy::default()));
-    let tools = tools(&RosToolsConfig::default(), &robot, &schemas, &guard);
+    let tools = tools(&RosToolsConfig::default(), &robot, (&schemas, &guard), None);
     let graph = tool(&tools, "ros_graph");
     // Nav2's servers do not hold "nav2" in their names; the container that runs them does.
     let listed = graph.call(json!({"kind": "nodes", "filter": "nav2"})).await;
@@ -287,7 +287,11 @@ async fn hz_and_echo_measure_and_summarise() {
     );
     let echo = sample.call(json!({"topic": "/status"})).await;
     let msg = &echo.data["messages"][0];
-    assert!(msg["data"].as_str().unwrap().ends_with("(300 characters)"));
+    let data = msg["data"].as_str().unwrap();
+    assert!(
+        data.starts_with("<world>") && data.contains("(300 characters)"),
+        "free text is fenced as the world's: {data}"
+    );
     assert_eq!(
         msg["list"].as_array().unwrap().len(),
         9,
@@ -329,7 +333,7 @@ fn a_slower_deadline_than_asked_is_a_mismatch() {
     let with_deadline = |secs: Option<u64>| Endpoint {
         qos: QosInfo {
             deadline: secs.map(Duration::from_secs),
-            ..qos("reliable", "volatile")
+            ..qos(Reliability::Reliable, Durability::Volatile)
         },
         ..Endpoint::default()
     };
@@ -387,7 +391,7 @@ async fn a_node_says_its_actions_and_lifecycle_and_an_action_its_ends() {
     let robot: Arc<dyn RobotPort> = Arc::new(fake);
     let schemas: Arc<dyn SchemaSource> = Arc::new(Schemas);
     let guard = Arc::new(Guard::new(Policy::default()));
-    let tools = tools(&RosToolsConfig::default(), &robot, &schemas, &guard);
+    let tools = tools(&RosToolsConfig::default(), &robot, (&schemas, &guard), None);
     let graph = tool(&tools, "ros_graph");
     let node = graph.call(json!({"name": "/behavior_server"})).await;
     assert_eq!(
@@ -419,7 +423,7 @@ async fn a_delay_is_measured_on_arrival_and_not_after_the_window() {
     let robot: Arc<dyn RobotPort> = Arc::new(fake);
     let schemas: Arc<dyn SchemaSource> = Arc::new(Schemas);
     let guard = Arc::new(Guard::new(Policy::default()));
-    let tools = tools(&RosToolsConfig::default(), &robot, &schemas, &guard);
+    let tools = tools(&RosToolsConfig::default(), &robot, (&schemas, &guard), None);
     let out = tool(&tools, "topic_sample")
         .call(json!({"topic": "/stamped", "mode": "delay", "seconds": 0.5}))
         .await;
@@ -444,7 +448,10 @@ async fn logs_filter_by_level() {
     let logs = tool(&tools, "log_tail")
         .call(json!({"min_level": "error"}))
         .await;
-    assert_eq!(logs.data["lines"][0], "[ERROR] nav: planner failed");
+    assert_eq!(
+        logs.data["lines"][0],
+        "[ERROR] nav: <world>planner failed</world>"
+    );
     let quiet = tool(&tools, "log_tail")
         .call(json!({"min_level": "fatal"}))
         .await;
@@ -556,6 +563,35 @@ fn the_profiles_rules_see_a_relative_name_as_the_read_resolves_it() {
             "{name}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_followed_path_across_a_keep_out_zone_is_refused() {
+    let (fake, tools, guard) = all_tools(&open(), true);
+    let profile: crate::profile::Profile = toml::from_str(
+        "[robot]\nname = \"x\"\n[models]\nfile = \"m.toml\"\n\
+         [[geofence.zone]]\nname = \"stairs\"\npolygon = [[2, -1], [3, -1], [3, 1], [2, 1]]\n",
+    )
+    .unwrap();
+    guard.set_zones(crate::zones::Zones::new(&profile, None));
+    // Both ends outside the zone, the frame given once for the path.
+    let pose =
+        |x: f64| json!({"header": {"frame_id": ""}, "pose": {"position": {"x": x, "y": 0.0}}});
+    let refused = tool(&tools, "action_goal")
+        .call(json!({"action": "/follow_path", "type": "nav2_msgs/action/FollowPath",
+                     "goal": {"path": {"header": {"frame_id": "map"}, "poses": [pose(1.0), pose(4.0)]}}}))
+        .await;
+    assert!(
+        refused
+            .message
+            .contains("crosses the keep-out zone `stairs`"),
+        "{}",
+        refused.message
+    );
+    assert!(
+        fake.calls().iter().all(|(n, _)| n != "/follow_path"),
+        "never sent"
+    );
 }
 
 #[tokio::test]
@@ -673,6 +709,72 @@ async fn a_slow_zone_alone_refuses_no_straight_move() {
         !straight.message.contains("run_mission"),
         "{}",
         straight.message
+    );
+}
+
+#[tokio::test]
+async fn a_secret_parameter_stays_hidden_wherever_it_is_read_or_set() {
+    let stored = Arc::new(std::sync::Mutex::new(
+        json!({"type": 4, "string_value": "hunter2"}),
+    ));
+    let (got, put) = (Arc::clone(&stored), Arc::clone(&stored));
+    let fake = robot()
+        .with_service("/vault/list_parameters", |_| {
+            Ok(json!({"result": {"names": ["api_key"], "prefixes": []}}))
+        })
+        .with_service("/vault/get_parameters", move |_| {
+            Ok(json!({"values": [got.lock().unwrap().clone()]}))
+        })
+        .with_service("/vault/describe_parameters", |_| {
+            Ok(json!({"descriptors": [{"name": "api_key", "description": "", "read_only": false, "type": 4}]}))
+        })
+        .with_service("/vault/set_parameters", move |req| {
+            *put.lock().unwrap() = req["parameters"][0]["value"].clone();
+            Ok(json!({"results": [{"successful": true, "reason": ""}]}))
+        });
+    let robot: Arc<dyn RobotPort> = Arc::new(fake);
+    let schemas: Arc<dyn SchemaSource> = Arc::new(Schemas);
+    let guard = Arc::new(Guard::new(Policy::default()));
+    guard.set_armed(true);
+    let config = RosToolsConfig {
+        param_set: vec!["/vault:*".into()],
+        service_call: vec!["*".into()],
+        ..RosToolsConfig::default()
+    };
+    let tools = tools(&config, &robot, (&schemas, &guard), None);
+    let listed = tool(&tools, "params")
+        .call(json!({"op": "list", "node": "/vault"}))
+        .await;
+    assert_eq!(
+        listed.data["parameters"][0]["value"], "(hidden)",
+        "{}",
+        listed.data
+    );
+    let set = tool(&tools, "param_set");
+    let args = json!({"node": "/vault", "name": "api_key", "value": "new-secret"});
+    let card = set.assess(&args).await.unwrap().unwrap();
+    assert!(
+        !card.reason.contains("hunter2") && !card.reason.contains("new-secret"),
+        "{}",
+        card.reason
+    );
+    let out = set.call(args).await;
+    assert_eq!(out.data["now"], "(hidden)", "{}", out.message);
+    assert_eq!(
+        *stored.lock().unwrap(),
+        json!({"type": 4, "string_value": "new-secret"}),
+        "it was set all the same"
+    );
+    let read = tool(&tools, "service_call")
+        .call(
+            json!({"service": "/vault/get_parameters", "type": "rcl_interfaces/srv/GetParameters",
+                     "request": {"names": ["api_key"]}}),
+        )
+        .await;
+    assert!(
+        !read.data.to_string().contains("new-secret"),
+        "{}",
+        read.data
     );
 }
 

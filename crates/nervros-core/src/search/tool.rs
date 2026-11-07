@@ -12,7 +12,7 @@ use super::rank::{Lookout, Seen, bare, label_word, rank};
 use crate::job::envelope::{DEFAULT_MINUTES, MAX_MINUTES};
 use crate::job::{Approval, Context, Envelope, JobKind, Jobs};
 use crate::mission::catalog::{Catalog, FIND_IN_VIEW, GO_TO_PLACE};
-use crate::mission::{Missions, Outcome};
+use crate::mission::{Missions, NotRun, Outcome};
 use crate::tools::{Assessment, Risk, Status, Tool, ToolOutcome, ToolSpec};
 
 const DEFAULT_PLACES: u64 = 4;
@@ -83,13 +83,49 @@ impl SearchTool {
             rooms: &seen.rooms,
             events: &events,
             robot,
-            now_s: crate::now_s(),
+            // Sightings carry the world model's stamps: ROS time, a simulator's under sim time.
+            now_s: self.missions.robot().ros_now_s(),
             places: &seen.places,
         });
         if ranked.is_empty() {
             return Err(
                 "the world model knows no rooms to look in; map the building first".to_owned(),
             );
+        }
+        // A walk into a keep-out zone is refused, and the refusal would end the whole search.
+        let (mut ranked, fenced): (Vec<Lookout>, Vec<Lookout>) =
+            ranked.into_iter().partition(|l| {
+                l.xy.is_none_or(|(x, y)| self.missions.keep_out_at(x, y).is_none())
+            });
+        if ranked.is_empty() {
+            return Err(format!(
+                "every place it would look is in a keep-out zone: {}",
+                fenced
+                    .iter()
+                    .map(|l| l.target.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        // What the operator approved is where it looks: a ranking made after a wait may differ.
+        if let Some(approved) = args["places"].as_array() {
+            ranked = approved
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|target| {
+                    ranked
+                        .iter()
+                        .find(|l| l.target == target)
+                        .cloned()
+                        .unwrap_or_else(|| Lookout {
+                            target: target.to_owned(),
+                            why: "approved".to_owned(),
+                            room: String::new(),
+                            score: 0.0,
+                            xy: None,
+                        })
+                })
+                .collect();
         }
         let places = args["max_places"]
             .as_u64()
@@ -183,11 +219,17 @@ async fn search(missions: &Arc<Missions>, ctx: &Context, plan: Plan) -> Result<S
             {"skill": FIND_IN_VIEW, "args": {"phrase": plan.phrase.as_deref().unwrap_or_default()}}
         ]);
         let intent = format!("look for {} at {}", plan.what, l.target);
-        let end = missions
-            .run_for_job(ctx, &intent, steps)
-            .await
+        let end = match missions.run_for_job(ctx, &intent, steps).await {
+            Ok(end) => end,
+            // This place only: one a zone covers now, say. The next may still be looked at.
+            Err(NotRun::Refused(why)) => {
+                ctx.log(format!("may not go to {}: {why}", l.target));
+                looked.push(format!("{} (not allowed)", l.target));
+                continue;
+            }
             // The robot cannot run missions now: looking further would fail the same way.
-            .map_err(|e| format!("the search could not go on: {e}"))?;
+            Err(NotRun::Cannot(why)) => return Err(format!("the search could not go on: {why}")),
+        };
         // Walking on to the next place would run into the same fault.
         if let Some(fault) = end.fault {
             return Err(format!(
@@ -316,7 +358,10 @@ impl Tool for SearchTool {
                     ),
                     args: Some(json!({"action": "go", "what": plan.what,
                                       "max_places": plan.lookouts.len(),
-                                      "max_minutes": plan.minutes})),
+                                      "max_minutes": plan.minutes,
+                                      "places": plan.lookouts.iter()
+                                          .map(|l| l.target.as_str())
+                                          .collect::<Vec<_>>()})),
                 }),
             }),
             _ => Some(Err(ToolOutcome::failed("`action` is plan or go"))),

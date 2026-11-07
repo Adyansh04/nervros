@@ -239,10 +239,19 @@ impl Gui {
     }
 
     fn approvals_tab(&mut self, ui: &mut egui::Ui) {
-        let pending: Vec<(u64, String, String)> = self
+        let pending: Vec<(u64, String, String, String, bool)> = self
             .chat
             .pending()
-            .map(|a| (a.id(), a.tool().to_owned(), a.reason().to_owned()))
+            .map(|a| {
+                let details = self.chat.details(a);
+                (
+                    a.id(),
+                    a.tool().to_owned(),
+                    a.reason().to_owned(),
+                    details,
+                    a.checking(),
+                )
+            })
             .collect();
         if pending.is_empty() {
             empty(
@@ -251,14 +260,24 @@ impl Gui {
             );
             return;
         }
-        for (id, tool, reason) in pending {
+        // A press aimed at the tab the dock was on lands here once a request switches it.
+        let settled = self.approvals_settled(ui.ctx());
+        for (id, tool, reason, details, checking) in pending {
             theme::status_card(ui, theme::WARN, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(RichText::new(tool).monospace().strong());
-                // What it would do, so the dock alone is enough to decide.
+                // What it would do, step by step, so the dock alone is enough to decide.
                 ui.label(RichText::new(reason).color(theme::DIM));
+                ui.add(egui::Label::new(RichText::new(details).monospace().size(12.0)).wrap());
                 ui.horizontal(|ui| {
-                    if ui.add(ReButton::new("Approve").small().blue()).clicked() {
+                    // An edit being checked would change what this approves.
+                    if ui
+                        .add_enabled(
+                            !checking && settled,
+                            ReButton::new("Approve").small().blue(),
+                        )
+                        .clicked()
+                    {
                         self.agent.session.send(Command::Approve(id));
                     }
                     if ui.add(ReButton::new("Deny").small().secondary()).clicked() {
@@ -341,15 +360,19 @@ impl Gui {
         if crate::incidents::show(ui, &incidents, now, checking, &mut actions) {
             self.live().investigating = true;
             let investigator = std::sync::Arc::clone(&self.agent.incidents);
-            let (live, wake) = (std::sync::Arc::clone(&self.live), ui.ctx().clone());
+            let done = crate::Reset::new(
+                std::sync::Arc::clone(&self.live),
+                |l: &mut super::Live| l.investigating = false,
+                ui.ctx().clone(),
+            );
+            // Detached: the check ends on its own and keeps what it found, window open or not.
             tokio::spawn(async move {
+                let _done = done;
                 let asked = nervros_core::incident::Trigger::new(
                     nervros_core::incident::Kind::Asked,
                     "asked from the Doctor tab",
                 );
                 investigator.investigate(asked).await;
-                lock(&live).investigating = false;
-                wake.request_repaint();
             });
         }
         self.act(ui.ctx(), actions);
@@ -382,19 +405,23 @@ impl Gui {
                 std::sync::Arc::clone(&self.agent.robot),
                 self.agent.profile.clone(),
             );
-            let (live, wake) = (std::sync::Arc::clone(&self.live), ui.ctx().clone());
+            let live = std::sync::Arc::clone(&self.live);
+            let done = crate::Reset::new(
+                std::sync::Arc::clone(&self.live),
+                |l: &mut super::Live| l.drafting = false,
+                ui.ctx().clone(),
+            );
+            // Detached: the draft ends on its own and is saved beside the persona.
             tokio::spawn(async move {
+                let _done = done;
                 let facts = nervros_core::whoami::facts(&profile, robot.as_ref()).await;
                 let drafted = match nervros_core::whoami::draft(&llm, &profile, &facts).await {
                     Ok(text) => nervros_core::whoami::save(&profile, &text).map(|p| (p, text)),
                     Err(e) => Err(e.to_string()),
                 };
                 let mut l = lock(&live);
-                l.drafting = false;
                 l.draft = Some(drafted);
                 l.draft_fresh = true;
-                drop(l);
-                wake.request_repaint();
             });
         }
         let draft = self.live().draft.clone();

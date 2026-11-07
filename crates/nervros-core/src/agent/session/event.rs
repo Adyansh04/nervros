@@ -17,6 +17,9 @@ pub enum Command {
     User(String),
     /// Stop the model's reply; the robot is not touched.
     StopGeneration,
+    /// Say again what is open, for a window that fell behind on events: answered with
+    /// [`Event::Open`].
+    Resync,
     /// Stop the reply and every motion, through the robot's `StopAll`.
     StopMission,
     /// Approve a pending request.
@@ -215,6 +218,14 @@ pub enum Event {
         /// The model's window.
         window: u64,
     },
+    /// What is open now, for a window that fell behind on events: the approvals still waiting
+    /// and whether a turn runs.
+    Open {
+        /// The approvals waiting for an answer.
+        approvals: Vec<u64>,
+        /// Whether a turn runs.
+        turn: bool,
+    },
     /// An earlier conversation was taken up: its exchanges, oldest first, the operator's marked.
     Restored {
         /// Each message's text, and whether the operator wrote it.
@@ -243,6 +254,9 @@ pub enum Event {
         reason: String,
         /// Whether `AllowForSession` would spare asking again: never for what moves the robot.
         can_allow: bool,
+        /// Whether it is asked every time, whatever the autonomy, as a keep-out zone's removal:
+        /// never answered for the operator.
+        always_asks: bool,
     },
     /// An edit to a pending approval passed its checks: it waits on these arguments now.
     ApprovalEdited {
@@ -456,24 +470,38 @@ fn ordered(text: &str) -> String {
 }
 
 /// Whether the operator's message is a plain order to stop, which takes the stop path and never
-/// waits on a model: "stop", "Stop!", "halt", "freeze", "please stop" and the like.
+/// waits on a model: "stop", "Stop!", "halt", "freeze", "abort", "cancel", "emergency stop",
+/// "stop everything", each with "please" or "now" around it.
 #[must_use]
 pub fn is_stop_word(text: &str) -> bool {
-    let text = text
-        .trim()
-        .trim_end_matches(['!', '.'])
-        .trim()
-        .to_lowercase();
-    let text = text.strip_prefix("please ").unwrap_or(&text);
+    let text: String = text
+        .to_lowercase()
+        .chars()
+        .map(|c| if matches!(c, '!' | '.' | ',') { ' ' } else { c })
+        .collect();
+    let mut words: Vec<&str> = text.split_whitespace().collect();
+    // "please" and "now" around a stop add nothing to it.
+    if words.first() == Some(&"please") {
+        words.remove(0);
+    }
+    while matches!(words.last(), Some(&("please" | "now"))) {
+        words.pop();
+    }
     matches!(
-        text,
+        words.join(" ").as_str(),
         "stop"
             | "/stop"
             | "halt"
             | "freeze"
+            | "abort"
+            | "cancel"
             | "stop it"
-            | "stop now"
             | "stop moving"
             | "stop the robot"
+            | "stop everything"
+            | "stop all"
+            | "emergency stop"
+            | "e-stop"
+            | "estop"
     )
 }

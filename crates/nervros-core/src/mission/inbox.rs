@@ -49,6 +49,8 @@ pub const FIXES: [Fix; 3] = [
 ];
 /// Open proposals kept at once: the operator's to read, not a backlog.
 const MAX_OPEN: usize = 10;
+/// How long a settled proposal is kept: a dismissed one holds off another for its step as long.
+const KEEP_SETTLED_S: u64 = 30 * 24 * 3600;
 
 /// How the drafter is told to answer.
 pub const DRAFTER_PREAMBLE: &str = "A robot's mission step keeps failing. You see the failure, \
@@ -118,12 +120,26 @@ impl Proposal {
         match self.tool.as_str() {
             "memory" => format!("Remember: {}", arg("text")),
             "geofence" => {
-                let around = ["room", "object", "place"]
+                // Every target, the rule and the margin, as the call that runs makes the zone.
+                let targets: Vec<&str> = ["room", "object", "place"]
                     .iter()
                     .map(|k| arg(k))
-                    .find(|v| !v.is_empty())
-                    .unwrap_or("the corners given");
-                format!("Keep out of {around}")
+                    .filter(|v| !v.is_empty())
+                    .collect();
+                let around = if targets.is_empty() {
+                    "the corners given".to_owned()
+                } else {
+                    targets.join(" and ")
+                };
+                let above_zero = |k: &str| self.args[k].as_f64().filter(|v| *v > 0.0);
+                let rule = match (above_zero("slow_percent"), above_zero("slow_mps")) {
+                    (Some(p), _) => format!("Slow to {p:.0}% of top speed in"),
+                    (None, Some(v)) => format!("Slow to {v:.2} m/s in"),
+                    (None, None) => "Keep out of".to_owned(),
+                };
+                let margin = above_zero("margin_m")
+                    .map_or_else(String::new, |m| format!(", {m:.1} m around it"));
+                format!("{rule} {around}{margin}")
             }
             "param_set" => format!(
                 "Set {} {} to {}",
@@ -236,12 +252,18 @@ impl Inbox {
     }
 
     /// The proposals, read again from the file first: the command line may have dismissed one
-    /// while this app ran, and a save here would undo it.
+    /// while this app ran, and a save here would undo it. Settled ones past [`KEEP_SETTLED_S`]
+    /// are let go.
     fn fresh(&self) -> MutexGuard<'_, Vec<Proposal>> {
         let mut proposals = self.lock();
         if let Some(file) = self.file.as_deref().filter(|f| f.exists()) {
             *proposals = Self::read(file);
         }
+        let now = crate::unix_secs(SystemTime::now());
+        proposals.retain(|p| {
+            p.state == State::Open
+                || p.accepted_at.unwrap_or(p.at).saturating_add(KEEP_SETTLED_S) > now
+        });
         proposals
     }
 
@@ -264,7 +286,7 @@ impl Inbox {
 
     /// Drafts a fix for `failure` and keeps it when it passes the checks; none when the drafter
     /// proposes none, or one that fails them.
-    pub async fn propose(&self, failure: &Failure) -> Option<Proposal> {
+    pub async fn propose(self: &Arc<Self>, failure: &Failure) -> Option<Proposal> {
         let reply = match self.drafter.draft(&prompt(failure, &self.fixes)).await {
             Ok(r) => r,
             Err(e) => {
@@ -283,8 +305,18 @@ impl Inbox {
                 return None;
             }
         };
+        let (inbox, failure) = (Arc::clone(self), failure.clone());
+        // It reads and writes the inbox file.
+        tokio::task::spawn_blocking(move || inbox.keep(&failure, tool, args, why))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Keeps a drafted fix for `failure`, unless another failure of the step drafted one
+    /// meanwhile.
+    fn keep(&self, failure: &Failure, tool: String, args: Value, why: String) -> Option<Proposal> {
         let mut proposals = self.fresh();
-        // Another failure of the step may have drafted one meanwhile.
         if !wanted_in(&proposals, &failure.skill, &failure.target) {
             return None;
         }
@@ -491,6 +523,33 @@ mod tests {
     use super::*;
     use crate::tools::Risk;
     use serde_json::json;
+
+    #[test]
+    fn a_geofence_fix_says_its_rule_every_target_and_its_margin() {
+        let fix = |args: serde_json::Value| Proposal {
+            id: 1,
+            at: 0,
+            mission: String::new(),
+            skill: String::new(),
+            target: String::new(),
+            failure: String::new(),
+            tool: "geofence".to_owned(),
+            args,
+            why: String::new(),
+            state: State::Open,
+            accepted_at: None,
+            before: None,
+        };
+        assert_eq!(
+            fix(json!({"action": "add", "room": "kitchen", "slow_percent": 90})).summary(),
+            "Slow to 90% of top speed in kitchen"
+        );
+        assert_eq!(
+            fix(json!({"action": "add", "room": "hall", "object": "O3", "margin_m": 0.5}))
+                .summary(),
+            "Keep out of hall and O3, 0.5 m around it"
+        );
+    }
 
     struct Writes(&'static str);
 

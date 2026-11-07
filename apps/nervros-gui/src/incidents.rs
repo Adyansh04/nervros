@@ -63,7 +63,7 @@ fn row(
     newest: bool,
     actions: &mut Vec<Action>,
 ) {
-    let ago = ago(now_s - incident.opened_s);
+    let ago = nervros_core::ago(now_s - incident.opened_s);
     let (colour, cause) = match incident.causes.first() {
         Some(c) => (theme::WARN, c.title.clone()),
         None => (theme::FAINT, "no known cause matched".to_owned()),
@@ -129,14 +129,6 @@ fn row(
             ))));
         }
     });
-}
-
-fn ago(seconds: f64) -> String {
-    match seconds {
-        s if s < 90.0 => format!("{s:.0} s ago"),
-        s if s < 5400.0 => format!("{:.0} min ago", s / 60.0),
-        s => format!("{:.0} h ago", s / 3600.0),
-    }
 }
 
 #[cfg(test)]

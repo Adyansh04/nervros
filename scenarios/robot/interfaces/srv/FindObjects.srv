@@ -1,4 +1,5 @@
-# The objects in the world model whose label holds `query`.
+# A stand-in for a world model's search, simpler than canopy's FindObjects and named apart from it:
+# the objects whose label holds `query`.
 string query
 ---
 string[] ids

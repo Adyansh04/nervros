@@ -121,23 +121,23 @@ impl RosGraph {
 
     /// The managed nodes and how they stand, like `ros2 lifecycle nodes` and `get`.
     async fn lifecycle_nodes(&self, graph: &GraphDetail, filter: &str) -> ToolOutcome {
-        let mut items = Vec::new();
-        for (service, _) in graph
+        let nodes: Vec<&str> = graph
             .services
             .iter()
             .filter(|(_, t)| t.first().is_some_and(|t| t == GET_STATE))
-        {
-            let Some(node) = service.strip_suffix("/get_state") else {
-                continue;
-            };
-            if !name_matches(filter, node) {
-                continue;
-            }
-            let state = self.lifecycle_state(graph, node).await;
-            items.push(json!({"name": node, "state": state}));
-        }
-        let total = items.len();
-        items.truncate(LIST_LIMIT);
+            .filter_map(|(service, _)| service.strip_suffix("/get_state"))
+            .filter(|node| name_matches(filter, node))
+            .collect();
+        // Only those shown are asked, all at once: a hung node costs one wait, not one each.
+        let total = nodes.len();
+        let shown = &nodes[..total.min(LIST_LIMIT)];
+        let states =
+            futures::future::join_all(shown.iter().map(|n| self.lifecycle_state(graph, n))).await;
+        let items: Vec<Value> = shown
+            .iter()
+            .zip(states)
+            .map(|(node, state)| json!({"name": node, "state": state}))
+            .collect();
         ToolOutcome::ok(
             json!({"kind": "lifecycle", "total": total, "shown": items.len(), "items": items}),
         )
@@ -292,8 +292,11 @@ impl RosGraph {
         let (mut servers, mut clients) = (Vec::new(), Vec::new());
         let mut nodes = graph.nodes.clone();
         nodes.dedup();
-        for node in &nodes {
-            if let Ok(n) = self.ctx.robot.node_entities(node).await {
+        // All at once: a node slow to answer costs one wait, not one each.
+        let entities =
+            futures::future::join_all(nodes.iter().map(|n| self.ctx.robot.node_entities(n))).await;
+        for (node, entities) in nodes.iter().zip(entities) {
+            if let Ok(n) = entities {
                 let has = |list: &[(String, Vec<String>)]| list.iter().any(|(s, _)| s == name);
                 if has(&n.services) {
                     servers.push(node.clone());

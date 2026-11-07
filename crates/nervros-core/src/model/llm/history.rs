@@ -16,15 +16,34 @@ impl History {
         if self.0.len() <= max {
             return;
         }
-        let mut start = self.0.len() - max;
+        // A summary of what came before stays: it is all that is left of it.
+        let keep = summary_len(&self.0);
+        let mut start = (self.0.len() - max).max(keep);
         while start < self.0.len() && !is_user_text(&self.0[start]) {
             start += 1;
         }
-        self.0.drain(..start);
+        self.0.drain(keep..start);
     }
 }
 
 impl History {
+    /// How many messages it holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether it holds no message.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Drops the messages past the first `len`, as a try that is made again needs.
+    pub fn truncate(&mut self, len: usize) {
+        self.0.truncate(len);
+    }
+
     /// Roughly how many tokens it takes.
     #[must_use]
     pub fn size(&self) -> usize {
@@ -38,10 +57,15 @@ impl History {
         let starts: Vec<usize> = (0..self.0.len())
             .filter(|&i| is_user_text(&self.0[i]))
             .collect();
+        // What the messages from each one on take, each message measured once.
+        let mut from = vec![0; self.0.len() + 1];
+        for (i, m) in self.0.iter().enumerate().rev() {
+            from[i] = from[i + 1] + size(std::slice::from_ref(m));
+        }
         let split = starts
             .iter()
             .copied()
-            .find(|&i| size(&self.0[i..]) <= keep)
+            .find(|&i| from[i] <= keep)
             .unwrap_or_else(|| starts.last().copied().unwrap_or(0));
         (split > 0).then(|| (split, transcript(&self.0[..split])))
     }
@@ -112,6 +136,22 @@ impl History {
             "(My reply was lost after I acted: {}.)",
             done.join("; ")
         )));
+    }
+
+    /// Keeps a turn that was cut off before its reply, by a stop or its time limit: what was
+    /// asked, and what it had done, or the next turn might ask for it again.
+    pub(crate) fn cut_off(&mut self, request: &str, done: &[String]) {
+        self.0.push(Message::User {
+            content: vec![UserContent::text(request)],
+        });
+        self.0.push(Message::assistant(if done.is_empty() {
+            "(I was stopped before I replied.)".to_owned()
+        } else {
+            format!(
+                "(I was stopped before I replied, after I acted: {}.)",
+                done.join("; ")
+            )
+        }));
     }
 
     /// Writes it as JSON, for a later session to resume.
@@ -322,13 +362,29 @@ pub(super) fn cut_old<M: Borrow<Message>>(messages: &[M], keep: usize) -> Vec<Me
 /// The newest messages that fit `budget`, from an operator's message on so that no tool result
 /// is left without its call; the last exchange stays whatever its size.
 pub(super) fn fit(mut messages: Vec<Message>, budget: usize) -> Vec<Message> {
-    while size(&messages) > budget {
-        let Some(next) = messages.iter().skip(1).position(is_user_text) else {
+    let keep = summary_len(&messages);
+    // Each message measured once, not the whole history again per exchange dropped.
+    let mut sizes: Vec<usize> = messages
+        .iter()
+        .map(|m| size(std::slice::from_ref(m)))
+        .collect();
+    let mut total: usize = sizes.iter().sum();
+    while total > budget {
+        let Some(next) = messages.iter().skip(keep + 1).position(is_user_text) else {
             break;
         };
-        messages.drain(..=next);
+        total -= sizes.drain(keep..=keep + next).sum::<usize>();
+        messages.drain(keep..=keep + next);
     }
     messages
+}
+
+/// How many leading messages are a summary of the earlier conversation and its reply: kept when
+/// the oldest are dropped, as the summary is all that is left of them.
+fn summary_len(messages: &[Message]) -> usize {
+    let summarised = matches!(messages.first(), Some(Message::User { content })
+        if content.iter().any(|c| matches!(c, UserContent::Text(t) if t.text.starts_with(SUMMARY_MARK))));
+    if summarised { messages.len().min(2) } else { 0 }
 }
 
 /// Messages as plain text, for a summary.
@@ -341,7 +397,14 @@ pub(super) fn transcript(messages: &[Message]) -> String {
                 for c in content {
                     match c {
                         UserContent::Text(t) => {
-                            let _ = writeln!(out, "Operator: {}", t.text);
+                            let who = if t.text.starts_with(REPORT_MARK) {
+                                "Robot report"
+                            } else if t.text.starts_with(SUMMARY_MARK) {
+                                "Earlier summary"
+                            } else {
+                                "Operator"
+                            };
+                            let _ = writeln!(out, "{who}: {}", t.text);
                         }
                         UserContent::ToolResult(r) => {
                             let text = crate::tools::clip(&result_text(&r.content), 300);

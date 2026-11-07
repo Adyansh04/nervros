@@ -170,14 +170,19 @@ impl RunMission {
             ));
         }
         let at_most = crate::duration_words(compiled.worst_case_s);
+        let mut reason = format!(
+            "runs \"{}\": {}, at most {at_most}",
+            compiled.plan.intent,
+            crate::counted(compiled.steps.len(), "step")
+        );
+        noted(&mut reason, compiled.concerns.iter().map(String::as_str));
+        let missions = Arc::clone(&self.0);
+        let previewed = compiled.sha256.clone();
+        tokio::spawn(async move { missions.preview(&previewed).await });
         Some(Ok(Assessment {
             risk: Risk::Manipulation,
             resources: Vec::new(),
-            reason: format!(
-                "runs \"{}\": {}, at most {at_most}",
-                compiled.plan.intent,
-                crate::counted(compiled.steps.len(), "step")
-            ),
+            reason,
             args: Some(with_goal(
                 json!({"hash": compiled.sha256}),
                 args.get("goal"),
@@ -208,10 +213,7 @@ impl RunMission {
         let steps = crate::counted(steps, "step");
         let mut reason = format!("runs \"{intent}\": {steps}, at most {at_most}");
         if let Some(concerns) = out.data["concerns"].as_array() {
-            // The operator's words: the fences of the scene check's doubts are the model's.
-            for c in concerns.iter().filter_map(Value::as_str) {
-                let _ = write!(reason, "; check: {}", crate::tools::unfenced(c));
-            }
+            noted(&mut reason, concerns.iter().filter_map(Value::as_str));
         }
         let missions = Arc::clone(&self.0);
         let previewed = hash.clone();
@@ -227,6 +229,14 @@ impl RunMission {
             reason,
             args: Some(args),
         })
+    }
+}
+
+/// Adds the checks' doubts to an approval's reason, in the operator's words: the fences of the
+/// scene check's doubts are the model's.
+fn noted<'c>(reason: &mut String, concerns: impl Iterator<Item = &'c str>) {
+    for c in concerns {
+        let _ = write!(reason, "; check: {}", crate::tools::unfenced(c));
     }
 }
 

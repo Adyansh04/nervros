@@ -71,17 +71,39 @@ fn stronger(
     }
 }
 
+/// How long a call stopped mid-way keeps its resources: its own cancel, sent as it is dropped,
+/// lands within it, and the base or the arm does not look free while its goal still runs.
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A call's resources: let go when it ends, or a moment after it is stopped mid-way.
+struct Held(Option<crate::guard::ResourceLock>, bool);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let (Some(lock), false) = (self.0.take(), self.1)
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            // Detached on purpose: it outlives the stopped call by the grace alone.
+            runtime.spawn(async move {
+                tokio::time::sleep(CANCEL_GRACE).await;
+                drop(lock);
+            });
+        }
+    }
+}
+
 impl Shared {
     async fn run(&self, tool: &Arc<dyn Tool>, args: Value, resources: &[Resource]) -> ToolOutcome {
-        let _held = if resources.is_empty() {
-            None
-        } else {
+        let mut held = Held(None, false);
+        if !resources.is_empty() {
             match self.guard.lock(resources) {
-                Ok(l) => Some(l),
+                Ok(l) => held.0 = Some(l),
                 Err(r) => return ToolOutcome::refused(r.message),
             }
-        };
-        tool.call(args).await
+        }
+        let out = tool.call(args).await;
+        held.1 = true;
+        out
     }
 
     /// What a call would do, for a tool whose risk depends on its arguments, and the answer when
@@ -201,7 +223,8 @@ impl Shared {
             Caller::Model => self.guard.decide(spec, args),
             Caller::Operator => self.guard.decide_operator(spec),
         };
-        let always_asks = always_asks && caller == Caller::Model;
+        // Also for the operator: a stored request asked again ("Ask again") runs as theirs, and
+        // what always asks, a keep-out removal, asks then too.
         let decision = match (decision, rule) {
             (Decision::Allow, Some(r)) => Decision::NeedApproval { reason: r.reason },
             (Decision::Allow, None) if always_asks => Decision::NeedApproval {
@@ -212,7 +235,8 @@ impl Shared {
                 if caller == Caller::Model
                     && !always_asks
                     && !matches!(spec.risk, Risk::Motion | Risk::Manipulation)
-                    && lock(&self.allowed).contains(&spec.name) =>
+                    && lock(&self.allowed)
+                        .contains(&super::approval::allowance(&spec.name, args)) =>
             {
                 Decision::Allow
             }
@@ -295,7 +319,13 @@ impl Shared {
             Some(out) => out,
             None if stopping => {
                 self.guard.note_stop();
-                tool.call(args).await
+                // Its own task, so Esc or the turn's time limit cannot cut the stop in half: the
+                // task runs to its end even when nobody waits for it any more.
+                let tool = Arc::clone(tool);
+                match tokio::spawn(async move { tool.call(args).await }).await {
+                    Ok(out) => out,
+                    Err(e) => ToolOutcome::failed(format!("the stop did not finish: {e}")),
+                }
             }
             None => match self.decide(&spec, &args, caller, rule, tool.always_asks(&args)) {
                 Decision::Deny(r) => ToolOutcome::refused(r.message),
@@ -326,8 +356,9 @@ impl Shared {
 
     /// Notes what a call did for the turn, and shows its images.
     fn took_effect(&self, spec: &ToolSpec, outcome: &ToolOutcome, flags: &TurnFlags) {
-        // An edit is not repeated by the next model either.
-        if spec.lane() != Lane::Observe && outcome.status.ok() {
+        // An edit is not repeated by the next model either, nor a call that ran and failed: a
+        // goal that drove and then timed out has moved the robot.
+        if spec.lane() != Lane::Observe && outcome.status != Status::Refused {
             flags.acted.store(true, Ordering::SeqCst);
             lock(&flags.done).push(format!(
                 "{} {}: {}",
@@ -356,6 +387,7 @@ impl Shared {
                     "said while you worked: \"{}\"; take it into account now",
                     said.join(" ")
                 ));
+                lock(&self.steer_heard).extend(said);
             }
         }
         if let Some(n) = self.stuck(tool, outcome) {

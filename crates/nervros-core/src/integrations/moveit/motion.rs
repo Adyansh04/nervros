@@ -15,14 +15,12 @@ use super::{Arms, CLEAR_SHARE, Goal, error_words, point_constraints};
 use crate::builtins::triple;
 use crate::integrations::{Control, Goals, NativeSkill, run_goal};
 
-/// How far above an object the hand goes, m: the object itself is in the way.
-const ABOVE_M: f64 = 0.10;
 const ARM_S: f64 = 60.0;
 const CALL_WAIT: Duration = Duration::from_secs(10);
 /// How far a held thing may tilt on the way, radians.
 const HELD_TILT: f64 = 0.2;
 /// Constrained planning needs longer than a free move, s.
-const HELD_PLANNING_S: f64 = 10.0;
+pub(super) const HELD_PLANNING_S: f64 = 10.0;
 
 /// The motions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,8 +37,8 @@ pub(super) struct Motions {
     goals: Arc<Goals>,
     /// The executor's `LendResources`, when it holds the arms.
     lend: Option<String>,
-    /// The executor's state, which says what each hand holds.
-    state: Option<String>,
+    /// Held while the arms go back, so a retry does not borrow them before a late give-back.
+    returning: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Motions {
@@ -50,7 +48,7 @@ impl Motions {
             arms: Arc::clone(arms),
             goals: Arc::clone(goals),
             lend: mission.and_then(|m| m.lend.clone()),
-            state: mission.map(|m| m.state.clone()),
+            returning: Arc::default(),
         });
         [Kind::ArmTo, Kind::HandTo, Kind::HandLine, Kind::Grip]
             .into_iter()
@@ -71,25 +69,8 @@ impl Motions {
         (constraints, path): (Value, Option<Value>),
         ctl: &Control,
     ) -> Result<(), String> {
-        let s = self.arms.settings();
-        let planning_s = if path.is_some() {
-            s.planning_s.max(HELD_PLANNING_S)
-        } else {
-            s.planning_s
-        };
         let goal = json!({
-            "request": {
-                "group_name": group,
-                "start_state": {"is_diff": true},
-                "goal_constraints": [constraints],
-                "path_constraints": path.unwrap_or_else(|| json!({})),
-                "pipeline_id": s.pipeline,
-                "planner_id": s.planner,
-                "num_planning_attempts": 1,
-                "allowed_planning_time": planning_s,
-                "max_velocity_scaling_factor": s.scaling,
-                "max_acceleration_scaling_factor": s.scaling,
-            },
+            "request": self.arms.plan_request(group, &constraints, path, &json!({"is_diff": true})),
             "planning_options": {
                 "planning_scene_diff": {"is_diff": true, "robot_state": {"is_diff": true}},
                 "plan_only": false,
@@ -183,43 +164,27 @@ impl Motions {
         })
     }
 
-    /// What the hand of `group` holds by the executor's state: an object id,
-    /// [`crate::mission::UNKNOWN_HELD`], or empty for nothing. Empty where no executor holds the
-    /// arms.
-    async fn holding(&self, group: &str) -> Result<String, String> {
-        let Some(topic) = &self.state else {
-            return Ok(String::new());
-        };
-        let side = if group.contains("left") {
-            "left"
-        } else {
-            "right"
-        };
-        let state = self
-            .arms
-            .robot
-            .latest(
-                topic,
-                "nervros_interfaces/msg/RobotState",
-                Duration::from_secs(1),
-            )
-            .await
-            .map_err(|e| format!("what the {side} hand holds is not known: {e}"))?;
-        Ok(crate::mission::held_by(&state, side))
-    }
-
     /// Runs `motion` with the arms the executor lends, given back however it ends.
     async fn lent<F>(&self, max_s: f64, motion: F) -> Result<(), String>
     where
         F: Future<Output = Result<(), String>> + Send,
     {
         let Some(service) = &self.lend else {
+            // An executor that lends nothing would not know NervROS moves its arms.
+            if self.arms.profile.mission.is_some() {
+                return Err(
+                    "this robot's executor has no `lend` service in `[mission]`, so NervROS may \
+                     not move the arms it holds"
+                        .to_owned(),
+                );
+            }
             return motion.await;
         };
         let ask = |lend: bool| {
             json!({"client": crate::mission::client_id(), "resources": ["left_arm", "right_arm"],
                    "lend": lend, "max_s": max_s})
         };
+        drop(self.returning.lock().await);
         let robot = &self.arms.robot;
         let lent = robot
             .call(
@@ -237,11 +202,24 @@ impl Motions {
             ));
         }
         // Given back even when the step is dropped part way, as a timeout does; otherwise given
-        // back before the next step, which may be the executor's.
-        let mut back = GiveBack(Some((Arc::clone(robot), service.clone(), ask(false))));
+        // back before the next step, which may be the executor's. Either way only once MoveIt's
+        // goals have ended: the executor takes the arms at once.
+        let mut back = GiveBack(
+            Some(Back {
+                robot: Arc::clone(robot),
+                service: service.clone(),
+                request: ask(false),
+                goals: Arc::clone(&self.goals),
+                actions: [
+                    self.arms.config.name("move_action"),
+                    self.arms.config.name("execute_trajectory"),
+                ],
+            }),
+            Arc::clone(&self.returning),
+        );
         let out = motion.await;
-        if let Some((robot, service, request)) = back.0.take() {
-            give_back(robot.as_ref(), &service, request).await;
+        if let Some(b) = back.0.take() {
+            b.give().await;
         }
         out
     }
@@ -261,13 +239,53 @@ async fn give_back(robot: &dyn nervros_ros::RobotPort, service: &str, request: V
     }
 }
 
-/// Gives the arms back to the executor when dropped.
-struct GiveBack(Option<(Arc<dyn nervros_ros::RobotPort>, String, Value)>);
+/// How long the arms wait for MoveIt's goals to end before they go back regardless: a little
+/// longer than a cancel's retries.
+const GIVE_BACK_WAIT: Duration = Duration::from_secs(12);
+
+/// What giving the arms back takes.
+struct Back {
+    robot: Arc<dyn nervros_ros::RobotPort>,
+    service: String,
+    request: Value,
+    goals: Arc<Goals>,
+    actions: [String; 2],
+}
+
+impl Back {
+    /// Gives the arms back once no goal of MoveIt's that NervROS sent is open.
+    async fn give(self) {
+        let deadline = tokio::time::Instant::now() + GIVE_BACK_WAIT;
+        while self
+            .goals
+            .open()
+            .iter()
+            .any(|(a, _)| self.actions.contains(a))
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        give_back(self.robot.as_ref(), &self.service, self.request).await;
+    }
+}
+
+/// Gives the arms back to the executor when dropped, holding `returning` until they are back.
+struct GiveBack(Option<Back>, Arc<tokio::sync::Mutex<()>>);
 
 impl Drop for GiveBack {
     fn drop(&mut self) {
-        if let Some((robot, service, request)) = self.0.take() {
-            tokio::spawn(async move { give_back(robot.as_ref(), &service, request).await });
+        if let Some(back) = self.0.take() {
+            let returning = Arc::clone(&self.1);
+            // Taken here, before the next attempt can ask for the arms.
+            let held = Arc::clone(&returning).try_lock_owned();
+            // Detached on purpose: a drop cannot wait, and the arms must go back after the move.
+            tokio::spawn(async move {
+                let _held = match held {
+                    Ok(held) => held,
+                    Err(_) => returning.lock_owned().await,
+                };
+                back.give().await;
+            });
         }
     }
 }
@@ -287,7 +305,7 @@ fn ended(r: &GoalResult) -> Result<(), String> {
 }
 
 /// Path constraints that keep `tip` turned as `orientation`, within a small tilt.
-fn held_level(planning: &str, tip: &str, orientation: &Value) -> Value {
+pub(super) fn held_level(planning: &str, tip: &str, orientation: &Value) -> Value {
     json!({"orientation_constraints": [{
         "header": {"frame_id": planning},
         "link_name": tip,
@@ -360,17 +378,10 @@ impl Native {
     async fn hand_to(&self, arm: &str, target: &str, ctl: &Control) -> Result<(), String> {
         let m = &self.shared;
         let (_, group, planning, tip) = m.arms.parts(&json!({"group": arm})).await?;
-        let args = target_args(target);
-        let (mut at, _) = m.arms.point(&args, &planning).await?;
-        if args.get("object").is_some() {
-            at[2] += ABOVE_M;
-        }
-        let turned = m.arms.tip_orientation(&planning, &tip);
+        let (at, _) = m.arms.point(&target_args(target), &planning).await?;
+        let turned = m.arms.tip_orientation(&planning, &tip)?;
         let constraints = point_constraints(&planning, &tip, at, &turned);
-        // What the hand holds stays as level as it is now the whole way: a full mug spills. Not
-        // knowing what it holds is no reason not to move.
-        let held = m.holding(&group).await.is_ok_and(|h| !h.is_empty());
-        let path = held.then(|| held_level(&planning, &tip, &turned));
+        let path = m.arms.hand_path(&group, &planning, &tip, &turned).await;
         m.lent(ARM_S, m.move_group(&group, (constraints, path), ctl))
             .await
     }
@@ -393,7 +404,7 @@ impl Native {
                 format!("{hand} has no state `{state}`; it has {}", names.join(", "))
             })?;
         // Any state can loosen a grip, pinch_ready as much as open: putting down is a place's.
-        let held = m.holding(&group).await?;
+        let held = m.arms.holding(&group).await?;
         if !held.is_empty() {
             return Err(full_hand(&held));
         }
@@ -459,10 +470,17 @@ impl NativeSkill for Native {
     }
 
     async fn check(&self, args: &BTreeMap<String, String>) -> Option<String> {
-        if self.kind != Kind::Grip {
+        // Every arm move with an object in hand risks it; carrying is what such an arm moves for,
+        // and HandTo keeps a held object level instead.
+        let guarded = match self.kind {
+            Kind::Grip | Kind::HandLine => true,
+            Kind::ArmTo => args.get("pose").is_none_or(|pose| pose.trim() != "carry"),
+            Kind::HandTo => false,
+        };
+        if !guarded {
             return None;
         }
-        match self.shared.holding(args.get("arm")?).await {
+        match self.shared.arms.holding(args.get("arm")?).await {
             Ok(held) if held.is_empty() => None,
             Ok(held) => Some(full_hand(&held)),
             Err(e) => Some(e),
@@ -487,12 +505,12 @@ impl NativeSkill for Native {
             Kind::ArmTo => self.arm_to(arg("arm"), arg("pose"), ctl).await,
             Kind::HandTo => self.hand_to(arg("arm"), arg("target"), ctl).await,
             Kind::HandLine => {
+                // Refused, not clamped: a line of no length would succeed without moving.
                 let metres = arg("distance_m")
                     .parse::<f64>()
                     .ok()
-                    .filter(|v| v.is_finite())
-                    .ok_or("`distance_m` must be a number")?
-                    .clamp(0.0, 0.5);
+                    .filter(|v| (super::check::MIN_LINE_M..=super::check::MAX_LINE_M).contains(v))
+                    .ok_or("`distance_m` must be a number from 0.01 to 0.5")?;
                 let m = &self.shared;
                 let srdf = m.arms.srdf().await?;
                 let group = Arms::group_named(&srdf, arg("arm"))?.name.clone();

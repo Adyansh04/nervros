@@ -163,7 +163,27 @@ impl Bags {
                 .map_err(|e| format!("cannot read {}: {e}", t.topic))?;
             streams.push(messages);
         }
-        let (mut running, id) = self.room()?;
+        // Made before the answer, in one step with the check that it is new: two records of
+        // one name cannot both say they are recording.
+        let (dir, path, taken) = (self.dir.clone(), file.clone(), name.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&dir).map_err(|e| format!("making {}: {e}", dir.display()))?;
+            File::create_new(&path).map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => {
+                    format!("a recording `{taken}` exists already; give another name")
+                }
+                _ => format!("creating {}: {e}", path.display()),
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let (mut running, id) = match self.room() {
+            Ok(room) => room,
+            Err(e) => {
+                let _ = std::fs::remove_file(&file);
+                return Err(e);
+            }
+        };
         let (tx, rx) = mpsc::sync_channel(QUEUE);
         let queued = Arc::new(AtomicU64::new(0));
         let mut readers = Vec::with_capacity(topics.len());
@@ -174,13 +194,11 @@ impl Bags {
         drop(tx);
         let (stop, stopped) = watch::channel(false);
         let session = self.session.get().cloned();
-        let (task_id, dir) = (id.clone(), self.dir.clone());
+        let task_id = id.clone();
         let task = tokio::spawn(async move {
             let until = Duration::from_secs(seconds);
             let ended = tokio::task::spawn_blocking(move || {
-                std::fs::create_dir_all(&dir)
-                    .map_err(|e| format!("making {}: {e}", dir.display()))?;
-                write(&file, &mut topics, (&rx, &queued), &stopped, until)
+                write((&file, out), &mut topics, (&rx, &queued), &stopped, until)
             })
             .await
             .map_err(|e| e.to_string())
@@ -370,9 +388,9 @@ fn bag_name(args: &Value) -> Result<String, String> {
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "seconds since the epoch"
+            reason = "milliseconds since the epoch"
         )]
-        return Ok(format!("bag-{}", crate::now_s() as u64));
+        return Ok(format!("bag-{}", (crate::now_s() * 1000.0) as u64));
     };
     if name
         .chars()
@@ -389,7 +407,7 @@ fn bag_name(args: &Value) -> Result<String, String> {
 /// Writes what arrives into `file` until the stop, the time limit, the size limit or the end of
 /// every topic, then closes it, which is what makes it readable, and keeps its summary beside it.
 fn write(
-    file: &Path,
+    (file, out): (&Path, File),
     topics: &mut [Recorded],
     (arrivals, queued): (&mpsc::Receiver<Arrived>, &AtomicU64),
     stopped: &watch::Receiver<bool>,
@@ -397,7 +415,6 @@ fn write(
 ) -> Result<Summary, String> {
     let failed = |e: mcap::McapError| format!("writing {}: {e}", file.display());
     let started = (Instant::now(), crate::now_s());
-    let out = File::create_new(file).map_err(|e| format!("creating {}: {e}", file.display()))?;
     let mut bag = mcap::WriteOptions::new()
         .compression(None)
         .profile("ros2")

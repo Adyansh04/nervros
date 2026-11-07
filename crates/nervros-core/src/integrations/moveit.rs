@@ -29,10 +29,15 @@ use crate::tools::Tool;
 use srdf::Srdf;
 
 const READ_WAIT: Duration = Duration::from_secs(3);
+/// How far above an object's top a hand goes to it, m.
+const ABOVE_M: f64 = 0.10;
 /// How much of a straight move must be clear for it to run.
 const CLEAR_SHARE: f64 = 0.98;
 /// How finely a straight move is checked, m.
 const LINE_STEP_M: f64 = 0.01;
+/// The most a joint may move between two of a straight line's waypoints, rad and m.
+const LINE_JUMP_RAD: f64 = 0.5;
+const LINE_JUMP_M: f64 = 0.05;
 /// How long the straight-line planner may take.
 const LINE_WAIT: Duration = Duration::from_secs(10);
 
@@ -106,6 +111,8 @@ pub(crate) struct Arms {
     settings: Mutex<settings::Settings>,
     /// Where the settings are kept, if anywhere.
     settings_file: Option<std::path::PathBuf>,
+    /// Held from a change to its write, so the file is written in the order of the changes.
+    writing: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for Arms {
@@ -122,17 +129,20 @@ impl Arms {
         crate::lock(&self.settings).clone()
     }
 
-    /// Changes the settings and keeps them.
-    pub(crate) fn change(&self, f: impl FnOnce(&mut settings::Settings)) {
+    /// Changes the settings and keeps them, written off the async threads.
+    pub(crate) async fn change(&self, f: impl FnOnce(&mut settings::Settings)) {
+        let _writing = self.writing.lock().await;
         let now = {
             let mut s = crate::lock(&self.settings);
             f(&mut s);
             s.clone()
         };
-        let Some(file) = &self.settings_file else {
+        let Some(file) = self.settings_file.clone() else {
             return;
         };
-        if let Err(e) = crate::persist::write_json(file, &now) {
+        let written =
+            tokio::task::spawn_blocking(move || crate::persist::write_json(&file, &now)).await;
+        if let Some(e) = written.map_or_else(|e| Some(e.to_string()), Result::err) {
             tracing::warn!(error = %e, "the arm settings were not kept");
         }
     }
@@ -206,7 +216,81 @@ impl Arms {
         })
     }
 
-    /// The point `args` name, in the planning frame.
+    /// What the hand of `group` holds by the executor's state: an object id,
+    /// [`crate::mission::UNKNOWN_HELD`], or empty for nothing. Empty where no executor holds the
+    /// arms.
+    ///
+    /// # Errors
+    ///
+    /// The executor's state is not fresh.
+    pub(crate) async fn holding(&self, group: &str) -> Result<String, String> {
+        let Some(mission) = &self.profile.mission else {
+            return Ok(String::new());
+        };
+        let side = if group.contains("left") {
+            "left"
+        } else {
+            "right"
+        };
+        // Fresh only: a stale "nothing held" from before a pick would let a full hand open.
+        let state = self
+            .robot
+            .latest_fresh(
+                &mission.state,
+                "nervros_interfaces/msg/RobotState",
+                Duration::from_secs(1),
+                crate::mission::STATE_FRESH,
+            )
+            .await
+            .map_err(|e| format!("what the {side} hand holds is not known: {e}"))?;
+        Ok(crate::mission::held_by(&state, side))
+    }
+
+    /// The path constraint a hand of `group` moves under, turned as `turned`: what it holds stays
+    /// as level as it is now the whole way, as a full mug would spill. Unknown counts as held:
+    /// the hand is kept level unless it is known to be empty.
+    pub(crate) async fn hand_path(
+        &self,
+        group: &str,
+        planning: &str,
+        tip: &str,
+        turned: &Value,
+    ) -> Option<Value> {
+        let held = !self.holding(group).await.is_ok_and(|h| h.is_empty());
+        held.then(|| motion::held_level(planning, tip, turned))
+    }
+
+    /// A motion plan request for `group` to `constraints`, under `path` when given, from `start`:
+    /// the planner, scaling and time the arm moves with, so a check asks what the move will do.
+    pub(crate) fn plan_request(
+        &self,
+        group: &str,
+        constraints: &Value,
+        path: Option<Value>,
+        start: &Value,
+    ) -> Value {
+        let s = self.settings();
+        let planning_s = if path.is_some() {
+            s.planning_s.max(motion::HELD_PLANNING_S)
+        } else {
+            s.planning_s
+        };
+        json!({
+            "group_name": group,
+            "start_state": start,
+            "goal_constraints": [constraints],
+            "path_constraints": path.unwrap_or_else(|| json!({})),
+            "pipeline_id": s.pipeline,
+            "planner_id": s.planner,
+            "num_planning_attempts": 1,
+            "allowed_planning_time": planning_s,
+            "max_velocity_scaling_factor": s.scaling,
+            "max_acceleration_scaling_factor": s.scaling,
+        })
+    }
+
+    /// The point `args` name, in the planning frame. For an object it is where a hand goes to
+    /// it: [`ABOVE_M`] over its top, as the object itself is in the way.
     pub(crate) async fn point(
         &self,
         args: &Value,
@@ -234,10 +318,12 @@ impl Arms {
                 .ok_or_else(|| format!("the world model has no object `{id}`"))?;
             let p = &found["pose"]["position"];
             let label = found["label"].as_str().unwrap_or(id).to_owned();
+            // Its centre is inside it: a tall bottle's would put the hand in the bottle.
+            let top = num(&p["z"]) + found["size"]["z"].as_f64().unwrap_or(0.0).max(0.0) / 2.0;
             (
-                [num(&p["x"]), num(&p["y"]), num(&p["z"])],
+                [num(&p["x"]), num(&p["y"]), top + ABOVE_M],
                 map.clone(),
-                label,
+                format!("above {label}"),
             )
         } else {
             let (Some(x), Some(y), Some(z)) =
@@ -291,14 +377,13 @@ impl Arms {
     }
 
     /// The hand's orientation now, in the planning frame.
-    pub(crate) fn tip_orientation(&self, planning: &str, tip: &str) -> Value {
-        match self.robot.transform(planning, tip) {
-            Ok(tip_now) => {
-                let [qx, qy, qz, qw] = tip_now.rotation;
-                json!({"x": qx, "y": qy, "z": qz, "w": qw})
-            }
-            Err(_) => json!({"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}),
-        }
+    pub(crate) fn tip_orientation(&self, planning: &str, tip: &str) -> Result<Value, String> {
+        // Unknown is not upright: a made-up turn would swing the hand, and what it holds.
+        let tip_now = self.robot.transform(planning, tip).map_err(|e| {
+            format!("how the hand {tip} is turned is not known ({e}), so it is not moved")
+        })?;
+        let [qx, qy, qz, qw] = tip_now.rotation;
+        Ok(json!({"x": qx, "y": qy, "z": qz, "w": qw}))
     }
 
     /// MoveIt's answer for the hand of `group` going straight by `along` in the planning frame:
@@ -327,6 +412,10 @@ impl Arms {
             }],
             "max_step": LINE_STEP_M,
             "jump_threshold": 0.0,
+            // A joint that swings this far between two waypoints a centimetre apart is a flip
+            // of the arm's solution, not a straight line: the path ends there.
+            "revolute_jump_threshold": LINE_JUMP_RAD,
+            "prismatic_jump_threshold": LINE_JUMP_M,
             "avoid_collisions": true,
             "max_velocity_scaling_factor": s.scaling,
             "max_acceleration_scaling_factor": s.scaling,
@@ -456,7 +545,12 @@ pub struct MoveIt {
     watcher: Arc<status::Watcher>,
     tools: Vec<Arc<dyn Tool>>,
     natives: Vec<Arc<dyn NativeSkill>>,
+    /// The stop's publisher, made at start so it is matched long before a stop needs it.
+    stop_event: Arc<tokio::sync::OnceCell<nervros_ros::Publisher>>,
 }
+
+/// MoveIt's execution events, where "stop" ends whatever trajectory it executes.
+const EXECUTION_EVENT: &str = "std_msgs/msg/String";
 
 impl std::fmt::Debug for MoveIt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -480,6 +574,10 @@ impl MoveIt {
         {
             kept.scaling = config.scaling;
         }
+        // A hand-edited file's scaling outside (0, max] is MoveIt's default speed, not a choice.
+        if !(kept.scaling.is_finite() && kept.scaling > 0.0) {
+            kept.scaling = config.scaling;
+        }
         kept.scaling = kept.scaling.min(config.max_scaling);
         let arms = Arc::new(Arms {
             config: config.clone(),
@@ -489,6 +587,7 @@ impl MoveIt {
             session: OnceLock::new(),
             settings: Mutex::new(kept),
             settings_file,
+            writing: tokio::sync::Mutex::new(()),
         });
         let watcher = status::Watcher::start(Arc::clone(&arms));
         let tools: Vec<Arc<dyn Tool>> = vec![
@@ -498,11 +597,26 @@ impl MoveIt {
             Arc::new(settings::ArmSettings::new(Arc::clone(&arms))),
         ];
         let natives = motion::Motions::natives(&arms, goals);
+        let stop_event = Arc::new(tokio::sync::OnceCell::new());
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (cell, arms) = (Arc::clone(&stop_event), Arc::clone(&arms));
+            // Detached: it only warms the publisher up, and a stop makes one itself otherwise.
+            runtime.spawn(async move {
+                let topic = arms.config.name("trajectory_execution_event");
+                if let Err(e) = cell
+                    .get_or_try_init(|| arms.robot.publisher(&topic, EXECUTION_EVENT))
+                    .await
+                {
+                    tracing::warn!(%topic, error = %e, "no kept publisher for MoveIt's stop");
+                }
+            });
+        }
         Arc::new(Self {
             arms,
             watcher,
             tools,
             natives,
+            stop_event,
         })
     }
 }
@@ -539,17 +653,28 @@ impl Integration for MoveIt {
             .collect()
     }
 
-    async fn stop(&self) {
+    async fn stop(&self) -> Vec<String> {
         // MoveIt stops any trajectory it executes, whoever sent it; the hands keep their grip.
         let topic = self.arms.config.name("trajectory_execution_event");
         let stop = json!({"data": "stop"});
-        if let Err(e) = self
+        if let Some(publisher) = self.stop_event.get() {
+            publisher.send(stop);
+            return Vec::new();
+        }
+        // No kept publisher: a one-shot one, which a new subscriber may not hear in time.
+        match self
             .arms
             .robot
-            .publish(&topic, "std_msgs/msg/String", stop, 1, Duration::ZERO)
+            .publish(&topic, EXECUTION_EVENT, stop, 1, Duration::ZERO)
             .await
         {
-            tracing::warn!(%topic, error = %e, "MoveIt was not told to stop");
+            Ok(0) => vec![format!(
+                "MoveIt: nothing subscribes to {topic}, so it may not have heard the stop"
+            )],
+            Ok(_) => Vec::new(),
+            Err(e) => vec![format!(
+                "MoveIt: the stop could not be sent on {topic}: {e}"
+            )],
         }
     }
 }

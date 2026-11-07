@@ -24,6 +24,8 @@ use crate::tools::{Assessment, Risk, Tool, ToolOutcome, ToolSpec};
 
 /// A zone smaller than this is a mistake, not a fence.
 const MIN_AREA_M2: f64 = 0.05;
+/// How far from the map's origin a zone's corner may be, m: further is a slip of units or digits.
+const MAX_REACH_M: f64 = 100_000.0;
 /// Kept clear around an object or a place, by default.
 const MARGIN_M: f64 = 0.3;
 /// Half the side of the square around a place: about the robot's own footprint.
@@ -181,6 +183,11 @@ impl Zone {
         if self.polygon.iter().flatten().any(|v| !v.is_finite()) {
             return Err("a zone's corners must be numbers".to_owned());
         }
+        if self.polygon.iter().flatten().any(|v| v.abs() > MAX_REACH_M) {
+            return Err(format!(
+                "a zone's corners must lie within {MAX_REACH_M} m of the map's origin"
+            ));
+        }
         if self.area() < MIN_AREA_M2 {
             return Err(format!(
                 "a zone of {:.2} m² is too small to keep anything out",
@@ -189,6 +196,31 @@ impl Zone {
         }
         Ok(())
     }
+}
+
+/// The operator's zones kept in `file`, each read on its own: one entry a hand edit or another
+/// version broke leaves the others keeping the robot out. The file, which the next save rewrites
+/// without what was left out, is copied aside first.
+fn remembered(file: &std::path::Path) -> Vec<Zone> {
+    let entries: Vec<Value> = crate::persist::read_or_default(file);
+    let total = entries.len();
+    let mut zones = Vec::with_capacity(total);
+    for entry in entries {
+        match serde_json::from_value::<Zone>(entry.clone())
+            .map_err(|e| e.to_string())
+            .and_then(|z| z.check().map(|()| z))
+        {
+            Ok(zone) => zones.push(zone),
+            Err(e) => tracing::error!(%entry, error = %e, "a remembered zone is left out"),
+        }
+    }
+    if zones.len() < total {
+        let aside = file.with_extension("json.left-out");
+        if let Err(e) = std::fs::copy(file, &aside) {
+            tracing::error!(error = %e, "the zones file was not copied before zones were left out");
+        }
+    }
+    zones
 }
 
 /// A square around `(x, y)`, `half` metres out each way.
@@ -220,10 +252,7 @@ impl Zones {
     #[must_use]
     pub fn new(profile: &Profile, file: Option<PathBuf>) -> Arc<Self> {
         let fixed = profile.geofence.zones.iter().map(Zone::from).collect();
-        let added = file
-            .as_deref()
-            .map(crate::persist::read_or_default)
-            .unwrap_or_default();
+        let added = file.as_deref().map(remembered).unwrap_or_default();
         Arc::new(Self {
             fixed,
             added: Mutex::new(added),
@@ -250,14 +279,28 @@ impl Zones {
     /// The slow zones a point is in, and the share of the top speed the slowest of them allows.
     #[must_use]
     pub fn slow_at(&self, x: f64, y: f64) -> Option<(Zone, f64)> {
-        self.all()
-            .into_iter()
-            .filter(|z| z.contains(x, y))
-            .filter_map(|z| match z.rule {
-                Rule::Slow(limit) => limit.percent(self.top_mps).map(|p| (z, p)),
-                Rule::KeepOut => None,
-            })
-            .min_by(|a, b| a.1.total_cmp(&b.1))
+        self.find(|zones| {
+            zones
+                .filter(|z| z.contains(x, y))
+                .filter_map(|z| match z.rule {
+                    Rule::Slow(limit) => limit.percent(self.top_mps).map(|p| (z, p)),
+                    Rule::KeepOut => None,
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(z, p)| (z.clone(), p))
+        })
+    }
+
+    /// What `pick` finds among every zone, looked through in place: the queries run per pose
+    /// pair, and only the zone found is copied.
+    fn find<T>(
+        &self,
+        pick: impl for<'z> FnOnce(
+            std::iter::Chain<std::slice::Iter<'z, Zone>, std::slice::Iter<'z, Zone>>,
+        ) -> Option<T>,
+    ) -> Option<T> {
+        let added = self.lock();
+        pick(self.fixed.iter().chain(added.iter()))
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<Zone>> {
@@ -287,16 +330,19 @@ impl Zones {
     /// The keep-out zone a point is in, if any.
     #[must_use]
     pub fn at(&self, x: f64, y: f64) -> Option<Zone> {
-        self.keep_out().into_iter().find(|z| z.contains(x, y))
+        self.find(|mut zones| zones.find(|z| z.keeps_out() && z.contains(x, y)).cloned())
     }
 
     /// The first keep-out zone a straight move from `a` to `b` enters, and how far along it does.
     #[must_use]
     pub fn crossed(&self, a: (f64, f64), b: (f64, f64)) -> Option<(Zone, f64)> {
-        self.keep_out()
-            .into_iter()
-            .filter_map(|z| z.entered(a, b).map(|d| (z, d)))
-            .min_by(|x, y| x.1.total_cmp(&y.1))
+        self.find(|zones| {
+            zones
+                .filter(|z| z.keeps_out())
+                .filter_map(|z| z.entered(a, b).map(|d| (z, d)))
+                .min_by(|x, y| x.1.total_cmp(&y.1))
+                .map(|(z, d)| (z.clone(), d))
+        })
     }
 
     fn save(&self, added: &[Zone]) -> Result<(), String> {
@@ -316,14 +362,16 @@ impl Zones {
         if let Rule::Slow(limit) = zone.rule {
             limit.check(self.slowest, self.top_mps)?;
         }
+        // Checked under the lock it is added under: two adds of one name cannot both pass.
+        let mut added = self.lock();
         if self
-            .all()
+            .fixed
             .iter()
+            .chain(added.iter())
             .any(|z| z.name.eq_ignore_ascii_case(&zone.name))
         {
             return Err(format!("there is already a zone called `{}`", zone.name));
         }
-        let mut added = self.lock();
         let mut next = added.clone();
         next.push(Zone {
             fixed: false,
@@ -346,10 +394,11 @@ impl Zones {
         self.removable(name)?;
         let mut added = self.lock();
         let mut next = added.clone();
-        next.retain(|z| !z.name.eq_ignore_ascii_case(name));
-        if next.len() == added.len() {
+        // The one named, never two at once.
+        let Some(at) = next.iter().position(|z| z.name.eq_ignore_ascii_case(name)) else {
             return Err(format!("there is no zone called `{name}`"));
-        }
+        };
+        next.remove(at);
         // Kept first: a removal that could not be kept leaves the zone in force.
         self.save(&next)?;
         *added = next;
@@ -490,10 +539,22 @@ impl GeofenceTool {
         }
     }
 
+    /// Refuses a world-model message in another frame than the map's, which zones are drawn in.
+    fn in_map_frame(&self, message: &Value) -> Result<(), String> {
+        let map = &self.profile.ros.map_frame;
+        match message["header"]["frame_id"].as_str() {
+            Some(frame) if !frame.is_empty() && frame.trim_start_matches('/') != map => Err(
+                format!("the world model gives it in `{frame}`, and zones are drawn in `{map}`"),
+            ),
+            _ => Ok(()),
+        }
+    }
+
     /// A room's outline from the world model, and its name.
     async fn room(&self, room: &str) -> Result<(String, Vec<[f64; 2]>), String> {
         let topic = self.profile.world.as_ref().and_then(|w| w.rooms.as_ref());
         let rooms = self.latest(topic).await;
+        self.in_map_frame(&rooms)?;
         let rooms: Vec<&Value> = rooms["rooms"].as_array().into_iter().flatten().collect();
         // By id, else name, else type; a type several rooms share must not fence only one.
         let tier = ["id", "name", "type"].iter().find_map(|key| {
@@ -524,12 +585,18 @@ impl GeofenceTool {
                 ));
             }
         };
-        let polygon = found["outline"]["points"]
+        // A point dropped would shrink the fence: a broken outline is no fence at all.
+        let polygon: Option<Vec<[f64; 2]>> = found["outline"]["points"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|p| Some([p["x"].as_f64()?, p["y"].as_f64()?]))
+            .map(|p| Some([p["x"].as_f64()?, p["y"].as_f64()?]))
             .collect();
+        let Some(polygon) = polygon else {
+            return Err(format!(
+                "the world model's outline of `{room}` has a point without x or y"
+            ));
+        };
         let name = crate::places::room_label(found).unwrap_or(room);
         Ok((name.to_owned(), polygon))
     }
@@ -538,6 +605,7 @@ impl GeofenceTool {
     async fn object(&self, id: &str, margin: f64) -> Result<(String, Vec<[f64; 2]>), String> {
         let topic = self.profile.world.as_ref().and_then(|w| w.objects.as_ref());
         let objects = self.latest(topic).await;
+        self.in_map_frame(&objects)?;
         let found = objects["objects"]
             .as_array()
             .into_iter()
@@ -586,13 +654,8 @@ impl GeofenceTool {
         } else if let Some(id) = text("object") {
             self.object(id, margin).await?
         } else if let Some(place) = text("place") {
-            let same = |a: &str| a.eq_ignore_ascii_case(place);
-            let Some(p) = self
-                .places
-                .all()
-                .into_iter()
-                .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)))
-            else {
+            let all = self.places.all();
+            let Some(p) = crate::places::find(&all, place).cloned() else {
                 return Err(format!(
                     "`{place}` is not a known place; list_places names them"
                 ));
@@ -632,14 +695,22 @@ impl GeofenceTool {
         // A keep-out zone around the robot would leave it nowhere to plan a way out; a slow one
         // only slows it on its way.
         let (map, base) = (&self.profile.ros.map_frame, &self.profile.ros.base_frame);
-        if zone.keeps_out()
-            && let Ok(t) = self.robot.transform(map, base)
-            && zone.contains(t.translation[0], t.translation[1])
-        {
-            return ToolOutcome::refused(format!(
-                "the robot stands inside `{}`: walk it out first, or it could not move at all",
-                zone.name
-            ));
+        if zone.keeps_out() {
+            // Not knowing where the robot stands is no proof it stands outside.
+            let Ok(t) = self.robot.transform(map, base) else {
+                return ToolOutcome::refused(format!(
+                    "where the robot stands is not known now, so `{}` cannot be checked against \
+                     it: try again once it is placed on the map",
+                    zone.name
+                ));
+            };
+            if zone.contains(t.translation[0], t.translation[1]) {
+                return ToolOutcome::refused(format!(
+                    "the robot stands inside `{}`: walk it out first, or it could not move at \
+                     all",
+                    zone.name
+                ));
+            }
         }
         let area = zone.area();
         let name = zone.name.clone();
@@ -820,6 +891,22 @@ impl Tool for GeofenceTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_broken_remembered_zone_leaves_the_others_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("zones.json");
+        let good = json!({"name": "hall", "polygon": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]});
+        let broken = json!({"name": "", "polygon": "garbled"});
+        std::fs::write(&file, json!([good, broken]).to_string()).unwrap();
+        let zones = remembered(&file);
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].name, "hall");
+        assert!(
+            dir.path().join("zones.json.left-out").exists(),
+            "the file is kept aside"
+        );
+    }
 
     fn zone(name: &str, polygon: &[[f64; 2]]) -> Zone {
         Zone {

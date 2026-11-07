@@ -61,11 +61,15 @@ pub fn show(ui: &mut egui::Ui, store: &Store, jobs: &Jobs, actions: &mut Vec<Act
         theme::row(
             ui,
             |ui| {
+                // As the operator's call, so the guard and the log see it as any other.
                 if ui
                     .add(ReButton::new("Forget").small().secondary())
                     .clicked()
                 {
-                    let _ = store.forget(&program.name);
+                    actions.push(Action::Send(Command::Run {
+                        tool: "program".to_owned(),
+                        args: json!({"action": "forget", "name": program.name}),
+                    }));
                 }
                 if ui
                     .add(ReButton::new("Run").small().secondary())

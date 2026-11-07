@@ -1,6 +1,6 @@
 //! Shapes on the floor: boxes and outlines, reshaping them by a handle, and which way a wall faces.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::world::{Object, Room};
 use super::{Grip, MIN_SIDE_M};
@@ -83,11 +83,12 @@ pub(super) fn reshape(origin: Shape2, grip: Grip, from: [f64; 2], at: [f64; 2]) 
     shape
 }
 
-/// The walls' angle, which canopy lays boxes along: the most common yaw, a quarter turn apart.
+/// The walls' angle, which canopy lays boxes along: the most common yaw of the shown objects, a
+/// quarter turn apart, the smaller angle on a tie so the same world always gives the same.
 pub(super) fn wall_yaw(objects: &[Object]) -> f64 {
     let quarter = std::f64::consts::FRAC_PI_2;
-    let mut counts: HashMap<i64, usize> = HashMap::new();
-    for o in objects {
+    let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
+    for o in objects.iter().filter(|o| o.shown) {
         #[expect(
             clippy::cast_possible_truncation,
             reason = "a bucket of a quarter turn"
@@ -98,7 +99,7 @@ pub(super) fn wall_yaw(objects: &[Object]) -> f64 {
     #[expect(clippy::cast_precision_loss, reason = "a small bucket number")]
     let best = counts
         .into_iter()
-        .max_by_key(|&(_, n)| n)
+        .max_by_key(|&(b, n)| (n, std::cmp::Reverse(b)))
         .map_or(0.0, |(b, _)| b as f64 / 50.0);
     best
 }

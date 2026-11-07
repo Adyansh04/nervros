@@ -35,6 +35,8 @@ struct Accepting {
     tool: String,
     /// Its step's record when Accept was clicked.
     before: Option<Track>,
+    /// The operator's call it was sent as, once it started.
+    call: Option<u64>,
 }
 
 /// The proposed fixes as the window keeps them.
@@ -48,19 +50,27 @@ pub(super) struct Fixes {
     since: std::collections::BTreeMap<u32, Option<Track>>,
 }
 
-/// A record as the operator reads it.
-fn record(t: Option<&Track>) -> String {
-    t.map_or_else(
-        || "no runs".to_owned(),
-        |t| format!("{} of {}", t.succeeded, t.runs),
-    )
-}
-
 impl Gui {
     /// Settles the fix being accepted once its call ends: accepted when it succeeded, still open
     /// when the operator turned the call down or it failed.
     pub(super) fn settle_fix(&mut self, e: &Event) {
+        // The operator's calls run as turn 0: the model's own call of the same tool is another.
+        if let Event::ToolStarted {
+            turn: 0,
+            call,
+            tool,
+            ..
+        } = e
+            && let Some(asked) = self.fixes.accepting.as_mut()
+            && asked.tool == *tool
+            && asked.call.is_none()
+        {
+            asked.call = Some(*call);
+            return;
+        }
         let Event::ToolFinished {
+            turn: 0,
+            call,
             tool,
             status,
             message,
@@ -69,7 +79,11 @@ impl Gui {
         else {
             return;
         };
-        let Some(asked) = self.fixes.accepting.take_if(|a| a.tool == *tool) else {
+        let Some(asked) = self
+            .fixes
+            .accepting
+            .take_if(|a| a.tool == *tool && a.call == Some(*call))
+        else {
             return;
         };
         let Some(inbox) = self.agent.inbox.clone() else {
@@ -242,10 +256,12 @@ impl Gui {
             };
             ui.label(RichText::new(g.status()).small().color(colour));
         }
-        if let Some(id) = drop
-            && let Err(e) = goals.drop_goal(id)
-        {
-            self.chat.items.push(crate::chat::Item::error(e));
+        // As the operator's call, so the guard and the log see it as any other.
+        if let Some(id) = drop {
+            self.send(Command::Run {
+                tool: "goal".to_owned(),
+                args: serde_json::json!({"action": "drop", "id": id}),
+            });
         }
     }
 
@@ -325,8 +341,8 @@ impl Gui {
                     ui.label(
                         RichText::new(format!(
                             "accepted; before {}, since {}",
-                            record(p.before.as_ref()),
-                            record(since)
+                            Track::said(p.before.as_ref()),
+                            Track::said(since)
                         ))
                         .small()
                         .color(theme::DIM),
@@ -360,6 +376,7 @@ impl Gui {
                     id,
                     tool: p.tool.clone(),
                     before,
+                    call: None,
                 });
                 self.agent.session.send(Command::Run {
                     tool: p.tool,
@@ -435,10 +452,11 @@ impl Gui {
                 },
             );
         }
-        if let Some(id) = forget
-            && let Err(e) = self.agent.memory.forget(id)
-        {
-            self.chat.items.push(crate::chat::Item::error(e));
+        if let Some(id) = forget {
+            self.send(Command::Run {
+                tool: "memory".to_owned(),
+                args: serde_json::json!({"action": "forget", "id": id}),
+            });
         }
     }
 
