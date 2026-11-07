@@ -25,8 +25,6 @@ use crate::watch::{Detector, Trigger};
 const MAX_TIMES: u64 = 48;
 const MAX_EVERY_MIN: u64 = 24 * 60;
 const MAX_SCHEDULES: usize = 4;
-/// How often a run waits for the mission before it to end.
-const POLL: Duration = Duration::from_secs(2);
 const DEFAULT_FOR_MIN: u64 = 60;
 
 /// A schedule as the operator sees it.
@@ -174,10 +172,9 @@ impl Schedules {
                     tokio::time::sleep(Duration::from_secs(every_min * 60)).await;
                 }
                 let Some(me) = me.upgrade() else { return };
-                // The interval counts from the end of the run before, never overlapping it.
-                while me.missions.busy() {
-                    tokio::time::sleep(POLL).await;
-                }
+                // The interval counts from the launch of the run before; a run still going
+                // delays the next.
+                me.missions.idle().await;
                 if me.guard.stops() != stops {
                     return;
                 }
@@ -247,7 +244,11 @@ impl Schedules {
                 if me.guard.stops() != stops {
                     return;
                 }
-                let seen = match detector.newly().await {
+                let newly = detector.newly().await;
+                if let Some(quiet) = detector.went_quiet() {
+                    me.report(format!("Trigger {id} ({what}): {quiet}."));
+                }
+                let seen = match newly {
                     Ok(Some(seen)) => seen,
                     Ok(None) => continue,
                     // A trigger on what cannot be read would wait out its hours for nothing.
@@ -279,9 +280,7 @@ impl Schedules {
                     me.report(skipped(&e));
                 }
                 // What the run itself changes does not fire it again.
-                while me.missions.busy() {
-                    tokio::time::sleep(POLL).await;
-                }
+                me.missions.idle().await;
                 let _ = detector.settle().await;
             }
         }.instrument(span));

@@ -12,7 +12,6 @@ use super::{
     BULK_TYPES, Ctx, FULL_CHARS, FULL_ITEMS, MAX_ECHO, MAX_SAMPLE, count, endpoint_json, failed,
     object, pick, read_name_arg, resolved_view, seconds, shortened, spec, summarize,
 };
-use crate::guard::glob_match;
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
 /// `topic_sample`.
@@ -229,7 +228,7 @@ impl TopicSample {
                 .await
                 .map_err(|e| failed(&e))?;
             while let Ok(Some(bytes)) = tokio::time::timeout_at(end, raw.next()).await {
-                delays.push(nervros_ros::now_s() - raw_stamp(&bytes).ok_or_else(no_stamp)?);
+                delays.push(self.ctx.robot.ros_now_s() - raw_stamp(&bytes).ok_or_else(no_stamp)?);
             }
         } else {
             let mut messages = self
@@ -244,7 +243,7 @@ impl TopicSample {
                 if !stamp.is_object() {
                     return Err(no_stamp());
                 }
-                delays.push(nervros_ros::now_s() - crate::stamp_s(stamp));
+                delays.push(self.ctx.robot.ros_now_s() - crate::stamp_s(stamp));
             }
         }
         Ok(delays)
@@ -266,14 +265,8 @@ impl Tool for TopicSample {
             Ok(t) => t,
             Err(why) => return ToolOutcome::refused(why),
         };
-        if self
-            .ctx
-            .config
-            .read_deny
-            .iter()
-            .any(|p| glob_match(p, &topic))
-        {
-            return ToolOutcome::refused(format!("`{topic}` may not be read by this agent"));
+        if let Err(why) = crate::watch::readable(&topic, &self.ctx.config.read_deny) {
+            return ToolOutcome::refused(why);
         }
         let ty = match self.ctx.topic_type(&topic).await {
             Ok(t) => t,

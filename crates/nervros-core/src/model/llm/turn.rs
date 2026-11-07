@@ -20,7 +20,7 @@ use super::history::{History, RESERVE_TOKENS, cut_old, fit, size, tokens_of};
 use super::{LlmError, Setback};
 use crate::providers::Role;
 use crate::providers::budget::Tokens;
-use crate::providers::router::Need;
+use crate::providers::router::{Need, Skip};
 
 /// Model-facing JSON a tool returns.
 pub type ToolFuture = BoxFuture<'static, serde_json::Value>;
@@ -51,6 +51,12 @@ impl std::fmt::Debug for LoopTool {
 pub trait AgentSource: Send + Sync {
     /// Model ids to try for a role, in order.
     fn candidates(&self, role: Role, need: Need) -> Vec<String>;
+
+    /// Why each model was passed over for a role, as "model: reason": what to tell the operator
+    /// when none is left.
+    fn passed_over(&self, _role: Role, _need: Need) -> Vec<String> {
+        Vec::new()
+    }
 
     /// A rig builder for one model.
     ///
@@ -114,6 +120,23 @@ impl AgentSource for Llm {
             .collect()
     }
 
+    fn passed_over(&self, role: Role, need: Need) -> Vec<String> {
+        self.router
+            .candidates(role, need, SystemTime::now())
+            .1
+            .into_iter()
+            .map(|(id, skip)| {
+                let why = match skip {
+                    Skip::NoVision => "it takes no images".to_owned(),
+                    Skip::NoTools => "it calls no tools".to_owned(),
+                    Skip::Privacy => "the privacy mode keeps it out".to_owned(),
+                    Skip::Refused(refused) => refused.to_string(),
+                };
+                format!("{id}: {why}")
+            })
+            .collect()
+    }
+
     fn builder(&self, model_id: &str) -> Result<AgentBuilder, LlmError> {
         let model = self
             .router
@@ -133,9 +156,7 @@ impl AgentSource for Llm {
     }
 
     fn park(&self, model_id: &str, for_how_long: Duration) {
-        if let Err(e) = self.router.park(model_id, SystemTime::now(), for_how_long) {
-            tracing::warn!(model = %model_id, error = %e, "could not save the quota ledger");
-        }
+        self.router.park(model_id, SystemTime::now(), for_how_long);
     }
 
     fn spent(&self, model_id: &str, cost: CallCost) {
@@ -181,8 +202,10 @@ pub(super) struct TurnHook {
     /// Tokens left for the history and the prompt in the model's window, when it is known.
     room: Option<usize>,
     on_call: Option<OnCall>,
-    /// When the pending call was sent.
-    sent: Mutex<Option<Instant>>,
+    /// When the pending call was sent, and its prompt's tokens as counted here.
+    sent: Mutex<Option<(Instant, u64)>>,
+    /// The preamble's and the tools' tokens, sent with every call.
+    fixed_tokens: usize,
     /// The system prompt for the last call, which says no tool can be called.
     last_word: String,
 }
@@ -190,19 +213,49 @@ pub(super) struct TurnHook {
 impl TurnHook {
     /// The hook for a turn of `model` from `source`, as `setup` asks.
     pub(super) fn new(source: Arc<dyn AgentSource>, model: &str, setup: &TurnSetup<'_>) -> Self {
+        let fixed_tokens = fixed_cost(setup.preamble, setup.tools);
         Self {
             source,
             model: model.to_owned(),
             started: Arc::clone(&setup.started),
             last: setup.max_turns,
-            room: setup.window.map(|w| {
-                w.saturating_sub(fixed_cost(setup.preamble, setup.tools) + RESERVE_TOKENS)
-            }),
+            room: setup
+                .window
+                .map(|w| w.saturating_sub(fixed_tokens + RESERVE_TOKENS)),
             on_call: setup.on_call.clone(),
             sent: Mutex::new(None),
+            fixed_tokens,
             last_word: format!("{}\n\n{LAST_CALL}", setup.preamble),
         }
     }
+}
+
+impl TurnHook {
+    fn charge(&self, cost: CallCost) {
+        self.source.spent(&self.model, cost);
+        if let Some(on_call) = &self.on_call {
+            on_call(cost);
+        }
+    }
+}
+
+impl Drop for TurnHook {
+    /// A call cut off in flight, by a stop or the turn's end, is billed for its prompt at least;
+    /// its reply's tokens are not known.
+    fn drop(&mut self) {
+        let in_flight = self.sent.get_mut().ok().and_then(Option::take);
+        if let Some((at, prompt)) = in_flight {
+            self.charge(CallCost {
+                input_tokens: prompt,
+                ms: millis(at),
+                ..CallCost::default()
+            });
+        }
+    }
+}
+
+fn millis(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 impl AgentHook for TurnHook {
@@ -239,7 +292,9 @@ impl AgentHook for TurnHook {
             );
         }
         if let Ok(mut sent) = self.sent.lock() {
-            *sent = Some(Instant::now());
+            let prompt =
+                self.fixed_tokens + size(event.history) + size(std::slice::from_ref(event.prompt));
+            *sent = Some((Instant::now(), u64::try_from(prompt).unwrap_or(u64::MAX)));
         }
         patch.map_or_else(
             CompletionCallAction::continue_run,
@@ -249,19 +304,22 @@ impl AgentHook for TurnHook {
 
     /// Charges every call that brought a whole reply, the ones the run retried or recovered from
     /// an invalid tool call too: the provider bills them all. Each call is reported with its time.
+    /// A call that failed is not billed; one cut off in flight is charged when the hook drops.
     async fn on_outcome(&self, _ctx: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        if !matches!(event.kind, rig::effect::EffectKind::Completion { .. }) {
+            return OutcomeAction::proceed();
+        }
+        let sent = self.sent.lock().ok().and_then(|mut s| s.take());
         if let Some(response) = event.completion() {
-            let sent = self.sent.lock().ok().and_then(|mut s| s.take());
-            let cost = CallCost {
-                ms: sent.map_or(0, |t| {
-                    u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
-                }),
+            let mut cost = CallCost {
+                ms: sent.map_or(0, |(t, _)| millis(t)),
                 ..CallCost::of(&response.usage)
             };
-            self.source.spent(&self.model, cost);
-            if let Some(on_call) = &self.on_call {
-                on_call(cost);
+            // A reply that carries no count is priced on its prompt as counted here.
+            if cost.input_tokens == 0 {
+                cost.input_tokens = sent.map_or(0, |(_, prompt)| prompt);
             }
+            self.charge(cost);
         }
         OutcomeAction::proceed()
     }
@@ -369,11 +427,24 @@ pub(super) fn plain(reply: String) -> String {
 /// What the system prompt and the tools' schemas take of every request.
 #[must_use]
 pub fn fixed_cost(preamble: &str, tools: &[LoopTool]) -> usize {
-    let schemas: usize = tools
-        .iter()
-        .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
-        .sum();
-    tokens_of(preamble.len() + schemas)
+    fixed_tokens(
+        preamble,
+        tools
+            .iter()
+            .map(|t| definition_chars(&t.name, &t.description, &t.parameters)),
+    )
+}
+
+/// What the system prompt and tool definitions of the given sizes take of every request.
+#[must_use]
+pub fn fixed_tokens(preamble: &str, definitions: impl Iterator<Item = usize>) -> usize {
+    tokens_of(preamble.len() + definitions.sum::<usize>())
+}
+
+/// The characters one tool's definition takes in a request.
+#[must_use]
+pub fn definition_chars(name: &str, description: &str, parameters: &serde_json::Value) -> usize {
+    name.len() + description.len() + parameters.to_string().len()
 }
 
 /// Runs one user turn on a model from `source`: the model may call the tools up to
@@ -488,7 +559,19 @@ pub(super) fn failure(e: &PromptError, model: &str) -> String {
 /// carry account ids (OpenRouter's `user_id`) that belong in neither the chat nor the log.
 pub(super) fn without_provider_body(text: &str) -> String {
     let Some(start) = text.find('{') else {
-        return text.to_owned();
+        // Not JSON, as an HTML page or plain text: its first line only, short, the rest held back.
+        let first: String = text
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        return if first.len() < text.trim_end().len() {
+            format!("{first} (the rest withheld)")
+        } else {
+            first
+        };
     };
     let (head, body) = text.split_at(start);
     let parsed = serde_json::Deserializer::from_str(body)

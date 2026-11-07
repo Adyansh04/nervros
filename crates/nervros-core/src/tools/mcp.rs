@@ -346,7 +346,13 @@ impl McpServer {
         let params = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
         let answer = tokio::time::timeout(self.config.timeout, self.client.call_tool_once(params));
         let result = match answer.await {
-            Err(_) => return ToolOutcome::failed("the MCP server did not answer in time"),
+            // A stop does not reach an MCP server: what it was asked can still be going on.
+            Err(_) => {
+                return ToolOutcome::failed(
+                    "the MCP server did not answer in time: what it was asked may still be \
+                     running, and a stop does not reach it; stop the robot if it moves",
+                );
+            }
             // The server wrote the error's words, so they are its data too.
             Ok(Err(e)) => {
                 return ToolOutcome::failed(format!(

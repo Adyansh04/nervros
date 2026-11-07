@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
@@ -128,10 +129,33 @@ pub struct NewGoal {
     pub hours: Option<f64>,
 }
 
+/// The goals file: the goals, and the number the next one gets, so a dropped goal's number is
+/// never given again while a mission run for it may still end and be counted.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Stored {
+    Numbered {
+        next_id: u32,
+        goals: Vec<Goal>,
+    },
+    /// A file of goals alone, numbered on from the highest.
+    Bare(Vec<Goal>),
+}
+
+impl Default for Stored {
+    fn default() -> Self {
+        Self::Bare(Vec::new())
+    }
+}
+
 /// The goals, and the file they live in.
 #[derive(Debug)]
 pub struct Goals {
-    goals: Mutex<Vec<Goal>>,
+    list: Mutex<Vec<Goal>>,
+    next_id: AtomicU32,
+    /// Held from a change to its write, so the file is written in the order the goals changed
+    /// while the goals themselves stay free to read.
+    writing: Mutex<()>,
     file: Option<PathBuf>,
 }
 
@@ -139,25 +163,42 @@ impl Goals {
     /// The goals in `file`, when it exists.
     #[must_use]
     pub fn new(file: Option<PathBuf>) -> Arc<Self> {
-        let goals = file
+        let stored: Stored = file
             .as_deref()
             .map(crate::persist::read_or_default)
             .unwrap_or_default();
+        let (next_id, goals) = match stored {
+            Stored::Numbered { next_id, goals } => (next_id, goals),
+            Stored::Bare(goals) => (0, goals),
+        };
+        let next_id = next_id.max(goals.iter().map(|g| g.id + 1).max().unwrap_or(1));
         Arc::new(Self {
-            goals: Mutex::new(goals),
+            list: Mutex::new(goals),
+            next_id: AtomicU32::new(next_id),
+            writing: Mutex::new(()),
             file,
         })
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<Goal>> {
-        crate::lock(&self.goals)
+        crate::lock(&self.list)
     }
 
-    fn save(&self, goals: &[Goal]) -> Result<(), String> {
-        let Some(file) = &self.file else {
-            return Ok(());
+    /// Changes the goals with `edit` and writes them out after letting them go. Blocking: an
+    /// async caller runs it through `spawn_blocking`.
+    fn edit<T>(&self, edit: impl FnOnce(&mut Vec<Goal>) -> Result<T, String>) -> Result<T, String> {
+        let _writing = crate::lock(&self.writing);
+        let (out, goals) = {
+            let mut goals = self.lock();
+            let out = edit(&mut goals)?;
+            (out, goals.clone())
         };
-        crate::persist::write_json(file, goals)
+        let Some(file) = &self.file else {
+            return Ok(out);
+        };
+        let next_id = self.next_id.load(Ordering::SeqCst);
+        crate::persist::write_json(file, &Stored::Numbered { next_id, goals })?;
+        Ok(out)
     }
 
     /// Every goal, oldest first.
@@ -166,12 +207,16 @@ impl Goals {
         self.lock().clone()
     }
 
-    /// Whether goal `id` is worked toward now.
+    /// Whether goal `id` is worked toward now: active, with missions and time left.
     #[must_use]
     pub fn active(&self, id: u32) -> bool {
-        self.lock()
-            .iter()
-            .any(|g| g.id == id && g.state == State::Active)
+        let now = crate::unix_secs(SystemTime::now());
+        self.lock().iter().any(|g| {
+            g.id == id
+                && g.state == State::Active
+                && g.missions.len() < usize::try_from(g.max_missions).unwrap_or(usize::MAX)
+                && g.expires.is_none_or(|e| now < e)
+        })
     }
 
     /// Sets a goal and judges it at once against `seen`: one that already holds is met.
@@ -233,28 +278,28 @@ impl Goals {
             }
             Some(_) => return Err("`hours` is more than 0 and at most 720".to_owned()),
         };
-        let mut goals = self.lock();
-        if goals.iter().filter(|g| g.state.open()).count() >= MAX_OPEN {
-            return Err(format!(
-                "{MAX_OPEN} goals are open already; drop or give up one first"
-            ));
-        }
-        let mut goal = Goal {
-            id: goals.iter().map(|g| g.id).max().unwrap_or(0) + 1,
-            text: text.to_owned(),
-            done_when,
-            max_missions,
-            missions: Vec::new(),
-            set_at,
-            expires,
-            state: State::Active,
-            unmet: Vec::new(),
-            why: String::new(),
-        };
-        judge(&mut goal, seen, set_at);
-        goals.push(goal.clone());
-        self.save(&goals)?;
-        Ok(goal)
+        self.edit(|goals| {
+            if goals.iter().filter(|g| g.state.open()).count() >= MAX_OPEN {
+                return Err(format!(
+                    "{MAX_OPEN} goals are open already; drop or give up one first"
+                ));
+            }
+            let mut goal = Goal {
+                id: self.next_id.fetch_add(1, Ordering::SeqCst),
+                text: text.to_owned(),
+                done_when,
+                max_missions,
+                missions: Vec::new(),
+                set_at,
+                expires,
+                state: State::Active,
+                unmet: Vec::new(),
+                why: String::new(),
+            };
+            judge(&mut goal, seen, set_at);
+            goals.push(goal.clone());
+            Ok(goal)
+        })
     }
 
     /// Changes goal `id` with `change`; the goal as it is now.
@@ -263,15 +308,14 @@ impl Goals {
         id: u32,
         change: impl FnOnce(&mut Goal) -> Result<(), String>,
     ) -> Result<Goal, String> {
-        let mut goals = self.lock();
-        let goal = goals
-            .iter_mut()
-            .find(|g| g.id == id)
-            .ok_or_else(|| format!("no goal {id}; list them first"))?;
-        change(goal)?;
-        let changed = goal.clone();
-        self.save(&goals)?;
-        Ok(changed)
+        self.edit(|goals| {
+            let goal = goals
+                .iter_mut()
+                .find(|g| g.id == id)
+                .ok_or_else(|| format!("no goal {id}; list them first"))?;
+            change(goal)?;
+            Ok(goal.clone())
+        })
     }
 
     /// Pauses goal `id`, or with `on` false makes it active again.
@@ -315,13 +359,11 @@ impl Goals {
     ///
     /// The file cannot be written.
     pub fn drop_goal(&self, id: u32) -> Result<bool, String> {
-        let mut goals = self.lock();
-        let before = goals.len();
-        goals.retain(|g| g.id != id);
-        if goals.len() == before {
-            return Ok(false);
-        }
-        self.save(&goals).map(|()| true)
+        self.edit(|goals| {
+            let before = goals.len();
+            goals.retain(|g| g.id != id);
+            Ok(goals.len() != before)
+        })
     }
 
     /// Counts mission `mission`, run for goal `id`, unless a fault made it no test of the plan.
@@ -342,19 +384,21 @@ impl Goals {
     /// and those that just ended.
     pub fn settle(&self, seen: &Observed, now: SystemTime) -> Vec<Goal> {
         let at = crate::unix_secs(now);
-        let mut goals = self.lock();
         let mut out = Vec::new();
-        for goal in goals.iter_mut() {
-            let was = goal.state;
-            // An exhausted goal that holds after all is met: the world can catch up.
-            if matches!(was, State::Active | State::Exhausted) {
-                judge(goal, seen, at);
+        let saved = self.edit(|goals| {
+            for goal in goals.iter_mut() {
+                let was = goal.state;
+                // An exhausted goal that holds after all is met: the world can catch up.
+                if matches!(was, State::Active | State::Exhausted) {
+                    judge(goal, seen, at);
+                }
+                if goal.state.open() || goal.state != was {
+                    out.push(goal.clone());
+                }
             }
-            if goal.state.open() || goal.state != was {
-                out.push(goal.clone());
-            }
-        }
-        if let Err(e) = self.save(&goals) {
+            Ok(())
+        });
+        if let Err(e) = saved {
             tracing::warn!(error = %e, "the goals were not saved");
         }
         out
@@ -362,9 +406,9 @@ impl Goals {
 }
 
 /// `done_when` with each name the world model does not know, such as a detector's `mug_4`, taken
-/// as the world model's likeliest object of its kind, and a line for each taken: the planner's
-/// names are the detector's, and a model told to set the goal again in other ids ran the mission
-/// first. A name with no likely object is left, for `set` to refuse.
+/// as the one live object its words name ([`check::likeliest`]), and a line for each taken: the
+/// planner's names are the detector's, and a model told to set the goal again in other ids ran the
+/// mission first. A name that no object or several could be is left, for `set` to refuse.
 fn in_world_ids(done_when: &[String], seen: &Observed) -> (Vec<String>, Vec<String>) {
     let now_s = crate::now_s();
     let mut taken: Vec<(&str, String)> = Vec::new();
@@ -397,8 +441,8 @@ fn unknown_names(done_when: &[String], unknown: &[&str]) -> String {
 }
 
 /// Judges one goal: met once every predicate holds, else exhausted once its missions or its time
-/// ran out, but only on what the world model plainly says: one it cannot judge now, as while
-/// perception catches up with a place, is not yet unmet for good.
+/// ran out, whatever the world model can judge now: budgets are counted here, and an exhausted
+/// goal that holds after all, once perception catches up, is met at a later judging.
 fn judge(goal: &mut Goal, seen: &Observed, at: u64) {
     #[expect(clippy::cast_precision_loss, reason = "seconds since 1970")]
     let verdicts = check::check(&goal.done_when, seen, goal.set_at as f64);
@@ -411,7 +455,7 @@ fn judge(goal: &mut Goal, seen: &Observed, at: u64) {
         goal.state = State::Met;
         return;
     }
-    if goal.state == State::Exhausted || verdicts.iter().any(|v| v.ok.is_none()) {
+    if goal.state == State::Exhausted {
         return;
     }
     if goal.missions.len() >= usize::try_from(goal.max_missions).unwrap_or(usize::MAX) {
@@ -498,6 +542,17 @@ impl GoalTool {
             missions,
         }
     }
+
+    /// Runs a change to the goals off the async threads, as it writes the goals file.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        change: impl FnOnce(&Goals) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let goals = Arc::clone(&self.goals);
+        tokio::task::spawn_blocking(move || change(&goals))
+            .await
+            .map_err(|e| format!("the goals were not changed: {e}"))?
+    }
 }
 
 fn id_of(args: &Value) -> u32 {
@@ -577,15 +632,17 @@ impl Tool for GoalTool {
                 };
                 let seen = self.missions.observe().await;
                 (new.done_when, taken) = in_world_ids(&new.done_when, &seen);
-                self.goals.set(&new, &seen, SystemTime::now())
+                let now = SystemTime::now();
+                self.blocking(move |g| g.set(&new, &seen, now)).await
             }
-            Some("pause") => self.goals.pause(id, true),
-            Some("resume") => self.goals.pause(id, false),
-            Some("impossible") => self
-                .goals
-                .impossible(id, args["why"].as_str().unwrap_or_default()),
+            Some("pause") => self.blocking(move |g| g.pause(id, true)).await,
+            Some("resume") => self.blocking(move |g| g.pause(id, false)).await,
+            Some("impossible") => {
+                let why = args["why"].as_str().unwrap_or_default().to_owned();
+                self.blocking(move |g| g.impossible(id, &why)).await
+            }
             Some("drop") => {
-                return match self.goals.drop_goal(id) {
+                return match self.blocking(move |g| g.drop_goal(id)).await {
                     Ok(true) => ToolOutcome::ok(json!({"dropped": id})),
                     Ok(false) => ToolOutcome::failed(format!("no goal {id}; list them first")),
                     Err(why) => ToolOutcome::failed(why),
@@ -685,20 +742,21 @@ mod tests {
     }
 
     #[test]
-    fn no_verdict_exhausts_nothing_and_an_exhausted_goal_may_be_met_late() {
+    fn a_goal_runs_out_without_a_verdict_and_may_be_met_late() {
         let goals = Goals::new(None);
         let now = SystemTime::now();
         let g = goals
             .set(&new(&["holding(right, O17)"], Some(1)), &seen(""), now)
             .unwrap();
+        assert!(goals.active(g.id));
         goals.ran(g.id, "m1", true);
+        assert!(!goals.active(g.id), "its one mission is used");
         let silent = Observed::default();
         assert_eq!(
             goals.settle(&silent, now)[0].state,
-            State::Active,
-            "no verdict yet"
+            State::Exhausted,
+            "counted whatever the world model can judge"
         );
-        assert_eq!(goals.settle(&seen(""), now)[0].state, State::Exhausted);
         assert_eq!(
             goals.settle(&seen("O17"), now)[0].state,
             State::Met,
@@ -707,10 +765,10 @@ mod tests {
     }
 
     #[test]
-    fn a_detectors_names_are_taken_as_the_world_models_likeliest_objects() {
+    fn a_detectors_names_are_taken_as_the_one_live_object_they_name() {
         let seen = Observed {
             objects: json!({"objects": [
-                {"id": "O27", "label": "mug", "state": 0, "last_seen": {"sec": 100, "nanosec": 0}},
+                {"id": "O27", "label": "mug", "state": 2, "last_seen": {"sec": 100, "nanosec": 0}},
                 {"id": "O783", "label": "mug", "state": 0, "last_seen": {"sec": 900, "nanosec": 0}},
                 {"id": "O261", "label": "tray", "state": 0}]}),
             ..seen("")
@@ -772,5 +830,40 @@ mod tests {
             State::Impossible
         );
         assert!(goals.drop_goal(open.id).unwrap() && !goals.drop_goal(open.id).unwrap());
+    }
+
+    #[test]
+    fn a_dropped_goal_number_is_not_given_again_even_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("goals.json");
+        let now = SystemTime::now();
+        let goals = Goals::new(Some(file.clone()));
+        let first = goals
+            .set(&new(&["holding(right, O18)"], None), &seen(""), now)
+            .unwrap();
+        assert!(goals.drop_goal(first.id).unwrap());
+        let second = goals
+            .set(&new(&["holding(right, O18)"], None), &seen(""), now)
+            .unwrap();
+        assert_ne!(second.id, first.id);
+        assert!(goals.drop_goal(second.id).unwrap());
+        let again = Goals::new(Some(file.clone()));
+        let third = again
+            .set(&new(&["holding(right, O18)"], None), &seen(""), now)
+            .unwrap();
+        assert!(third.id > second.id, "{} after {}", third.id, second.id);
+
+        // A file of goals alone numbers on from its highest.
+        std::fs::write(
+            &file,
+            serde_json::to_vec(std::slice::from_ref(&third)).unwrap(),
+        )
+        .unwrap();
+        let bare = Goals::new(Some(file));
+        assert_eq!(bare.all().len(), 1);
+        let fourth = bare
+            .set(&new(&["holding(right, O18)"], None), &seen(""), now)
+            .unwrap();
+        assert_eq!(fourth.id, third.id + 1);
     }
 }

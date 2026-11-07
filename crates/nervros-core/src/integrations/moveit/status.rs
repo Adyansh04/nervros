@@ -15,6 +15,8 @@ use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
 /// Where an arm or a hand is when it is at none of its named poses.
 const BETWEEN: &str = "between named poses";
+/// Where an arm is when no joint states come.
+const UNKNOWN: &str = "not known: no joint states";
 
 /// How often the watcher looks.
 const PERIOD: Duration = Duration::from_secs(5);
@@ -96,6 +98,7 @@ impl Watcher {
             parts: Mutex::new(Vec::new()),
         });
         let weak = Arc::downgrade(&watcher);
+        // Detached: it holds the watcher weakly and ends once the watcher is dropped.
         tokio::spawn(async move {
             loop {
                 let Some(watcher) = weak.upgrade() else {
@@ -122,8 +125,14 @@ async fn look(arms: &Arms) -> Vec<String> {
         return vec!["MoveIt: not heard from".to_owned()];
     };
     let mut parts = Vec::new();
+    // The SRDF is read once and kept: only the planning scene says move_group answers now.
+    if scene.is_err() {
+        parts.push("MoveIt: not answering, its planning scene did not come".to_owned());
+    }
     if let Ok(joints) = joints {
-        parts.push("MoveIt: up".to_owned());
+        if scene.is_ok() {
+            parts.push("MoveIt: up".to_owned());
+        }
         parts.extend(
             arms_at(&srdf, &joints)
                 .into_iter()
@@ -132,7 +141,7 @@ async fn look(arms: &Arms) -> Vec<String> {
                     None => format!("{arm} {BETWEEN}"),
                 }),
         );
-    } else {
+    } else if scene.is_ok() {
         parts.push("MoveIt: up, no joint states".to_owned());
     }
     if let Ok(scene) = scene {
@@ -237,7 +246,11 @@ impl Tool for ArmStatus {
             self.planners(),
             self.controllers()
         );
+        let known = joints.is_ok();
         let joints = joints.unwrap_or_default();
+        let unknown = |at: Option<String>| {
+            at.unwrap_or_else(|| if known { BETWEEN } else { UNKNOWN }.to_owned())
+        };
         let at: BTreeMap<String, Option<String>> = arms_at(&srdf, &joints).into_iter().collect();
         let arms: Vec<Value> = srdf
             .arms()
@@ -248,7 +261,7 @@ impl Tool for ArmStatus {
                     "tip": srdf.tip(&g.name),
                     "poses": srdf.poses_of(&g.name).map(|p| p.name.clone()).collect::<Vec<_>>(),
                     // Words, not null: a model read an arm out as "at null".
-                    "at": at.get(&g.name).cloned().flatten().unwrap_or_else(|| BETWEEN.to_owned()),
+                    "at": unknown(at.get(&g.name).cloned().flatten()),
                 })
             })
             .collect();
@@ -263,7 +276,7 @@ impl Tool for ArmStatus {
                     "group": e.group,
                     "on": e.parent_group,
                     "poses": srdf.poses_of(&e.group).map(|p| p.name.clone()).collect::<Vec<_>>(),
-                    "at": at.unwrap_or_else(|| BETWEEN.to_owned()),
+                    "at": unknown(at),
                 })
             })
             .collect();

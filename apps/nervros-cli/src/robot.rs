@@ -92,7 +92,7 @@ pub(crate) async fn ros(profile_path: &Path, name: &str, args: &str) -> Result<(
         Arc::new(RosidlSchemas::load(&profile).context("loading the interfaces")?);
     let guard = Arc::new(Guard::new(profile.policy.clone()));
     let config = profile.ros_tools.clone().unwrap_or_default();
-    let tools = nervros_core::ros_tools::tools(&config, &robot, &schemas, &guard);
+    let tools = nervros_core::ros_tools::tools(&config, &robot, (&schemas, &guard), None);
     let names: Vec<String> = tools.iter().map(|t| t.spec().name.clone()).collect();
     let tool = tools
         .iter()
@@ -292,6 +292,7 @@ fn print_event(e: &Event, logs: &Path) {
             args,
             reason,
             can_allow,
+            always_asks: _,
         } => {
             let allow = if *can_allow {
                 format!(", /allow {id} for the session,")
@@ -337,7 +338,8 @@ fn print_event(e: &Event, logs: &Path) {
         | Event::Plot { .. }
         | Event::Context { .. }
         | Event::ModelCall { .. }
-        | Event::ReplyDelta { .. } => {}
+        | Event::ReplyDelta { .. }
+        | Event::Open { .. } => {}
         Event::Restored { exchanges } => {
             println!(
                 "  [carrying on an earlier conversation: {} messages]",

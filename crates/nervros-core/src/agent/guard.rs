@@ -88,13 +88,20 @@ pub struct Policy {
     /// Per-turn limits.
     #[serde(default)]
     pub budgets: Budgets,
-    /// ROS names no tool may reach; `*` matches any run of characters. Setting this replaces the
-    /// defaults, so a robot that truly needs one of them must list the rest itself.
-    #[serde(default = "default_hard_deny")]
+    /// ROS names no tool may reach; `*` matches any run of characters. A profile's names are
+    /// added to the defaults, which no profile can remove.
+    #[serde(
+        default = "default_hard_deny",
+        deserialize_with = "beyond_default_hard_deny"
+    )]
     pub hard_deny: Vec<String>,
     /// Interface types no generic tool may call, send or publish, globbed like `hard_deny`:
-    /// velocity and joint commands, controller switches, lifecycle changes.
-    #[serde(default = "default_hard_deny_types")]
+    /// velocity and joint commands, controller switches, lifecycle changes. Added to the defaults
+    /// like `hard_deny`.
+    #[serde(
+        default = "default_hard_deny_types",
+        deserialize_with = "beyond_default_hard_deny_types"
+    )]
     pub hard_deny_types: Vec<String>,
     /// Refusals or approvals the profile adds for particular arguments, `[[policy.rule]]`. They
     /// only ever tighten: no rule lets through what the guard would stop.
@@ -130,8 +137,12 @@ pub enum RuleAction {
 
 /// The values at a dotted path, every entry of a list where the path says `*`.
 fn values_at<'a>(value: &'a Value, path: &[&str]) -> Vec<&'a Value> {
+    // A path that ends on a list reads each of its entries: a rule on `places` holds for any one.
     let Some((first, rest)) = path.split_first() else {
-        return vec![value];
+        return match value {
+            Value::Array(items) => items.iter().flat_map(|v| values_at(v, &[])).collect(),
+            _ => vec![value],
+        };
     };
     match (*first, value) {
         ("*", Value::Array(items)) => items.iter().flat_map(|v| values_at(v, rest)).collect(),
@@ -159,7 +170,14 @@ pub fn default_hard_deny() -> Vec<String> {
     [
         "rt/lowcmd",
         "*/lowcmd",
+        "*/low_cmd",
         "*/rt/*",
+        // A DDS topic rt/X is the ROS topic /X: the Dex3 hands' rt/dex3/<side>/cmd included.
+        "*/dex3/*/cmd",
+        "*/commands",
+        "*/joint_commands",
+        // Nav2's speed limit: a publish could lift a slow zone.
+        "*/speed_limit",
         "*cmd_vel*",
         "*/controller_manager/*",
         "*/set_parameters",
@@ -183,12 +201,30 @@ pub fn default_hard_deny_types() -> Vec<String> {
         "trajectory_msgs/msg/*",
         "control_msgs/action/*",
         "control_msgs/msg/JointJog",
+        "unitree_hg/msg/*",
+        "nav2_msgs/msg/SpeedLimit",
         "controller_manager_msgs/srv/*",
         "lifecycle_msgs/srv/ChangeState",
         "rcl_interfaces/srv/SetParameters*",
     ]
     .map(str::to_owned)
     .to_vec()
+}
+
+fn beyond_default_hard_deny<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<String>, D::Error> {
+    let mut all = default_hard_deny();
+    all.extend(Vec::<String>::deserialize(d)?);
+    Ok(all)
+}
+
+fn beyond_default_hard_deny_types<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<String>, D::Error> {
+    let mut all = default_hard_deny_types();
+    all.extend(Vec::<String>::deserialize(d)?);
+    Ok(all)
 }
 
 impl Default for Policy {
@@ -571,6 +607,26 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_adds_to_the_hard_deny_defaults_and_cannot_drop_them() {
+        let policy: Policy = toml::from_str(
+            r#"
+            hard_deny = ["/arm/brake"]
+            hard_deny_types = ["my_msgs/msg/Brake"]
+            "#,
+        )
+        .unwrap();
+        let guard = Guard::new(policy);
+        assert!(guard.hard_denied("/arm/brake"));
+        assert!(guard.hard_denied("rt/lowcmd"), "a default stays");
+        assert!(guard.hard_denied("/g1/cmd_vel"), "a default stays");
+        assert!(guard.hard_denied_type("my_msgs/Brake"));
+        assert!(
+            guard.hard_denied_type("geometry_msgs/msg/Twist"),
+            "a default stays"
+        );
+    }
+
+    #[test]
     fn a_rule_reads_the_arguments_by_path_and_a_refusal_beats_a_question() {
         let policy: Policy = toml::from_str(
             r#"
@@ -592,6 +648,12 @@ mod tests {
             matches = "4*"
             then = "ask"
             reason = "a schedule this long"
+            [[rule]]
+            tool = "patrol"
+            arg = "places"
+            matches = "bedroom"
+            then = "deny"
+            reason = "the bedroom is private"
             "#,
         )
         .unwrap();
@@ -610,6 +672,14 @@ mod tests {
             "a number by its text"
         );
         assert!(guard.rule("schedule", &json!({"times": 5})).is_none());
+        assert_eq!(
+            guard
+                .rule("patrol", &json!({"places": ["kitchen", "bedroom"]}))
+                .unwrap()
+                .then,
+            RuleAction::Deny,
+            "a rule on a list holds for any one entry"
+        );
         assert!(
             guard
                 .rule("run_mission", &json!({"hash": "ab12"}))

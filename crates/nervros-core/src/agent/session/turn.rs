@@ -114,6 +114,17 @@ pub(super) async fn limited(
     }
 }
 
+/// Why no model answered a turn that none failed: each passed over, as for a spent budget, the
+/// privacy mode or a model resting.
+fn no_model(source: &dyn AgentSource, need: Need) -> String {
+    let why = source.passed_over(Role::Routine, need);
+    if why.is_empty() {
+        "no model is available".to_owned()
+    } else {
+        format!("no model is available: {}", why.join("; "))
+    }
+}
+
 /// Who started a turn.
 pub(super) enum Origin {
     User(String),
@@ -173,9 +184,10 @@ fn announce(shared: &Shared, turn: u64, origin: Origin) -> String {
             if notes.is_empty() {
                 text
             } else {
+                // Fenced as the robot's: a note can quote what a node logged.
                 format!(
-                    "{text}\n\n(Noticed by the robot since: {}.)",
-                    notes.join("; ")
+                    "{text}\n\n<robot-notes>Noticed by the robot since: {}.</robot-notes>",
+                    crate::tools::fence_text(&notes.join("; "), "robot-notes")
                 )
             }
         }
@@ -201,11 +213,14 @@ async fn ask(
     // The reasoning in the history is the last turn's model's, and only it takes it back.
     let theirs = lock(&shared.answered_by).as_deref() != Some(model);
     let mut tries = 0;
+    let mut updated = history.clone();
+    if theirs {
+        updated.drop_reasoning();
+    }
+    // A try only appends: the next one starts from the same messages without copying them again.
+    let start = updated.len();
     loop {
-        let mut updated = history.clone();
-        if theirs {
-            updated.drop_reasoning();
-        }
+        updated.truncate(start);
         let used = Arc::new(AtomicU64::new(0));
         let answered = Arc::new(AtomicBool::new(false));
         let setup = llm::TurnSetup {
@@ -239,6 +254,23 @@ async fn ask(
             continue;
         }
         return (result, updated, used.load(Ordering::Relaxed));
+    }
+}
+
+/// After a model failed before the robot acted: the next one starts from the turn's start, so
+/// what the operator said that this one read is said again; and, with a model after it, the
+/// operator hears of the change (with none, the turn's own error says it once).
+fn fall_back(shared: &Shared, e: &impl std::fmt::Display, more: bool) {
+    let heard = std::mem::take(&mut *lock(&shared.steer_heard));
+    if !heard.is_empty() {
+        let mut steer = lock(&shared.steer);
+        let newer = std::mem::replace(&mut *steer, heard);
+        steer.extend(newer);
+    }
+    if more {
+        shared.emit(Event::Notice {
+            text: format!("{e}; trying the next model"),
+        });
     }
 }
 
@@ -283,6 +315,7 @@ pub(super) async fn run_turn(
     *lock(&shared.repeated) = (String::new(), 0);
     let text = announce(&shared, turn, origin);
     let flags = Arc::new(TurnFlags::default());
+    *lock(&shared.working) = Some((text.clone(), Arc::clone(&flags)));
     for tool in registry.iter() {
         tool.ready().await;
     }
@@ -293,6 +326,8 @@ pub(super) async fn run_turn(
     };
     let mut candidates = source.candidates(Role::Routine, need).into_iter();
     let mut history = history;
+    // A stale look or listing would otherwise go with every call of every later turn.
+    history.mask();
     fit_window(
         &shared,
         &source,
@@ -323,6 +358,7 @@ pub(super) async fn run_turn(
         };
         let window = source.context(&model);
         let last = candidates.as_slice().is_empty();
+        lock(&shared.steer_heard).clear();
         let (result, mut updated, used) = ask(
             (&model, last),
             (&shared, &source, &flags),
@@ -356,12 +392,7 @@ pub(super) async fn run_turn(
                         again = Some(model);
                         continue;
                     }
-                    // With no model after it, the turn's own error says this once.
-                    if !candidates.as_slice().is_empty() {
-                        shared.emit(Event::Notice {
-                            text: format!("{e}; trying the next model"),
-                        });
-                    }
+                    fall_back(&shared, &e, !candidates.as_slice().is_empty());
                     failures.push(e.to_string());
                     continue;
                 }
@@ -377,7 +408,7 @@ pub(super) async fn run_turn(
         }
     }
     let text = if failures.is_empty() {
-        "no model is available".to_owned()
+        no_model(source.as_ref(), need)
     } else {
         failures.join("; ")
     };

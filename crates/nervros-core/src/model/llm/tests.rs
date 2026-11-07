@@ -4,7 +4,7 @@ use rig::completion::Message;
 use rig::message::{AssistantContent, CallId, ToolName, UserContent};
 
 use super::client::Llm;
-use super::history::{CUT_MARK, History, is_user_text, result_text};
+use super::history::{CUT_MARK, History, fit, is_user_text, result_text};
 use super::turn::{failure, plain, streamed, without_provider_body};
 use super::*;
 use crate::providers::Role;
@@ -34,6 +34,17 @@ fn a_long_history_is_cut_from_the_oldest_exchange_and_summarised() {
         "a summary is not the operator's words: {first:?}"
     );
     assert!(summarised.size() <= 2600, "{}", summarised.size());
+    let mut trimmed = summarised.clone();
+    trimmed.trim(4);
+    assert!(
+        trimmed.exchanges()[0].1.contains("ten things"),
+        "the summary is kept when the oldest go"
+    );
+    let fitted = fit(summarised.0.clone(), 1200);
+    assert!(
+        History(fitted).exchanges()[0].1.contains("ten things"),
+        "and when they are fitted to a window"
+    );
     let mut squeezed = history;
     squeezed.squeeze(2500);
     assert!(squeezed.size() <= 2500 && is_user_text(&squeezed.0[0]));
@@ -233,6 +244,11 @@ fn a_provider_error_keeps_its_words_and_loses_its_body() {
     assert_eq!(
         without_provider_body("oops: {not json"),
         "oops: details withheld"
+    );
+    assert_eq!(
+        without_provider_body("502 Bad Gateway\n<html>account 12345</html>"),
+        "502 Bad Gateway (the rest withheld)",
+        "a page is cut to its first line"
     );
 }
 

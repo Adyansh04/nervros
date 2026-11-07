@@ -88,8 +88,30 @@ pub async fn run(profile: &Profile, robot: &dyn RobotPort) -> Vec<Check> {
             ("catalog", &m.catalog, "nervros_interfaces/srv/GetCatalog"),
             ("stop", &m.stop, "nervros_interfaces/srv/StopAll"),
         ];
-        if let Some(pause) = &m.pause {
-            services.push(("pause", pause, "nervros_interfaces/srv/PauseMission"));
+        // Each optional service the profile names is one the agent will call.
+        let optional = [
+            ("pause", &m.pause, "nervros_interfaces/srv/PauseMission"),
+            (
+                "preview",
+                &m.preview,
+                "nervros_interfaces/srv/PreviewMission",
+            ),
+            (
+                "define_skill",
+                &m.define_skill,
+                "nervros_interfaces/srv/DefineSkill",
+            ),
+            (
+                "forget_skill",
+                &m.forget_skill,
+                "nervros_interfaces/srv/ForgetSkill",
+            ),
+            ("lend", &m.lend, "nervros_interfaces/srv/LendResources"),
+        ];
+        for (what, name, ty) in optional {
+            if let Some(name) = name {
+                services.push((what, name, ty));
+            }
         }
         let answered = futures::future::join_all(
             services
@@ -261,7 +283,7 @@ impl Tool for HealthCheck {
             json!({"healthy": problems.is_empty(), "problems": problems, "fine": fine}),
         );
         out.message = if problems.is_empty() {
-            format!("all {} checks pass", checks.len())
+            format!("these {} checks pass", checks.len())
         } else {
             format!("{} of {} checks fail", problems.len(), checks.len())
         };
@@ -316,7 +338,7 @@ mod tests {
         assert!(
             unread
                 .iter()
-                .any(|c| !c.ok && c.what.contains("nothing reads it"))
+                .any(|c| !c.ok && c.what.contains("no costmap reads it"))
         );
         let filter = nervros_ros::Endpoint {
             node: "/global_costmap/global_costmap".into(),
@@ -333,7 +355,25 @@ mod tests {
         let read = run(&profile, &robot).await;
         assert!(
             read.iter()
-                .any(|c| c.ok && c.what.contains("Nav2 reads it"))
+                .any(|c| c.ok && c.what.contains("Nav2 reads it in /global_costmap"))
+        );
+        let viewer = nervros_ros::Endpoint {
+            node: "/rviz2".into(),
+            ..nervros_ros::Endpoint::default()
+        };
+        let robot = FakeRobot::new().with_endpoints(
+            "/keepout_filter_mask",
+            nervros_ros::TopicEndpoints {
+                publishers: Vec::new(),
+                subscribers: vec![viewer],
+            },
+        );
+        let by_viewer = run(&profile, &robot).await;
+        assert!(
+            by_viewer
+                .iter()
+                .any(|c| !c.ok && c.what.contains("no costmap reads it")),
+            "a viewer is not Nav2"
         );
     }
 }

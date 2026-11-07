@@ -9,7 +9,7 @@ use nervros_ros::GoalStatus;
 use serde_json::{Value, json};
 
 use super::{
-    Ctx, MAX_GOAL_WAIT, Prepared, failed, name_arg, object, payload, seconds, spec, summarize,
+    Ctx, MAX_GOAL_WAIT, Prepared, failed, name_arg, object, seconds, spec, summarize, with_type,
 };
 use crate::guard::glob_match;
 use crate::tools::{Assessment, Resource, Risk, SchemaPart, Tool, ToolOutcome, ToolSpec};
@@ -77,34 +77,26 @@ impl ActionGoal {
                 "the profile does not let this agent send goals to `{action}`"
             )));
         }
-        let ty = match args["type"].as_str().filter(|t| !t.is_empty()) {
-            Some(t) => t.to_owned(),
-            None => self.ctx.action_type(&action).await?,
-        };
-        if let Some(out) = self.ctx.deny_act(&action, &ty) {
-            return Err(out);
-        }
-        let goal = payload(args, "goal");
-        if !Self::cancelling(args) {
-            if ty == "nervros_interfaces/action/ExecuteMission" {
+        let graph = self.ctx.action_type(&action).await;
+        // A cancel sends no goal, so there is none to check.
+        let sends = !Self::cancelling(args);
+        let p = self.ctx.checked(
+            (action, graph),
+            args,
+            ("goal", sends.then_some(SchemaPart::Goal)),
+        )?;
+        if sends {
+            if p.ty == "nervros_interfaces/action/ExecuteMission" {
                 return Err(ToolOutcome::refused(
                     "a mission goes through run_mission, which checks it against the keep-out \
                      zones and asks the operator",
                 ));
             }
-            self.ctx
-                .schemas
-                .validate(&ty, SchemaPart::Goal, &goal)
-                .map_err(|why| ToolOutcome::failed(format!("the goal does not fit {ty}: {why}")))?;
-            if let Some(refused) = self.ctx.zone_refusal(&ty, &goal) {
+            if let Some(refused) = self.ctx.zone_refusal(&p.ty, &p.payload) {
                 return Err(refused);
             }
         }
-        Ok(Prepared {
-            name: action,
-            ty,
-            payload: goal,
-        })
+        Ok(p)
     }
 
     async fn cancel_all(&self, action: &str) -> ToolOutcome {
@@ -149,7 +141,7 @@ impl Tool for ActionGoal {
         Some(self.prepare(args).await.map(|p| Assessment {
             risk: Risk::Motion,
             resources: Resource::ALL.to_vec(),
-            args: None,
+            args: Some(with_type(args, &p.ty)),
             reason: if Self::cancelling(args) {
                 format!("cancels every goal of {} ({})", p.name, p.ty)
             } else {
@@ -177,6 +169,8 @@ impl Tool for ActionGoal {
             Err(e) => return failed(&e),
         };
         let mut guard = CancelOnDrop(Some(handle.canceller()));
+        // Seen by a stop and the watchdog for as long as it is waited on.
+        let _open = self.ctx.goals.as_ref().map(|g| g.track(&p.name, &handle));
         let mut feedback = Vec::new();
         let deadline = tokio::time::Instant::now() + wait;
         let result = loop {

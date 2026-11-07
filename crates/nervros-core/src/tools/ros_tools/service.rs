@@ -6,7 +6,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{Ctx, MAX_CALL, Prepared, failed, name_arg, object, payload, seconds, spec, summarize};
+use super::{
+    Ctx, MAX_CALL, Prepared, failed, name_arg, object, seconds, spec, summarize, with_type,
+};
 use crate::guard::glob_match;
 use crate::tools::{Assessment, Resource, Risk, SchemaPart, Tool, ToolOutcome, ToolSpec};
 
@@ -75,23 +77,12 @@ impl ServiceCall {
                 "the profile does not let this agent call `{service}`"
             )));
         }
-        let ty = match args["type"].as_str().filter(|t| !t.is_empty()) {
-            Some(t) => t.to_owned(),
-            None => self.ctx.service_type(&service).await?,
-        };
-        if let Some(out) = self.ctx.deny_act(&service, &ty) {
-            return Err(out);
-        }
-        let request = payload(args, "request");
-        self.ctx
-            .schemas
-            .validate(&ty, SchemaPart::Request, &request)
-            .map_err(|why| ToolOutcome::failed(format!("the request does not fit {ty}: {why}")))?;
-        Ok(Prepared {
-            name: service,
-            ty,
-            payload: request,
-        })
+        let graph = self.ctx.service_type(&service).await;
+        self.ctx.checked(
+            (service, graph),
+            args,
+            ("request", Some(SchemaPart::Request)),
+        )
     }
 }
 
@@ -107,14 +98,14 @@ impl Tool for ServiceCall {
                 Assessment {
                     risk: Risk::Observe,
                     resources: Vec::new(),
-                    args: None,
+                    args: Some(with_type(args, &p.ty)),
                     reason: format!("reads {} ({})", p.name, p.ty),
                 }
             } else {
                 Assessment {
                     risk: Risk::Motion,
                     resources: Resource::ALL.to_vec(),
-                    args: None,
+                    args: Some(with_type(args, &p.ty)),
                     reason: format!("calls {} ({}) with {}", p.name, p.ty, p.payload),
                 }
             }
@@ -139,9 +130,22 @@ impl Tool for ServiceCall {
                 if p.ty == "rcl_interfaces/srv/GetParameters" {
                     self.mask_values(&names, &mut response);
                 }
-                ToolOutcome::ok(
-                    json!({"service": p.name, "type": p.ty, "response": summarize(&response)}),
-                )
+                let data =
+                    json!({"service": p.name, "type": p.ty, "response": summarize(&response)});
+                // A server that answered "no" did not do it: the call failed, its answer kept.
+                let refused = response["success"] == json!(false)
+                    || response["ok"] == json!(false)
+                    || response["error"].as_str().is_some_and(|e| !e.is_empty());
+                if refused {
+                    let mut out = ToolOutcome::failed(format!(
+                        "{} answered that it did not do it: {}",
+                        p.name,
+                        crate::tools::from_world(&summarize(&response).to_string())
+                    ));
+                    out.data = data;
+                    return out;
+                }
+                ToolOutcome::ok(data)
             }
             Err(e) => failed(&e),
         }

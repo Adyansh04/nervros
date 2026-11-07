@@ -200,8 +200,9 @@ impl Test {
                 crate::watch::readable(topic, read_deny)?;
                 crate::watch::small(topic, ty)
             }
-            Self::Log { .. }
-            | Self::NodeMissing(_)
+            // The log is /rosout's, which the profile may keep from being read too.
+            Self::Log { .. } => crate::watch::readable("/rosout", read_deny),
+            Self::NodeMissing(_)
             | Self::NodeDuplicated(_)
             | Self::TfMissing { .. }
             | Self::Failure(_) => Ok(()),
@@ -375,10 +376,15 @@ fn parse(text: &str, vars: &[(&str, &str)], source: &str) -> Result<Loaded, Stri
         .check(source)
 }
 
-/// NervROS's playbooks, then each folder's `*.toml`, a later one replacing an earlier of its id;
-/// and what could not be read. `vars` fills `{map_frame}` and the like.
+/// NervROS's playbooks, then each folder's `*.toml`, then the `remembered` folder's, a later one
+/// replacing an earlier of its id; and what could not be read. `vars` fills `{map_frame}` and the
+/// like.
 #[must_use]
-pub fn load(dirs: &[PathBuf], vars: &[(&str, &str)]) -> (Vec<Loaded>, Vec<String>) {
+pub fn load(
+    dirs: &[PathBuf],
+    remembered: Option<&Path>,
+    vars: &[(&str, &str)],
+) -> (Vec<Loaded>, Vec<String>) {
     let mut books: Vec<Loaded> = Vec::new();
     let mut problems = Vec::new();
     let mut add = |loaded: Loaded| match books.iter_mut().find(|b| b.book.id == loaded.book.id) {
@@ -391,10 +397,17 @@ pub fn load(dirs: &[PathBuf], vars: &[(&str, &str)]) -> (Vec<Loaded>, Vec<String
             Err(e) => problems.push(format!("built-in playbook {name}: {e}")),
         }
     }
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            // A folder for remembered playbooks is made by the first one.
-            continue;
+    for dir in dirs.iter().map(PathBuf::as_path).chain(remembered) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            // The folder for remembered playbooks is made by the first one.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && Some(dir) == remembered => {
+                continue;
+            }
+            Err(e) => {
+                problems.push(format!("{}: {e}", dir.display()));
+                continue;
+            }
         };
         let mut files: Vec<PathBuf> = entries
             .filter_map(Result::ok)
@@ -435,7 +448,7 @@ mod tests {
 
     #[test]
     fn the_built_in_playbooks_load_with_the_profile_s_frames() {
-        let (books, problems) = load(&[], &VARS);
+        let (books, problems) = load(&[], None, &VARS);
         assert!(problems.is_empty(), "{problems:?}");
         let lost = books
             .iter()
@@ -489,7 +502,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let (books, problems) = load(&[dir.path().to_path_buf()], &VARS);
+        let (books, problems) = load(&[dir.path().to_path_buf()], None, &VARS);
         let lost = books
             .iter()
             .find(|b| b.book.id == "no-localization")
@@ -506,6 +519,16 @@ mod tests {
             bad.contains("check 2: pose_gap is [target, source]"),
             "{bad}"
         );
+    }
+
+    #[test]
+    fn a_missing_folder_is_a_problem_unless_it_is_the_remembered_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let typo = dir.path().join("playbok");
+        let remembered = dir.path().join("remembered");
+        let (_, problems) = load(std::slice::from_ref(&typo), Some(&remembered), &VARS);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("playbok"), "{problems:?}");
     }
 
     #[test]

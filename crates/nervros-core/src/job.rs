@@ -9,6 +9,7 @@ pub mod envelope;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::Serialize;
 use tokio::sync::watch;
@@ -26,6 +27,8 @@ use crate::tools::Risk;
 const KEPT: usize = 12;
 /// Jobs running at once; at most one of them may move the robot.
 const MAX_RUNNING: usize = 3;
+/// How long a stopped job's work may take to cancel what it started; longer than its cancels.
+const SETTLE: Duration = Duration::from_secs(10);
 
 /// What a job is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -286,21 +289,29 @@ impl Jobs {
         tokio::spawn(
             async move {
                 let watcher = ctx.clone();
+                let work = work(ctx);
+                tokio::pin!(work);
                 // A stop wins over work that ends at the same moment: it was the operator's word.
                 let result = tokio::select! {
                     biased;
                     () = watcher.until_stopped() => None,
-                    r = work(ctx) => Some(r),
+                    r = &mut work => Some(r),
                 };
+                if result.is_none() {
+                    // The work hears the stop too: a moment to cancel what it started, noting on
+                    // the context what may still move.
+                    let _ = tokio::time::timeout(SETTLE, &mut work).await;
+                }
                 let state = match &result {
                     Some(Ok(_)) => JobState::Done,
                     Some(Err(_)) => JobState::Failed,
-                    None if watcher.left().is_zero() => JobState::TimedOut,
-                    None => JobState::Stopped,
+                    // A stop at the last moment is still the operator's.
+                    None if watcher.told() || !watcher.left().is_zero() => JobState::Stopped,
+                    None => JobState::TimedOut,
                 };
                 let summary = match result {
                     Some(Ok(text) | Err(text)) => text,
-                    None => String::new(),
+                    None => watcher.left_moving().unwrap_or_default(),
                 };
                 let job = finish(&list, &id, state, &summary);
                 if let (Some(s), Some(job)) = (&session, job) {
@@ -330,6 +341,15 @@ fn finish(list: &Mutex<Vec<Entry>>, id: &str, state: JobState, summary: &str) ->
     Some(entry.info.clone())
 }
 
+/// The words for what a stopped job left moving, or none.
+fn moving(said: &str) -> String {
+    if said.is_empty() {
+        String::new()
+    } else {
+        format!(" But {said}: tell the operator to stop the robot.")
+    }
+}
+
 /// What the model is told when a job ends. Its result can hold what the world model calls
 /// things, such as a program's list of objects: world text.
 fn report(job: &JobInfo, name: &str) -> String {
@@ -339,16 +359,24 @@ fn report(job: &JobInfo, name: &str) -> String {
         JobState::Done => format!("The {kind} {} ({name}) finished: {said}", job.id),
         JobState::Failed => format!("The {kind} {} ({name}) failed: {said}", job.id),
         JobState::TimedOut => format!(
-            "The {kind} {} ({name}) ran out of its {} min and was ended.",
+            "The {kind} {} ({name}) ran out of its {} min and was ended.{}",
             job.id,
-            job.envelope.max_minutes()
+            job.envelope.max_minutes(),
+            moving(&said)
         ),
         // Only the operator, the model or a stop of the robot ends one so: there is no fault to
-        // look for.
-        JobState::Stopped | JobState::Running => {
+        // look for, unless what it started did not stop.
+        JobState::Stopped | JobState::Running if said.is_empty() => {
             format!(
                 "The {kind} {} ({name}) was stopped, as asked: not a fault.",
                 job.id
+            )
+        }
+        JobState::Stopped | JobState::Running => {
+            format!(
+                "The {kind} {} ({name}) was stopped.{}",
+                job.id,
+                moving(&said)
             )
         }
     }
@@ -373,8 +401,9 @@ mod tests {
         }
     }
 
+    /// The job once it ended, waiting up to 20 s: a stopped job's work may take SETTLE to end.
     async fn settled(jobs: &Jobs, id: &str) -> JobInfo {
-        for _ in 0..200 {
+        for _ in 0..4000 {
             if let Some(j) = jobs
                 .list()
                 .into_iter()

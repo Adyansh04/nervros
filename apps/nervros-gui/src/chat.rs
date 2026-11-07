@@ -404,7 +404,10 @@ impl Chat {
             }
             // The viewer draws a plot, and the tool's card already says what; the Doctor tab
             // lists an incident, and a toast says it opened.
-            Event::Plot { .. } | Event::Drawn { .. } | Event::Incident { .. } => {}
+            Event::Plot { .. }
+            | Event::Drawn { .. }
+            | Event::Incident { .. }
+            | Event::Open { .. } => {}
             Event::ModelCall {
                 input_tokens,
                 cached_tokens,
@@ -479,6 +482,7 @@ impl Chat {
                 args,
                 reason,
                 can_allow,
+                always_asks: _,
             } => self.items.push(Item::Approval(Approval {
                 id: *id,
                 tool: tool.clone(),

@@ -29,6 +29,8 @@ const TURN_S: f64 = 60.0;
 const STRAIGHT_S: f64 = 60.0;
 /// The longest straight walk one step takes, as executors' walks keep it.
 const STRAIGHT_MAX_M: f64 = 2.0;
+/// Points along a straight walk tested for a slow zone, after its start.
+const STRAIGHT_SAMPLES: u32 = 8;
 /// How near the end of a route the robot may stand for the route to be a round, m: well past
 /// Nav2's goal tolerance.
 const ROUND_M: f64 = 1.0;
@@ -151,6 +153,7 @@ impl Motions {
     }
 
     async fn walk(&self, pose: Value, ctl: &Control) -> Result<(), String> {
+        self.clear_of_zones(&pose)?;
         let goal = json!({"pose": pose, "behavior_tree": ""});
         // Paused, the walk stops; resumed, it sets out for the same pose again.
         let again = |goal: &Value, _: &Value| goal.clone();
@@ -162,12 +165,13 @@ impl Motions {
     /// Nav2's planner between them, so that the walk goes round what the graph does not know of and
     /// keeps Nav2's recoveries, which tracking the route's own path does not.
     async fn walk_graph(&self, goal: Value, ctl: &Control) -> Result<(), String> {
+        self.clear_of_zones(&goal)?;
         let asked = json!({"goal": goal, "use_poses": true, "use_start": false});
         let types = ("compute_route", "nav2_msgs/action/ComputeRoute");
         let route = self.send(types, asked, ctl, None).await?;
         let path = &route["path"];
         // A route's edges are the graph's, which Nav2's keep-out filter never sees.
-        if let Some(zone) = self.crossed(path) {
+        if let Some(zone) = self.crossed(path, &goal) {
             return Err(format!(
                 "the route graph's way there crosses the keep-out zone `{zone}`: walk with \
                  {GO_TO_PLACE}, which plans around it"
@@ -188,8 +192,46 @@ impl Motions {
             .map(|_| ())
     }
 
+    /// How fast a straight walk of `metres` (negative backward) goes: the profile's speed, no
+    /// faster than the slowest zone along the line allows, which Nav2's speed filter may not
+    /// apply to a behaviour's goal.
+    fn straight_speed(&self, metres: f64) -> Result<f64, String> {
+        let speed = self.config.drive_speed_mps.abs();
+        if !speed.is_finite() || speed <= 0.0 || metres.abs() <= 0.0 {
+            return Err(format!(
+                "a straight walk needs a distance and a speed above 0 m/s, not {metres} m at \
+                 {speed} m/s (`drive_speed_mps`)"
+            ));
+        }
+        let (Some((x, y, yaw)), Some(top)) = (self.here(), self.zones.top_speed_mps()) else {
+            return Ok(speed);
+        };
+        Ok((0..=STRAIGHT_SAMPLES)
+            .map(|i| f64::from(i) / f64::from(STRAIGHT_SAMPLES) * metres)
+            .filter_map(|d| self.zones.slow_at(x + yaw.cos() * d, y + yaw.sin() * d))
+            .map(|(_, percent)| top * percent / 100.0)
+            .fold(speed, f64::min))
+    }
+
+    /// Refuses a walk that ends in a keep-out zone: the plan's fence tests what a step names, not
+    /// the spot beside it a walk resolves to, and a zone may have been added since.
+    fn clear_of_zones(&self, pose: &Value) -> Result<(), String> {
+        let at = &pose["pose"]["position"];
+        let (x, y) = (
+            at["x"].as_f64().unwrap_or(0.0),
+            at["y"].as_f64().unwrap_or(0.0),
+        );
+        match self.zones.at(x, y) {
+            Some(zone) => Err(format!(
+                "the walk would end at ({x:.1}, {y:.1}), inside keep-out zone {}",
+                zone.name
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// The keep-out zone a path crosses, if any.
-    fn crossed(&self, path: &Value) -> Option<String> {
+    fn crossed(&self, path: &Value, goal: &Value) -> Option<String> {
         let at = |p: &Value| {
             let at = &p["pose"]["position"];
             (
@@ -197,10 +239,13 @@ impl Motions {
                 at["y"].as_f64().unwrap_or(0.0),
             )
         };
-        let poses = path["poses"].as_array()?;
-        poses
+        // From the robot onto the route and off it to the goal too, taken as straight lines.
+        let mut points: Vec<(f64, f64)> = self.here().map(|(x, y, _)| (x, y)).into_iter().collect();
+        points.extend(path["poses"].as_array().into_iter().flatten().map(at));
+        points.push(at(goal));
+        points
             .windows(2)
-            .find_map(|w| self.zones.crossed(at(&w[0]), at(&w[1])))
+            .find_map(|w| self.zones.crossed(w[0], w[1]))
             .map(|(zone, _)| zone.name)
     }
 
@@ -246,7 +291,8 @@ impl Motions {
             let id = named(&objects["objects"], target, &["id"])
                 .or_else(|| nearest(&objects["objects"], target, here));
             if let Some(id) = id {
-                return Ok((beside(&objects, &id, here, BESIDE_M)?, id));
+                let spot = beside(&objects, &id, (here, self.robot.ros_now_s()), BESIDE_M)?;
+                return Ok((spot, id));
             }
         }
         Err(format!(
@@ -272,6 +318,12 @@ impl Motions {
                 }
             }
             let spot = spot.map_err(|_| format!("`{name}` is not a known place or room"))?;
+            if let Some(zone) = self.zones.at(spot.x, spot.y) {
+                return Err(format!(
+                    "`{name}` lies inside keep-out zone {}, so the route may not pass it",
+                    zone.name
+                ));
+            }
             let yaw = spot
                 .yaw
                 .unwrap_or_else(|| from.map_or(0.0, |(fx, fy)| (spot.y - fy).atan2(spot.x - fx)));
@@ -638,7 +690,8 @@ impl NativeSkill for Native {
                 } else {
                     1.0
                 };
-                let goal = drive(sign * metres, sign * m.config.drive_speed_mps.abs());
+                let speed = m.straight_speed(sign * metres)?;
+                let goal = drive(sign * metres, sign * speed);
                 let types = ("drive_on_heading", "nav2_msgs/action/DriveOnHeading");
                 m.send(types, goal, ctl, Some(&drive_left))
                     .await
@@ -650,16 +703,21 @@ impl NativeSkill for Native {
                     .await
                     .map(|()| none)
             }
+            // Paused, the docking stops; resumed, it starts again, as a walk does.
             Kind::Dock => {
                 let goal = json!({"use_dock_id": true, "dock_id": arg("dock"),
                                   "navigate_to_staging_pose": true, "max_staging_time": 1000.0});
                 let types = ("dock_robot", "nav2_msgs/action/DockRobot");
-                m.send(types, goal, ctl, None).await.map(|_| none)
+                m.send(types, goal, ctl, Some(&same_again))
+                    .await
+                    .map(|_| none)
             }
             Kind::Undock => {
                 let goal = json!({"dock_type": "", "max_undocking_time": 30.0});
                 let types = ("undock_robot", "nav2_msgs/action/UndockRobot");
-                m.send(types, goal, ctl, None).await.map(|_| none)
+                m.send(types, goal, ctl, Some(&same_again))
+                    .await
+                    .map(|_| none)
             }
         }
     }
@@ -728,6 +786,11 @@ fn spin_left(goal: &Value, fb: &Value) -> Value {
         .unwrap_or(0.0)
         .abs();
     spin(target.signum() * (target.abs() - done).max(0.0))
+}
+
+/// The same goal once more, for a step whose server has no progress to resume from.
+fn same_again(goal: &Value, _: &Value) -> Value {
+    goal.clone()
 }
 
 /// Resumed, a straight walk walks what was left.

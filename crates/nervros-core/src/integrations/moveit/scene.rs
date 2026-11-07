@@ -24,6 +24,9 @@ use crate::tools::{Assessment, Resource, Risk, Tool, ToolOutcome, ToolSpec};
 const CALL_WAIT: Duration = Duration::from_secs(5);
 /// How often the planning frame's place on the map is checked.
 const FOLLOW_PERIOD: Duration = Duration::from_secs(1);
+/// How often the obstacles are sent again though nothing moved: a `move_group` that restarted
+/// holds none of them.
+const RESEND_PERIOD: Duration = Duration::from_secs(15);
 /// How far the planning frame moves before the obstacles are sent again, m and rad.
 const MOVED_M: f64 = 0.01;
 const TURNED_RAD: f64 = 0.02;
@@ -80,6 +83,9 @@ pub(super) struct Scene {
     arms: Arc<Arms>,
     file: Option<PathBuf>,
     added: Arc<Mutex<BTreeMap<String, Obstacle>>>,
+    /// Held from reading `added` to MoveIt taking the change, so a resend of the obstacles cannot
+    /// bring back one a removal or an attach has just taken out.
+    writing: tokio::sync::Mutex<()>,
 }
 
 impl Scene {
@@ -126,6 +132,7 @@ impl Scene {
             arms,
             file,
             added: Arc::new(Mutex::new(kept)),
+            writing: tokio::sync::Mutex::new(()),
         });
         scene.follow();
         scene
@@ -134,8 +141,9 @@ impl Scene {
     /// Sends NervROS's obstacles again whenever the planning frame moves on the map.
     fn follow(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
+        // Detached: it holds the scene weakly and ends once the scene is dropped.
         tokio::spawn(async move {
-            let mut sent_at: Option<Transform> = None;
+            let mut sent_at: Option<(Transform, tokio::time::Instant)> = None;
             loop {
                 tokio::time::sleep(FOLLOW_PERIOD).await;
                 let Some(scene) = weak.upgrade() else {
@@ -148,16 +156,18 @@ impl Scene {
                 let Ok(t) = scene.map_to_planning().await else {
                     continue;
                 };
-                if sent_at.is_some_and(|s| !moved(&s, &t)) {
+                // Sent whole on a timer, which costs less than reading the scene back to compare.
+                if sent_at.is_some_and(|(s, at)| !moved(&s, &t) && at.elapsed() < RESEND_PERIOD) {
                     continue;
                 }
+                let _writing = scene.writing.lock().await;
                 let all = crate::lock(&scene.added).clone();
                 let objects: Vec<Value> = all
                     .iter()
                     .filter_map(|(id, o)| scene.object(id, o, &t).ok())
                     .collect();
                 if scene.apply_objects(objects).await.is_ok() {
-                    sent_at = Some(t);
+                    sent_at = Some((t, tokio::time::Instant::now()));
                 }
             }
         });
@@ -215,12 +225,16 @@ impl Scene {
             .await
     }
 
-    fn save(&self) {
-        let Some(file) = &self.file else {
+    /// Keeps the obstacles, written off the async threads; the caller holds `writing`, so the
+    /// writes go in order.
+    async fn save(&self) {
+        let Some(file) = self.file.clone() else {
             return;
         };
         let all = crate::lock(&self.added).clone();
-        if let Err(e) = crate::persist::write_json(file, &all) {
+        let written =
+            tokio::task::spawn_blocking(move || crate::persist::write_json(&file, &all)).await;
+        if let Some(e) = written.map_or_else(|e| Some(e.to_string()), Result::err) {
             tracing::warn!(error = %e, "the planning scene's obstacles were not kept");
         }
     }
@@ -328,10 +342,10 @@ impl Scene {
         ))
     }
 
-    async fn list(&self) -> ToolOutcome {
+    /// MoveIt's planning scene: its objects and what the arms hold.
+    async fn scene(&self) -> Result<Value, String> {
         let service = self.arms.config.name("get_planning_scene");
-        let scene = match self
-            .arms
+        self.arms
             .robot
             .call(
                 &service,
@@ -340,11 +354,13 @@ impl Scene {
                 CALL_WAIT,
             )
             .await
-        {
+            .map_err(|e| format!("MoveIt's planning scene did not answer: {e}"))
+    }
+
+    async fn list(&self) -> ToolOutcome {
+        let scene = match self.scene().await {
             Ok(s) => s,
-            Err(e) => {
-                return ToolOutcome::failed(format!("MoveIt's planning scene did not answer: {e}"));
-            }
+            Err(why) => return ToolOutcome::failed(why),
         };
         let added = crate::lock(&self.added).clone();
         let obstacles: Vec<Value> = scene["scene"]["world"]["collision_objects"]
@@ -375,6 +391,23 @@ impl Scene {
             Ok(o) => o,
             Err(why) => return ToolOutcome::failed(why),
         };
+        // MoveIt replaces an object added again under its id: a smaller one would be a removal,
+        // which asks first.
+        let scene = match self.scene().await {
+            Ok(s) => s,
+            Err(why) => return ToolOutcome::failed(why),
+        };
+        let taken = scene["scene"]["world"]["collision_objects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|o| o["id"].as_str() == Some(id.as_str()));
+        if taken {
+            return ToolOutcome::failed(format!(
+                "`{id}` is already in the planning scene, and adding it again would replace it: \
+                 use another id, or remove it first"
+            ));
+        }
         let t = match self.map_to_planning().await {
             Ok(t) => t,
             Err(why) => return ToolOutcome::failed(why),
@@ -383,12 +416,13 @@ impl Scene {
             Ok(o) => o,
             Err(why) => return ToolOutcome::failed(why),
         };
+        let _writing = self.writing.lock().await;
         if let Err(why) = self.apply_objects(vec![object]).await {
             return ToolOutcome::failed(why);
         }
         let words = obstacle.shape.words();
         crate::lock(&self.added).insert(id.clone(), obstacle);
-        self.save();
+        self.save().await;
         ToolOutcome {
             message: format!("MoveIt plans the arms around `{id}`, {words}"),
             ..ToolOutcome::ok(json!({"added": id}))
@@ -404,11 +438,12 @@ impl Scene {
             ));
         }
         let gone = json!({"id": id, "operation": REMOVE});
+        let _writing = self.writing.lock().await;
         if let Err(why) = self.apply_objects(vec![gone]).await {
             return ToolOutcome::failed(why);
         }
         crate::lock(&self.added).remove(id);
-        self.save();
+        self.save().await;
         ToolOutcome::ok(json!({"removed": id}))
     }
 
@@ -434,12 +469,13 @@ impl Scene {
             "touch_links": srdf.hand_links(&group),
         });
         let scene = json!({"is_diff": true, "robot_state": {"is_diff": true, "attached_collision_objects": [held]}});
+        let _writing = self.writing.lock().await;
         match self.apply(scene).await {
             Ok(()) => {
                 // An attached obstacle is the hand's now, not the map's.
                 if on {
                     crate::lock(&self.added).remove(id);
-                    self.save();
+                    self.save().await;
                 }
                 ToolOutcome::ok(json!({if on { "attached" } else { "detached" }: id, "link": tip}))
             }

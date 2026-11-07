@@ -9,13 +9,14 @@ use serde_json::{Value, json};
 
 use super::catalog::Catalog;
 use super::check::Observed;
+use super::execution::boot_of;
 use super::plan::{Author as By, Compiled, Plan, PlannedStep, Problem, Thing, World};
 use super::sanity::{Concern, Verdict};
 use super::tool::{concern_line, questioned};
 use super::{
     CATALOG_RETRY, CRITIC_TIMEOUT, KEPT_PLANS, MAX_PLAN_ATTEMPTS, MIN_HASH_PREFIX, Missions,
-    SERVICE_TIMEOUT, STATE, STATE_FRESH, WORLD_WAIT, advice, held_by, ledger, plan, preview,
-    sanity,
+    PREVIEW_TIMEOUT, SERVICE_TIMEOUT, STATE, STATE_FRESH, WORLD_WAIT, advice, held_by, ledger,
+    plan, preview, sanity,
 };
 use crate::lock;
 use crate::session::Event;
@@ -37,7 +38,7 @@ impl Missions {
                 service,
                 "nervros_interfaces/srv/PreviewMission",
                 json!({"tree_xml": compiled.xml}),
-                SERVICE_TIMEOUT,
+                PREVIEW_TIMEOUT,
             )
             .await;
         match reply
@@ -48,7 +49,13 @@ impl Missions {
                 hash: compiled.sha256,
                 steps,
             }),
-            Err(why) => tracing::info!(%why, "no preview of the plan"),
+            // The card shows no route either way: the operator is told why.
+            Err(why) => {
+                tracing::info!(%why, "no preview of the plan");
+                self.emit(Event::Notice {
+                    text: format!("No route picture for \"{}\": {why}", compiled.plan.intent),
+                });
+            }
         }
     }
 
@@ -85,9 +92,19 @@ impl Missions {
         ))
     }
 
-    /// The catalog, fetched once and kept.
+    /// The catalog, fetched once and kept while the executor that sent it runs: a restarted one
+    /// may load another catalog or have lost its drafts.
     pub(crate) async fn catalog(&self) -> Result<Arc<Catalog>, String> {
-        if let Some(c) = lock(&self.catalog).clone() {
+        let boot = self
+            .robot
+            .latest(&self.config.state, STATE, Duration::ZERO)
+            .await
+            .ok()
+            .as_ref()
+            .and_then(boot_of);
+        if let Some(c) = lock(&self.catalog).clone()
+            && (boot.is_none() || *lock(&self.catalog_boot) == boot)
+        {
             return Ok(c);
         }
         let fetched = self
@@ -108,6 +125,7 @@ impl Missions {
             Ok(catalog) => {
                 let catalog = Arc::new(catalog);
                 *lock(&self.catalog) = Some(Arc::clone(&catalog));
+                *lock(&self.catalog_boot) = boot;
                 Ok(catalog)
             }
             Err(e) => {
@@ -140,6 +158,22 @@ impl Missions {
 
     /// What the plan compiler knows: places, rooms and objects with their positions, where the
     /// robot is and what it holds.
+    /// Of `names`, those a walk could not go to: no place by any of its names, no room by its id
+    /// or name, no object by its id.
+    pub(crate) async fn unknown_places(&self, names: &[String]) -> Vec<String> {
+        let world = self.world_of(&self.observe().await);
+        names
+            .iter()
+            .filter(|n| {
+                let same = |a: &str| crate::places::same_words(a, n);
+                let place = crate::places::find(&world.places, n).is_some();
+                let room = world.rooms.iter().any(|r| r.id == **n || same(&r.name));
+                !(place || room || world.objects.iter().any(|o| o.id == **n))
+            })
+            .cloned()
+            .collect()
+    }
+
     fn world_of(&self, seen: &Observed) -> World {
         let things = |msg: &Value, list: &str, name: fn(&Value) -> &str, at: &str| {
             msg[list]
@@ -285,21 +319,61 @@ impl Missions {
         }
     }
 
+    /// Why a plan may not run on the robot's skills as they are now: a taught skill defined again
+    /// since the plan was made would run a body the operator never approved, under its hash.
+    pub(super) async fn same_skills(&self, compiled: &Compiled) -> Result<(), String> {
+        let reply = self
+            .robot
+            .call(
+                &self.config.catalog,
+                "nervros_interfaces/srv/GetCatalog",
+                json!({}),
+                SERVICE_TIMEOUT,
+            )
+            .await
+            .map_err(|e| format!("the robot's skill catalog is not available: {e}"))?;
+        let now = Catalog::parse(reply["catalog_json"].as_str().unwrap_or_default())
+            .map_err(|e| format!("the skill catalog is malformed: {e}"))?;
+        if now.catalog_version == compiled.catalog_version {
+            return Ok(());
+        }
+        *lock(&self.catalog) = Some(Arc::new(now));
+        *lock(&self.last) = None;
+        Err(
+            "the robot's skills changed since this plan was made, so it would not run what was \
+             approved: plan it again"
+                .to_owned(),
+        )
+    }
+
     /// The steps of a plan that would take the robot into a keep-out zone.
     fn fenced(&self, compiled: &Compiled, world: &World, catalog: &Catalog) -> Vec<Problem> {
+        self.fenced_steps(&compiled.steps, world, catalog)
+    }
+
+    /// The steps of `steps` that would take the robot into a keep-out zone, from where it stands.
+    fn fenced_steps(
+        &self,
+        steps: &[PlannedStep],
+        world: &World,
+        catalog: &Catalog,
+    ) -> Vec<Problem> {
         let Some(zones) = self.guard.get().and_then(|g| g.zones()) else {
             return Vec::new();
         };
         let (map, base) = (&self.profile.ros.map_frame, &self.profile.ros.base_frame);
         let start = self.robot.transform(map, base).ok().map(|t| t.planar());
-        super::fence::check(
-            &compiled.steps,
-            start,
-            world,
-            catalog,
-            &self.config.checks,
-            zones,
-        )
+        super::fence::check(steps, start, world, catalog, &self.config.checks, zones)
+    }
+
+    /// Why `steps`, the ones a running mission has still to do, may not run now that the zones
+    /// changed: none when they still keep out of every zone.
+    pub(super) async fn fenced_now(&self, steps: &[PlannedStep]) -> Option<String> {
+        let catalog = self.catalog().await.ok()?;
+        let world = self.world_of(&self.observe().await);
+        self.fenced_steps(steps, &world, &catalog)
+            .first()
+            .map(|p| p.message.clone())
     }
 
     /// Ways a plan may not do what the operator asked, and whether any is plain enough to send
@@ -390,12 +464,14 @@ impl Missions {
     /// the model with what went wrong before with its steps.
     fn checked(
         &self,
-        compiled: Compiled,
+        mut compiled: Compiled,
         worst: f64,
         concerns: Vec<Concern>,
         by: By,
     ) -> ToolOutcome {
         let noted: Vec<String> = concerns.iter().map(concern_line).collect();
+        // Kept with the plan: run later by its hash, it is approved with them too.
+        compiled.concerns.clone_from(&noted);
         self.emit(Event::MissionPlanned {
             hash: compiled.sha256.clone(),
             intent: compiled.plan.intent.clone(),
@@ -652,9 +728,10 @@ impl Missions {
     pub(crate) async fn observe(&self) -> Observed {
         let world = self.profile.world.as_ref();
         // Read together: with the world model down, each waits its full time.
+        // A silent executor's last word on its hands is not what they hold now.
         let state = async {
             self.robot
-                .latest(&self.config.state, STATE, WORLD_WAIT)
+                .latest_fresh(&self.config.state, STATE, WORLD_WAIT, STATE_FRESH)
                 .await
                 .unwrap_or(Value::Null)
         };
@@ -683,6 +760,22 @@ impl Missions {
             objects,
             state,
             arms,
+        }
+    }
+
+    /// The places and the world model's rooms and, with `objects`, its objects: what a program
+    /// reads of the world, without the robot's state, arms and pose that [`Self::observe`] waits on.
+    pub(crate) async fn world_only(&self, objects: bool) -> Observed {
+        let world = self.profile.world.as_ref();
+        let (rooms, objects) = tokio::join!(
+            self.latest(world.and_then(|w| w.rooms.as_ref())),
+            self.latest(world.and_then(|w| w.objects.as_ref()).filter(|_| objects)),
+        );
+        Observed {
+            places: self.places.all(),
+            rooms,
+            objects,
+            ..Observed::default()
         }
     }
 }

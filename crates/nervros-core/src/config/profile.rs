@@ -786,6 +786,65 @@ impl Profile {
     }
 
     /// The zones' names are unique and each zone and speed usable, within the speeds allowed.
+    /// Refuses a name NervROS itself sends to that the hard deny list forbids: these come from
+    /// the profile, past every tool's check, and a typo such as a heartbeat named `rt/lowcmd`
+    /// would otherwise go out.
+    fn check_sent(&self) -> Result<(), ProfileError> {
+        let mut sent: Vec<&str> = self.ros.open_goals.iter().map(String::as_str).collect();
+        if let Some(m) = &self.mission {
+            sent.extend([m.execute.as_str(), &m.validate, &m.catalog, &m.stop]);
+            let optional = [
+                &m.pause,
+                &m.preview,
+                &m.define_skill,
+                &m.forget_skill,
+                &m.heartbeat,
+                &m.teleop,
+                &m.teleop_cmd,
+                &m.lend,
+            ];
+            sent.extend(optional.into_iter().flatten().map(String::as_str));
+        }
+        let deny = crate::guard::default_hard_deny();
+        let denied = sent.into_iter().find(|name| {
+            let name =
+                crate::guard::canonical_ros_name(name).unwrap_or_else(|_| (*name).to_owned());
+            deny.iter().any(|p| crate::guard::glob_match(p, &name))
+        });
+        match denied {
+            Some(name) => Err(ProfileError::Invalid(format!(
+                "`{name}` is on the hard deny list, which NervROS never sends to"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The arm's speed shares and the flight recorder's window and rates.
+    fn check_rates(&self) -> Result<(), ProfileError> {
+        // MoveIt takes a scaling outside (0, 1] as its own default speed.
+        if let Some(m) = &self.moveit
+            && !(m.max_scaling.is_finite()
+                && m.max_scaling <= 1.0
+                && m.scaling > 0.0
+                && m.scaling <= m.max_scaling)
+        {
+            return Err(ProfileError::Invalid(
+                "[moveit] scaling is above 0 and at most max_scaling, which is at most 1"
+                    .to_owned(),
+            ));
+        }
+        if let Some(i) = &self.incidents {
+            let positive = |v: f64| v.is_finite() && v > 0.0;
+            if !positive(i.window_s) || i.watch.iter().any(|w| !positive(w.min_hz)) {
+                return Err(ProfileError::Invalid(
+                    "[incidents] window_s and each watch's min_hz are finite and above 0"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn check_zones(&self) -> Result<(), ProfileError> {
         let g = &self.geofence;
         let top_ok = g.top_speed_mps.is_none_or(|t| t.is_finite() && t > 0.0);
@@ -813,7 +872,47 @@ impl Profile {
         Ok(())
     }
 
+    /// The executor's section: a deadman it can keep, and arms lent only to an agent that beats.
+    fn check_mission(&self) -> Result<(), ProfileError> {
+        // The executor reads a timeout of zero or less as "no deadman", and NaN reaches it as one.
+        if let Some(m) = &self.mission
+            && !(m.heartbeat_timeout_s.is_finite() && m.heartbeat_timeout_s > 0.0)
+        {
+            return Err(ProfileError::Invalid(format!(
+                "[mission] heartbeat_timeout_s must be a number of seconds above 0, not {}",
+                m.heartbeat_timeout_s
+            )));
+        }
+        // The executor takes lent arms back once their borrower's beats stop: with none, every
+        // arm move NervROS makes would be cut off within seconds.
+        if let Some(m) = &self.mission
+            && m.lend.is_some()
+            && m.heartbeat.is_none()
+        {
+            return Err(ProfileError::Invalid(
+                "[mission] lend needs heartbeat: the executor takes the arms back from a borrower \
+                 it hears no heartbeat from"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn check(&self) -> Result<(), ProfileError> {
+        self.check_mission()?;
+        // At zero the agent would refuse every call, or every approval would expire at once.
+        let b = &self.policy.budgets;
+        if b.model_calls == 0
+            || b.tool_calls == 0
+            || b.wall_time.is_zero()
+            || self.policy.approval_ttl.is_zero()
+        {
+            return Err(ProfileError::Invalid(
+                "[policy] budgets (model_calls, tool_calls, wall_time) and approval_ttl must be \
+                 above 0"
+                    .to_owned(),
+            ));
+        }
         let mut seen = std::collections::BTreeSet::new();
         for t in &self.tools {
             if !seen.insert(t.name.as_str()) {
@@ -823,9 +922,12 @@ impl Profile {
                 });
             }
         }
-        let mut seen = std::collections::BTreeSet::new();
-        for p in &self.places {
-            if !seen.insert(p.name.as_str()) {
+        // As every lookup finds a place: by its words, case aside, the first that matches.
+        for (i, p) in self.places.iter().enumerate() {
+            if self.places[..i]
+                .iter()
+                .any(|q| crate::tools::places::same_words(&q.name, &p.name))
+            {
                 return Err(ProfileError::Duplicate {
                     kind: "place",
                     name: p.name.clone(),
@@ -833,6 +935,8 @@ impl Profile {
             }
         }
         self.check_zones()?;
+        self.check_rates()?;
+        self.check_sent()?;
         if let Some(k) = &self.keyframes {
             let sane = |v: f64, most: f64| v.is_finite() && v > 0.0 && v <= most;
             if !sane(k.period_s, 3600.0) || !sane(k.keep_h, 24.0 * 30.0) || k.edge_px < 64 {
@@ -964,6 +1068,16 @@ mod tests {
     const BASE: &str = "[robot]\nname = \"r\"\n[models]\nfile = \"m.toml\"\n";
     const LOOK: &str = "[look]\nname = \"chest\"\nimage = \"/chest\"\n\
         detections = { topic = \"/d\", type = \"canopy_msgs/msg/InstanceMaskArray\" }\n";
+
+    #[test]
+    fn arms_are_lent_only_to_an_agent_that_beats() {
+        let mission = "[mission]\nexecute = \"/e\"\nvalidate = \"/v\"\ncatalog = \"/c\"\n\
+            stop = \"/s\"\nstate = \"/st\"\nlend = \"/l\"\n";
+        let lone = format!("{BASE}{mission}");
+        assert!(check(&lone).is_err_and(|e| e.to_string().contains("lend needs heartbeat")));
+        let beating = format!("{BASE}{mission}heartbeat = \"/h\"\n");
+        assert!(check(&beating).is_ok());
+    }
 
     #[test]
     fn cameras_segment_and_layers_are_checked() {

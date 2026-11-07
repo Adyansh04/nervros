@@ -14,7 +14,7 @@ use rig::run::PromptResponse;
 use rig::{Agent, AgentBuilder, ErrorKind};
 use secrecy::{ExposeSecret as _, SecretString};
 
-use super::turn::{AgentSource as _, CallCost, without_provider_body};
+use super::turn::{AgentSource, CallCost, without_provider_body};
 use super::{Answer, Ask, BUSY_RETRY, LlmError, Setback, user_message};
 use crate::providers::router::{Need, Router, Skip};
 use crate::providers::{ModelConfig, ProviderConfig, ProviderKind, Role, free_only};
@@ -146,6 +146,7 @@ impl Llm {
             })?;
         if provider.is_openrouter() {
             free_only::check_openrouter_id(&model.model)?;
+            free_only::check_openrouter_params(&model.model, model.params.as_ref())?;
         }
         if let Some(why) = self.missing_keys.get(&provider.id) {
             return Err(LlmError::Client {
@@ -154,6 +155,18 @@ impl Llm {
             });
         }
         let key = self.keys.get(&provider.id);
+        // A key goes out encrypted, or to this machine only.
+        if key.is_some()
+            && provider
+                .base_url
+                .as_deref()
+                .is_some_and(|url| !secure_or_local(url))
+        {
+            return Err(LlmError::Client {
+                provider: provider.id.clone(),
+                message: "a key is sent over https only, or to this machine".to_owned(),
+            });
+        }
         let http = match self.http.get(&(provider.id.clone(), model.stream)) {
             Some(Ok(client)) => client.clone(),
             Some(Err(why)) => {
@@ -226,56 +239,90 @@ impl Llm {
             ..Need::default()
         };
         let (candidates, skipped) = self.router.candidates(ask.role, need, SystemTime::now());
-        let mut failed = Vec::new();
-        for model in candidates {
-            let agent = match self.agent_builder(model) {
-                Ok(builder) => builder.preamble(ask.preamble).build(),
-                Err(e) => {
-                    failed.push((model.id.clone(), e.to_string()));
-                    continue;
-                }
-            };
-            // Checked and counted before the call, as a turn's are: a call cut short by a timeout
-            // was still made, and the next candidate's limits are read anew.
-            if let Err(refused) = self.router.take_request(&model.id, SystemTime::now()) {
-                failed.push((model.id.clone(), refused.to_string()));
-                continue;
-            }
-            // Gemini segments from the prompt before the image; given the image first, Flash-Lite
-            // answered with boxes where the outlines belong.
-            let message = user_message(ask.prompt, &ask.images, ask.role == Role::Segment);
-            let again = || {
-                self.router
-                    .take_request(&model.id, SystemTime::now())
-                    .is_ok()
-            };
-            match prompt_once_more(&agent, message, again).await {
-                Ok(response) => {
-                    self.spent(&model.id, CallCost::of(&response.usage));
-                    // A count the provider leaves out is zero tokens to the budget and the report.
-                    return Ok(Answer {
-                        text: response.output(),
-                        model: model.id.clone(),
-                        input_tokens: response.usage.input_tokens.unwrap_or(0),
-                        output_tokens: response.usage.output_tokens.unwrap_or(0),
-                    });
-                }
-                Err(e) => {
-                    if let Some(setback) = prompt_setback(&e) {
-                        self.set_back(&model.id, setback);
-                    }
-                    let said = without_provider_body(&e.to_string());
-                    tracing::info!(model = %model.id, error = %said, "model failed, trying the next one");
-                    failed.push((model.id.clone(), said));
-                }
-            }
+        let models: Vec<String> = candidates.into_iter().map(|m| m.id.clone()).collect();
+        // Gemini segments from the prompt before the image; given the image first, Flash-Lite
+        // answered with boxes where the outlines belong.
+        let message = user_message(ask.prompt, &ask.images, ask.role == Role::Segment);
+        match first_answer(self, models, ask.preamble, &message, |_| true).await {
+            // A count the provider leaves out is zero tokens to the report.
+            Ok((model, response)) => Ok(Answer {
+                text: response.output(),
+                model,
+                input_tokens: response.usage.input_tokens.unwrap_or(0),
+                output_tokens: response.usage.output_tokens.unwrap_or(0),
+            }),
+            Err(failed) => Err(LlmError::NoModel { skipped, failed }),
         }
-        Err(LlmError::NoModel { skipped, failed })
     }
 }
 
-/// The provider's HTTP client: `timeout_s` bounds a unary call whole and the connection of a
-/// streamed one, whose reply may take long while words keep coming (rig times its silences).
+/// The first answer to `message` that `accept` takes, from `models` in turn, each built with
+/// `preamble`. Each call is checked and counted before it is made, as a turn's are: a call cut
+/// short by a timeout was still made, and the next model's limits are read anew. A failed model is
+/// set back; each failure comes back as the model and why.
+pub(super) async fn first_answer(
+    source: &dyn AgentSource,
+    models: Vec<String>,
+    preamble: &str,
+    message: &Message,
+    accept: impl Fn(&PromptResponse) -> bool,
+) -> Result<(String, PromptResponse), Vec<(String, String)>> {
+    let mut failed = Vec::new();
+    for model in models {
+        let agent = match source.builder(&model) {
+            Ok(builder) => builder.preamble(preamble).build(),
+            Err(e) => {
+                failed.push((model, e.to_string()));
+                continue;
+            }
+        };
+        if let Err(refused) = source.take_request(&model) {
+            failed.push((model, refused));
+            continue;
+        }
+        let again = || source.take_request(&model).is_ok();
+        match prompt_once_more(&agent, message.clone(), again).await {
+            Ok(response) => {
+                source.spent(&model, CallCost::of(&response.usage));
+                if accept(&response) {
+                    return Ok((model, response));
+                }
+                failed.push((model, "its answer was empty".to_owned()));
+            }
+            Err(e) => {
+                if let Some(setback) = prompt_setback(&e) {
+                    source.set_back(&model, setback);
+                }
+                let said = without_provider_body(&e.to_string());
+                tracing::info!(model = %model, error = %said, "model failed, trying the next one");
+                failed.push((model, said));
+            }
+        }
+    }
+    Err(failed)
+}
+
+/// Whether a key may go to `url`: over https, or over http to this machine.
+fn secure_or_local(url: &str) -> bool {
+    let url = url.trim().to_ascii_lowercase();
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    // The host alone: `localhost.example.com` or a port does not make it this machine.
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// The provider's HTTP client: `timeout_s` bounds a unary call whole, and the connection and each
+/// silence of a streaming model's calls, whose replies may take long while words keep coming.
+/// A unary call to a streaming model (a compaction, a check) is then bounded by its silence too.
 fn http_client(provider: &ProviderConfig, streamed: bool) -> Result<reqwest::Client, LlmError> {
     let mut headers = reqwest::header::HeaderMap::new();
     for (name, value) in &provider.headers {
@@ -290,7 +337,7 @@ fn http_client(provider: &ProviderConfig, streamed: bool) -> Result<reqwest::Cli
         .default_headers(headers)
         .connect_timeout(timeout);
     if streamed {
-        builder
+        builder.read_timeout(timeout)
     } else {
         builder.timeout(timeout)
     }
@@ -342,9 +389,14 @@ fn malformed_call(report: &ErrorReport) -> Option<Setback> {
 
 /// What a run's failure says about its model; see [`setback`].
 pub(super) fn prompt_setback(error: &PromptError) -> Option<Setback> {
+    with_report(error, setback).flatten()
+}
+
+/// `read` of the provider's report on a failed run, when it gave one.
+fn with_report<T>(error: &PromptError, read: impl FnOnce(&ErrorReport) -> T) -> Option<T> {
     match error {
-        PromptError::Provider(e) => setback(&e.report()),
-        PromptError::Report(report) => setback(report),
+        PromptError::Provider(e) => Some(read(&e.report())),
+        PromptError::Report(report) => Some(read(report)),
         _ => None,
     }
 }
@@ -352,11 +404,7 @@ pub(super) fn prompt_setback(error: &PromptError) -> Option<Setback> {
 /// Whether a run failed because its request outgrew the model's context window, as the provider
 /// says it in any of its words.
 pub(super) fn overflowed(error: &PromptError) -> bool {
-    match error {
-        PromptError::Provider(e) => e.report().is_context_overflow(),
-        PromptError::Report(report) => report.is_context_overflow(),
-        _ => false,
-    }
+    with_report(error, ErrorReport::is_context_overflow).unwrap_or(false)
 }
 
 /// `agent`'s answer to `message`, asked once more [`BUSY_RETRY`] later when the provider was busy
@@ -373,5 +421,19 @@ pub(super) async fn prompt_once_more(
             agent.prompt(message).await
         }
         answered => answered,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::secure_or_local;
+
+    #[test]
+    fn a_key_goes_over_https_or_to_this_machine_only() {
+        assert!(secure_or_local("https://api.anthropic.com"));
+        assert!(secure_or_local("http://127.0.0.1:18081/v1"));
+        assert!(secure_or_local("http://[::1]:8080"));
+        assert!(!secure_or_local("http://localhost.example.com/v1"));
+        assert!(!secure_or_local("http://10.0.0.2:8080"));
     }
 }

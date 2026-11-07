@@ -46,8 +46,13 @@ fn needs(op: &str) -> &'static [&'static str] {
     }
 }
 
-/// What is wrong with one edit before the editor sees it: a missing field, or a room's id where
-/// an object's goes, which the editor answered with a bare Python error, three times running.
+/// How far from the map's origin an object's centre may be, m.
+const MAX_REACH_M: f64 = 100_000.0;
+/// The longest side an object's box may have, m.
+const MAX_SIDE_M: f64 = 100.0;
+
+/// What is wrong with one edit before the editor sees it: a missing field, a room's id where an
+/// object's goes (which the editor answered with a bare Python error), or a box beyond any room.
 fn edit_problem(edit: &Value) -> Option<String> {
     let op = edit["op"].as_str().unwrap_or_default();
     if let Some(missing) = needs(op).iter().find(|f| edit[**f].is_null()) {
@@ -76,6 +81,17 @@ fn edit_problem(edit: &Value) -> Option<String> {
             "{op} takes an object such as O12, and a room is changed{room_op}"
         ));
     }
+    // A slip of units or digits would draw, and keep, a box far beyond any room.
+    for (key, limit) in [("centre", MAX_REACH_M), ("size", MAX_SIDE_M)] {
+        if edit[key].as_array().is_some_and(|values| {
+            values.iter().any(|v| {
+                !v.as_f64()
+                    .is_some_and(|x| x.is_finite() && x.abs() <= limit)
+            })
+        }) {
+            return Some(format!("{op}: `{key}` takes numbers of at most {limit} m"));
+        }
+    }
     None
 }
 
@@ -102,6 +118,10 @@ fn edit_words(edit: &Value) -> String {
 
 /// How long a call may take; the editor answers from memory, a save writes a few files.
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// The most of the editor's answer read: a world, or a view of an object, is far less.
+const MOST_BODY: usize = 64 * 1024 * 1024;
+/// The most of a refusal's body read for its reason.
+const MOST_ERROR: usize = 64 * 1024;
 
 /// Why the editor did not do what it was asked.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -113,6 +133,12 @@ pub enum EditorError {
          editor/canopy_editor.py <world_dir>"
     )]
     Unreachable(String),
+    /// It answered nothing in time: what it was sent may have been done.
+    #[error(
+        "the world editor at {0} did not answer in time; what it was sent may have been done, \
+         so look at the world before sending it again"
+    )]
+    TimedOut(String),
     /// The editor refused, and says why.
     #[error("{0}")]
     Refused(String),
@@ -173,15 +199,24 @@ impl EditorClient {
             Some(t) => request.header("Cookie", format!("canopy_token={}", t.expose_secret())),
             None => request,
         };
-        let response = request
-            .send()
-            .await
-            .map_err(|_| EditorError::Unreachable(self.base.clone()))?;
+        let response = request.send().await.map_err(|e| {
+            if e.is_connect() {
+                EditorError::Unreachable(self.base.clone())
+            } else if e.is_timeout() {
+                EditorError::TimedOut(self.base.clone())
+            } else {
+                EditorError::Refused(e.to_string())
+            }
+        })?;
         let status = response.status();
         if status.is_success() {
             return Ok(response);
         }
-        let body: Value = response.json().await.unwrap_or(Value::Null);
+        let body: Value = body(response, MOST_ERROR)
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(Value::Null);
         let why = body["error"]
             .as_str()
             .map_or_else(|| status.to_string(), str::to_owned);
@@ -195,10 +230,7 @@ impl EditorClient {
     async fn post(&self, path: &str, body: &Value) -> Result<Value, EditorError> {
         let request = self.http.post(format!("{}{path}", self.base)).json(body);
         let response = self.send(request).await?;
-        response
-            .json()
-            .await
-            .map_err(|e| EditorError::Refused(e.to_string()))
+        json_of(response).await
     }
 
     /// The whole world, as the editor's page draws it.
@@ -210,10 +242,7 @@ impl EditorClient {
         let response = self
             .send(self.http.get(format!("{}/api/world", self.base)))
             .await?;
-        response
-            .json()
-            .await
-            .map_err(|e| EditorError::Refused(e.to_string()))
+        json_of(response).await
     }
 
     /// Applies one op; a failed one leaves the world as it was.
@@ -295,7 +324,7 @@ impl EditorClient {
     pub async fn crop(&self, id: u64) -> Result<Option<Vec<u8>>, EditorError> {
         let request = self.http.get(format!("{}/api/crops/O{id}.jpg", self.base));
         match self.send(request).await {
-            Ok(response) => Ok(response.bytes().await.ok().map(|b| b.to_vec())),
+            Ok(response) => Ok(body(response, MOST_BODY).await.ok()),
             Err(EditorError::Refused(_)) => Ok(None),
             Err(e) => Err(e),
         }
@@ -310,12 +339,37 @@ impl EditorClient {
         let response = self
             .send(self.http.get(format!("{}/api/map.png", self.base)))
             .await?;
-        response
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| EditorError::Refused(e.to_string()))
+        body(response, MOST_BODY).await
     }
+}
+
+/// A response's body, refused past `most` bytes.
+async fn body(mut response: reqwest::Response, most: usize) -> Result<Vec<u8>, EditorError> {
+    let too_large = || EditorError::Refused(format!("its answer is over {most} bytes"));
+    if response
+        .content_length()
+        .is_some_and(|n| usize::try_from(n).map_or(true, |n| n > most))
+    {
+        return Err(too_large());
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| EditorError::Refused(e.to_string()))?
+    {
+        if out.len() + chunk.len() > most {
+            return Err(too_large());
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// A response's body as JSON, within [`MOST_BODY`].
+async fn json_of(response: reqwest::Response) -> Result<Value, EditorError> {
+    let bytes = body(response, MOST_BODY).await?;
+    serde_json::from_slice(&bytes).map_err(|e| EditorError::Refused(e.to_string()))
 }
 
 /// An object id as the editor takes it: `12`, `"12"` or `"O12"`.
@@ -473,9 +527,15 @@ impl InspectObject {
             .as_object()
             .map(|v| v.iter().take(4).map(|(k, n)| json!([k, n])).collect())
             .unwrap_or_default();
+        // What the world model's vision wrote of it is the world's words.
+        let fenced = |v: &Value| {
+            v.as_str()
+                .map_or(Value::Null, |t| json!(crate::tools::world_label(t)))
+        };
         let mut data = json!({
-            "id": format!("O{id}"), "label": object["label"], "name": object["name"],
-            "caption": object["caption"], "votes": votes, "sightings": object["observations"],
+            "id": format!("O{id}"), "label": fenced(&object["label"]), "name": fenced(&object["name"]),
+            "caption": object["caption"].as_str().map_or(Value::Null, |t| json!(crate::tools::from_world(&crate::tools::clip(t, 300)))),
+            "votes": votes, "sightings": object["observations"],
             "size_m": object["size"], "height_m": [object["z_min"], object["z_max"]],
             "centre": object["centre"], "yaw": object["yaw"], "state": object["state"],
             "removed_by": object["removed_by"], "checked": object["checked"],
@@ -484,8 +544,11 @@ impl InspectObject {
         let mut images = Vec::new();
         match self.editor.crop(id).await.map_err(|e| e.to_string())? {
             Some(jpeg) => {
-                let size =
-                    image::load_from_memory(&jpeg).map_or((0, 0), |i| (i.width(), i.height()));
+                let size = image::ImageReader::new(std::io::Cursor::new(&jpeg))
+                    .with_guessed_format()
+                    .ok()
+                    .and_then(|r| r.into_dimensions().ok())
+                    .unwrap_or((0, 0));
                 // A view canopy kept from some earlier moment: no frame stamp to give it.
                 let snapshot = self.snapshots.store(jpeg.clone(), size, 0.0, Vec::new());
                 data["snapshot"] = json!(snapshot.id);
@@ -546,7 +609,8 @@ impl EditWorld {
         let spec = ToolSpec::new(
             "edit_world",
             "Edits the saved world as the operator does in the world editor: the edits run in \
-             order, and if one fails the earlier ones are undone. Ops: label (id, label; \"\" \
+             order, and if one fails the earlier ones are undone as far as the editor's undo goes; the \
+             answer says what stays applied. Ops: label (id, label; \"\" \
              hands it back to the detector's votes), name (id, name), check (id, checked), \
              remove or restore (ids, reason), merge (into, ids), box (id, centre, size, yaw), \
              split (id, polygon, label, name), add (label, centre, size, yaw, z_min, z_max, \
@@ -601,14 +665,23 @@ impl EditWorld {
                     world = e.world;
                 }
                 Err(why) => {
+                    // The undo stack is the editor's, the operator's too: stop at the first undo
+                    // it refuses, and say what stays applied.
                     let mut undone = 0;
-                    for _ in 0..done {
-                        if self.editor.command("undo").await.is_ok() {
-                            undone += 1;
-                        }
+                    while undone < done && self.editor.command("undo").await.is_ok() {
+                        undone += 1;
                     }
+                    let rolled = if undone == done {
+                        format!("the {done} before it were undone")
+                    } else {
+                        format!(
+                            "{undone} of the {done} before it were undone, and {} stay applied: \
+                             look at the world before going on",
+                            done - undone
+                        )
+                    };
                     return Err(format!(
-                        "edit {} ({}) failed: {why}; the {undone} before it were undone",
+                        "edit {} ({}) failed: {why}; {rolled}",
                         done + 1,
                         op["op"].as_str().unwrap_or("?")
                     ));
@@ -804,6 +877,16 @@ mod tests {
         let config: EditorConfig =
             toml::from_str(&format!("url = \"{url}\"\nreload = \"/world/reload\"")).unwrap();
         (Arc::new(EditorClient::new(&config).unwrap()), log)
+    }
+
+    #[test]
+    fn a_box_far_beyond_any_room_is_refused_before_the_editor_sees_it() {
+        let edit =
+            |size: f64| json!({"op": "box", "id": "O3", "centre": [1.0, 2.0], "size": [size, 1.0]});
+        assert_eq!(edit_problem(&edit(0.8)), None);
+        assert!(edit_problem(&edit(1e9)).is_some_and(|why| why.contains("size")));
+        let far = json!({"op": "add", "label": "cup", "centre": [1e12, 0.0], "size": [0.1, 0.1]});
+        assert!(edit_problem(&far).is_some());
     }
 
     #[tokio::test]

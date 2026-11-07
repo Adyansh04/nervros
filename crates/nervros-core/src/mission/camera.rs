@@ -296,8 +296,13 @@ fn contained(thing: &str, host: &str, marks: &[Instance]) -> Option<(usize, usiz
     };
     for (i, t) in marks.iter().enumerate().filter(|(_, m)| of(thing, m)) {
         let (x, y, w, h) = t.bbox;
-        let (cx, cy) = (x + w / 2, y + h / 2);
-        for (j, h_mark) in marks.iter().enumerate().filter(|(_, m)| of(host, m)) {
+        let (cx, cy) = (x.saturating_add(w / 2), y.saturating_add(h / 2));
+        // A mark both names share is one thing, not a thing and its host.
+        for (j, h_mark) in marks
+            .iter()
+            .enumerate()
+            .filter(|&(j, m)| j != i && of(host, m))
+        {
             let (hx, hy, hw, hh) = h_mark.bbox;
             if (hx..=hx + hw).contains(&cx) && (hy..=hy + hh).contains(&cy) {
                 return Some((i + 1, j + 1));
@@ -507,6 +512,12 @@ mod tests {
             contained("cupboard", "tray", &cup),
             None,
             "whole words only"
+        );
+        let one = [mark("mug", (300, 150, 20, 14))];
+        assert_eq!(
+            contained("mug", "mug coaster", &one),
+            None,
+            "one mark is not both"
         );
     }
 

@@ -13,6 +13,8 @@ pub mod job;
 pub mod mission;
 pub mod model;
 mod persist;
+/// Writes a file whole or not at all: see [`persist::write_atomic`].
+pub use persist::write_atomic;
 pub mod program;
 pub mod search;
 pub mod telemetry;
@@ -23,7 +25,7 @@ pub(crate) use agent::{argcheck, context};
 pub use agent::{evalcase, guard, log, session};
 pub(crate) use config::secret;
 pub use config::{profile, schemas};
-pub use mission::check::how_long;
+pub use mission::check::{ago, how_long};
 pub(crate) use mission::schedule;
 pub use model::{llm, providers};
 pub use tools::places::room_label;

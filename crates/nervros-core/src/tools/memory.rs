@@ -74,7 +74,10 @@ impl Memory {
     ///
     /// The note is empty or too long, there are too many, or the file cannot be written.
     pub fn remember(&self, text: &str) -> Result<Note, String> {
-        let text = text.trim();
+        // One line: a note sits in the system prompt, where a line break could start a section
+        // that reads as the operator's own words.
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let text = text.as_str();
         if text.is_empty() {
             return Err("`text` is what to remember, in a sentence".to_owned());
         }
@@ -97,8 +100,11 @@ impl Memory {
             text: text.to_owned(),
             at: crate::unix_secs(SystemTime::now()),
         };
-        notes.push(note.clone());
-        self.save(&notes)?;
+        // Saved first, then kept: a note the file does not hold would vanish at the next start.
+        let mut next = notes.clone();
+        next.push(note.clone());
+        self.save(&next)?;
+        *notes = next;
         Ok(note)
     }
 
@@ -109,12 +115,13 @@ impl Memory {
     /// The file cannot be written.
     pub fn forget(&self, id: u32) -> Result<bool, String> {
         let mut notes = self.lock();
-        let before = notes.len();
-        notes.retain(|n| n.id != id);
-        if notes.len() == before {
+        let next: Vec<Note> = notes.iter().filter(|n| n.id != id).cloned().collect();
+        if next.len() == notes.len() {
             return Ok(false);
         }
-        self.save(&notes).map(|()| true)
+        self.save(&next)?;
+        *notes = next;
+        Ok(true)
     }
 }
 

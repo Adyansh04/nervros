@@ -42,6 +42,10 @@ const TOGGLE_WAIT: Duration = Duration::from_secs(5);
 const SHOWN_WAIT: Duration = Duration::from_secs(1);
 /// How often the kept shapes and states are checked against the monitor's own.
 const RESTORE_EVERY: Duration = Duration::from_secs(5);
+/// The longest the whole monitor stays off: then NervROS turns it on again.
+const OFF_AT_MOST: Duration = Duration::from_mins(30);
+/// How far `scale` may grow or shrink a shape at once.
+const SCALE_RANGE: std::ops::RangeInclusive<f64> = 0.05..=20.0;
 
 /// A shape NervROS gave a polygon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,6 +71,15 @@ impl Shape {
         match self {
             Self::Points(p) => Self::Points(p.iter().map(|[x, y]| [x * by, y * by]).collect()),
             Self::Radius(r) => Self::Radius(r * by),
+        }
+    }
+
+    /// Whether every number of it is finite: a kept infinity is written as null and the whole
+    /// file is then unreadable.
+    fn finite(&self) -> bool {
+        match self {
+            Self::Points(p) => p.iter().flatten().all(|v| v.is_finite()),
+            Self::Radius(r) => r.is_finite(),
         }
     }
 }
@@ -127,9 +140,19 @@ impl Polygon {
         }
     }
 
-    /// Whether NervROS may set its shape.
+    /// Whether it is a circle, whose topic takes a radius rather than corners.
+    fn circle(&self) -> bool {
+        self.kind == "circle"
+    }
+
+    /// Whether NervROS may set its shape: one that takes it from a topic, with no fixed one.
     fn shapeable(&self) -> bool {
-        self.topic.is_some() && self.points.is_none()
+        self.topic.is_some()
+            && if self.circle() {
+                self.radius.is_none()
+            } else {
+                self.points.is_none()
+            }
     }
 }
 
@@ -141,8 +164,11 @@ pub(super) struct Monitor {
     file: Option<PathBuf>,
     kept: Mutex<BTreeMap<String, Kept>>,
     publishers: tokio::sync::Mutex<BTreeMap<String, Publisher>>,
-    /// On or off, as NervROS last set it; none until it does.
-    on: Mutex<Option<bool>>,
+    /// Held while a change or a restore runs, so a restore working from what was kept cannot undo
+    /// a change approved meanwhile.
+    changing: tokio::sync::Mutex<()>,
+    /// On or off, as NervROS last set it, and since when it is off; none until it does.
+    on: Mutex<Option<(bool, f64)>>,
 }
 
 impl Monitor {
@@ -178,6 +204,17 @@ impl Monitor {
             .as_deref()
             .map(crate::persist::read_or_default)
             .unwrap_or_default();
+        // Turned off before NervROS last stopped: still off, and on again when its time is up.
+        let off_since = file.as_deref().and_then(|f| {
+            let since: f64 =
+                serde_json::from_str(&std::fs::read_to_string(off_file(f)).ok()?).ok()?;
+            tracing::warn!(
+                "NervROS turned the collision monitor off before it restarted; it turns it on \
+                 again {} min after that",
+                OFF_AT_MOST.as_secs() / 60
+            );
+            Some(since)
+        });
         let monitor = Arc::new(Self {
             spec,
             node: config.monitor_node(),
@@ -185,11 +222,13 @@ impl Monitor {
             file,
             kept: Mutex::new(kept),
             publishers: tokio::sync::Mutex::new(BTreeMap::new()),
-            on: Mutex::new(None),
+            changing: tokio::sync::Mutex::new(()),
+            on: Mutex::new(off_since.map(|since| (false, since))),
         });
         // Until the monitor holds what was kept, and again whenever it comes back as its
         // configuration has it, as after a restart.
         let weak = Arc::downgrade(&monitor);
+        // Detached: it holds the monitor weakly and ends once the monitor is dropped.
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(RESTORE_EVERY);
             loop {
@@ -197,15 +236,35 @@ impl Monitor {
                 let Some(monitor) = weak.upgrade() else {
                     return;
                 };
+                monitor.end_off().await;
                 monitor.restore().await;
             }
         });
         monitor
     }
 
+    /// Turns the whole monitor on again once it has been off for [`OFF_AT_MOST`]: an off with no
+    /// end would outlive the task it was for.
+    async fn end_off(&self) {
+        let Some((false, since)) = *crate::lock(&self.on) else {
+            return;
+        };
+        if crate::now_s() - since < OFF_AT_MOST.as_secs_f64() {
+            return;
+        }
+        let out = self.toggle(true).await;
+        tracing::warn!(
+            outcome = %out.message,
+            "the collision monitor was off for {} min: NervROS turned it on again",
+            OFF_AT_MOST.as_secs() / 60
+        );
+    }
+
     /// Sends each kept shape that has not gone out, and turns each kept polygon on or off where
-    /// the monitor says otherwise. Nothing while the monitor does not answer.
+    /// the monitor says otherwise, its shape sent again first: a monitor that restarted may not
+    /// have heard it. Nothing while the monitor does not answer.
     async fn restore(&self) {
+        let _changing = self.changing.lock().await;
         let kept = crate::lock(&self.kept).clone();
         if kept.is_empty() {
             return;
@@ -216,13 +275,14 @@ impl Monitor {
         };
         for ((name, k), (enabled, _)) in kept.iter().zip(now) {
             let sent = self.publishers.lock().await.contains_key(name);
-            let restored = if sent {
+            let differs = enabled.as_bool() != Some(k.on);
+            let restored = if sent && !differs {
                 Ok(())
             } else {
                 self.publish(name, k).await
             };
             let restored = match restored {
-                Ok(()) if enabled.as_bool() != Some(k.on) => self.set_on(name, k.on).await,
+                Ok(()) if differs => self.set_on(name, k.on).await,
                 other => other,
             };
             if let Err(why) = restored {
@@ -252,10 +312,18 @@ impl Monitor {
             .and_then(|(v, _)| v.as_str())
             .unwrap_or("base_footprint")
             .to_owned();
+        // Every polygon's fields in one read, not a read (and a listing) per polygon.
+        let asked: Vec<String> = names
+            .iter()
+            .flat_map(|name| FIELDS.iter().map(move |f| format!("{name}.{f}")))
+            .collect();
+        let all = if asked.is_empty() {
+            Vec::new()
+        } else {
+            get_params(robot, &self.node, &asked).await?
+        };
         let mut out = Vec::new();
-        for name in names {
-            let asked: Vec<String> = FIELDS.iter().map(|f| format!("{name}.{f}")).collect();
-            let v = get_params(robot, &self.node, &asked).await?;
+        for (name, v) in names.into_iter().zip(all.chunks(FIELDS.len())) {
             let get = |i: usize| v.get(i).map_or(&Value::Null, |(value, _)| value);
             let text = |i: usize| get(i).as_str().filter(|s| !s.is_empty()).map(str::to_owned);
             let visualize = get(10).as_bool() == Some(true);
@@ -334,6 +402,16 @@ impl Monitor {
                 p.name
             ));
         }
+        let circle = p.circle();
+        if args.get("points").is_some() && circle {
+            return Err(format!("`{}` is a circle: give its radius", p.name));
+        }
+        if args.get("radius").is_some() && !circle {
+            return Err(format!(
+                "`{}` is a polygon: give its corners as points",
+                p.name
+            ));
+        }
         if let Some(points) = args["points"].as_array() {
             let points: Option<Vec<[f64; 2]>> = points
                 .iter()
@@ -354,14 +432,25 @@ impl Monitor {
             };
         }
         if let Some(by) = args["scale"].as_f64() {
-            if !(by.is_finite() && by > 0.0) {
-                return Err("scale is above 0".to_owned());
+            if !SCALE_RANGE.contains(&by) {
+                return Err(format!(
+                    "scale is from {} to {}",
+                    SCALE_RANGE.start(),
+                    SCALE_RANGE.end()
+                ));
             }
-            return self
+            let scaled = self
                 .shape_now(p)
                 .await
                 .map(|s| s.scaled(by))
-                .ok_or_else(|| format!("`{}` has no shape yet to scale: give its points", p.name));
+                .ok_or_else(|| {
+                    format!("`{}` has no shape yet to scale: give its points", p.name)
+                })?;
+            return if scaled.finite() {
+                Ok(scaled)
+            } else {
+                Err("the scaled shape is beyond any number".to_owned())
+            };
         }
         Err("shape needs points, radius or scale".to_owned())
     }
@@ -419,9 +508,15 @@ impl Monitor {
             "node": self.node,
             "frame": frame,
             "monitor": match on {
-                Some(true) => "on",
-                Some(false) => "off",
-                None => "on unless turned off outside NervROS",
+                Some((true, _)) => "on".to_owned(),
+                Some((false, since)) => format!(
+                    "off for {} min; NervROS turns it on again at {} min",
+                    ((crate::now_s() - since) / 60.0).max(0.0).round(),
+                    OFF_AT_MOST.as_secs() / 60
+                ),
+                None => "not known: NervROS has not turned it on or off since it started, and \
+                         Nav2 does not say"
+                    .to_owned(),
             },
             "polygons": listed,
         }))
@@ -440,7 +535,8 @@ impl Monitor {
             .await
         {
             Ok(r) if r["success"].as_bool() != Some(false) => {
-                *crate::lock(&self.on) = Some(on);
+                *crate::lock(&self.on) = Some((on, crate::now_s()));
+                self.keep_off(on).await;
                 let message = if on {
                     "the collision monitor is on"
                 } else {
@@ -473,11 +569,39 @@ impl Monitor {
         .await
     }
 
-    fn keep(&self, all: &BTreeMap<String, Kept>) {
+    /// Keeps since when the whole monitor is off, or that it is on, across a restart.
+    async fn keep_off(&self, on: bool) {
         let Some(file) = &self.file else {
             return;
         };
-        if let Err(e) = crate::persist::write_json(file, all) {
+        let file = off_file(file);
+        // Off the async threads: the write syncs.
+        let kept = tokio::task::spawn_blocking(move || {
+            if on {
+                match std::fs::remove_file(&file) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+                    _ => Ok(()),
+                }
+            } else {
+                crate::persist::write_json(&file, &crate::now_s())
+            }
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        if let Err(e) = kept {
+            tracing::warn!(error = %e, "whether the collision monitor is off was not kept");
+        }
+    }
+
+    async fn keep(&self, all: &BTreeMap<String, Kept>) {
+        let Some(file) = self.file.clone() else {
+            return;
+        };
+        let all = all.clone();
+        // Written and synced off the async threads.
+        let written =
+            tokio::task::spawn_blocking(move || crate::persist::write_json(&file, &all)).await;
+        if let Some(e) = written.map_or_else(|e| Some(e.to_string()), Result::err) {
             tracing::warn!(error = %e, "the collision monitor's shapes were not kept");
         }
     }
@@ -493,13 +617,14 @@ impl Monitor {
                 p.name
             ));
         }
+        let _changing = self.changing.lock().await;
         if let Err(why) = self.set_on(&p.name, on).await {
             return ToolOutcome::failed(why);
         }
         let mut kept = crate::lock(&self.kept).clone();
         if let Some(k) = kept.get_mut(&p.name) {
             k.on = on;
-            self.keep(&kept);
+            self.keep(&kept).await;
             *crate::lock(&self.kept) = kept;
         }
         ToolOutcome::ok(json!({"polygon": p.name, "on": on, "does": p.does()}))
@@ -523,6 +648,7 @@ impl Monitor {
             shape: shape.clone(),
             on: true,
         };
+        let _changing = self.changing.lock().await;
         if let Err(why) = self.publish(&p.name, &kept).await {
             return ToolOutcome::failed(why);
         }
@@ -534,7 +660,7 @@ impl Monitor {
         }
         let mut all = crate::lock(&self.kept).clone();
         all.insert(p.name.clone(), kept);
-        self.keep(&all);
+        self.keep(&all).await;
         *crate::lock(&self.kept) = all;
         ToolOutcome::ok(json!({
             "polygon": p.name,
@@ -543,6 +669,11 @@ impl Monitor {
             "on": true,
         }))
     }
+}
+
+/// Where the whole monitor's off is kept, beside the kept shapes.
+fn off_file(shapes: &std::path::Path) -> PathBuf {
+    shapes.with_extension("off.json")
 }
 
 #[async_trait]
@@ -577,10 +708,10 @@ impl Tool for Monitor {
                     Err(why) => return Some(Err(ToolOutcome::failed(why))),
                 };
                 let now = self.shape_now(&p).await;
-                // A shape that covers the old one only makes it react sooner: free. A polygon that
-                // takes its shape from a topic and has none yet detects nothing: any shape is a
-                // gain.
-                let unshaped = p.shapeable() && now.is_none();
+                // A shape that covers the old one only makes it react sooner: free. A polygon known
+                // to be off detects nothing: any shape is a gain. One whose shape is only unknown
+                // here may detect plenty, so a change asks.
+                let unshaped = p.shapeable() && now.is_none() && p.enabled == Some(false);
                 if unshaped || now.as_ref().is_some_and(|n| covers(&next, n)) {
                     return None;
                 }
@@ -604,9 +735,11 @@ impl Tool for Monitor {
             }
             _ => return None,
         };
+        // The base: a mission walking it holds it, so the last guard before an obstacle does not
+        // go while it walks.
         Some(Ok(Assessment {
             risk: Risk::WorldEdit,
-            resources: Vec::new(),
+            resources: vec![crate::tools::Resource::Base],
             reason,
             args: None,
         }))
@@ -751,6 +884,60 @@ mod tests {
 
     fn monitor(robot: FakeRobot) -> Arc<Monitor> {
         Monitor::new(&Nav2Config::default(), Arc::new(robot), None)
+    }
+
+    #[tokio::test]
+    async fn a_shape_fits_its_kind_and_a_scale_its_bounds() {
+        let m = monitor(robot());
+        let radius = m
+            .call(json!({"action": "shape", "polygon": "PolygonSlow", "radius": 0.5}))
+            .await;
+        assert!(
+            radius.message.contains("is a polygon"),
+            "{}",
+            radius.message
+        );
+        let huge = m
+            .call(json!({"action": "shape", "polygon": "PolygonSlow", "scale": 1e300}))
+            .await;
+        assert!(huge.message.contains("scale is from"), "{}", huge.message);
+    }
+
+    #[tokio::test]
+    async fn an_off_monitor_is_kept_off_across_a_restart_and_said_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shapes.json");
+        let m = Monitor::new(
+            &Nav2Config::default(),
+            Arc::new(robot()),
+            Some(file.clone()),
+        );
+        let status = m.call(json!({"action": "status"})).await;
+        assert!(
+            status.data["monitor"]
+                .as_str()
+                .unwrap()
+                .starts_with("not known"),
+            "{}",
+            status.data["monitor"]
+        );
+        m.call(json!({"action": "off"})).await;
+        let again = Monitor::new(
+            &Nav2Config::default(),
+            Arc::new(robot()),
+            Some(file.clone()),
+        );
+        let status = again.call(json!({"action": "status"})).await;
+        assert!(
+            status.data["monitor"]
+                .as_str()
+                .unwrap()
+                .starts_with("off for 0 min"),
+            "{}",
+            status.data["monitor"]
+        );
+        again.call(json!({"action": "on"})).await;
+        assert!(!off_file(&file).exists(), "on again: nothing kept off");
     }
 
     #[tokio::test]

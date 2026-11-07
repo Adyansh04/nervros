@@ -387,30 +387,49 @@ impl ParamSet {
     }
 }
 
+/// Words in a node or parameter name that say it guards the robot's motion.
+const GUARDS_MOTION: [&str; 8] = [
+    "keepout",
+    "keep_out",
+    "speed",
+    "velocity",
+    "collision",
+    "limit",
+    "safety",
+    "enabled",
+];
+
 #[async_trait]
 impl Tool for ParamSet {
     fn spec(&self) -> Cow<'_, ToolSpec> {
         Cow::Borrowed(&self.spec)
     }
 
+    /// A parameter that guards motion (a keep-out filter's switch, a speed or collision limit)
+    /// asks the operator every time, whatever the autonomy.
+    fn always_asks(&self, args: &Value) -> bool {
+        let at = format!(
+            "{}/{}",
+            args["node"].as_str().unwrap_or_default(),
+            args["name"].as_str().unwrap_or_default()
+        )
+        .to_lowercase();
+        GUARDS_MOTION.iter().any(|w| at.contains(w))
+    }
+
     async fn assess(&self, args: &Value) -> Option<Result<Assessment, ToolOutcome>> {
         Some(self.prepare(args).await.map(|c| {
-            // The card and the log see the old value only when it is not masked.
-            let was = if self.ctx.masked(&c.name) {
-                json!("(hidden)")
+            // The card and the log see the values only when the name is not masked.
+            let (was, to) = if self.ctx.masked(&c.name) {
+                (json!("(hidden)"), json!("(hidden)"))
             } else {
-                c.was
+                (c.was, param_value(&c.value))
             };
             Assessment {
                 risk: Risk::WorldEdit,
                 resources: Vec::new(),
                 args: None,
-                reason: format!(
-                    "sets {} on {} from {was} to {}",
-                    c.name,
-                    c.node,
-                    param_value(&c.value)
-                ),
+                reason: format!("sets {} on {} from {was} to {to}", c.name, c.node),
             }
         }))
     }
@@ -448,8 +467,9 @@ impl Tool for ParamSet {
             .await
             .ok();
         let now = after.and_then(|a| a.first().map(|(_, v, _)| v.clone()));
+        // Hidden only what was read: a failed read-back says none either way.
         let (was, now) = if self.ctx.masked(&c.name) {
-            (json!("(hidden)"), Some(json!("(hidden)")))
+            (json!("(hidden)"), now.map(|_| json!("(hidden)")))
         } else {
             (c.was, now)
         };

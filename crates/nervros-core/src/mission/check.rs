@@ -20,6 +20,8 @@ const FOOTPRINT_SLACK_M: f64 = 0.05;
 /// How much lower a support's middle is than what rests on it: a mug's box in a tray can share
 /// the tray's height.
 const SUPPORT_BELOW_M: f64 = 0.1;
+/// The world model's state for an object it removed (`WorldObject.STATE_REMOVED`).
+const REMOVED: u64 = 2;
 
 /// One predicate's verdict.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -121,18 +123,32 @@ fn verdict(predicate: &str, seen: &Observed, since_s: f64) -> Verdict {
     match predicate_of(predicate) {
         Some(("at", args)) if args.len() == 1 => at(args[0], seen, out),
         Some(("holding", args)) if args.len() == 2 => {
-            let held = seen.state[format!("holding_{}", args[0])].as_str();
-            match held {
-                Some(h) => out(
-                    Some(h == args[1]),
-                    format!(
-                        "the {} hand holds {}",
-                        args[0],
-                        if h.is_empty() { "nothing" } else { h }
-                    ),
-                ),
-                None => out(None, "the executor's state is not available".to_owned()),
+            if seen.state[format!("holding_{}", args[0])]
+                .as_str()
+                .is_none()
+            {
+                return out(None, "the executor's state is not available".to_owned());
             }
+            // As the report reads a hand: one the executor cannot account for is no empty hand.
+            let held = crate::mission::held_by(&seen.state, args[0]);
+            if held == crate::mission::UNKNOWN_HELD {
+                return out(
+                    None,
+                    format!("what the {} hand holds is not known", args[0]),
+                );
+            }
+            out(
+                Some(held == args[1]),
+                format!(
+                    "the {} hand holds {}",
+                    args[0],
+                    if held.is_empty() {
+                        "nothing"
+                    } else {
+                        held.as_str()
+                    }
+                ),
+            )
         }
         Some(("arm_at", args)) if args.len() == 2 => arm_at(args[0], args[1], seen, out),
         Some(("inside" | "on", args)) if args.len() == 2 => {
@@ -145,7 +161,11 @@ fn verdict(predicate: &str, seen: &Observed, since_s: f64) -> Verdict {
                     format!("{} or {} is not in the world model", args[0], args[1]),
                 );
             };
-            if let Some(how) = placed(obj, host) {
+            // A stale or removed object's pose is where it was, not where it is.
+            let state = obj["state"].as_u64().unwrap_or(0);
+            if state == 0
+                && let Some(how) = placed(obj, host)
+            {
                 return out(Some(true), how.said(args[0], args[1]));
             }
             if let Some((moved, how)) = moved_as(&seen.objects, obj, host, since_s) {
@@ -163,10 +183,23 @@ fn verdict(predicate: &str, seen: &Observed, since_s: f64) -> Verdict {
                     ),
                 );
             }
-            out(
-                Some(false),
-                format!("{} is not within {}'s footprint", args[0], args[1]),
-            )
+            match state {
+                0 => out(
+                    Some(false),
+                    format!("{} is not within {}'s footprint", args[0], args[1]),
+                ),
+                REMOVED => out(
+                    Some(false),
+                    format!("the world model removed {}: it is no longer there", args[0]),
+                ),
+                _ => out(
+                    None,
+                    format!(
+                        "{} was looked for where it was last seen and not found",
+                        args[0]
+                    ),
+                ),
+            }
         }
         _ => out(None, "not a predicate NervROS can check".to_owned()),
     }
@@ -234,10 +267,7 @@ fn moved_as<'v>(
 
 /// The profile's place called `target`, by its name or an alias.
 fn place<'s>(seen: &'s Observed, target: &str) -> Option<&'s PlaceConfig> {
-    let same = |a: &str| a.eq_ignore_ascii_case(target);
-    seen.places
-        .iter()
-        .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)))
+    crate::places::find(&seen.places, target)
 }
 
 /// The world model's room `target`, by its id or name.
@@ -286,9 +316,10 @@ pub fn renamed(predicate: &str, names: &[(&str, String)]) -> String {
     format!("{name}({})", args.join(", "))
 }
 
-/// The world model's object that `id`'s words likeliest name, by its id and as `O27 (mug, last
-/// seen 2 min ago in the office, on desk O47)`: what a detector's own name, such as `mug_4`, is
-/// likely called there. A live one seen last wins: a stale one is rarely the one meant.
+/// The world model's object that `id`'s words name, by its id and as `O27 (mug, last seen 2 min
+/// ago in the office, on desk O47)`: what a detector's own name, such as `mug_4`, is called there.
+/// Only the one live object whose label holds every word of the name: with two mugs in view,
+/// `mug_4` is not whichever was seen last, and a red mug is not `red_block`.
 #[must_use]
 pub fn likeliest(seen: &Observed, id: &str, now_s: f64) -> Option<(String, String)> {
     let words: Vec<String> = words_of(id)
@@ -296,19 +327,18 @@ pub fn likeliest(seen: &Observed, id: &str, now_s: f64) -> Option<(String, Strin
         .filter(|w| w.len() > 2)
         .map(str::to_ascii_lowercase)
         .collect();
-    let gone = |o: &Value| o["state"].as_u64().is_some_and(|s| s != 0);
-    let best = seen.objects["objects"]
-        .as_array()?
-        .iter()
-        .filter(|o| {
-            let label = text(o, "label").to_ascii_lowercase();
-            words.iter().any(|w| label.contains(w.as_str()))
-        })
-        .min_by(|a, b| {
-            gone(a)
-                .cmp(&gone(b))
-                .then(seen_at(b).total_cmp(&seen_at(a)))
-        })?;
+    if words.is_empty() {
+        return None;
+    }
+    let mut matching = seen.objects["objects"].as_array()?.iter().filter(|o| {
+        let label = text(o, "label").to_ascii_lowercase();
+        let label: Vec<&str> = label.split_whitespace().collect();
+        o["state"].as_u64() == Some(0) && words.iter().all(|w| label.contains(&w.as_str()))
+    });
+    let best = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
     let described = describe_seen(best, seen, now_s);
     let (what, when) = described
         .split_once(": last seen")
@@ -547,10 +577,31 @@ fn seen_at(o: &Value) -> f64 {
 
 /// Whether an object's label or name is, or holds, `words`.
 pub(crate) fn named(o: &Value, words: &str) -> bool {
-    let words = words.to_lowercase();
-    [text(o, "label"), text(o, "name")]
-        .iter()
-        .any(|n| !n.is_empty() && n.to_lowercase().contains(&words))
+    // Whole words: a "cup" is not the "cupboard", nor a "pen" the "pencil".
+    let wanted = word_list(words);
+    !wanted.is_empty()
+        && [text(o, "label"), text(o, "name")].iter().any(|n| {
+            word_list(n)
+                .windows(wanted.len())
+                .any(|w| w == wanted.as_slice())
+        })
+}
+
+/// The words of `text`, lowercase, without what lies between them.
+fn word_list(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// `word` without one plural `s`: "mugs" is a mug, but "glass" stays a glass.
+pub(crate) fn singular(word: &str) -> &str {
+    if word.ends_with("ss") {
+        word
+    } else {
+        word.strip_suffix('s').unwrap_or(word)
+    }
 }
 
 /// The words of a name such as `mug_4` or `small_white_mug`, without its number.
@@ -559,6 +610,17 @@ pub(crate) fn words_of(name: &str) -> String {
         .filter(|p| !p.is_empty() && !p.chars().all(|c| c.is_ascii_digit()))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// How long ago, for people: "just now" under a minute (or for a time in the future), then
+/// "75 s ago", "12 min ago", "3 h ago", "5 days ago".
+#[must_use]
+pub fn ago(seconds: f64) -> String {
+    if seconds >= 60.0 {
+        format!("{} ago", how_long(seconds))
+    } else {
+        "just now".to_owned()
+    }
 }
 
 /// A duration for people: "40 s", "12 min", "3 h", "5 days".
@@ -717,16 +779,34 @@ mod tests {
         seen.objects["objects"][1]["last_seen"]["sec"] = json!(650.0);
         assert_eq!(
             check(&goal, &seen, 500.0)[0].ok,
-            Some(false),
-            "O17 seen elsewhere after the one in the tray: that one is another mug"
+            None,
+            "O17 seen elsewhere after the one in the tray: that one is another mug, and where \
+             O17 is now is not known"
         );
         seen.objects["objects"][1]["last_seen"]["sec"] = json!(550.0);
         seen.objects["objects"][2]["state"] = json!(1);
         assert_eq!(
             check(&goal, &seen, 500.0)[0].ok,
-            Some(false),
-            "one gone from the tray too"
+            None,
+            "one gone from the tray too: where O17 is now is not known"
         );
+    }
+
+    #[test]
+    fn a_stale_or_removed_object_is_not_judged_where_it_was() {
+        let goal = ["inside(O17, O31)".to_owned()];
+        let mut seen = seen();
+        assert_eq!(check(&goal, &seen, 0.0)[0].ok, Some(true));
+        seen.objects["objects"][0]["state"] = json!(1);
+        assert_eq!(
+            check(&goal, &seen, 0.0)[0].ok,
+            None,
+            "looked for, not found"
+        );
+        seen.objects["objects"][0]["state"] = json!(2);
+        let removed = &check(&goal, &seen, 0.0)[0];
+        assert_eq!(removed.ok, Some(false), "{}", removed.detail);
+        assert!(removed.detail.contains("removed O17"), "{}", removed.detail);
     }
 
     #[test]
@@ -769,12 +849,14 @@ mod tests {
     }
 
     #[test]
-    fn a_detectors_name_is_likeliest_the_live_object_seen_last() {
+    fn a_detectors_name_is_the_one_live_object_with_all_its_words() {
         let mut seen = seen();
         seen.objects = json!({"objects": [
-            {"id": "O27", "label": "mug", "state": 0, "last_seen": {"sec": 100, "nanosec": 0}},
+            {"id": "O27", "label": "mug", "state": 2, "last_seen": {"sec": 100, "nanosec": 0}},
             {"id": "O46", "label": "mug", "state": 1, "last_seen": {"sec": 990, "nanosec": 0}},
             {"id": "O818", "label": "mug", "state": 0, "last_seen": {"sec": 880, "nanosec": 0}},
+            {"id": "O5", "label": "red mug", "state": 1},
+            {"id": "O6", "label": "cupboard", "state": 0},
             {"id": "O9", "label": "dining table"}]});
         assert_eq!(
             likeliest(&seen, "mug_4", 1000.0),
@@ -785,6 +867,18 @@ mod tests {
             "not O46, seen later but looked for there since and not found"
         );
         assert_eq!(likeliest(&seen, "kettle_2", 1000.0), None);
+        assert_eq!(
+            likeliest(&seen, "red_block", 1000.0),
+            None,
+            "one word is not all"
+        );
+        assert_eq!(likeliest(&seen, "cup_2", 1000.0), None, "whole words only");
+        seen.objects["objects"][0]["state"] = json!(0);
+        assert_eq!(
+            likeliest(&seen, "mug_4", 1000.0),
+            None,
+            "two live mugs: which is not guessed"
+        );
         assert_eq!(
             renamed("inside(mug_4, O31)", &[("mug_4", "O818".to_owned())]),
             "inside(O818, O31)"

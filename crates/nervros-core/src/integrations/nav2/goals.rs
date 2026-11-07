@@ -40,7 +40,9 @@ pub(crate) fn destinations<'a>(ty: &str, payload: &'a Value) -> Destinations<'a>
         | "nav2_msgs/action/AssistedTeleop"
         | "nav2_msgs/action/ComputeRoute"
         | "nav2_msgs/action/ComputeAndTrackRoute"
-        | "nav2_msgs/action/FollowGPSWaypoints" => Destinations::Unchecked,
+        | "nav2_msgs/action/FollowGPSWaypoints"
+        | "nav2_msgs/action/DockRobot"
+        | "nav2_msgs/action/UndockRobot" => Destinations::Unchecked,
         _ => Destinations::Elsewhere,
     }
 }

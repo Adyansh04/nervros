@@ -50,10 +50,12 @@ mod report;
 mod tests;
 mod tool;
 
-pub use awaited::MissionEnd;
+pub use awaited::{MissionEnd, NotRun};
 use tool::RunMission;
 
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A route preview's wait: above the executor's own budget for one (`preview_total_s`, 12 s).
+const PREVIEW_TIMEOUT: Duration = Duration::from_secs(15);
 const WORLD_WAIT: Duration = Duration::from_secs(2);
 /// Plans kept for `run_mission`, newest last.
 const KEPT_PLANS: usize = 8;
@@ -146,6 +148,8 @@ pub enum Fault {
     Teleop,
     /// Another mission was running on the executor.
     Busy,
+    /// The executor ended it for a reason of its own: its tree threw, or a pause ran too long.
+    Executor,
     /// No result came: the executor went quiet or restarted.
     ExecutorLost,
     /// NervROS stopped while it ran.
@@ -154,13 +158,14 @@ pub enum Fault {
 
 impl Fault {
     /// In the order of the executor's `cause` codes, after `CAUSE_NONE`.
-    const BY_CAUSE: [Self; 6] = [
+    const BY_CAUSE: [Self; 7] = [
         Self::Robot,
         Self::Deadman,
         Self::Shutdown,
         Self::NoServer,
         Self::Teleop,
         Self::Busy,
+        Self::Executor,
     ];
 
     /// The fault an executor's `cause` names; none for `CAUSE_NONE` or a code it does not know.
@@ -180,6 +185,7 @@ impl Fault {
             Self::NoServer => "no_server",
             Self::Teleop => "teleop",
             Self::Busy => "busy",
+            Self::Executor => "executor",
             Self::ExecutorLost => "executor_lost",
             Self::Interrupted => "interrupted",
         }
@@ -210,6 +216,10 @@ impl Fault {
             Self::Busy => {
                 "Another mission was running on the robot. Do not retry until the operator says \
                  it is free."
+            }
+            Self::Executor => {
+                "The executor ended it for a reason of its own, which says nothing about the plan. \
+                 Tell the operator what it said; run it again only if they ask."
             }
             Self::ExecutorLost => {
                 "The link to the executor was lost, so how the mission ended is unknown. Do not \
@@ -272,11 +282,15 @@ pub struct Missions {
     profile: Profile,
     config: MissionConfig,
     catalog: Mutex<Option<Arc<Catalog>>>,
+    /// The executor run the catalog came from.
+    catalog_boot: Mutex<Option<String>>,
     /// When fetching the catalog last failed: a robot without an executor is not asked again
     /// before every turn.
     catalog_failed: Mutex<Option<Instant>>,
     planned: Mutex<VecDeque<Compiled>>,
     running: Mutex<Option<Running>>,
+    /// Told whenever the slot is freed.
+    freed: tokio::sync::Notify,
     plan_failures: AtomicU32,
     /// Missions of the operator's latest request that failed.
     run_failures: AtomicU32,
@@ -310,6 +324,9 @@ pub struct Missions {
     questioned: AtomicBool,
     /// Whether the running mission is paused, as its feedback last said.
     paused: AtomicBool,
+    /// Whether the executor took a pause it has not reported yet: a pick finishes before it
+    /// pauses, and a resume said meanwhile is still an order.
+    pause_asked: AtomicBool,
     /// The skills taught in this session that wait for a mission to keep them.
     drafts: learn::Drafts,
     /// The operator's goals, judged after every mission.
@@ -386,9 +403,11 @@ impl Missions {
             profile: profile.clone(),
             config,
             catalog: Mutex::default(),
+            catalog_boot: Mutex::default(),
             catalog_failed: Mutex::default(),
             planned: Mutex::default(),
             running: Mutex::default(),
+            freed: tokio::sync::Notify::new(),
             plan_failures: AtomicU32::new(0),
             run_failures: AtomicU32::new(0),
             said: AtomicU32::new(0),
@@ -405,6 +424,7 @@ impl Missions {
             guard: OnceLock::new(),
             questioned: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            pause_asked: AtomicBool::new(false),
             drafts: learn::Drafts::default(),
             goals: OnceLock::new(),
             inbox: OnceLock::new(),
@@ -469,6 +489,11 @@ impl Missions {
     /// The robot the missions run on.
     pub(crate) fn robot(&self) -> &Arc<dyn RobotPort> {
         &self.robot
+    }
+
+    /// The keep-out zone a point of the map is in, if any.
+    pub(crate) fn keep_out_at(&self, x: f64, y: f64) -> Option<crate::zones::Zone> {
+        self.guard.get()?.zones()?.at(x, y)
     }
 
     /// Where the world model publishes its objects.
@@ -609,8 +634,8 @@ impl Missions {
     #[must_use]
     pub fn pause_order(&self, text: &str) -> Option<bool> {
         let on = crate::session::pause_word(text)?;
-        (self.config.pause.is_some() && self.busy() && on != self.paused.load(Ordering::SeqCst))
-            .then_some(on)
+        let paused = self.paused.load(Ordering::SeqCst) || self.pause_asked.load(Ordering::SeqCst);
+        (self.config.pause.is_some() && self.busy() && on != paused).then_some(on)
     }
 
     /// Pauses the running mission, or with `on` false lets it go on, through the executor's
@@ -628,7 +653,12 @@ impl Missions {
                 )
                 .await
             {
-                Ok(r) => r["message"].as_str().unwrap_or_default().to_owned(),
+                Ok(r) => {
+                    if r["ok"].as_bool() == Some(true) {
+                        self.pause_asked.store(on, Ordering::SeqCst);
+                    }
+                    r["message"].as_str().unwrap_or_default().to_owned()
+                }
                 Err(e) => format!(
                     "the robot did not answer the {}: {e}",
                     if on { "pause" } else { "resume" }
@@ -649,12 +679,15 @@ impl Missions {
         lock(&self.catalog).clone()
     }
 
-    /// Reads the catalog again now: a skill was taught or forgotten, and the next plan and the
-    /// window's list of taught skills both need it as it is. A plan that failed before may work
-    /// now, though it reads the same: it names the skill, not its new body.
-    pub(crate) async fn reload_catalog(&self) {
+    /// Reads the catalog again now: a skill was taught, kept or forgotten, and the next plan and
+    /// the window's list of taught skills both need it as it is. With a `new_body`, a plan that
+    /// failed before may work now though it reads the same, as it names the skill, not its body;
+    /// keeping or forgetting one changes no body, so the guard against rerunning it stands.
+    pub(crate) async fn reload_catalog(&self, new_body: bool) {
         *lock(&self.catalog) = None;
-        *lock(&self.last) = None;
+        if new_body {
+            *lock(&self.last) = None;
+        }
         let _ = self.catalog().await;
     }
 
@@ -676,6 +709,21 @@ impl Missions {
         let mut running = lock(&self.running);
         if running.as_ref().is_some_and(|r| r.id == id) {
             *running = None;
+            self.freed.notify_waiters();
+        }
+    }
+
+    /// Returns once no mission holds the slot.
+    pub(crate) async fn idle(&self) {
+        loop {
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            // Listening before the look, so a release between the two is not missed.
+            freed.as_mut().enable();
+            if !self.busy() {
+                return;
+            }
+            freed.await;
         }
     }
 }

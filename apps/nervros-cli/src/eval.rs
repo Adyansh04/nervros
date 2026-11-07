@@ -411,7 +411,9 @@ async fn run_case(run: &Run<'_>, case: &Case, model: Option<&str>, trial: usize)
     };
     let began = Instant::now();
     for text in &case.say {
-        if say(&agent.session, &mut events, text, deadline, true, &mut seen).await {
+        if say(&agent.session, &mut events, text, deadline, true, &mut seen).await
+            != nervros_core::evalcase::Said::Finished
+        {
             seen.timed_out = true;
             // A case over its time stops the robot rather than leave it running into the next.
             agent.session.send(Command::StopMission);

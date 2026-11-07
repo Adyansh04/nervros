@@ -14,6 +14,10 @@ use super::plan::StepArg;
 
 /// How many of a step's latest runs its track record counts.
 const TRACK_RUNS: u32 = 20;
+/// How long missions and gaps are kept: a robot that runs for years would read ever more of them.
+const KEEP_S: f64 = 180.0 * 24.0 * 3600.0;
+/// A gap noted again within this long is the same request asked again, not a new one.
+const GAP_REPEAT_S: f64 = 3600.0;
 
 const SCHEMA: &str = "
     PRAGMA journal_mode = WAL;
@@ -125,6 +129,17 @@ pub struct Track {
     pub last_failure: Option<String>,
 }
 
+impl Track {
+    /// A record as the operator reads it: "3 of 4", or "no runs" without one.
+    #[must_use]
+    pub fn said(track: Option<&Self>) -> String {
+        track.map_or_else(
+            || "no runs".to_owned(),
+            |t| format!("{} of {}", t.succeeded, t.runs),
+        )
+    }
+}
+
 /// A plan the operator saved by name, to run again.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Template {
@@ -193,7 +208,9 @@ impl Ledger {
             // A failure here shows as the open's own error.
             let _ = std::fs::create_dir_all(dir);
         }
-        Self::with(Connection::open(path)?)
+        let ledger = Self::with(Connection::open(path)?)?;
+        ledger.prune(crate::now_s() - KEEP_S)?;
+        Ok(ledger)
     }
 
     /// A ledger kept in memory and gone when dropped: tests, and a robot with no state folder.
@@ -234,6 +251,14 @@ impl Ledger {
             )?;
         }
         Ok(Arc::new(Self { db: Mutex::new(db) }))
+    }
+
+    /// Lets go of the missions and gaps older than `before_s`.
+    fn prune(&self, before_s: f64) -> rusqlite::Result<()> {
+        let db = self.db();
+        db.execute("DELETE FROM missions WHERE started < ?1", [before_s])?;
+        db.execute("DELETE FROM gaps WHERE at < ?1", [before_s])?;
+        Ok(())
     }
 
     fn db(&self) -> MutexGuard<'_, Connection> {
@@ -372,15 +397,15 @@ impl Ledger {
         Ok(Some(track))
     }
 
-    /// How `skill` went in its latest runs, on whatever it acted on: runs and successes, counted
-    /// as [`Self::track`] counts them.
+    /// How `skill` went in its latest runs of missions that started at `since_s` or later, on
+    /// whatever it acted on: runs and successes, counted as [`Self::track`] counts them.
     ///
     /// # Errors
     ///
     /// The read failed.
-    pub fn skill_runs(&self, skill: &str) -> rusqlite::Result<(u32, u32)> {
+    pub fn skill_runs(&self, skill: &str, since_s: f64) -> rusqlite::Result<(u32, u32)> {
         Ok(self
-            .tally(skill, None, 0.0)?
+            .tally(skill, None, since_s)?
             .map_or((0, 0), |t| (t.runs, t.succeeded)))
     }
 
@@ -531,15 +556,16 @@ impl Ledger {
             > 0)
     }
 
-    /// Notes a request the skills could not do.
+    /// Notes a request the skills could not do, once within [`GAP_REPEAT_S`].
     ///
     /// # Errors
     ///
     /// The write failed.
     pub fn note_gap(&self, request: &str, reason: &str, nearest: &str) -> rusqlite::Result<()> {
         self.db().execute(
-            "INSERT INTO gaps VALUES (?1, ?2, ?3, ?4)",
-            params![crate::now_s(), request, reason, nearest],
+            "INSERT INTO gaps SELECT ?1, ?2, ?3, ?4 WHERE NOT EXISTS (
+                 SELECT 1 FROM gaps WHERE request = ?2 AND reason = ?3 AND at > ?1 - ?5)",
+            params![crate::now_s(), request, reason, nearest, GAP_REPEAT_S],
         )?;
         Ok(())
     }
@@ -718,7 +744,12 @@ mod tests {
             .record(&mission("m5", 500.0, ("failure", 25.0, "slipped")))
             .unwrap();
 
-        assert_eq!(ledger.skill_runs("PickObject").unwrap(), (2, 1));
+        assert_eq!(ledger.skill_runs("PickObject", 0.0).unwrap(), (2, 1));
+        assert_eq!(
+            ledger.skill_runs("PickObject", 400.0).unwrap(),
+            (1, 0),
+            "taught again at 400 s: only its own runs"
+        );
         let walks = ledger.track("GoToPlace", "dining_table_side").unwrap();
         assert_eq!(
             walks.unwrap().runs,
@@ -840,6 +871,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ledger.gaps(5).unwrap()[0].nearest, "PlaceInto");
+        ledger
+            .note_gap(
+                "put the mug on the sofa",
+                "PlaceInto takes only tray_1",
+                "PlaceInto",
+            )
+            .unwrap();
+        assert_eq!(ledger.gaps(5).unwrap().len(), 1, "asked again, noted once");
+    }
+
+    #[test]
+    fn missions_older_than_the_keep_time_go_at_the_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = Ledger::open(&path).unwrap();
+        let now = crate::now_s();
+        for (id, started) in [("old", now - KEEP_S - 60.0), ("new", now)] {
+            ledger
+                .record(&MissionRecord {
+                    id: id.to_owned(),
+                    started,
+                    ended: started,
+                    outcome: "success".to_owned(),
+                    ..MissionRecord::default()
+                })
+                .unwrap();
+        }
+        drop(ledger);
+        let ledger = Ledger::open(&path).unwrap();
+        let kept: Vec<String> = ledger
+            .recent(10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(kept, ["new"]);
     }
 
     #[test]

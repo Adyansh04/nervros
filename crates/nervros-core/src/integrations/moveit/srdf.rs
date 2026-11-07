@@ -88,18 +88,27 @@ impl Srdf {
                     srdf.groups.push(group);
                 }
                 "group_state" => {
-                    let joints = node
+                    let joints: Option<Vec<(String, f64)>> = node
                         .children()
                         .filter(|j| j.has_tag_name("joint"))
-                        .filter_map(|j| {
-                            Some((attr(j, "name"), j.attribute("value")?.trim().parse().ok()?))
+                        .map(|j| {
+                            let value: f64 = j.attribute("value")?.trim().parse().ok()?;
+                            value.is_finite().then(|| (attr(j, "name"), value))
                         })
                         .collect();
-                    srdf.poses.push(NamedPose {
-                        name: attr(node, "name"),
-                        group: attr(node, "group"),
-                        joints,
-                    });
+                    // A pose short of a joint would move the arm somewhere else, or nowhere.
+                    if let Some(joints) = joints.filter(|j| !j.is_empty()) {
+                        srdf.poses.push(NamedPose {
+                            name: attr(node, "name"),
+                            group: attr(node, "group"),
+                            joints: joints.into_iter().collect(),
+                        });
+                    } else {
+                        tracing::warn!(
+                            pose = %attr(node, "name"),
+                            "the SRDF pose has a joint value that is not a number; left out"
+                        );
+                    }
                 }
                 "end_effector" => srdf.end_effectors.push(EndEffector {
                     name: attr(node, "name"),
@@ -217,6 +226,7 @@ mod tests {
   <group_state name="home" group="right_arm"><joint name="shoulder" value="0"/><joint name="elbow" value="1.2"/></group_state>
   <group_state name="tucked" group="right_arm"><joint name="shoulder" value="-0.4"/><joint name="elbow" value="2.0"/></group_state>
   <group_state name="open" group="right_hand"><joint name="right_finger_joint" value="0.0"/></group_state>
+  <group_state name="broken" group="right_arm"><joint name="shoulder" value="0"/><joint name="elbow" value="up"/></group_state>
   <end_effector name="right_gripper" parent_link="right_palm" group="right_hand" parent_group="right_arm"/>
   <disable_collisions link1="a" link2="b" reason="Never"/>
 </robot>"#;

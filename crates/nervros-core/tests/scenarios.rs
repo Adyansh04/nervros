@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nervros_core::evalcase::{Expect, Seen, judge, say};
+use nervros_core::evalcase::{Expect, Said, Seen, judge, say};
 use nervros_core::llm::{AgentBuilder, AgentSource, LlmError};
 use nervros_core::providers::Role;
 use nervros_core::providers::router::Need;
@@ -143,6 +143,7 @@ async fn run(path: &Path) -> Result<Vec<String>, String> {
             &mut seen,
         )
         .await
+            != Said::Finished
         {
             seen.timed_out = true;
             break;

@@ -10,7 +10,6 @@ use image::{Rgb, RgbImage};
 use nervros_ros::RobotPort;
 use serde_json::{Value, json};
 
-use crate::llm::ImageInput;
 use crate::segment::{Outliner, inside};
 use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 use crate::vision::{Cameras, Instance, SnapshotStore, draw_marks, marks_json};
@@ -59,7 +58,10 @@ pub fn parse_points(text: &str, width: u32, height: u32) -> Vec<Pointed> {
             let open = after.find('[')?;
             // A `]` of the prose before the point's own `[` is not its end.
             let inner = &after[open + 1..open + after[open..].find(']')?];
-            let mut numbers = inner.split(',').map(|n| n.trim().parse::<f64>().ok());
+            // "NaN" and "inf" parse as numbers, and would place an invented point.
+            let mut numbers = inner
+                .split(',')
+                .map(|n| n.trim().parse::<f64>().ok().filter(|v| v.is_finite()));
             let (y, x) = (numbers.next()??, numbers.next()??);
             let label = entry
                 .find("\"label\"")
@@ -166,27 +168,36 @@ impl PointTool {
         // on the marks they are reported with.
         let (dets, frame, _, _) = camera.marked(self.robot.as_ref(), newest).await;
         let marks = dets.instances;
-        let img = frame.to_rgb().map_err(|e| e.to_string())?;
-        let image = ImageInput::jpeg(&img)?;
+        let (img, image) = crate::vision::rgb_for_model(Arc::clone(&frame)).await?;
         let (answer, model) = self.pointer.outline(&point_prompt(what), image).await?;
         tracing::debug!(%model, %answer, "points");
         let points = parse_points(&answer, img.width(), img.height());
-        let mut drawn = img;
-        draw_marks(&mut drawn, &marks);
+        // Drawn and encoded off the threads that serve the stop.
+        let (to_draw, rings): (Vec<Instance>, Vec<(u32, u32)>) =
+            (marks.clone(), points.iter().map(|p| (p.x, p.y)).collect());
+        let (drawn, jpeg) = tokio::task::spawn_blocking(move || {
+            let mut drawn = img;
+            draw_marks(&mut drawn, &to_draw);
+            for (x, y) in rings {
+                ring(&mut drawn, x, y);
+            }
+            let jpeg = crate::vision::jpeg(&drawn)?;
+            Ok::<_, String>((drawn, jpeg))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         let listed: Vec<Value> = points
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                ring(&mut drawn, p.x, p.y);
-                let mut entry = json!({"point": i + 1, "label": p.label, "px": [p.x, p.y]});
+                let mut entry = json!({"point": i + 1, "label": crate::tools::world_label(&p.label), "px": [p.x, p.y]});
                 if let Some(m) = mark_at(&marks, p.x, p.y) {
                     entry["mark"] = json!(m + 1);
-                    entry["mark_label"] = json!(marks[m].label);
+                    entry["mark_label"] = json!(crate::tools::world_label(&marks[m].label));
                 }
                 entry
             })
             .collect();
-        let jpeg = crate::vision::jpeg(&drawn)?;
         let marks_listed = marks_json(&marks);
         let snapshot = self
             .snapshots
@@ -227,6 +238,7 @@ impl Tool for PointTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::ImageInput;
 
     #[test]
     fn points_are_read_as_y_then_x_with_their_labels() {
@@ -290,7 +302,7 @@ mod tests {
         let point = PointTool::new(cameras, robot, Arc::default(), Arc::new(Bin));
         let out = point.call(json!({"what": "the bin"})).await;
         assert_eq!(
-            out.data["points"][0]["mark_label"], "dustbin",
+            out.data["points"][0]["mark_label"], "<world>dustbin</world>",
             "{}",
             out.data
         );

@@ -198,11 +198,21 @@ impl Tool for Remember {
                         (n, Match::All) => format!("its {n} checks hold"),
                         (n, Match::Any) => format!("one of its {n} checks holds"),
                     };
+                    // Loaded last, a remembered playbook stands in for one of its id from then on.
+                    let replaces =
+                        self.0
+                            .shadowed(&book.id)
+                            .map_or_else(String::new, |(t, from)| {
+                                format!(
+                                    "; it replaces the robot's own playbook `{}` (\"{t}\", {from})",
+                                    book.id
+                                )
+                            });
                     Assessment {
                         risk: Risk::Annotate,
                         resources: Vec::new(),
                         reason: format!(
-                            "remembers \"{}\": when {when}, {}",
+                            "remembers \"{}\": when {when}, {}{replaces}",
                             book.title, book.verdict
                         ),
                         args: None,

@@ -126,7 +126,11 @@ pub fn draw_marks(img: &mut RgbImage, instances: &[Instance]) {
         tint(img, inst, colour);
         let (bx, by, bw, bh) = inst.bbox;
         let (left, top) = (i64::from(bx), i64::from(by));
-        let (right, bottom) = (left + i64::from(bw), top + i64::from(bh));
+        // Drawn within the image only, however large the box.
+        let (right, bottom) = (
+            (left + i64::from(bw)).min(i64::from(img.width())),
+            (top + i64::from(bh)).min(i64::from(img.height())),
+        );
         for t in 0..2 {
             for col in left..=right {
                 put(img, (col, top + t), colour);
@@ -146,10 +150,11 @@ pub fn draw_marks(img: &mut RgbImage, instances: &[Instance]) {
 pub(crate) fn close_up(img: &RgbImage, (x, y, w, h): (u32, u32, u32, u32)) -> RgbImage {
     let margin = |side: u32| (side / 4).max(24);
     let (mx, my) = (margin(w), margin(h));
-    let x0 = x.saturating_sub(mx);
-    let y0 = y.saturating_sub(my);
-    let x1 = (x + w + mx).min(img.width());
-    let y1 = (y + h + my).min(img.height());
+    // A box past the frame's edge crops to nothing rather than below zero.
+    let x0 = x.saturating_sub(mx).min(img.width());
+    let y0 = y.saturating_sub(my).min(img.height());
+    let x1 = x.saturating_add(w).saturating_add(mx).min(img.width());
+    let y1 = y.saturating_add(h).saturating_add(my).min(img.height());
     let crop = image::imageops::crop_imm(img, x0, y0, x1 - x0, y1 - y0).to_image();
     let long = crop.width().max(crop.height()).max(1);
     if long >= CLOSE_UP_PX {

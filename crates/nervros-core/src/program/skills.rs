@@ -1,8 +1,9 @@
 //! The skills a program's text says it runs, read before it runs so the approval can name them:
 //! each `run("Skill", ...)`, a call of a skill by its name, `find(...)` for `FindInView` and
-//! `walk(...)` for `GoToPlace`. Comments
-//! and strings are skipped, so text inside them names nothing. The envelope is enforced again on
-//! every mission the program sends, so a call this misses is refused, never let through.
+//! `walk(...)` for `GoToPlace`. Comments and strings are skipped, so text inside them names
+//! nothing, but the code inside a backtick string's `${...}` is read; a call through `Fn`, `call`
+//! or `curry` is refused. The envelope is enforced again on every mission the program sends, so a
+//! call this misses is refused, never let through.
 
 use std::collections::BTreeSet;
 
@@ -25,6 +26,22 @@ pub fn named_in(source: &str, callable: &[SkillCall]) -> Result<BTreeSet<String>
                 i.checked_sub(1).and_then(|p| tokens.get(p)),
                 Some(Token::Punct('.'))
             );
+        // A function pointer runs what the text does not name: the approval could not say.
+        let method = matches!(
+            i.checked_sub(1).and_then(|p| tokens.get(p)),
+            Some(Token::Punct('.'))
+        );
+        if (*name == "Fn" && called)
+            || (method
+                && matches!(*name, "call" | "curry")
+                && tokens.get(i + 1) == Some(&Token::Punct('(')))
+        {
+            return Err(
+                "call each skill by its name or with run(\"Skill\", ...), not through Fn, call or \
+                 curry, so the approval can say what the program runs"
+                    .to_owned(),
+            );
+        }
         if !called {
             continue;
         }
@@ -95,10 +112,12 @@ fn tokens(source: &str) -> Vec<Token<'_>> {
                 while i < bytes.len() && bytes[i] != c {
                     i += if bytes[i] == b'\\' { 2 } else { 1 };
                 }
+                let text = source.get(start..i.min(bytes.len())).unwrap_or("");
                 if c == b'"' {
-                    out.push(Token::Str(
-                        source.get(start..i.min(bytes.len())).unwrap_or(""),
-                    ));
+                    out.push(Token::Str(text));
+                } else if c == b'`' {
+                    // Code inside `${...}` runs: its calls count as the program's own.
+                    out.extend(interpolated(text).flat_map(tokens));
                 }
                 i += 1;
             }
@@ -119,12 +138,41 @@ fn tokens(source: &str) -> Vec<Token<'_>> {
     out
 }
 
+/// The code inside each `${...}` of a backtick string's text.
+fn interpolated(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        let start = rest.find("${")? + 2;
+        let mut depth = 1;
+        let end = rest[start..].char_indices().find_map(|(i, c)| {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(start + i)
+        })?;
+        let code = &rest[start..end];
+        rest = &rest[end + 1..];
+        Some(code)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn calls_inside_interpolation_count_and_indirect_calls_are_refused() {
+        let named = named_in("say(`took ${run(\"Wave\", #{})}`);", &[]).unwrap();
+        assert_eq!(named, set(&["Wave"]));
+        assert!(named_in("let f = Fn(\"walk\"); f.call(\"kitchen\");", &[]).is_err());
+        assert!(named_in("let f = |x| x; f.call(1);", &[]).is_err());
+        assert_eq!(named_in("say(`${1 + 2} mugs`);", &[]).unwrap(), set(&[]));
     }
 
     #[test]

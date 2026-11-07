@@ -14,8 +14,9 @@ use crate::tools::{Risk, Tool, ToolOutcome, ToolSpec};
 
 /// A skill's text past this many characters is cut: a procedure, not a manual.
 const BODY_CHARS: usize = 6000;
-/// A description past this many characters is cut in the prompt's index.
-const DESCRIPTION_CHARS: usize = 200;
+/// A description past this many characters is cut in the prompt's index: room for when to use
+/// a skill and when not.
+const DESCRIPTION_CHARS: usize = 300;
 
 /// One skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +87,10 @@ pub(crate) fn parse(text: &str) -> Result<Skill, String> {
     let description = field("description")
         .filter(|d| !d.is_empty())
         .ok_or("it says nothing of when to use it (description)")?;
+    // Only one-line values are read: a folded or literal block would be read as its marker.
+    if description.starts_with(['>', '|']) {
+        return Err("its description is a YAML block: write it on the description line".to_owned());
+    }
     Ok(Skill {
         name,
         description,
@@ -192,6 +197,10 @@ mod tests {
         assert_eq!(skill.body, "# Nav2\n1. Check robot_state.");
         assert!(parse("# no front matter").is_err());
         assert!(parse("---\nname: Bad Name\ndescription: d\n---\nx").is_err());
+        assert!(
+            parse("---\nname: folded\ndescription: >\n  when\n---\nx").is_err(),
+            "a block description would read as its marker"
+        );
     }
 
     #[test]

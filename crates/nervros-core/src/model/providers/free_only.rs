@@ -34,6 +34,11 @@ pub enum FreeOnlyError {
     /// The price list has no entry for the model.
     #[error("model `{0}` is not in the provider's price list")]
     NotListed(String),
+    /// Extra request parameters that could route the call to another, paid, model.
+    #[error(
+        "model `{0}`: `params` may not route an OpenRouter call (`{1}`); name the :free model alone"
+    )]
+    Routed(String, String),
     /// `free_only = false` on OpenRouter.
     #[error("provider `{0}`: free_only cannot be turned off; NervROS calls free models only")]
     TurnedOff(String),
@@ -84,6 +89,23 @@ pub fn check_openrouter_id(id: &str) -> Result<(), FreeOnlyError> {
     Ok(())
 }
 
+/// Checks that a model's extra request parameters cannot make OpenRouter answer from another
+/// model than its `:free` id, through a model list, a fallback route or a provider choice.
+///
+/// # Errors
+///
+/// [`FreeOnlyError::Routed`] naming the parameter.
+pub fn check_openrouter_params(id: &str, params: Option<&Value>) -> Result<(), FreeOnlyError> {
+    let routing = ["models", "model", "route", "provider"];
+    match params
+        .and_then(Value::as_object)
+        .and_then(|p| routing.into_iter().find(|k| p.contains_key(*k)))
+    {
+        Some(key) => Err(FreeOnlyError::Routed(id.to_owned(), key.to_owned())),
+        None => Ok(()),
+    }
+}
+
 /// Checks OpenRouter's `/api/v1/models` response: every price of every id must be zero.
 ///
 /// # Errors
@@ -123,6 +145,18 @@ pub fn check_prices(models_json: &Value, ids: &[&str]) -> Result<(), FreeOnlyErr
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn params_that_could_route_to_another_model_are_refused() {
+        let id = "qwen/qwen3-8b:free";
+        assert!(check_openrouter_params(id, None).is_ok());
+        assert!(check_openrouter_params(id, Some(&json!({"temperature": 0.2}))).is_ok());
+        let routed = json!({"models": ["openai/gpt-5"], "route": "fallback"});
+        assert!(matches!(
+            check_openrouter_params(id, Some(&routed)),
+            Err(FreeOnlyError::Routed(_, _))
+        ));
+    }
 
     #[test]
     fn only_explicit_free_variants_pass() {

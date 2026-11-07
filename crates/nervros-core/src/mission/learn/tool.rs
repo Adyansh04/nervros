@@ -78,6 +78,14 @@ impl TeachSkill {
                 "`name` is the skill's, such as PointAt",
             ));
         }
+        // A skill NervROS runs itself, or the planner's own walk, would be shadowed by the taught
+        // one at the executor while every check still read it as NervROS's.
+        let native = catalog.skill(name).is_some_and(|s| !s.native.is_empty());
+        if native || name == crate::mission::catalog::GO_TO_PLACE {
+            return Err(ToolOutcome::refused(format!(
+                "{name} is a skill NervROS runs itself; teach this one under another name"
+            )));
+        }
         let world_args: Vec<&str> = args["args"]
             .as_array()
             .map_or(&[][..], Vec::as_slice)
@@ -117,12 +125,19 @@ impl TeachSkill {
             .map_or(&[][..], Vec::as_slice)
             .iter()
             .map(|a| {
-                json!({
+                let mut arg = json!({
                     "name": a["name"], "type": a["type"].as_str().unwrap_or("string"),
                     "format": a["format"].as_str().unwrap_or_default(),
                     "description": a["description"].as_str().unwrap_or_default(),
                     "enum": a["enum"].as_array().cloned().unwrap_or_default(),
-                })
+                });
+                // A number takes its range, which the executor requires of one.
+                for bound in ["min", "max"] {
+                    if let Some(v) = a[bound].as_f64() {
+                        arg[bound] = json!(v);
+                    }
+                }
+                arg
             })
             .collect();
         Ok(json!({
@@ -372,7 +387,8 @@ impl Missions {
                 problems.join("; ")
             });
         }
-        self.reload_catalog().await;
+        self.reload_catalog(request["keep"].as_bool() != Some(true))
+            .await;
         Ok(())
     }
 
@@ -392,7 +408,7 @@ impl Missions {
             .call(service, FORGET, json!({"name": name}), SERVICE_TIMEOUT)
             .await
             .map_err(|e| format!("the executor did not answer: {e}"))?;
-        self.reload_catalog().await;
+        self.reload_catalog(false).await;
         if reply["ok"].as_bool() == Some(true) {
             Ok(())
         } else {

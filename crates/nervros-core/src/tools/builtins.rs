@@ -331,7 +331,13 @@ impl Tool for Stop {
 
     async fn call(&self, args: Value) -> ToolOutcome {
         let Some(m) = &self.mission else {
-            self.integrations.stop().await;
+            let moving = self.integrations.stop().await;
+            if !moving.is_empty() {
+                return ToolOutcome::failed(format!(
+                    "these may still be moving: {}",
+                    moving.join("; ")
+                ));
+            }
             return ToolOutcome::ok(
                 json!({"stopped": true, "note": "this robot has no mission executor; NervROS cancelled its own goals"}),
             );
@@ -348,8 +354,11 @@ impl Tool for Stop {
                 Duration::from_secs(5),
             )
             .await;
-        self.integrations.stop().await;
+        let moving = self.integrations.stop().await;
         match stopped {
+            Ok(_) if !moving.is_empty() => {
+                ToolOutcome::failed(format!("these may still be moving: {}", moving.join("; ")))
+            }
             Ok(r) if r["ok"].as_bool() == Some(true) => {
                 ToolOutcome::ok(json!({"stopped": true, "state": r["state_after"]}))
             }

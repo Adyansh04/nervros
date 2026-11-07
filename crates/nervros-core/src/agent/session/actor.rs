@@ -19,6 +19,13 @@ use crate::llm::{AgentSource, History};
 use crate::lock;
 use crate::tools::{Registry, Status};
 
+/// How long a stop of the robot may go unanswered before the operator is told it may still move.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Mission reports kept while a turn runs; older ones give way.
+const MAX_QUEUED_REPORTS: usize = 16;
+/// Notes kept for the operator's next message; older ones give way.
+const MAX_NOTES: usize = 8;
+
 #[expect(
     clippy::too_many_lines,
     reason = "one arm per command, each a few lines"
@@ -37,6 +44,7 @@ pub(super) async fn actor(
     // Calls the operator made from the window, which a stop of the robot ends too.
     let mut operator_runs: Vec<JoinHandle<()>> = Vec::new();
     let mut reports: Vec<String> = Vec::new();
+    let mut dropped_reports = 0_usize;
     // Nobody asked for a report's reply, so a message sent during one waits for it, not refused.
     let (mut answering_report, mut queued) = (false, None::<String>);
     let start = |turn: u64, origin: Origin, history: &History| {
@@ -49,6 +57,13 @@ pub(super) async fn actor(
             Arc::clone(&source),
             Arc::clone(&registry),
         );
+        // Ended by itself, the turn's own history says what happened; cut off, `working` does.
+        let ran = Arc::clone(&shared);
+        let task = async move {
+            let out = task.await;
+            lock(&ran.working).take();
+            out
+        };
         let task = limited(turn, Arc::clone(&shared), task).instrument(span);
         (turn, tokio::spawn(task))
     };
@@ -92,12 +107,29 @@ pub(super) async fn actor(
                         running = Some(start(turns, Origin::User(text), &history));
                         answering_report = false;
                     }
-                    Command::Note(text) => lock(&shared.notes).push(text),
+                    Command::Note(text) => {
+                        // The newest few: they wait for the operator's next message.
+                        let mut notes = lock(&shared.notes);
+                        if notes.len() >= MAX_NOTES {
+                            notes.remove(0);
+                        }
+                        notes.push(text);
+                    }
+                    Command::Resync => shared.emit(Event::Open {
+                        approvals: lock(&shared.approvals).keys().copied().collect(),
+                        turn: running.is_some(),
+                    }),
                     Command::Report(text) => {
+                        // A turn that runs long while schedules keep reporting would otherwise
+                        // gather reports without end; the newest say where things stand.
+                        if reports.len() >= MAX_QUEUED_REPORTS {
+                            reports.remove(0);
+                            dropped_reports += 1;
+                        }
                         reports.push(text);
                         if running.is_none() {
                             turns += 1;
-                            running = Some(start(turns, Origin::Report(reports.split_off(0).join("\n\n")), &history));
+                            running = Some(start(turns, Origin::Report(take_reports(&mut reports, &mut dropped_reports)), &history));
                             answering_report = true;
                         }
                     }
@@ -108,6 +140,7 @@ pub(super) async fn actor(
                         }
                         if let Some((turn, handle)) = running.take() {
                             handle.abort();
+                            cut_off(&shared, &mut history);
                             shared.emit(Event::TurnFinished { turn });
                         }
                         if mission {
@@ -117,7 +150,15 @@ pub(super) async fn actor(
                         // Esc stops the reply to say something else: what was said meanwhile goes
                         // now. A stop of the robot drops it.
                         let said = std::mem::take(&mut *lock(&shared.steer));
-                        if !said.is_empty() && !mission {
+                        if !said.is_empty() && mission {
+                            shared.emit(Event::Notice {
+                                text: format!(
+                                    "the stop dropped what you said meanwhile (\"{}\"); say it \
+                                     again if it still holds",
+                                    said.join(" ")
+                                ),
+                            });
+                        } else if !said.is_empty() {
                             turns += 1;
                             running = Some(start(turns, Origin::User(said.join(" ")), &history));
                             answering_report = false;
@@ -176,6 +217,8 @@ pub(super) async fn actor(
                     if let Ok(Some(updated)) = done {
                         history = updated;
                         save(&shared, &history);
+                    } else {
+                        cut_off(&shared, &mut history);
                     }
                     shared.emit(Event::TurnFinished { turn });
                 }
@@ -187,7 +230,7 @@ pub(super) async fn actor(
                     answering_report = false;
                 } else if !reports.is_empty() {
                     turns += 1;
-                    running = Some(start(turns, Origin::Report(reports.split_off(0).join("\n\n")), &history));
+                    running = Some(start(turns, Origin::Report(take_reports(&mut reports, &mut dropped_reports)), &history));
                     answering_report = true;
                 }
             }
@@ -219,32 +262,41 @@ fn halt(shared: &Arc<Shared>, robot: bool) {
     for id in pending {
         shared.answer(id, Answer::Deny);
     }
-    // Turned down, so not left for the next session to ask again.
-    let waited = !std::mem::take(&mut *lock(&shared.waiting)).is_empty();
-    if waited {
-        shared.write_waiting();
-    }
     let stop = shared.stop.as_ref().filter(|_| robot);
     if robot {
         shared.guard.note_stop();
     }
+    // Sent before anything else, and answered within STOP_WAIT whatever the robot does.
     if let Some(stop) = stop.cloned() {
         let shared = Arc::clone(shared);
         tokio::spawn(async move {
-            let out = stop.call(json!({"reason": "operator"})).await;
-            let ok = out.status == Status::Succeeded;
-            shared.emit(Event::Stopped {
-                ok,
-                detail: if ok {
-                    stopped_state(&out.data)
-                } else {
-                    out.message
-                },
-            });
+            let (ok, detail) =
+                match tokio::time::timeout(STOP_WAIT, stop.call(json!({"reason": "operator"})))
+                    .await
+                {
+                    Ok(out) if out.status == Status::Succeeded => (true, stopped_state(&out.data)),
+                    Ok(out) => (false, out.message),
+                    Err(_) => (
+                        false,
+                        format!(
+                            "the stop got no answer in {} s: the robot may still be moving",
+                            STOP_WAIT.as_secs()
+                        ),
+                    ),
+                };
+            shared.emit(Event::Stopped { ok, detail });
         });
     }
+    // Turned down, so not left for the next session to ask again; off the actor, as a slow disk
+    // must not hold up the next command. Detached: the write ends on its own.
+    let waited = !std::mem::take(&mut *lock(&shared.waiting)).is_empty();
+    if waited {
+        let shared = Arc::clone(shared);
+        tokio::task::spawn_blocking(move || shared.write_waiting());
+    }
+    // The robot's own answer comes as `Stopped`; until then it is only asked.
     let reason = if stop.is_some() {
-        "the operator stopped the reply and the robot"
+        "the operator stopped the reply and asked the robot to stop"
     } else {
         "the operator stopped the reply"
     };
@@ -260,6 +312,27 @@ fn stopped_state(data: &Value) -> String {
         .iter()
         .find_map(|key| data[key].as_str())
         .map_or_else(|| data.to_string(), str::to_owned)
+}
+
+/// Keeps what a turn cut off before its end had been asked and had done.
+fn cut_off(shared: &Shared, history: &mut History) {
+    if let Some((request, flags)) = lock(&shared.working).take() {
+        let done = lock(&flags.done).clone();
+        history.cut_off(&request, &done);
+        save(shared, history);
+    }
+}
+
+/// The queued reports as one message, saying how many gave way to newer ones.
+fn take_reports(reports: &mut Vec<String>, dropped: &mut usize) -> String {
+    let mut text = reports.split_off(0).join("\n\n");
+    if *dropped > 0 {
+        text = format!(
+            "({} older reports were dropped while the agent was busy.)\n\n{text}",
+            std::mem::take(dropped)
+        );
+    }
+    text
 }
 
 #[cfg(test)]

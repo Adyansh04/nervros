@@ -21,6 +21,10 @@ const RATE_S: (f64, f64) = (0.5, 30.0);
 const WAIT_MAX_S: f64 = 3600.0;
 /// How often a wait looks whether the program must stop.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
+/// The longest line a program says, in characters.
+const SAID_CHARS: usize = 500;
+/// The lines a program says at most: each goes to every listener of the session.
+const SAID_LINES: usize = 300;
 
 /// The robot of one program's run.
 pub struct RobotHost {
@@ -31,6 +35,8 @@ pub struct RobotHost {
     frames: (String, String),
     last_said: Mutex<Option<String>>,
     skills_run: std::sync::atomic::AtomicUsize,
+    /// Lines said so far.
+    said: std::sync::atomic::AtomicUsize,
 }
 
 impl RobotHost {
@@ -49,6 +55,7 @@ impl RobotHost {
             frames,
             last_said: Mutex::default(),
             skills_run: std::sync::atomic::AtomicUsize::new(0),
+            said: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -62,6 +69,17 @@ impl RobotHost {
     #[must_use]
     pub fn last_said(&self) -> Option<String> {
         lock(&self.last_said).clone()
+    }
+
+    /// `work` run to its end, or an error once the job is stopped: a stopped program must not
+    /// hold its thread for a reading's whole window.
+    fn until_stopped<T>(&self, work: impl std::future::Future<Output = T>) -> Result<T, String> {
+        self.runtime.block_on(async {
+            tokio::select! {
+                done = work => Ok(done),
+                () = self.ctx.until_stopped() => Err("the program was stopped".to_owned()),
+            }
+        })
     }
 
     /// A topic the profile lets programs read, and its type; `whole` when it is read message by
@@ -79,7 +97,7 @@ impl RobotHost {
 
 impl Host for RobotHost {
     fn objects(&self, words: &str, room: Option<&str>) -> Result<Value, String> {
-        let seen = self.runtime.block_on(self.missions.observe());
+        let seen = self.runtime.block_on(self.missions.world_only(true));
         if seen.objects.is_null() {
             return Err("the world model has not said what objects it knows".to_owned());
         }
@@ -87,7 +105,7 @@ impl Host for RobotHost {
     }
 
     fn rooms(&self) -> Result<Value, String> {
-        let seen = self.runtime.block_on(self.missions.observe());
+        let seen = self.runtime.block_on(self.missions.world_only(false));
         if seen.rooms.is_null() {
             return Err("the world model has not said what rooms it knows".to_owned());
         }
@@ -95,7 +113,7 @@ impl Host for RobotHost {
     }
 
     fn places(&self) -> Result<Value, String> {
-        let seen = self.runtime.block_on(self.missions.observe());
+        let seen = self.runtime.block_on(self.missions.world_only(false));
         let rooms = seen.rooms["rooms"].as_array().cloned().unwrap_or_default();
         Ok(Value::Array(
             seen.places
@@ -154,8 +172,7 @@ impl Host for RobotHost {
 
     fn read(&self, topic: &str) -> Result<Value, String> {
         let (topic, msg_type) = self.topic(topic, true)?;
-        self.runtime
-            .block_on(self.missions.robot().latest(&topic, &msg_type, READ_WAIT))
+        self.until_stopped(self.missions.robot().latest(&topic, &msg_type, READ_WAIT))?
             .map_err(|e| e.to_string())
     }
 
@@ -164,12 +181,11 @@ impl Host for RobotHost {
         let seconds = within(seconds, RATE_S);
         let window = Duration::from_secs_f64(seconds);
         let arrivals = self
-            .runtime
-            .block_on(
+            .until_stopped(
                 self.missions
                     .robot()
                     .sample_sizes(&topic, &msg_type, window, RATE_MAX),
-            )
+            )?
             .map_err(|e| e.to_string())?;
         let count = u32::try_from(arrivals.len()).unwrap_or(u32::MAX);
         Ok(f64::from(count) / seconds)
@@ -194,8 +210,17 @@ impl Host for RobotHost {
     }
 
     fn say(&self, text: &str) {
-        *lock(&self.last_said) = Some(text.to_owned());
-        self.ctx.log(text);
+        let text = crate::tools::clip(text, SAID_CHARS);
+        *lock(&self.last_said) = Some(text.clone());
+        // A loop of says would fill every listener's events: past the cap, one line says so.
+        let n = self.said.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match n.cmp(&SAID_LINES) {
+            std::cmp::Ordering::Less => self.ctx.log(text),
+            std::cmp::Ordering::Equal => self.ctx.log(format!(
+                "(the program said more than {SAID_LINES} lines; the rest are not shown)"
+            )),
+            std::cmp::Ordering::Greater => {}
+        }
     }
 }
 
@@ -242,7 +267,8 @@ fn room_ids(rooms: &Value, room: &str) -> Vec<String> {
 }
 
 /// The objects whose label or name holds `words`, as the planner matches them, in `room` when
-/// given, as a program sees them.
+/// given, as a program sees them. One the world model marked removed is left out, as the planner
+/// leaves it out, so a count is of what is there; a stale one comes with `state: "stale"`.
 fn objects_matching(objects: &Value, rooms: &Value, words: &str, room: Option<&str>) -> Value {
     let inside = room.map(|r| room_ids(rooms, r));
     Value::Array(
@@ -251,17 +277,18 @@ fn objects_matching(objects: &Value, rooms: &Value, words: &str, room: Option<&s
             .map_or(&[][..], Vec::as_slice)
             .iter()
             .filter(|o| {
-                crate::mission::check::named(o, words)
-                    && inside.as_ref().is_none_or(|ids| {
-                        ids.iter().any(|id| o["room_id"] == id.as_str())
-                    })
+                o["state"].as_u64() != Some(2)
+                    && crate::mission::check::named(o, words)
+                    && inside
+                        .as_ref()
+                        .is_none_or(|ids| ids.iter().any(|id| o["room_id"] == id.as_str()))
             })
             .map(|o| {
                 let at = &o["pose"]["position"];
                 json!({
                     "id": o["id"], "label": o["label"], "name": o["name"],
                     "room": o["room_id"], "x": at["x"], "y": at["y"], "z": at["z"],
-                    "state": match o["state"].as_u64() { Some(1) => "stale", Some(2) => "removed", _ => "active" },
+                    "state": if o["state"].as_u64() == Some(1) { "stale" } else { "active" },
                     "last_seen_s": o["last_seen"]["sec"],
                 })
             })

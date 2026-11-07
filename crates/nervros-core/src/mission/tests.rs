@@ -261,6 +261,60 @@ async fn report_from(commands: &mut tokio::sync::mpsc::UnboundedReceiver<Command
 }
 
 #[tokio::test]
+async fn a_plan_made_before_the_robot_changed_its_skills_does_not_run() {
+    let fetches = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let n = Arc::clone(&fetches);
+    let changed = CATALOG.replace("a1b2c3d4e5f6", "f6e5d4c3b2a1");
+    let fake = robot(ended(0, "", "")).with_service("/x/catalog", move |_| {
+        let first = n.fetch_add(1, Ordering::SeqCst) == 0;
+        Ok(json!({"catalog_json": if first { CATALOG } else { changed.as_str() }}))
+    });
+    let robot: Arc<dyn RobotPort> = Arc::new(fake);
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+    let hash = missions.plan(steps(), By::Model).await.data["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let refused = missions.run(&json!({"hash": hash})).await;
+    assert_eq!(refused.status, Status::Failed, "{}", refused.message);
+    assert!(
+        refused.message.contains("skills changed"),
+        "{}",
+        refused.message
+    );
+}
+
+#[tokio::test]
+async fn a_restarted_executor_has_its_catalog_read_again() {
+    let fetches = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let n = Arc::clone(&fetches);
+    let fake = Arc::new(
+        robot(ended(0, "", ""))
+            .with_topic("/x/state", json!({"boot_id": "a"}))
+            .with_service("/x/catalog", move |_| {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"catalog_json": CATALOG}))
+            }),
+    );
+    let robot: Arc<dyn RobotPort> = Arc::clone(&fake) as Arc<dyn RobotPort>;
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+    missions.catalog().await.unwrap();
+    missions.catalog().await.unwrap();
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        1,
+        "kept while the executor runs"
+    );
+    fake.set_topic("/x/state", json!({"boot_id": "b"}));
+    missions.catalog().await.unwrap();
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        2,
+        "read again after a restart"
+    );
+}
+
+#[tokio::test]
 async fn two_launches_at_once_start_one_mission() {
     let robot: Arc<dyn RobotPort> =
         Arc::new(robot(ended(0, "", "")).with_latency(Duration::from_millis(200)));
@@ -465,6 +519,31 @@ async fn a_plan_runs_and_reports_with_goal_checks() {
             ..
         }
     )));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resume_said_before_the_pause_is_reported_is_an_order() {
+    let forever = ScriptedRun {
+        step: Duration::from_hours(1),
+        ..ended(0, "", "")
+    };
+    let robot: Arc<dyn RobotPort> = Arc::new(
+        robot(forever).with_service("/x/pause", |_| Ok(json!({"ok": true, "message": "ok"}))),
+    );
+    let profile = profile_with(r#"pause = "/x/pause""#);
+    let missions = Missions::new(&profile, Places::new(&profile, None), robot).unwrap();
+    let hash = missions.plan(steps(), By::Model).await.data["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        missions.run(&json!({"hash": hash})).await.status,
+        Status::Accepted
+    );
+    assert_eq!(missions.pause_order("pause"), Some(true));
+    missions.pause(true, "test").await;
+    assert_eq!(missions.pause_order("pause"), None, "asked already");
+    assert_eq!(missions.pause_order("carry on"), Some(false));
 }
 
 #[tokio::test]
@@ -749,7 +828,7 @@ async fn a_stopped_mission_for_a_goal_is_counted_and_asks_for_no_other() {
 
 #[test]
 fn every_executor_cause_names_its_fault() {
-    let faults: Vec<Option<Fault>> = (0..8).map(Fault::of_cause).collect();
+    let faults: Vec<Option<Fault>> = (0..9).map(Fault::of_cause).collect();
     assert_eq!(
         faults,
         [
@@ -760,6 +839,7 @@ fn every_executor_cause_names_its_fault() {
             Some(Fault::NoServer),
             Some(Fault::Teleop),
             Some(Fault::Busy),
+            Some(Fault::Executor),
             None
         ],
         "in the order of ExecuteMission's CAUSE_ constants"
@@ -813,7 +893,11 @@ async fn a_mission_is_given_up_once_the_executor_restarts() {
         step: Duration::from_hours(1),
         ..ended(0, "", "")
     };
-    let fake = Arc::new(robot(forever).with_topic("/x/state", json!({"boot_id": "a"})));
+    let fake = Arc::new(
+        robot(forever)
+            .with_topic("/x/state", json!({"boot_id": "a"}))
+            .with_service("/x/stop", |_| Ok(json!({"ok": true}))),
+    );
     let robot: Arc<dyn RobotPort> = Arc::clone(&fake) as Arc<dyn RobotPort>;
     let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
     let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
@@ -834,6 +918,40 @@ async fn a_mission_is_given_up_once_the_executor_restarts() {
     let text = report_from(&mut commands).await;
     assert!(text.contains("the executor restarted"), "{text}");
     assert!(text.contains(Fault::ExecutorLost.next()), "{text}");
+    assert!(
+        !fake.calls().iter().any(|(name, _)| name == "/x/stop"),
+        "a mission that restarted with its executor is gone already"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_mission_no_longer_heard_of_is_stopped_before_its_locks_are_freed() {
+    let forever = ScriptedRun {
+        step: Duration::from_hours(1),
+        ..ended(0, "", "")
+    };
+    let fake = Arc::new(
+        robot(forever)
+            .with_topic("/x/state", json!({"mission_id": ""}))
+            .with_service("/x/stop", |_| Ok(json!({"ok": true}))),
+    );
+    let robot: Arc<dyn RobotPort> = Arc::clone(&fake) as Arc<dyn RobotPort>;
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot).unwrap();
+    let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+    let (events, _rx) = tokio::sync::broadcast::channel(64);
+    missions.attach(SessionHandle::for_tests(&tx, events));
+    let hash = missions.plan(steps(), By::Model).await.data["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    missions.run(&json!({"hash": hash})).await;
+
+    let text = report_from(&mut commands).await;
+    assert!(text.contains("has not said it runs this mission"), "{text}");
+    assert!(
+        fake.calls().iter().any(|(name, _)| name == "/x/stop"),
+        "the executor is told to stop what it may still run"
+    );
 }
 
 #[tokio::test]
@@ -877,6 +995,27 @@ async fn a_mission_left_running_by_an_earlier_nervros_is_settled_at_start() {
         (kept.outcome.as_str(), kept.fault.as_str()),
         ("canceled", "interrupted")
     );
+}
+
+#[tokio::test]
+async fn missions_left_running_stay_open_while_the_executor_says_nothing() {
+    let ledger = Ledger::in_memory().unwrap();
+    ledger
+        .record(&MissionRecord {
+            id: "m0".to_owned(),
+            outcome: "running".to_owned(),
+            ..MissionRecord::default()
+        })
+        .unwrap();
+    let robot: Arc<dyn RobotPort> = Arc::new(FakeRobot::new());
+    let missions = Missions::new(&profile(), Places::new(&profile(), None), robot)
+        .unwrap()
+        .with_ledger(Arc::clone(&ledger));
+    let (tx, _commands) = tokio::sync::mpsc::unbounded_channel();
+    let (events, _seen) = tokio::sync::broadcast::channel(64);
+    missions.attach(SessionHandle::for_tests(&tx, events));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(ledger.mission("m0").unwrap()[0].outcome, "running");
 }
 
 #[tokio::test]

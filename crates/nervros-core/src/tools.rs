@@ -256,6 +256,14 @@ pub fn from_world(text: &str) -> String {
     format!("<world>{}</world>", fence_text(text, "world"))
 }
 
+/// A short label a vision model or the world model wrote, such as a region's name: cut to a
+/// label's length and fenced as the world's.
+#[must_use]
+pub fn world_label(text: &str) -> String {
+    const LABEL_CHARS: usize = 80;
+    from_world(&clip(text, LABEL_CHARS))
+}
+
 /// `text` without its [`from_world`] fences, for a person: the fences are for the model.
 #[must_use]
 pub fn unfenced(text: &str) -> String {
@@ -281,6 +289,22 @@ pub fn fence_text(text: &str, tag: &str) -> String {
     }
     out.push_str(&clean[last..]);
     out
+}
+
+/// `text` with each character no reader would see written out as `\u{...}`: what a person
+/// approves after reading it is all there is.
+#[must_use]
+pub fn visible(text: &str) -> String {
+    use std::fmt::Write as _;
+    text.chars()
+        .fold(String::with_capacity(text.len()), |mut out, c| {
+            if hidden(c) {
+                let _ = write!(out, "\\u{{{:04X}}}", u32::from(c));
+            } else {
+                out.push(c);
+            }
+            out
+        })
 }
 
 /// Characters no reader sees: controls but a newline or a tab, and the invisible marks of
@@ -344,7 +368,11 @@ pub fn clip(text: &str, max: usize) -> String {
     if len <= max {
         return text.to_owned();
     }
-    let head: String = text.chars().take(max).collect();
+    let mut head: String = text.chars().take(max).collect();
+    // A cut inside a world fence closes it: the data must not run on into what follows.
+    if head.matches("<world>").count() > head.matches("</world>").count() {
+        head.push_str("</world>");
+    }
     format!("{head}… ({} more characters)", len - max)
 }
 
@@ -544,11 +572,19 @@ pub struct TopicTool {
     spec: ToolSpec,
     ros_name: String,
     ros_type: String,
+    /// Fields holding text from the world, marked as such.
+    world_text: Vec<String>,
     robot: Arc<dyn RobotPort>,
 }
 
-/// Takes the dotted `path` out of `value`.
+/// Takes the dotted `path` out of `value`, from each element of an array on the way.
 fn remove_path(value: &mut Value, path: &str) {
+    if let Value::Array(items) = value {
+        for item in items {
+            remove_path(item, path);
+        }
+        return;
+    }
     match path.split_once('.') {
         Some((head, rest)) => {
             if let Some(inner) = value.get_mut(head) {
@@ -563,10 +599,20 @@ fn remove_path(value: &mut Value, path: &str) {
     }
 }
 
+/// `args` over `defaults`, object by object: a nested object the model gives keeps the defaults
+/// it leaves out, hidden ones among them.
 fn merge(defaults: &Map<String, Value>, args: Value) -> Value {
     let mut out = defaults.clone();
     if let Value::Object(given) = args {
-        out.extend(given);
+        for (key, value) in given {
+            let merged = match (out.get(&key), value) {
+                (Some(Value::Object(inner)), Value::Object(more)) => {
+                    merge(inner, Value::Object(more))
+                }
+                (_, value) => value,
+            };
+            out.insert(key, merged);
+        }
     }
     Value::Object(out)
 }
@@ -617,14 +663,29 @@ impl Tool for TopicTool {
     }
 
     async fn call(&self, _args: Value) -> ToolOutcome {
-        match self
+        let (name, ty) = (&self.ros_name, &self.ros_type);
+        let fresh = crate::watch::VALUE_FRESH;
+        // A latched or quiet topic's last message is still news, said with its age.
+        let (mut msg, stale) = match self
             .robot
-            .latest(&self.ros_name, &self.ros_type, self.spec.timeout)
+            .latest_fresh(name, ty, self.spec.timeout, fresh)
             .await
         {
-            Ok(msg) => ToolOutcome::ok(msg),
-            Err(e) => ros_failure(&e),
+            Ok(msg) => (msg, false),
+            Err(_) => match self.robot.latest(name, ty, Duration::ZERO).await {
+                Ok(msg) => (msg, true),
+                Err(e) => return ros_failure(&e),
+            },
+        };
+        mark_world_text(&mut msg, &self.world_text);
+        let mut out = ToolOutcome::ok(msg);
+        if stale {
+            out.message = format!(
+                "the newest message on {name} is more than {} s old: it may have gone quiet",
+                fresh.as_secs()
+            );
         }
+        out
     }
 }
 
@@ -736,12 +797,20 @@ impl Registry {
                     .trim()
                     .to_owned()
             });
+            // A tool that moves the robot and names nothing it moves takes it all, as an MCP tool
+            // does: one that took nothing could run beside a mission that holds the base.
+            let moves = matches!(risk, Risk::Motion | Risk::Manipulation);
+            let resources = if moves && c.resources.is_empty() {
+                Resource::ALL.to_vec()
+            } else {
+                c.resources.clone()
+            };
             let spec = ToolSpec {
                 name: c.name.clone(),
                 description,
                 parameters,
                 risk,
-                resources: c.resources.clone(),
+                resources,
                 timeout: c.timeout,
             };
             let tool: Arc<dyn Tool> = match c.kind {
@@ -759,6 +828,7 @@ impl Registry {
                     spec,
                     ros_name: c.ros_name.clone(),
                     ros_type: c.ros_type.clone(),
+                    world_text: c.world_text.clone(),
                     robot: Arc::clone(robot),
                 }),
             };
@@ -831,6 +901,14 @@ mod tests {
 
     fn robot() -> Arc<dyn RobotPort> {
         Arc::new(FakeRobot::new().with_service("/find", |req| Ok(json!({"got": req}))))
+    }
+
+    #[test]
+    fn a_hidden_mark_is_spelt_out_for_the_reader() {
+        assert_eq!(
+            visible("a\u{202E}b\u{200B}c\nd"),
+            "a\\u{202E}b\\u{200B}c\nd"
+        );
     }
 
     #[test]
@@ -944,6 +1022,28 @@ mod tests {
         let out = reg.get("gone").unwrap().call(json!({})).await;
         assert_eq!(out.status, Status::Failed);
         assert_eq!(out.for_model(100)["message"], "`/gone` is not available");
+    }
+
+    #[test]
+    fn hidden_fields_keep_their_defaults_when_nested_and_go_from_arrays() {
+        let defaults: Map<String, Value> =
+            serde_json::from_value(json!({"a": {"b": 1, "c": 0}})).unwrap();
+        let mut given = json!({"a": {"b": 9, "c": 2}, "list": [{"b": 5, "d": 1}]});
+        for path in ["a.b", "list.b"] {
+            remove_path(&mut given, path);
+        }
+        assert_eq!(
+            merge(&defaults, given),
+            json!({"a": {"b": 1, "c": 2}, "list": [{"d": 1}]})
+        );
+    }
+
+    #[test]
+    fn a_clip_inside_a_world_fence_closes_it() {
+        let text = from_world(&"a".repeat(50));
+        let cut = clip(&text, 20);
+        assert!(cut.contains("</world>"), "{cut}");
+        assert_eq!(clip("<world>ab</world> plus", 30), "<world>ab</world> plus");
     }
 
     #[test]

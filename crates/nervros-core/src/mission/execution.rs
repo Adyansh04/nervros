@@ -20,6 +20,9 @@ use crate::lock;
 use crate::session::{Command, Event};
 use crate::tools::{Status, ToolOutcome};
 
+/// How long stopping a lost mission waits on its goal's cancel, and then on `StopAll`.
+const LOST_STOP: Duration = Duration::from_secs(5);
+
 impl Missions {
     /// Runs an approved plan, unless a mission runs or this one just failed the same way.
     pub(super) async fn run(self: &Arc<Self>, args: &Value) -> ToolOutcome {
@@ -100,6 +103,15 @@ impl Missions {
         // Run by its hash or on a schedule, a plan was checked when it was made: a zone may have
         // been added since, and a straight walk starts from where the robot stands now.
         self.still_clear(&compiled).await?;
+        self.same_skills(&compiled).await?;
+        // The executor stops a mission whose agent goes quiet only if it hears the agent at all.
+        if self.config.heartbeat.is_some() && lock(&self.heartbeat).is_none() {
+            return Err(
+                "the executor's deadman hears no heartbeat from NervROS yet, so no mission starts: \
+                 try again in a moment"
+                    .to_owned(),
+            );
+        }
         let id = uuid::Uuid::now_v7().to_string();
         {
             let mut running = lock(&self.running);
@@ -140,6 +152,8 @@ impl Missions {
                 0.0
             },
             "heartbeat_client": self.client,
+            // The executor turns it away once its skills differ from those it was approved with.
+            "catalog_version": compiled.catalog_version,
             "mode": 0
         });
         let goal = self
@@ -179,13 +193,14 @@ impl Missions {
             ..MissionRecord::default()
         };
         let launched = self.keep(running);
+        let drafts = self.drafts.snapshot();
         tokio::spawn(
             Arc::clone(self)
                 .watch(
                     id.clone(),
                     compiled,
                     goal,
-                    (before, held),
+                    (before, held, drafts),
                     (request, reported, for_goal),
                     (started_s, launched),
                 )
@@ -241,13 +256,17 @@ impl Missions {
         id: String,
         compiled: Compiled,
         goal: Goal,
-        (before, held): (camera::Frames, Option<crate::guard::ResourceLock>),
+        (before, held, drafts): (
+            camera::Frames,
+            Option<crate::guard::ResourceLock>,
+            std::collections::BTreeMap<String, Value>,
+        ),
         (request, reported, for_goal): (String, Reported, Option<u32>),
         (started_s, launched): (f64, Option<tokio::task::JoinHandle<()>>),
     ) {
         let started = Instant::now();
         let mut times = StepTimes::default();
-        let result = self.outcome_of(&id, goal, &mut times).await;
+        let result = self.outcome_of(&id, goal, &mut times, &compiled).await;
         let outputs = outputs_of(&result);
         let ended = summarise(result, started.elapsed().as_secs_f64());
         drop(held);
@@ -275,6 +294,7 @@ impl Missions {
             .map(|s| times.record(s, &ended.step, &ended.reason, cut))
             .collect();
         let passed_over = passed_over(&compiled, &steps, &ended.step);
+        let failed = failed_ids(&compiled, &steps);
         if let Some(launched) = launched {
             let _ = launched.await;
         }
@@ -299,7 +319,7 @@ impl Missions {
             let _ = kept.await;
         }
         if ended.fault.is_none() {
-            self.settle_taught(&compiled, ended.outcome, &ended.step)
+            self.settle_taught(&compiled, ended.outcome, (&ended.step, &failed), &drafts)
                 .await;
         }
         // A job hears its mission end from the event; the report, and the failures it counts
@@ -368,7 +388,7 @@ impl Missions {
             started_s,
         };
         let mut report = self.report(id, compiled, ended, &evidence);
-        report.push_str(&self.settle_goals(id, ended, &seen, for_goal));
+        report.push_str(&self.settle_goals(id, ended, &seen, for_goal).await);
         if let Some(s) = self.session.get() {
             s.send(Command::Report(report));
         }
@@ -411,7 +431,7 @@ impl Missions {
                 typical_s: None,
                 last_failure: None,
             },
-            world: check::last_seen(step, seen, crate::now_s()),
+            world: check::last_seen(step, seen, self.robot().ros_now_s()),
         };
         let me = Arc::clone(self);
         tokio::spawn(async move {
@@ -448,25 +468,32 @@ impl Missions {
 
     /// Counts mission `id` for `for_goal`, the goal it worked toward, judges every goal, and says
     /// where the open ones and the ones that just ended stand, as the report's closing lines.
-    fn settle_goals(
+    async fn settle_goals(
         &self,
         id: &str,
         ended: &Ended,
         seen: &Observed,
         for_goal: Option<u32>,
     ) -> String {
-        let Some(goals) = self.goals.get() else {
+        let Some(goals) = self.goals.get().map(Arc::clone) else {
             return String::new();
         };
-        if let Some(goal) = for_goal {
-            goals.ran(goal, id, ended.fault.is_none());
-        }
         // After a stop or a fault, or once the request failed too often, the report says not to
         // run again: its goals wait for the operator too.
         let may_go_on = ended.fault.is_none()
             && ended.outcome != Outcome::Canceled
             && self.run_failures.load(Ordering::SeqCst) <= self.config.max_replans;
-        goals::report_lines(&goals.settle(seen, SystemTime::now()), may_go_on)
+        let (id, counted, seen) = (id.to_owned(), ended.fault.is_none(), seen.clone());
+        // Both write the goals file.
+        let settled = tokio::task::spawn_blocking(move || {
+            if let Some(goal) = for_goal {
+                goals.ran(goal, &id, counted);
+            }
+            goals.settle(&seen, SystemTime::now())
+        })
+        .await
+        .unwrap_or_default();
+        goals::report_lines(&settled, may_go_on)
     }
 
     /// Judges the goals as the robot stands at start, and tells the operator of the open ones and
@@ -479,7 +506,11 @@ impl Missions {
             return;
         }
         let seen = self.observe().await;
-        let lines = goals::report_lines(&goals.settle(&seen, SystemTime::now()), false);
+        let goals = Arc::clone(goals);
+        let settled = tokio::task::spawn_blocking(move || goals.settle(&seen, SystemTime::now()))
+            .await
+            .unwrap_or_default();
+        let lines = goals::report_lines(&settled, false);
         if !lines.is_empty() {
             self.emit(Event::Notice {
                 text: lines.trim().to_owned(),
@@ -494,7 +525,9 @@ impl Missions {
         id: &str,
         goal: Goal,
         times: &mut StepTimes,
+        compiled: &Compiled,
     ) -> Result<GoalResult, RosError> {
+        let cancel = goal.canceller();
         let Goal {
             mut feedback,
             result,
@@ -509,8 +542,31 @@ impl Missions {
         // The executor's run as it ran the mission: a new one says it restarted, and the mission
         // with it.
         let mut boot = None;
+        let mut restarted = false;
+        // A zone drawn while it runs is checked against the steps still to come.
+        let mut zones = self
+            .guard
+            .get()
+            .and_then(|g| g.zones())
+            .map(|z| z.changes());
         let result = loop {
             tokio::select! {
+                Some(()) = changed(zones.as_mut()) => {
+                    let left: Vec<PlannedStep> = compiled
+                        .steps
+                        .iter()
+                        .filter(|s| !times.ended(&s.id))
+                        .cloned()
+                        .collect();
+                    if let Some(why) = self.fenced_now(&left).await {
+                        self.emit(Event::Notice {
+                            text: format!("Mission {id} is stopped: {why}"),
+                        });
+                        if !matches!(tokio::time::timeout(LOST_STOP, cancel()).await, Ok(Ok(()))) {
+                            tracing::warn!(mission = %id, "a fenced mission did not take its cancel");
+                        }
+                    }
+                }
                 Some(fb) = feedback.recv() => {
                     if fb["paused"].as_bool().unwrap_or(false) != paused {
                         paused = !paused;
@@ -530,6 +586,7 @@ impl Missions {
                     let runs = state.as_ref().is_some_and(|s| s["mission_id"].as_str() == Some(id));
                     let now = state.as_ref().and_then(boot_of);
                     if boot.as_ref().zip(now.as_ref()).is_some_and(|(was, is)| was != is) {
+                        restarted = true;
                         break Err(RosError::Middleware(
                             "the executor restarted, and the mission with it".into(),
                         ));
@@ -549,6 +606,16 @@ impl Missions {
             }
         };
         self.paused.store(false, Ordering::SeqCst);
+        self.pause_asked.store(false, Ordering::SeqCst);
+        // Unheard of is not ended: the mission may still drive the robot once its locks are free.
+        // One the executor never took, or that restarted with it, runs nowhere.
+        if !restarted
+            && result
+                .as_ref()
+                .is_err_and(|e| !matches!(e, RosError::Rejected(_)))
+        {
+            self.stop_lost(id, &cancel).await;
+        }
         // The executor's last word on the steps can come just behind its result.
         while let Ok(Some(fb)) =
             tokio::time::timeout(Duration::from_millis(50), feedback.recv()).await
@@ -556,6 +623,26 @@ impl Missions {
             self.progress(id, &fb, times);
         }
         result
+    }
+
+    /// Stops mission `id`, which the executor may still run though NervROS lost track of it: its
+    /// goal is cancelled and the executor told to stop everything.
+    async fn stop_lost(&self, id: &str, cancel: &nervros_ros::CancelFn) {
+        if !matches!(tokio::time::timeout(LOST_STOP, cancel()).await, Ok(Ok(()))) {
+            tracing::warn!(mission = %id, "the lost mission's goal was not cancelled");
+        }
+        let stopped = self
+            .robot
+            .call(
+                &self.config.stop,
+                "nervros_interfaces/srv/StopAll",
+                json!({"reason": format!("NervROS lost track of mission {id}")}),
+                LOST_STOP,
+            )
+            .await;
+        if let Err(e) = stopped {
+            tracing::warn!(mission = %id, error = %e, "the executor was not told to stop a lost mission");
+        }
     }
 
     /// Writes a finished mission to the ledger, off the async threads; the write, to wait for.
@@ -575,12 +662,17 @@ impl Missions {
         let Some(ledger) = self.ledger.get().cloned() else {
             return;
         };
-        let still = self.executor_state().await.and_then(|s| {
-            s["mission_id"]
-                .as_str()
-                .filter(|m| !m.is_empty())
-                .map(str::to_owned)
-        });
+        // Unread is not idle: a mission the executor still runs would be recorded as cut short.
+        let Some(state) = self.executor_state().await else {
+            tracing::info!(
+                "the executor's state is not known yet: the missions left running stay open"
+            );
+            return;
+        };
+        let still = state["mission_id"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned);
         let marked =
             match tokio::task::spawn_blocking(move || ledger.interrupted(still.as_deref())).await {
                 Ok(Ok(marked)) => marked,
@@ -653,7 +745,7 @@ impl Missions {
 }
 
 /// The executor run a state comes from; none from an executor that does not say.
-fn boot_of(state: &Value) -> Option<String> {
+pub(super) fn boot_of(state: &Value) -> Option<String> {
     state["boot_id"]
         .as_str()
         .filter(|b| !b.is_empty())
@@ -683,6 +775,18 @@ fn outputs_of(result: &Result<GoalResult, RosError>) -> serde_json::Map<String, 
             _ => None,
         })
         .unwrap_or_default()
+}
+
+/// The ids of the steps that failed, those the mission went on past included: a draft taught
+/// skill is not proven by a run of them.
+fn failed_ids(compiled: &Compiled, steps: &[StepRecord]) -> Vec<String> {
+    compiled
+        .steps
+        .iter()
+        .zip(steps)
+        .filter(|(_, r)| r.outcome == "failure")
+        .map(|(s, _)| s.id.clone())
+        .collect()
 }
 
 /// Steps that failed while the mission went on, such as a look that saw nothing: its success
@@ -738,16 +842,34 @@ fn summarise(result: Result<GoalResult, RosError>, elapsed_s: f64) -> Ended {
                 .copied()
                 .unwrap_or(fallback);
             let text = |k: &str| r.result[k].as_str().unwrap_or_default().to_owned();
-            // A rejected mission says why in its diagnostics, not in the failure reason.
-            let mut reason = text("failure_reason");
+            // A rejection lists every problem in its diagnostics, and its failure reason holds the
+            // first alone: the model fixes them all at once.
+            let problems: Vec<String> = serde_json::from_str::<Value>(&text("diagnostics_json"))
+                .ok()
+                .and_then(|d| d.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|d| d["message"].as_str().map(str::to_owned))
+                .collect();
+            let mut reason = if problems.len() > 1 {
+                problems.join("; ")
+            } else {
+                text("failure_reason")
+            };
             if reason.is_empty() {
                 reason = text("diagnostics_json");
             }
+            // A cause this NervROS does not know, or an executor error with none, is still no
+            // test of the plan: it is the executor's, not the plan's.
+            let cause = r.result["cause"].as_u64().unwrap_or(0);
+            let fault = Fault::of_cause(cause).or_else(|| {
+                (cause != 0 || outcome == Outcome::Error).then_some(Fault::ExecutorLost)
+            });
             Ended {
                 outcome,
                 step: text("failed_step_id"),
                 reason,
-                fault: r.result["cause"].as_u64().and_then(Fault::of_cause),
+                fault,
                 elapsed_s,
             }
         }
@@ -758,6 +880,14 @@ fn summarise(result: Result<GoalResult, RosError>, elapsed_s: f64) -> Ended {
             fault: Some(Fault::ExecutorLost),
             elapsed_s,
         },
+    }
+}
+
+/// Waits for the zones to change; never, without zones or once they are gone.
+async fn changed(zones: Option<&mut tokio::sync::watch::Receiver<u64>>) -> Option<()> {
+    match zones {
+        Some(rx) => rx.changed().await.ok(),
+        None => std::future::pending().await,
     }
 }
 
@@ -786,6 +916,11 @@ impl StepTimes {
             (false, Some(at)) => self.paused += (elapsed - at).max(0.0),
             (false, None) => {}
         }
+    }
+
+    /// Whether `step` has ended, well or not.
+    fn ended(&self, step: &str) -> bool {
+        self.steps.get(step).is_some_and(|t| t.end.is_some())
     }
 
     /// Notes a step event: its first one starts the step, a success or failure ends it.

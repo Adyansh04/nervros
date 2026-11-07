@@ -20,6 +20,8 @@ pub const MAX_STEPS: usize = 12;
 const MAX_RETRIES: u8 = 2;
 /// The longest id a plan may give a step.
 const MAX_ID: usize = 24;
+/// The longest phrase the executor takes, in characters.
+const MAX_PHRASE: usize = 80;
 /// How near the robot must already stand for a skill that needs it near an object; the executor's
 /// skills ask for about half a metre.
 const NEAR_M: f64 = 0.6;
@@ -233,6 +235,16 @@ impl World {
     /// Whether an object or room with this id is in the world model.
     fn knows(&self, id: &str) -> bool {
         self.objects.iter().chain(&self.rooms).any(|t| t.id == id)
+    }
+
+    /// Whether the world model holds `id` as what an argument `names`: an object, a room, or
+    /// either when it does not say.
+    fn holds(&self, id: &str, names: &str) -> bool {
+        match names {
+            "object" => self.objects.iter().any(|t| t.id == id),
+            "room" => self.rooms.iter().any(|t| t.id == id),
+            _ => self.knows(id),
+        }
     }
 }
 
@@ -536,6 +548,10 @@ pub struct PlannedStep {
     /// no model can weaken it; an end check that fails names the step that should have made it.
     #[serde(skip)]
     pub expect: Vec<String>,
+    /// The arguments the planner filled in, which the tree carries though the model left them
+    /// out: a `phrase` from an object's label, the one value an argument allows.
+    #[serde(skip)]
+    pub filled: Vec<StepArg>,
 }
 
 impl PlannedStep {
@@ -558,6 +574,7 @@ impl PlannedStep {
         let mut args: Vec<serde_json::Value> = self
             .args
             .iter()
+            .chain(&self.filled)
             .map(|a| serde_json::json!({"name": a.name, "value": a.value.trim()}))
             .collect();
         if let Some(target) = &self.target {
@@ -598,6 +615,8 @@ pub struct Compiled {
     /// What should hold at the end, from the steps' effects: a model's own goals once
     /// contradicted its steps, and their failed checks sent it to repeat a mission that worked.
     pub goal: Vec<String>,
+    /// The checks' doubts about it, one line each, for the operator who approves it.
+    pub concerns: Vec<String>,
 }
 
 /// Something wrong with a plan, for the model to fix.
@@ -676,7 +695,7 @@ pub fn compile(
             n += 1;
             let id = format!("s{n}");
             match compile_step(&id, step, catalog, world, author, &links) {
-                Ok((node, timeout_s, spot, skill)) => {
+                Ok((node, timeout_s, spot, skill, filled)) => {
                     if let (Some(name), false) = (&planned.id, added) {
                         links.produced.insert(
                             name.clone(),
@@ -700,15 +719,11 @@ pub fn compile(
                     let attempts = f64::from(step.retries) + 1.0;
                     worst += timeout_s * attempts;
                     body.push_str(&wrap(&node, step, timeout_s));
-                    let mut text = summary(step);
-                    if added {
-                        text.push_str(" (added)");
-                    }
                     steps.push(PlannedStep {
                         id,
                         name: if added { None } else { step.id.clone() },
                         skill: step.skill.clone(),
-                        summary: text,
+                        summary: summary(step, &filled) + if added { " (added)" } else { "" },
                         args: step.args.clone(),
                         timeout_s,
                         retries: step.retries,
@@ -723,6 +738,7 @@ pub fn compile(
                         native: skill.native.clone(),
                         may_take,
                         expect,
+                        filled,
                     });
                 }
                 Err(mut p) => problems.append(&mut p),
@@ -748,6 +764,7 @@ pub fn compile(
         worst_case_s: worst,
         catalog_version: catalog.catalog_version.clone(),
         goal: sim.end_state(),
+        concerns: Vec::new(),
     })
 }
 
@@ -796,7 +813,24 @@ fn may_take(
 
 /// A step's `SubTree` element, its timeout in seconds, where a `GoToPlace` leaves the robot, and
 /// the skill it runs.
-type CompiledStep<'c> = (String, f64, Option<Spot>, &'c Skill);
+/// A step's node, timeout, where it leaves the robot, its skill, and the arguments the planner
+/// filled in for it.
+type CompiledStep<'c> = (String, f64, Option<Spot>, &'c Skill, Vec<StepArg>);
+
+/// Why `step` may not retry `skill`: one that is not idempotent would repeat what it already did.
+fn retry_refusal(id: &str, step: &Step, skill: &Skill) -> Option<Problem> {
+    (step.retries > 0 && !skill.idempotent).then(|| {
+        Problem::new(
+            id,
+            "retries",
+            format!(
+                "{} may not be retried: a retry repeats what it already did, such as walking the \
+                 whole distance again; leave retries at 0",
+                skill.name
+            ),
+        )
+    })
+}
 
 /// The step's `SubTree` element, with the outputs later steps take, its timeout in seconds and,
 /// for `GoToPlace`, where it leaves the robot.
@@ -807,11 +841,7 @@ fn route_end(step: &Step, world: &World) -> Option<Spot> {
         .map(str::trim)
         .rfind(|n| !n.is_empty())?;
     let same = |a: &str| crate::places::same_words(a, last);
-    if let Some(p) = world
-        .places
-        .iter()
-        .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)))
-    {
+    if let Some(p) = crate::places::find(&world.places, last) {
         return Some(Spot {
             id: p.name.clone(),
             xy: Some((p.pose.x, p.pose.y)),
@@ -903,6 +933,7 @@ fn compile_step<'c>(
         ));
         return Err(problems);
     };
+    problems.extend(retry_refusal(id, step, skill));
     let timeout_s = match step.timeout_s {
         // At least a second, unless the skill itself is quicker.
         Some(t) if t.is_finite() && t > 0.0 => {
@@ -924,16 +955,33 @@ fn compile_step<'c>(
     if !problems.is_empty() {
         return Err(problems);
     }
+    let filled = filled_in(step, &ports);
     let mut node = format!(
         "<SubTree ID=\"{}\" name=\"{id}_{}\"",
-        escape(&skill.template),
-        escape(&step.skill)
+        xml_attr(&skill.template),
+        xml_attr(&step.skill)
     );
     for (name, value) in ports {
-        let _ = write!(node, " {name}=\"{}\"", escape(&value));
+        let _ = write!(node, " {name}=\"{}\"", xml_attr(&value));
     }
     node.push_str("/>");
-    Ok((node, timeout_s, spot, skill))
+    Ok((node, timeout_s, spot, skill, filled))
+}
+
+/// What the tree carries beyond the model's words: a value derived, or the one allowed. A walk's
+/// resolved pose is its target, not an argument, and what a step takes or hands on is a key.
+fn filled_in(step: &Step, ports: &[(String, String)]) -> Vec<StepArg> {
+    if step.skill == GO_TO_PLACE {
+        return Vec::new();
+    }
+    ports
+        .iter()
+        .filter(|(name, value)| !value.starts_with('{') && arg(&step.args, name).is_none())
+        .map(|(name, value)| StepArg {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect()
 }
 
 /// An argument that takes what an earlier step hands on: that step, the output, and a fit.
@@ -1068,13 +1116,16 @@ fn ports_for(
             && value.starts_with(|c: char| c.is_ascii_uppercase())
             && value[1..].chars().all(|c| c.is_ascii_digit());
         let words = arg.format == "phrase" && !id_shaped;
-        if arg.is_world_id() && !words && !world.knows(value) {
+        if arg.is_world_id() && !words && !world.holds(value, &arg.names) {
+            let what = match arg.names.as_str() {
+                "object" if world.knows(value) => format!("{value} is a room, not an object"),
+                "room" if world.knows(value) => format!("{value} is an object, not a room"),
+                _ => format!("{value} is not in the world model"),
+            };
             problems.push(Problem::new(
                 id,
                 &arg.name,
-                format!(
-                    "{value} is not in the world model; call find_objects and use an id it returns"
-                ),
+                format!("{what}; call find_objects and use an id it returns"),
             ));
         }
         ports.push((arg.name.clone(), value.to_owned()));
@@ -1088,6 +1139,31 @@ fn ports_for(
 
 /// A navigation macro, its one port, and where it leaves the robot.
 type Resolved<'c> = (&'c Skill, Vec<(String, String)>, Spot);
+
+/// `text` in the words the executor takes as a phrase: ASCII letters and digits, spaces, `-`, `_`
+/// and `'`, at most [`MAX_PHRASE`] characters. Accents are taken off and anything else is a space:
+/// "café mug (blue)" is "cafe mug blue".
+fn to_phrase(text: &str) -> String {
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    let plain: String = text
+        .nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '\'') {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let words = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    words
+        .chars()
+        .take(MAX_PHRASE)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
 
 /// A derived argument's value: `label(x)` is the world model's label of what argument `x` names,
 /// or, for something it does not know, such as a detector's `red_block`, that name in words. For
@@ -1113,7 +1189,11 @@ fn derive(rule: &str, step: &Step, world: &World, links: &Links<'_>) -> Option<S
         .find(|t| t.id == id)
         .map(|t| t.name.clone())
         .filter(|n| !n.is_empty());
-    label.or_else(|| Some(id.replace('_', " ")).filter(|w| !w.trim().is_empty()))
+    // In the executor's plain words: a world model's name may hold more.
+    label
+        .or_else(|| Some(id.replace('_', " ")))
+        .map(|w| to_phrase(&w))
+        .filter(|w| !w.is_empty())
 }
 
 /// `GoToPlace(place)`: a profile place becomes `GoToPose` at its pose; a room or object id, or a
@@ -1131,10 +1211,7 @@ fn go_to_place<'c>(
     };
     // "living room" is canopy's living_room, and "dining table side" the dining_table_side place.
     let same = |a: &str| crate::places::same_words(a, place);
-    let named = world
-        .places
-        .iter()
-        .find(|p| same(&p.name) || p.aliases.iter().any(|a| same(a)));
+    let named = crate::places::find(&world.places, place);
     if let (Some(p), Some(skill)) = (named, catalog.skill(GO_TO_POSE)) {
         let station = format!("{};{};{}", p.pose.x, p.pose.y, p.pose.yaw);
         let spot = Spot {
@@ -1230,10 +1307,12 @@ fn wrap(node: &str, step: &Step, timeout_s: f64) -> String {
     format!("      {inner}\n")
 }
 
-fn summary(step: &Step) -> String {
+/// One line for a step, with what the planner `filled` in: the operator approves what runs.
+fn summary(step: &Step, filled: &[StepArg]) -> String {
     let args: Vec<String> = step
         .args
         .iter()
+        .chain(filled)
         .map(|a| format!("{}={}", a.name, a.value))
         .collect();
     format!("{}({})", step.skill, args.join(", "))
@@ -1248,7 +1327,8 @@ fn msec(seconds: f64) -> u64 {
     (seconds * 1000.0).ceil() as u64
 }
 
-fn escape(text: &str) -> String {
+/// Text as an XML attribute value holds it, for every tree NervROS writes.
+pub(crate) fn xml_attr(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -1365,6 +1445,36 @@ mod tests {
     }
 
     #[test]
+    fn an_argument_that_names_objects_takes_no_room() {
+        let mut c: Value = serde_json::from_str(CATALOG).unwrap();
+        let pick = c["skills"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s["name"] == "PickObject")
+            .unwrap();
+        let arg = pick["args"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|a| a["name"] == "object_id")
+            .unwrap();
+        arg["type"] = json!("world_id");
+        arg["names"] = json!("object");
+        let catalog = Catalog::parse(&c.to_string()).unwrap();
+        let p = plan(&json!([
+            {"skill": "PickObject", "args": {"object_id": "R2", "phrase": "kitchen", "arm": "right"}}
+        ]));
+        let problems = compile(&p, &catalog, &world(), Author::Model).unwrap_err();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.message.starts_with("R2 is a room, not an object")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
     fn an_object_is_walked_to_by_what_it_is_and_the_end_state_follows_the_steps() {
         let p = plan(&json!([
             {"skill": "GoToPlace", "args": {"place": "Basket"}},
@@ -1431,10 +1541,22 @@ mod tests {
     }
 
     #[test]
+    fn a_skill_that_is_not_idempotent_is_never_retried() {
+        let p = plan(&json!([
+            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}, "retries": 1}
+        ]));
+        let problems = compile(&p, &catalog(), &world(), Author::Model).unwrap_err();
+        assert!(
+            format!("{problems:?}").contains("may not be retried"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
     fn a_plan_compiles_to_subtree_references() {
         let p = plan(&json!([
             {"skill": "GoToPlace", "args": [{"name": "place", "value": "kitchen"}]},
-            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}, "retries": 1},
+            {"skill": "PickObject", "args": {"object_id": "O17", "phrase": "red mug", "arm": "right"}},
             {"skill": "GoToPlace", "args": {"place": "Charging Dock"}, "optional": true, "timeout_s": 60}
         ]));
         let c = compile(&p, &catalog(), &world(), Author::Model).unwrap();
@@ -1443,12 +1565,12 @@ mod tests {
                 .contains(r#"<SubTree ID="GoToTarget" name="s1_GoToPlace" target="R2"/>"#)
         );
         assert!(c.xml.contains(
-            r#"<RetryUntilSuccessful num_attempts="2"><Timeout msec="420000"><SubTree ID="PickObject" name="s2_PickObject" object_id="O17" phrase="red mug" arm="right"/></Timeout></RetryUntilSuccessful>"#
+            r#"<Timeout msec="420000"><SubTree ID="PickObject" name="s2_PickObject" object_id="O17" phrase="red mug" arm="right"/></Timeout>"#
         ));
         assert!(c.xml.contains(
             r#"<ForceSuccess><Timeout msec="60000"><SubTree ID="GoToPose" name="s3_GoToPlace" station="1.5;-2;0.5"/></Timeout></ForceSuccess>"#
         ));
-        assert!((c.worst_case_s - (300.0 + 840.0 + 60.0)).abs() < 1e-9);
+        assert!((c.worst_case_s - (300.0 + 420.0 + 60.0)).abs() < 1e-9);
         // The executor's watchdog is the limit, which a pause does not run down.
         assert!(
             c.xml
@@ -1909,6 +2031,18 @@ mod tests {
             "{}",
             compiled.xml
         );
+        let pick = &compiled.steps[1];
+        assert_eq!(
+            pick.summary, "PickObject(arm=right, object_id=O17, phrase=red mug)",
+            "the operator approves what the tree carries"
+        );
+        assert!(
+            pick.for_rules()["args"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"name": "phrase", "value": "red mug"})),
+            "a rule on the phrase sees it"
+        );
     }
 
     #[test]
@@ -1953,6 +2087,14 @@ mod tests {
             "{}",
             compiled.xml
         );
+    }
+
+    #[test]
+    fn a_derived_phrase_is_plain_words() {
+        assert_eq!(to_phrase("café mug (blue)"), "cafe mug blue");
+        assert_eq!(to_phrase("Tom's cup, large"), "Tom's cup large");
+        assert_eq!(to_phrase("(:)"), "");
+        assert_eq!(to_phrase(&"word ".repeat(40)).chars().count(), 79);
     }
 
     #[test]

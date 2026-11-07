@@ -43,7 +43,7 @@ pub trait Host: Send + Sync {
     /// The skill is not one the program was approved for, the plan failed its checks, the robot
     /// cannot run a mission now, or the robot or its executor cut the mission short.
     fn run(&self, skill: &str, args: Value) -> Result<Value, String>;
-    /// The newest message on a topic, as JSON.
+    /// The newest message on a topic, as JSON, however old: a topic that went quiet keeps its last.
     ///
     /// # Errors
     ///
@@ -77,7 +77,7 @@ pub const REFERENCE: &str = "objects(words) and objects(words, room) -> [#{id, l
      its arguments in a map, PickObject(#{object_id: id, arm: \"right\"}), or in the catalog's \
      order, PickObject(id, \"right\") or PlaceOn(id, \"left\"), or none, TuckForTravel(), or \
      run(\"Skill\", #{args}), -> #{ok, outcome, reason, outputs}; read(topic) -> the newest \
-     message; rate(topic, seconds) -> Hz; tf(parent, child) -> #{x, y, z, yaw}; wait(seconds); \
+     message, however old (rate tells whether it still comes); rate(topic, seconds) -> Hz; tf(parent, child) -> #{x, y, z, yaw}; wait(seconds); \
      say(text) tells the operator. The last value is the program's result.";
 
 /// A skill as a program may call it by name: the skill and the argument a bare value fills.

@@ -76,11 +76,10 @@ impl ArmSettings {
         Self { spec, arms }
     }
 
-    async fn show(&self) -> ToolOutcome {
-        let now = self.arms.settings();
+    /// MoveIt's pipelines and each one's planners; none when `move_group` does not answer.
+    async fn planners(&self) -> Option<Vec<Value>> {
         let service = self.arms.config.name("query_planner_interface");
-        let planners: Vec<Value> = self
-            .arms
+        self.arms
             .robot
             .call(
                 &service,
@@ -89,6 +88,7 @@ impl ArmSettings {
                 QUERY_WAIT,
             )
             .await
+            .ok()
             .map(|r| {
                 r["planner_interfaces"]
                     .as_array()
@@ -97,7 +97,52 @@ impl ArmSettings {
                     .map(|p| json!({"pipeline": p["pipeline_id"], "planners": p["planner_ids"]}))
                     .collect()
             })
-            .unwrap_or_default();
+    }
+
+    /// Whether `pipeline` and `planner`, those given, are ones MoveIt offers: a pipeline among
+    /// its own, and a planner of that pipeline, or of the one in use when none is given.
+    async fn known(&self, pipeline: Option<String>, planner: Option<String>) -> Result<(), String> {
+        let Some(offered) = self.planners().await else {
+            return Err("move_group did not say which planners it has; try again".to_owned());
+        };
+        let pipeline = pipeline.unwrap_or_else(|| self.arms.settings().pipeline);
+        // No pipeline named is MoveIt's default, whichever it is.
+        let entries: Vec<&Value> = if pipeline.is_empty() {
+            offered.iter().collect()
+        } else {
+            offered
+                .iter()
+                .filter(|p| p["pipeline"] == pipeline.as_str())
+                .collect()
+        };
+        if entries.is_empty() {
+            let names: Vec<&str> = offered
+                .iter()
+                .filter_map(|p| p["pipeline"].as_str())
+                .collect();
+            return Err(format!(
+                "MoveIt has no pipeline `{pipeline}`; it has {}",
+                names.join(", ")
+            ));
+        }
+        let has = |planner: &str| {
+            entries.iter().any(|e| {
+                e["planners"]
+                    .as_array()
+                    .is_some_and(|ps| ps.iter().any(|p| p == planner))
+            })
+        };
+        if let Some(planner) = planner.filter(|p| !p.is_empty() && !has(p)) {
+            return Err(format!(
+                "MoveIt has no planner `{planner}` in pipeline `{pipeline}`; `show` lists them"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn show(&self) -> ToolOutcome {
+        let now = self.arms.settings();
+        let planners = self.planners().await.unwrap_or_default();
         let remembered: BTreeMap<&String, Vec<&String>> = now
             .poses
             .iter()
@@ -137,6 +182,12 @@ impl ArmSettings {
             Ok(g) => g.name.clone(),
             Err(why) => return ToolOutcome::failed(why),
         };
+        // An arm move looks in the SRDF first: a remembered pose of its name would never be used.
+        if srdf.poses_of(&group).any(|p| p.name == name) {
+            return ToolOutcome::failed(format!(
+                "{group} has a pose `{name}` of its own; remember this one under another name"
+            ));
+        }
         let joints = match self.arms.joints().await {
             Ok(j) => j,
             Err(why) => return ToolOutcome::failed(why),
@@ -158,12 +209,26 @@ impl ArmSettings {
         if pose.is_empty() {
             return ToolOutcome::failed(format!("the joint states name none of {group}'s joints"));
         }
-        self.arms.change(|s| {
-            s.poses
-                .entry(group.clone())
-                .or_default()
-                .insert(name.to_owned(), pose.clone());
-        });
+        // A pose short of a joint would leave it wherever it was when the pose is used.
+        let missing: std::collections::BTreeSet<&str> = mine
+            .iter()
+            .filter(|j| !pose.contains_key(*j))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return ToolOutcome::failed(format!(
+                "the joint states lack {}: a pose of {group} needs all its joints",
+                missing.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        self.arms
+            .change(|s| {
+                s.poses
+                    .entry(group.clone())
+                    .or_default()
+                    .insert(name.to_owned(), pose.clone());
+            })
+            .await;
         ToolOutcome::ok(json!({"remembered": name, "group": group, "joints": pose.len()}))
     }
 }
@@ -221,7 +286,7 @@ impl Tool for ArmSettings {
             "show" => self.show().await,
             "speed" => match self.scalings(&args) {
                 Ok((_, next)) => {
-                    self.arms.change(|s| s.scaling = next);
+                    self.arms.change(|s| s.scaling = next).await;
                     ToolOutcome::ok(json!({"scaling": next}))
                 }
                 Err(why) => ToolOutcome::failed(why),
@@ -232,17 +297,25 @@ impl Tool for ArmSettings {
                     return ToolOutcome::failed("planning_s must be above 0 and at most 60");
                 }
                 let text = |k: &str| args[k].as_str().map(|v| v.trim().to_owned());
-                self.arms.change(|s| {
-                    if let Some(p) = text("pipeline") {
-                        s.pipeline = p;
-                    }
-                    if let Some(p) = text("planner") {
-                        s.planner = p;
-                    }
-                    if let Some(t) = time {
-                        s.planning_s = t;
-                    }
-                });
+                // Sent with every arm move: a name MoveIt does not have fails them all.
+                if (text("pipeline").is_some() || text("planner").is_some())
+                    && let Err(why) = self.known(text("pipeline"), text("planner")).await
+                {
+                    return ToolOutcome::failed(why);
+                }
+                self.arms
+                    .change(|s| {
+                        if let Some(p) = text("pipeline") {
+                            s.pipeline = p;
+                        }
+                        if let Some(p) = text("planner") {
+                            s.planner = p;
+                        }
+                        if let Some(t) = time {
+                            s.planning_s = t;
+                        }
+                    })
+                    .await;
                 let now = self.arms.settings();
                 ToolOutcome::ok(
                     json!({"pipeline": now.pipeline, "planner": now.planner, "planning_s": now.planning_s}),
@@ -252,12 +325,14 @@ impl Tool for ArmSettings {
             "forget" => {
                 let name = args["name"].as_str().unwrap_or_default();
                 let mut gone = false;
-                self.arms.change(|s| {
-                    for poses in s.poses.values_mut() {
-                        gone |= poses.remove(name).is_some();
-                    }
-                    s.poses.retain(|_, p| !p.is_empty());
-                });
+                self.arms
+                    .change(|s| {
+                        for poses in s.poses.values_mut() {
+                            gone |= poses.remove(name).is_some();
+                        }
+                        s.poses.retain(|_, p| !p.is_empty());
+                    })
+                    .await;
                 if gone {
                     ToolOutcome::ok(json!({"forgot": name}))
                 } else {

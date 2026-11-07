@@ -1,5 +1,6 @@
 //! What a running job has: its id, its envelope, a way to report, and whether it must stop.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -16,6 +17,8 @@ pub struct Context {
     deadline: Instant,
     stop: watch::Receiver<bool>,
     session: Option<SessionHandle>,
+    /// What the job started that may still move the robot after its stop.
+    unsettled: Arc<Mutex<Option<String>>>,
 }
 
 impl std::fmt::Debug for Context {
@@ -40,7 +43,19 @@ impl Context {
             envelope,
             stop,
             session,
+            unsettled: Arc::default(),
         }
+    }
+
+    /// Notes that something the job started may still move the robot after its stop.
+    pub fn unsettled(&self, why: impl Into<String>) {
+        *crate::lock(&self.unsettled) = Some(why.into());
+    }
+
+    /// What the job left moving, when its stop did not settle everything.
+    #[must_use]
+    pub fn left_moving(&self) -> Option<String> {
+        crate::lock(&self.unsettled).clone()
     }
 
     /// Its id, such as `j3`.
@@ -69,6 +84,12 @@ impl Context {
     #[must_use]
     pub fn stopped(&self) -> bool {
         *self.stop.borrow() || Instant::now() >= self.deadline
+    }
+
+    /// Whether it was told to stop, as against running out of time.
+    #[must_use]
+    pub fn told(&self) -> bool {
+        *self.stop.borrow()
     }
 
     /// How long it may still run.

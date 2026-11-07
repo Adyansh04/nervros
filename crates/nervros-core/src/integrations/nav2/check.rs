@@ -86,6 +86,30 @@ impl NavCheck {
             .map(|t| (t.translation[0], t.translation[1]))
     }
 
+    /// Nav2's plan for `goal` (`ComputePathToPose`), cancelled when it takes too long: dropping a
+    /// goal does not end it, and a planner left working is told to stop.
+    async fn plan_path(
+        &self,
+        goal: Value,
+    ) -> Result<nervros_ros::GoalResult, nervros_ros::RosError> {
+        let action = self.config.name("compute_path_to_pose");
+        let goal = self
+            .robot
+            .send_goal(
+                &action,
+                "nav2_msgs/action/ComputePathToPose",
+                goal,
+                PLAN_WAIT,
+            )
+            .await?;
+        let cancel = goal.canceller();
+        let Ok(done) = tokio::time::timeout(PLAN_WAIT, goal.result).await else {
+            let _ = cancel().await;
+            return Err(nervros_ros::RosError::Timeout(action));
+        };
+        done.map_err(|_| nervros_ros::RosError::Middleware("the planner went away".into()))?
+    }
+
     async fn path(&self, args: &Value) -> ToolOutcome {
         let seen = self.watcher.now(self.robot.as_ref()).await;
         if seen.moving() {
@@ -123,23 +147,7 @@ impl NavCheck {
             "planner_id": "",
             "use_start": from.is_some(),
         });
-        let action = self.config.name("compute_path_to_pose");
-        let planned = async {
-            let goal = self
-                .robot
-                .send_goal(
-                    &action,
-                    "nav2_msgs/action/ComputePathToPose",
-                    goal,
-                    PLAN_WAIT,
-                )
-                .await?;
-            tokio::time::timeout(PLAN_WAIT, goal.result)
-                .await
-                .map_err(|_| nervros_ros::RosError::Timeout(action.clone()))?
-                .map_err(|_| nervros_ros::RosError::Middleware("the planner went away".into()))?
-        };
-        let result = match planned.await {
+        let result = match self.plan_path(goal).await {
             Ok(r) => r.result,
             Err(e) => return ToolOutcome::failed(format!("Nav2's planner did not answer: {e}")),
         };
@@ -153,7 +161,11 @@ impl NavCheck {
                 Some((at["x"].as_f64()?, at["y"].as_f64()?))
             })
             .collect();
-        if code != 0 || poses.len() < 2 {
+        // A plan of one pose or none, given without an error, is a robot already there.
+        if code == 0 && poses.len() < 2 {
+            return ToolOutcome::ok(json!({"reachable": true, "to": to.what, "length_m": 0.0}));
+        }
+        if code != 0 {
             let why = result["error_msg"].as_str().filter(|m| !m.is_empty());
             return ToolOutcome::ok(json!({
                 "reachable": false,
@@ -176,6 +188,10 @@ impl NavCheck {
         }
         if !way.keep_out.is_empty() {
             // Nav2 plans around its keepout mask; a way through one means it does not read it.
+            out["warning"] = json!(format!(
+                "Nav2's path crosses the keep-out zone {}: a walk this way would be refused",
+                way.keep_out.join(", ")
+            ));
             out["through_keep_out_zones"] = json!(way.keep_out);
         }
         ToolOutcome::ok(out)
@@ -324,7 +340,8 @@ impl Way {
             if let Some(t) = top {
                 seconds += d / (t * share);
             }
-            if let Some(zone) = zones.at(mx, my)
+            // The whole segment, not its middle: a narrow zone can lie between two path points.
+            if let Some((zone, _)) = zones.crossed((x1, y1), (x2, y2))
                 && !way.keep_out.contains(&zone.name)
             {
                 way.keep_out.push(zone.name);
